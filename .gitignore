@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+.pytest_cache/
+docs/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyQt
+*.qmlc
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+.translation-project/
+chi-srt/
+chi-ass/
+translate/
+Fonts/
+*.mkv
+*.eng.ass
+*.md
+!README.md
+
+# OS
+.DS_Store
+Thumbs.db

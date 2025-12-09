@@ -1,0 +1,12 @@
+# No pip dependencies required - all packages are installed system-wide
+#
+# System Requirements:
+# - Python 3.13
+# - python-pyqt6 6.10.0 (system package)
+# - python-opencv-cuda 4.12.0 (system package)
+# - ffmpeg 8.0.1
+# - ffprobe 8.0.1
+#
+# CLI Tools (must be in PATH):
+# - ocrp, ass-credits, ass-header, ass-qafix, sub-visualize
+# - subs-translator, submerge, srt-to-ass

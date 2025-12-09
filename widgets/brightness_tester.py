@@ -1,0 +1,553 @@
+"""Brightness tester dialog with visual previews."""
+import subprocess
+import shutil
+import uuid
+from pathlib import Path
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
+                              QLabel, QSlider, QComboBox, QSpinBox, QScrollArea,
+                              QWidget, QMessageBox, QSizePolicy)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPointF
+from PyQt6.QtGui import QPixmap, QPainter, QWheelEvent, QMouseEvent
+
+from core.video_utils import get_video_duration
+
+
+class ZoomableImageLabel(QLabel):
+    """Label that supports zooming and panning."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self.original_pixmap = None
+        self.zoom_factor = 1.0
+        self.min_zoom = 0.01
+        self.max_zoom = 10.0
+        self.pan_offset = QPointF(0, 0)
+
+        # For panning
+        self.panning = False
+        self.last_pan_point = QPoint()
+
+    def set_image(self, pixmap: QPixmap):
+        """Set the image to display."""
+        self.original_pixmap = pixmap
+        self.update_display()
+
+    def calculate_fit_zoom(self):
+        """Calculate zoom factor to fit image within viewport."""
+        if self.original_pixmap is None:
+            return 1.0
+
+        # Calculate scale factors for width and height
+        width_scale = self.width() / self.original_pixmap.width()
+        height_scale = self.height() / self.original_pixmap.height()
+
+        # Use the smaller scale to ensure the entire image fits
+        fit_zoom = min(width_scale, height_scale)
+
+        # Clamp to min/max zoom
+        return max(self.min_zoom, min(self.max_zoom, fit_zoom))
+
+    def reset_view(self):
+        """Reset zoom and pan to fit viewport."""
+        self.zoom_factor = self.calculate_fit_zoom()
+        self.pan_offset = QPointF(0, 0)
+        self.update_display()
+
+    def update_display(self):
+        """Update the displayed image with current zoom and pan."""
+        if self.original_pixmap is None:
+            return
+
+        # Calculate scaled size
+        scaled_width = int(self.original_pixmap.width() * self.zoom_factor)
+        scaled_height = int(self.original_pixmap.height() * self.zoom_factor)
+
+        # Scale the pixmap
+        scaled_pixmap = self.original_pixmap.scaled(
+            scaled_width, scaled_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+        # Create a pixmap the size of the widget
+        display_pixmap = QPixmap(self.size())
+        display_pixmap.fill(Qt.GlobalColor.black)
+
+        # Calculate position with pan offset
+        x = int((self.width() - scaled_pixmap.width()) / 2 + self.pan_offset.x())
+        y = int((self.height() - scaled_pixmap.height()) / 2 + self.pan_offset.y())
+
+        # Draw the scaled image
+        painter = QPainter(display_pixmap)
+        painter.drawPixmap(x, y, scaled_pixmap)
+        painter.end()
+
+        self.setPixmap(display_pixmap)
+
+    def wheelEvent(self, event: QWheelEvent):
+        """Handle mouse wheel for zooming."""
+        if self.original_pixmap is None:
+            return
+
+        # Get zoom direction
+        delta = event.angleDelta().y()
+        zoom_in = delta > 0
+
+        # Calculate new zoom factor
+        zoom_step = 1.15
+        if zoom_in:
+            new_zoom = self.zoom_factor * zoom_step
+        else:
+            new_zoom = self.zoom_factor / zoom_step
+
+        # Clamp zoom factor
+        new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
+
+        # Get mouse position relative to widget center
+        mouse_pos = event.position()
+        center = QPointF(self.width() / 2, self.height() / 2)
+        mouse_offset = mouse_pos - center
+
+        # Adjust pan offset to zoom towards mouse position
+        zoom_ratio = new_zoom / self.zoom_factor
+        self.pan_offset = self.pan_offset * zoom_ratio - mouse_offset * (zoom_ratio - 1)
+
+        self.zoom_factor = new_zoom
+        self.update_display()
+
+    def mousePressEvent(self, event: QMouseEvent):
+        """Start panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.panning = True
+            self.last_pan_point = event.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        """Handle panning."""
+        if self.panning:
+            delta = event.pos() - self.last_pan_point
+            self.pan_offset += QPointF(delta.x(), delta.y())
+            self.last_pan_point = event.pos()
+            self.update_display()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        """Stop panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def resizeEvent(self, event):
+        """Handle resize."""
+        super().resizeEvent(event)
+        self.update_display()
+
+
+class BrightnessTesterDialog(QDialog):
+    """Dialog for testing brightness levels with visual previews."""
+
+    brightness_selected = pyqtSignal(int)
+
+    def __init__(self, mkv_files: list, selected_episode: int = 0, timeline_position: int = 5000, brightness: int = 230, parent=None):
+        super().__init__(parent)
+        self.mkv_files = sorted(mkv_files)
+        self.selected_episode = selected_episode
+        self.initial_timeline_position = timeline_position
+        self.initial_brightness = brightness
+        self.current_duration = 0
+
+        # Create temp directory
+        self.temp_dir = Path(f"/tmp/translator-{uuid.uuid4().hex[:8]}")
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+        self.current_frame = None
+        self.selected_brightness = brightness
+
+        # Carousel state
+        self.preview_images = []  # List of (brightness, pixmap) tuples
+        self.current_preview_index = 0
+        self.has_generated_previews = False  # Track if we've generated before
+
+        # Debounce timer for auto frame extraction
+        self.extract_timer = QTimer(self)
+        self.extract_timer.setSingleShot(True)
+        self.extract_timer.timeout.connect(self.extract_current_frame)
+
+        self.setWindowTitle("Test Brightness")
+        self.resize(1400, 900)
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Setup dialog UI."""
+        layout = QVBoxLayout(self)
+
+        # Instructions
+        instructions = QLabel("Move slider to find a frame with subtitles, then generate previews to find optimal brightness")
+        instructions.setStyleSheet("font-weight: bold; color: #0078d4;")
+        layout.addWidget(instructions)
+
+        # Frame preview
+        self.frame_preview = QLabel()
+        self.frame_preview.setMinimumSize(640, 200)
+        self.frame_preview.setMaximumHeight(250)
+        self.frame_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.frame_preview.setStyleSheet("background-color: #1e1e1e;")
+        layout.addWidget(self.frame_preview)
+
+        # Timeline slider
+        timeline_layout = QHBoxLayout()
+        timeline_layout.addWidget(QLabel("Position:"))
+
+        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider.setRange(0, 10000)
+        self.timeline_slider.setValue(self.initial_timeline_position)  # Already on 0-10000 scale
+        self.timeline_slider.valueChanged.connect(self.on_timeline_changed)
+        timeline_layout.addWidget(self.timeline_slider)
+
+        self.time_label = QLabel("0:00.00")
+        self.time_label.setMinimumWidth(80)
+        timeline_layout.addWidget(self.time_label)
+
+        layout.addLayout(timeline_layout)
+
+        # Episode selector
+        episode_layout = QHBoxLayout()
+        episode_layout.addWidget(QLabel("Episode:"))
+
+        self.episode_combo = QComboBox()
+        self.episode_combo.addItems([Path(f).name for f in self.mkv_files])
+        self.episode_combo.setCurrentIndex(min(self.selected_episode, len(self.mkv_files) - 1))
+        self.episode_combo.currentIndexChanged.connect(self.on_episode_changed)
+        episode_layout.addWidget(self.episode_combo)
+        episode_layout.addStretch()
+
+        layout.addLayout(episode_layout)
+
+        # Brightness controls
+        control_layout = QHBoxLayout()
+        control_layout.addWidget(QLabel("Brightness:"))
+
+        self.brightness_spin = QSpinBox()
+        self.brightness_spin.setRange(0, 255)
+        self.brightness_spin.setValue(self.initial_brightness)
+        control_layout.addWidget(self.brightness_spin)
+
+        control_layout.addWidget(QLabel("Range:"))
+        self.range_spin = QSpinBox()
+        self.range_spin.setRange(1, 50)
+        self.range_spin.setValue(20)
+        control_layout.addWidget(self.range_spin)
+
+        generate_btn = QPushButton("Generate Previews")
+        generate_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+        """)
+        generate_btn.clicked.connect(self.on_generate_previews_clicked)
+        control_layout.addWidget(generate_btn)
+
+        control_layout.addStretch()
+        layout.addLayout(control_layout)
+
+        # Carousel preview section
+        carousel_label = QLabel("Preview Carousel (scroll to zoom, drag to pan, arrows to navigate):")
+        layout.addWidget(carousel_label)
+
+        # Carousel container
+        carousel_container = QWidget()
+        carousel_layout = QHBoxLayout(carousel_container)
+        carousel_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Left arrow
+        self.prev_btn = QPushButton("<")
+        self.prev_btn.setFixedSize(50, 100)
+        self.prev_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 24px;
+                font-weight: bold;
+                background-color: #333;
+                color: white;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #555;
+            }
+            QPushButton:disabled {
+                background-color: #1a1a1a;
+                color: #555;
+            }
+        """)
+        self.prev_btn.clicked.connect(self.show_previous_preview)
+        self.prev_btn.setEnabled(False)
+        carousel_layout.addWidget(self.prev_btn)
+
+        # Zoomable image
+        self.carousel_image = ZoomableImageLabel()
+        self.carousel_image.setMinimumSize(800, 400)
+        self.carousel_image.setStyleSheet("background-color: #000;")
+        carousel_layout.addWidget(self.carousel_image, 1)
+
+        # Right arrow
+        self.next_btn = QPushButton(">")
+        self.next_btn.setFixedSize(50, 100)
+        self.next_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 24px;
+                font-weight: bold;
+                background-color: #333;
+                color: white;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #555;
+            }
+            QPushButton:disabled {
+                background-color: #1a1a1a;
+                color: #555;
+            }
+        """)
+        self.next_btn.clicked.connect(self.show_next_preview)
+        self.next_btn.setEnabled(False)
+        carousel_layout.addWidget(self.next_btn)
+
+        layout.addWidget(carousel_container, 1)
+
+        # Brightness indicator
+        self.brightness_indicator = QLabel("Brightness: --")
+        self.brightness_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.brightness_indicator.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: #0078d4;
+                padding: 10px;
+            }
+        """)
+        layout.addWidget(self.brightness_indicator)
+
+        # Navigation indicator
+        self.nav_indicator = QLabel("")
+        self.nav_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.nav_indicator.setStyleSheet("color: #888;")
+        layout.addWidget(self.nav_indicator)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        reset_zoom_btn = QPushButton("Reset Zoom")
+        reset_zoom_btn.clicked.connect(self.carousel_image.reset_view)
+        button_layout.addWidget(reset_zoom_btn)
+
+        button_layout.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        apply_btn = QPushButton("Apply Selected Brightness")
+        apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+        """)
+        apply_btn.clicked.connect(self.on_apply_clicked)
+        button_layout.addWidget(apply_btn)
+
+        layout.addLayout(button_layout)
+
+        # Load initial episode and extract frame
+        if self.mkv_files:
+            self.load_episode(self.episode_combo.currentIndex())
+            # Update time label for initial position
+            self.on_timeline_changed(self.initial_timeline_position)
+
+    def load_episode(self, index: int):
+        """Load episode and extract initial frame."""
+        if 0 <= index < len(self.mkv_files):
+            mkv_path = self.mkv_files[index]
+            try:
+                self.current_duration = get_video_duration(mkv_path)
+            except:
+                self.current_duration = 600  # Default 10 minutes
+            self.extract_current_frame()
+
+    def on_timeline_changed(self, value: int):
+        """Update time label and trigger debounced frame extraction."""
+        total_seconds = (value / 10000) * self.current_duration
+        minutes = int(total_seconds) // 60
+        secs = int(total_seconds) % 60
+        centisecs = int((total_seconds - int(total_seconds)) * 100)
+        self.time_label.setText(f"{minutes}:{secs:02d}.{centisecs:02d}")
+
+        # Debounce: wait 300ms after slider stops moving
+        self.extract_timer.start(300)
+
+    def on_episode_changed(self, index: int):
+        """Handle episode change."""
+        self.load_episode(index)
+
+    def extract_current_frame(self):
+        """Extract frame at current timeline position."""
+        if not self.mkv_files:
+            return
+
+        episode_idx = self.episode_combo.currentIndex()
+        mkv_path = self.mkv_files[episode_idx]
+
+        position = self.timeline_slider.value()
+        total_seconds = (position / 10000) * self.current_duration
+
+        hours = int(total_seconds) // 3600
+        minutes = (int(total_seconds) % 3600) // 60
+        secs = int(total_seconds) % 60
+        centisecs = int((total_seconds - int(total_seconds)) * 100)
+        timestamp = f"{hours:02d}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
+
+        # Extract frame as sub.png in temp directory
+        frame_path = self.temp_dir / "sub.png"
+
+        try:
+            subprocess.run([
+                'ffmpeg', '-ss', timestamp, '-i', mkv_path,
+                '-vframes', '1', '-y', str(frame_path)
+            ], capture_output=True, check=True)
+
+            if frame_path.exists():
+                self.current_frame = str(frame_path)
+                pixmap = QPixmap(str(frame_path))
+                scaled_pixmap = pixmap.scaled(
+                    self.frame_preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.frame_preview.setPixmap(scaled_pixmap)
+        except Exception as e:
+            print(f"Failed to extract frame: {e}")
+
+    def on_generate_previews_clicked(self):
+        """Generate brightness preview gallery using sub-visualize."""
+        if not self.current_frame or not Path(self.current_frame).exists():
+            QMessageBox.warning(self, "Error", "No frame extracted yet. Move the slider to extract a frame first.")
+            return
+
+        base_brightness = self.brightness_spin.value()
+        range_value = self.range_spin.value()
+
+        # Generate brightness values
+        brightness_values = []
+        for i in range(-range_value, range_value + 1):
+            b = base_brightness + i
+            if 0 <= b <= 255:
+                brightness_values.append(b)
+
+        # Run sub-visualize in temp directory
+        try:
+            result = subprocess.run(
+                ['sub-visualize', 'sub.png', '-b', str(base_brightness), '--span', str(range_value)],
+                cwd=str(self.temp_dir),
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                print(f"sub-visualize stderr: {result.stderr}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to run sub-visualize: {e}")
+            return
+
+        # Load generated preview images
+        self.preview_images.clear()
+        for brightness in brightness_values:
+            preview_path = self.temp_dir / f"sub_{brightness}.png"
+            if preview_path.exists():
+                pixmap = QPixmap(str(preview_path))
+                self.preview_images.append((brightness, pixmap))
+
+        if not self.preview_images:
+            QMessageBox.warning(self, "No Previews", "No preview images were generated.")
+            return
+
+        # Only reset zoom on first generation, maintain zoom for subsequent generations
+        should_reset_zoom = not self.has_generated_previews
+        self.has_generated_previews = True
+
+        # Show first preview (middle one - the base brightness)
+        middle_index = len(self.preview_images) // 2
+        self.current_preview_index = middle_index
+        self.show_current_preview(reset_zoom=should_reset_zoom)
+        self.update_navigation_buttons()
+
+    def show_current_preview(self, reset_zoom=False):
+        """Display the current preview image in the carousel."""
+        if not self.preview_images or self.current_preview_index >= len(self.preview_images):
+            return
+
+        brightness, pixmap = self.preview_images[self.current_preview_index]
+
+        # Keep current zoom and pan when changing images (unless resetting)
+        current_zoom = self.carousel_image.zoom_factor
+        current_pan = self.carousel_image.pan_offset
+
+        self.carousel_image.set_image(pixmap)
+
+        if reset_zoom:
+            # Calculate zoom to fit image in viewport
+            fit_zoom = self.carousel_image.calculate_fit_zoom()
+            self.carousel_image.zoom_factor = fit_zoom
+            self.carousel_image.pan_offset = QPointF(0, 0)
+        else:
+            # Restore zoom and pan
+            self.carousel_image.zoom_factor = current_zoom
+            self.carousel_image.pan_offset = current_pan
+
+        self.carousel_image.update_display()
+
+        # Update indicators
+        self.brightness_indicator.setText(f"Brightness: {brightness}")
+        self.nav_indicator.setText(f"{self.current_preview_index + 1} / {len(self.preview_images)}")
+
+        # Update selected brightness
+        self.selected_brightness = brightness
+        self.brightness_spin.setValue(brightness)
+
+    def show_previous_preview(self):
+        """Show the previous preview image."""
+        if self.current_preview_index > 0:
+            self.current_preview_index -= 1
+            self.show_current_preview()
+            self.update_navigation_buttons()
+
+    def show_next_preview(self):
+        """Show the next preview image."""
+        if self.current_preview_index < len(self.preview_images) - 1:
+            self.current_preview_index += 1
+            self.show_current_preview()
+            self.update_navigation_buttons()
+
+    def update_navigation_buttons(self):
+        """Update the enabled state of navigation buttons."""
+        self.prev_btn.setEnabled(self.current_preview_index > 0)
+        self.next_btn.setEnabled(self.current_preview_index < len(self.preview_images) - 1)
+
+    def on_apply_clicked(self):
+        """Apply brightness selection."""
+        self.brightness_selected.emit(self.brightness_spin.value())
+        self.accept()
+
+    def closeEvent(self, event):
+        """Clean up temp files."""
+        try:
+            shutil.rmtree(self.temp_dir)
+        except:
+            pass
+        super().closeEvent(event)
