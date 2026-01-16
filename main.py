@@ -6,7 +6,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QGroupBox, QLineEdit, QPushButton,
                               QSpinBox, QPlainTextEdit, QLabel, QFileDialog,
-                              QMessageBox, QSplitter, QCheckBox, QMenuBar)
+                              QMessageBox, QSplitter, QCheckBox, QMenuBar,
+                              QComboBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QShortcut
 
@@ -17,6 +18,7 @@ from core.pipeline import Pipeline
 from widgets.terminal_output import TerminalOutputWidget
 from widgets.crop_selector import CropSelectorDialog
 from widgets.brightness_tester import BrightnessTesterDialog
+from widgets.subtitle_position import SubtitlePositionDialog
 
 
 class MainWindow(QMainWindow):
@@ -50,6 +52,7 @@ class MainWindow(QMainWindow):
         self.start_button = None
         self.auto_scroll_check = None
         self.open_dir_button = None
+        self.stop_at_phase_combo = None
 
         self.init_ui()
         self.check_dependencies()
@@ -121,8 +124,18 @@ class MainWindow(QMainWindow):
         ocr_group = QGroupBox("OCR Parameters")
         ocr_layout = QVBoxLayout()
 
-        # Crop region
-        crop_layout = QHBoxLayout()
+        # Full frame option
+        fullframe_layout = QHBoxLayout()
+        self.fullframe_checkbox = QCheckBox("Full Frame")
+        self.fullframe_checkbox.stateChanged.connect(self.on_fullframe_changed)
+        fullframe_layout.addWidget(self.fullframe_checkbox)
+        fullframe_layout.addStretch()
+        ocr_layout.addLayout(fullframe_layout)
+
+        # Crop region (wrapped in widget for visibility toggle)
+        self.crop_widget = QWidget()
+        crop_layout = QHBoxLayout(self.crop_widget)
+        crop_layout.setContentsMargins(0, 0, 0, 0)
         crop_layout.addWidget(QLabel("Crop Region:"))
         self.crop_input = QLineEdit()
         self.crop_input.setPlaceholderText("x, y, width, height")
@@ -131,7 +144,7 @@ class MainWindow(QMainWindow):
         crop_select_btn = QPushButton("Select")
         crop_select_btn.clicked.connect(self.on_crop_select_clicked)
         crop_layout.addWidget(crop_select_btn)
-        ocr_layout.addLayout(crop_layout)
+        ocr_layout.addWidget(self.crop_widget)
 
         # Brightness
         brightness_layout = QHBoxLayout()
@@ -146,6 +159,18 @@ class MainWindow(QMainWindow):
         brightness_layout.addWidget(brightness_test_btn)
         brightness_layout.addStretch()
         ocr_layout.addLayout(brightness_layout)
+
+        # OCR Width (downscale for faster processing)
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(QLabel("Width:"))
+        self.ocr_width_spin = QSpinBox()
+        self.ocr_width_spin.setRange(0, 4096)
+        self.ocr_width_spin.setValue(1280)
+        self.ocr_width_spin.setSpecialValueText("Original")
+        self.ocr_width_spin.valueChanged.connect(self.auto_save_config)
+        width_layout.addWidget(self.ocr_width_spin)
+        width_layout.addStretch()
+        ocr_layout.addLayout(width_layout)
 
         # Time start/end
         time_layout = QHBoxLayout()
@@ -197,6 +222,10 @@ class MainWindow(QMainWindow):
 
         # Header default buttons
         header_btn_layout = QHBoxLayout()
+        self.position_subs_btn = QPushButton("Position Subtitles")
+        self.position_subs_btn.setToolTip("Visually position subtitle text on video frame")
+        self.position_subs_btn.clicked.connect(self.on_position_subs_clicked)
+        header_btn_layout.addWidget(self.position_subs_btn)
         header_btn_layout.addStretch()
         self.save_default_btn = QPushButton("Save Default")
         self.save_default_btn.setToolTip("Save current header as the global default")
@@ -210,6 +239,22 @@ class MainWindow(QMainWindow):
 
         header_group.setLayout(header_layout)
         layout.addWidget(header_group)
+
+        # Pipeline Control
+        pipeline_group = QGroupBox("Pipeline Control")
+        pipeline_layout = QHBoxLayout()
+        pipeline_layout.addWidget(QLabel("Stop after phase:"))
+
+        self.stop_at_phase_combo = QComboBox()
+        self.stop_at_phase_combo.addItem("Run all phases", -1)
+        for i, phase_name in enumerate(Pipeline.PHASES):
+            self.stop_at_phase_combo.addItem(f"{i + 1}. {phase_name}", i)
+        self.stop_at_phase_combo.currentIndexChanged.connect(self.auto_save_config)
+        pipeline_layout.addWidget(self.stop_at_phase_combo)
+        pipeline_layout.addStretch()
+
+        pipeline_group.setLayout(pipeline_layout)
+        layout.addWidget(pipeline_group)
 
         # Action buttons
         button_layout = QHBoxLayout()
@@ -331,15 +376,20 @@ class MainWindow(QMainWindow):
             self.config.header_template = self.global_config.default_header_template
 
         # Temporarily block signals to avoid triggering auto-save during load
+        self.fullframe_checkbox.blockSignals(True)
         self.crop_input.blockSignals(True)
         self.brightness_spin.blockSignals(True)
+        self.ocr_width_spin.blockSignals(True)
         self.time_start_input.blockSignals(True)
         self.time_end_input.blockSignals(True)
         self.ocr_parallel_spin.blockSignals(True)
         self.remove_credits_checkbox.blockSignals(True)
         self.header_text.blockSignals(True)
+        self.stop_at_phase_combo.blockSignals(True)
 
         # Update UI with config values
+        self.fullframe_checkbox.setChecked(self.config.fullframe)
+
         if self.config.crop_width > 0:
             self.crop_input.setText(
                 f"{self.config.crop_x}, {self.config.crop_y}, "
@@ -347,20 +397,33 @@ class MainWindow(QMainWindow):
             )
 
         self.brightness_spin.setValue(self.config.brightness)
+        self.ocr_width_spin.setValue(self.config.ocr_width)
         self.time_start_input.setText(self.config.time_start)
         self.time_end_input.setText(self.config.time_end)
         self.ocr_parallel_spin.setValue(self.config.ocr_parallel)
         self.remove_credits_checkbox.setChecked(self.config.remove_credits)
         self.header_text.setPlainText(self.config.header_template)
 
+        # Set stop_at_phase combo box
+        index = self.stop_at_phase_combo.findData(self.config.stop_at_phase)
+        if index >= 0:
+            self.stop_at_phase_combo.setCurrentIndex(index)
+
         # Re-enable signals
+        self.fullframe_checkbox.blockSignals(False)
         self.crop_input.blockSignals(False)
         self.brightness_spin.blockSignals(False)
+        self.ocr_width_spin.blockSignals(False)
         self.time_start_input.blockSignals(False)
         self.time_end_input.blockSignals(False)
         self.ocr_parallel_spin.blockSignals(False)
         self.remove_credits_checkbox.blockSignals(False)
         self.header_text.blockSignals(False)
+        self.stop_at_phase_combo.blockSignals(False)
+
+    def on_fullframe_changed(self, state):
+        """Handle fullframe checkbox change (crop region stays visible - both can be combined)."""
+        self.auto_save_config()
 
     def on_crop_select_clicked(self):
         """Open crop selector dialog."""
@@ -442,12 +505,78 @@ class MainWindow(QMainWindow):
 
         self.header_text.setPlainText(self.global_config.default_header_template)
 
+    def on_position_subs_clicked(self):
+        """Open subtitle position dialog."""
+        if not self.project_path:
+            QMessageBox.warning(self, "Error", "Please select a project directory first")
+            return
+
+        # Find MKV files
+        mkv_files = list(Path(self.project_path).glob("*.mkv"))
+        if not mkv_files:
+            QMessageBox.warning(self, "Error", "No MKV files found in project directory")
+            return
+
+        # Get current header template
+        header_template = self.header_text.toPlainText()
+        if not header_template.strip():
+            QMessageBox.warning(self, "Error", "Header template is empty. Please set a header template first.")
+            return
+
+        dialog = SubtitlePositionDialog(
+            [str(f) for f in mkv_files],
+            header_template,
+            self.last_timeline_position,
+            self
+        )
+        dialog.position_selected.connect(self.on_position_selected)
+        if dialog.exec():
+            self.last_timeline_position = dialog.get_timeline_position()
+
+    def on_position_selected(self, margin_v: int, font_size: int):
+        """Handle subtitle position selection - update header template."""
+        import re
+
+        header = self.header_text.toPlainText()
+
+        # Update Fontsize in Style line
+        # Style line format: Style: Name,Fontname,Fontsize,...
+        def replace_fontsize(match):
+            prefix = match.group(1)  # "Style: Default,FontName,"
+            old_size = match.group(2)  # old font size
+            suffix = match.group(3)  # rest of the line
+            return f"{prefix}{font_size}{suffix}"
+
+        header = re.sub(
+            r'(Style:\s*Default,[^,]+,)(\d+)(,.+)',
+            replace_fontsize,
+            header
+        )
+
+        # Update MarginV in Style line
+        # MarginV is the second-to-last value (before Encoding)
+        # Split by commas, replace second-to-last, rejoin
+        lines = header.split('\n')
+        new_lines = []
+        for line in lines:
+            if line.startswith('Style: Default,') or line.startswith('Style:Default,'):
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    # MarginV is at index -2
+                    parts[-2] = str(margin_v)
+                    line = ','.join(parts)
+            new_lines.append(line)
+
+        header = '\n'.join(new_lines)
+        self.header_text.setPlainText(header)
+
     def auto_save_config(self):
         """Automatically save configuration when any input changes."""
         if not self.config:
             return
 
         # Update config from UI
+        self.config.fullframe = self.fullframe_checkbox.isChecked()
         crop_values = self.crop_input.text().split(',')
         if len(crop_values) == 4:
             try:
@@ -459,11 +588,13 @@ class MainWindow(QMainWindow):
                 pass  # Ignore invalid crop values during typing
 
         self.config.brightness = self.brightness_spin.value()
+        self.config.ocr_width = self.ocr_width_spin.value()
         self.config.time_start = self.time_start_input.text()
         self.config.time_end = self.time_end_input.text()
         self.config.ocr_parallel = self.ocr_parallel_spin.value()
         self.config.remove_credits = self.remove_credits_checkbox.isChecked()
         self.config.header_template = self.header_text.toPlainText()
+        self.config.stop_at_phase = self.stop_at_phase_combo.currentData()
 
         save_project_config(self.config)
 
@@ -491,8 +622,11 @@ class MainWindow(QMainWindow):
         # Config is already saved via auto-save, just ensure it's up to date
         self.auto_save_config()
 
+        # Determine stop_at_phase value (convert -1 to None for Pipeline)
+        stop_at = None if self.config.stop_at_phase == -1 else self.config.stop_at_phase
+
         # Create and start pipeline
-        self.pipeline = Pipeline(self.config, self.global_config)
+        self.pipeline = Pipeline(self.config, self.global_config, stop_at)
         self.pipeline.command_started.connect(self.terminal.append_command)
         self.pipeline.output_received.connect(self.terminal.append_output)
         self.pipeline.error_occurred.connect(self.on_pipeline_error)
@@ -574,6 +708,8 @@ class MainWindow(QMainWindow):
         self.header_text.setEnabled(False)
         self.save_default_btn.setEnabled(False)
         self.load_default_btn.setEnabled(False)
+        self.position_subs_btn.setEnabled(False)
+        self.stop_at_phase_combo.setEnabled(False)
 
     def enable_ui(self):
         """Re-enable UI after processing."""
@@ -586,6 +722,8 @@ class MainWindow(QMainWindow):
         self.header_text.setEnabled(True)
         self.save_default_btn.setEnabled(True)
         self.load_default_btn.setEnabled(True)
+        self.position_subs_btn.setEnabled(True)
+        self.stop_at_phase_combo.setEnabled(True)
 
     def check_dependencies(self):
         """Check if required CLI tools are available."""

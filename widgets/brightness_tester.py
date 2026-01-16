@@ -165,6 +165,7 @@ class BrightnessTesterDialog(QDialog):
 
         self.current_frame = None
         self.selected_brightness = brightness
+        self.initial_resize_done = False  # Track if initial auto-resize has been done
 
         # Carousel state
         self.preview_images = []  # List of (brightness, pixmap) tuples
@@ -191,8 +192,7 @@ class BrightnessTesterDialog(QDialog):
 
         # Frame preview
         self.frame_preview = QLabel()
-        self.frame_preview.setMinimumSize(640, 200)
-        self.frame_preview.setMaximumHeight(250)
+        self.frame_preview.setMinimumSize(400, 225)
         self.frame_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.frame_preview.setStyleSheet("background-color: #1e1e1e;")
         layout.addWidget(self.frame_preview)
@@ -371,6 +371,32 @@ class BrightnessTesterDialog(QDialog):
             # Update time label for initial position
             self.on_timeline_changed(self.initial_timeline_position)
 
+    def get_available_frame_size(self, pixmap: QPixmap) -> tuple[int, int]:
+        """Calculate optimal frame size based on pixmap aspect ratio and available space."""
+        from PyQt6.QtWidgets import QApplication
+
+        # Get screen dimensions
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_dialog_height = int(screen.height() * 0.8)
+
+        # Available width = dialog width minus margins (layout margins ~20px total)
+        available_width = self.width() - 40
+
+        # Calculate height based on aspect ratio
+        aspect_ratio = pixmap.height() / pixmap.width()
+        optimal_height = int(available_width * aspect_ratio)
+
+        # Estimate height of other UI elements (instructions, timeline, carousel, buttons, etc.)
+        ui_overhead = 450  # More overhead for brightness tester due to carousel
+
+        # Cap frame height if dialog would exceed 80% screen height
+        max_frame_height = max_dialog_height - ui_overhead
+        if optimal_height > max_frame_height:
+            optimal_height = max_frame_height
+            available_width = int(optimal_height / aspect_ratio)
+
+        return (available_width, optimal_height)
+
     def load_episode(self, index: int):
         """Load episode and extract initial frame."""
         if 0 <= index < len(self.mkv_files):
@@ -425,12 +451,26 @@ class BrightnessTesterDialog(QDialog):
             if frame_path.exists():
                 self.current_frame = str(frame_path)
                 pixmap = QPixmap(str(frame_path))
+
+                # Calculate and set optimal frame size
+                optimal_width, optimal_height = self.get_available_frame_size(pixmap)
+                self.frame_preview.setFixedSize(optimal_width, optimal_height)
+
+                # Scale to fill the label exactly
                 scaled_pixmap = pixmap.scaled(
                     self.frame_preview.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
                 self.frame_preview.setPixmap(scaled_pixmap)
+
+                # Store original pixmap for resize events
+                self.frame_preview.original_pixmap = pixmap
+
+                # Only auto-resize dialog on initial frame load
+                if not self.initial_resize_done:
+                    self.adjustSize()
+                    self.initial_resize_done = True
         except Exception as e:
             print(f"Failed to extract frame: {e}")
 
@@ -551,3 +591,17 @@ class BrightnessTesterDialog(QDialog):
         except:
             pass
         super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        """Handle dialog resize - adjust frame size to fill width."""
+        super().resizeEvent(event)
+        if hasattr(self, 'frame_preview') and hasattr(self.frame_preview, 'original_pixmap') and self.frame_preview.original_pixmap:
+            pixmap = self.frame_preview.original_pixmap
+            optimal_width, optimal_height = self.get_available_frame_size(pixmap)
+            self.frame_preview.setFixedSize(optimal_width, optimal_height)
+            scaled_pixmap = pixmap.scaled(
+                self.frame_preview.size(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.frame_preview.setPixmap(scaled_pixmap)

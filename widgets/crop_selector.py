@@ -34,15 +34,13 @@ class FrameLabel(QLabel):
         if existing_crop is not None:
             self.stored_crop = existing_crop
 
-        # Scale to fit while maintaining aspect ratio
-        self.scaled_pixmap = pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+        # Scale to fill the label exactly (label is sized to match aspect ratio)
+        self.scaled_pixmap = pixmap.scaled(self.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
                                            Qt.TransformationMode.SmoothTransformation)
         self.scale_factor = pixmap.width() / self.scaled_pixmap.width() if self.scaled_pixmap.width() > 0 else 1.0
 
-        # Calculate offset for centered pixmap
-        offset_x = (self.width() - self.scaled_pixmap.width()) // 2
-        offset_y = (self.height() - self.scaled_pixmap.height()) // 2
-        self.pixmap_offset = QPoint(offset_x, offset_y)
+        # No offset needed - pixmap fills entire label
+        self.pixmap_offset = QPoint(0, 0)
 
         # Clear previous crop when loading new frame
         self.start_point = None
@@ -164,6 +162,7 @@ class CropSelectorDialog(QDialog):
         self.initial_timeline_position = timeline_position
         self.temp_dir = tempfile.mkdtemp()
         self.current_duration = 0
+        self.initial_resize_done = False  # Track if initial auto-resize has been done
 
         # Debounce timer for auto frame extraction
         from PyQt6.QtCore import QTimer
@@ -191,7 +190,7 @@ class CropSelectorDialog(QDialog):
 
         # Frame display
         self.frame_label = FrameLabel()
-        self.frame_label.setMinimumSize(800, 450)
+        self.frame_label.setMinimumSize(400, 225)
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.frame_label.setStyleSheet("background-color: #1e1e1e;")
         layout.addWidget(self.frame_label)
@@ -257,6 +256,32 @@ class CropSelectorDialog(QDialog):
 
         layout.addLayout(button_layout)
 
+    def get_available_frame_size(self, pixmap: QPixmap) -> tuple[int, int]:
+        """Calculate optimal frame size based on pixmap aspect ratio and available space."""
+        from PyQt6.QtWidgets import QApplication
+
+        # Get screen dimensions
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_dialog_height = int(screen.height() * 0.8)
+
+        # Available width = dialog width minus margins (layout margins ~20px total)
+        available_width = self.width() - 40
+
+        # Calculate height based on aspect ratio
+        aspect_ratio = pixmap.height() / pixmap.width()
+        optimal_height = int(available_width * aspect_ratio)
+
+        # Estimate height of other UI elements (instructions, timeline, buttons, etc.)
+        ui_overhead = 200
+
+        # Cap frame height if dialog would exceed 80% screen height
+        max_frame_height = max_dialog_height - ui_overhead
+        if optimal_height > max_frame_height:
+            optimal_height = max_frame_height
+            available_width = int(optimal_height / aspect_ratio)
+
+        return (available_width, optimal_height)
+
     def load_episode(self, index: int):
         """Load episode and extract initial frame."""
         if 0 <= index < len(self.mkv_files):
@@ -303,10 +328,20 @@ class CropSelectorDialog(QDialog):
 
             if frame_path.exists():
                 pixmap = QPixmap(str(frame_path))
+
+                # Calculate and set optimal frame size
+                optimal_width, optimal_height = self.get_available_frame_size(pixmap)
+                self.frame_label.setFixedSize(optimal_width, optimal_height)
+
                 # Pass existing crop on first load only
                 self.frame_label.set_frame(pixmap, self.existing_crop)
                 # Clear existing_crop after first use so it doesn't re-apply on frame changes
                 self.existing_crop = None
+
+                # Only auto-resize dialog on initial frame load
+                if not self.initial_resize_done:
+                    self.adjustSize()
+                    self.initial_resize_done = True
         except Exception as e:
             print(f"Failed to extract frame: {e}")
 
@@ -341,3 +376,11 @@ class CropSelectorDialog(QDialog):
         except:
             pass
         super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        """Handle dialog resize - adjust frame size to fill width."""
+        super().resizeEvent(event)
+        if hasattr(self, 'frame_label') and self.frame_label.original_pixmap:
+            optimal_width, optimal_height = self.get_available_frame_size(self.frame_label.original_pixmap)
+            self.frame_label.setFixedSize(optimal_width, optimal_height)
+            self.frame_label.set_frame(self.frame_label.original_pixmap)
