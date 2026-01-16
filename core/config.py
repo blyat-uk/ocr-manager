@@ -19,12 +19,17 @@ class Config:
     time_start: str = ""
     time_end: str = ""
     ocr_parallel: int = 4
+    ocr_width: int = 1280      # Downscale width for OCR (0 = original)
+    fullframe: bool = False    # OCR full frame instead of crop
 
     # Cleanup
     remove_credits: bool = True  # Whether to run ass-credits --yes
 
     # Styling
     header_template: str = ""
+
+    # Pipeline Control
+    stop_at_phase: int = -1  # -1 = run all phases, 0-7 = stop after that phase
 
     # Metadata
     project_path: str = ""
@@ -95,8 +100,9 @@ def save_global_config(config: GlobalConfig):
 
 def validate_config(config: Config) -> tuple[bool, str]:
     """Validate configuration completeness."""
-    if config.crop_width == 0 or config.crop_height == 0:
-        return False, "Crop region not set"
+    if not config.fullframe:  # Only require crop if not fullframe
+        if config.crop_width == 0 or config.crop_height == 0:
+            return False, "Crop region not set"
     if not config.header_template:
         return False, "Header template not set"
     return True, ""
