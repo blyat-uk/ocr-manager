@@ -1,4 +1,5 @@
 """Pipeline execution and workflow management."""
+
 import shutil
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal, QProcess
@@ -16,64 +17,51 @@ class Pipeline(QObject):
     phase_completed = pyqtSignal(str)
     pipeline_finished = pyqtSignal(bool)
 
-    PHASES = [
-        "Preparation",
-        "OCR Extraction",
-        "Format Conversion",
-        "Quality Assurance",
-        "Translation",
-        "Cleanup",
-        "Styling",
-        "Embedding"
-    ]
+    PHASES = ["Preparation", "OCR Extraction", "Quality Assurance", "Translation", "Cleanup", "Styling", "Embedding"]
 
-    def __init__(self, config: Config, global_config: GlobalConfig):
+    def __init__(self, config: Config, global_config: GlobalConfig, stop_at_phase: int = None):
         super().__init__()
         self.config = config
         self.global_config = global_config
         self.process = None
         self.current_phase = 0
         self.subphase = 0
-        self.srt_files_to_convert = []
-        self.current_srt_index = 0
+        self.stop_at_phase = stop_at_phase  # None = run all, 0-6 = stop after that phase
 
     def detect_resume_phase(self) -> int:
         """Detect which phase to resume from based on file structure.
 
         Checkpoints (ass-* commands are idempotent):
-        - eng-ass/*.eng.ass exists → resume from Phase 8 (Embedding)
-        - translate/*.eng.ass exists → resume from Phase 6 (Cleanup)
-        - chi-ass/*.ass exists → resume from Phase 4 (QA)
-        - chi-srt/*.srt exists → resume from Phase 3 (Format Conversion)
+        - eng-ass/*.eng.ass exists → resume from Phase 7 (Embedding)
+        - translate/*.eng.ass exists → resume from Phase 5 (Cleanup)
+        - chi-ass/*.ass exists → resume from Phase 3 (QA)
         """
         project_path = Path(self.config.project_path)
 
-        eng_ass = project_path / 'eng-ass'
-        translate = project_path / 'translate'
-        chi_ass = project_path / 'chi-ass'
-        chi_srt = project_path / 'chi-srt'
+        eng_ass = project_path / "eng-ass"
+        translate = project_path / "translate"
+        chi_ass = project_path / "chi-ass"
 
         # Check 1: Styling complete? (files moved to eng-ass)
-        if eng_ass.exists() and list(eng_ass.glob('*.eng.ass')):
-            return 7  # Resume from Phase 8 (Embedding)
+        if eng_ass.exists() and list(eng_ass.glob("*.eng.ass")):
+            return 6  # Resume from Phase 7 (Embedding)
 
         # Check 2: Translation complete? (files still in translate)
-        if translate.exists() and list(translate.glob('*.eng.ass')):
-            return 5  # Resume from Phase 6 (Cleanup)
+        if translate.exists() and list(translate.glob("*.eng.ass")):
+            return 4  # Resume from Phase 5 (Cleanup)
 
-        # Check 3: Conversion complete?
-        if chi_ass.exists() and list(chi_ass.glob('*.ass')):
-            return 3  # Resume from Phase 4 (QA) - idempotent
-
-        # Check 4: OCR complete?
-        if chi_srt.exists() and list(chi_srt.glob('*.srt')):
-            return 2  # Resume from Phase 3 (Format Conversion)
+        # Check 3: OCR complete? (files in chi-ass)
+        if chi_ass.exists() and list(chi_ass.glob("*.ass")):
+            return 2  # Resume from Phase 3 (QA) - idempotent
 
         # Fresh start
         return 0
 
     def start(self):
         """Start pipeline execution, resuming from detected phase."""
+        # Always ensure directories exist (even when resuming)
+        self.ensure_directories()
+
         detected_phase = self.detect_resume_phase()
 
         self.current_phase = detected_phase
@@ -83,7 +71,20 @@ class Pipeline(QObject):
             phase_name = self.PHASES[detected_phase]
             self.output_received.emit(f"Resuming from phase {detected_phase + 1}: {phase_name}...\n")
 
+        # Check if resume phase already exceeds stop_at_phase
+        if self.stop_at_phase is not None and detected_phase > self.stop_at_phase:
+            self.output_received.emit(f"Resume phase ({detected_phase + 1}) is beyond stop-at phase ({self.stop_at_phase + 1}). Already complete.\n")
+            self.pipeline_finished.emit(True)
+            return
+
         self.run_next_phase()
+
+    def ensure_directories(self):
+        """Ensure all required directories exist."""
+        project_path = Path(self.config.project_path)
+        dirs = ["chi-ass", "translate", "eng-ass", ".translation-project"]
+        for d in dirs:
+            (project_path / d).mkdir(exist_ok=True)
 
     def run_next_phase(self):
         """Execute next phase in sequence."""
@@ -91,7 +92,12 @@ class Pipeline(QObject):
             self.pipeline_finished.emit(True)
             return
 
-        phase_name = self.PHASES[self.current_phase]
+        # Check if we should stop after completing target phase
+        if self.stop_at_phase is not None and self.current_phase > self.stop_at_phase:
+            self.output_received.emit(f"\n✓ Stopped after phase {self.stop_at_phase + 1}: {self.PHASES[self.stop_at_phase]}\n")
+            self.pipeline_finished.emit(True)
+            return
+
         phase_method = getattr(self, f"phase_{self.current_phase + 1}")
         phase_method()
 
@@ -99,10 +105,8 @@ class Pipeline(QObject):
         """Phase 1: Preparation - Create directory structure and copy fonts."""
         project_path = Path(self.config.project_path)
 
-        # Create directories
-        dirs = ['chi-srt', 'chi-ass', 'translate', 'eng-ass', '.translation-project']
-        for d in dirs:
-            (project_path / d).mkdir(exist_ok=True)
+        # Create directories (already called in start(), but safe to call again)
+        self.ensure_directories()
 
         # Save header template to translate/header.txt for persistence
         if self.config.header_template:
@@ -112,7 +116,7 @@ class Pipeline(QObject):
         # Copy fonts
         if self.global_config.fonts_directory:
             fonts_src = Path(self.global_config.fonts_directory)
-            fonts_dst = project_path / 'Fonts'
+            fonts_dst = project_path / "Fonts"
             if fonts_src.exists() and not fonts_dst.exists():
                 shutil.copytree(fonts_src, fonts_dst)
 
@@ -121,39 +125,38 @@ class Pipeline(QObject):
         self.run_next_phase()
 
     def phase_2(self):
-        """Phase 2: OCR Extraction."""
+        """Phase 2: OCR Extraction - ocrp outputs .ass files directly."""
         project_path = Path(self.config.project_path)
+        chi_ass_dir = project_path / "chi-ass"
 
         if self.subphase == 0:
             # Pre-process: Move already OCR'd files to 'ocr-ready' (created on demand)
-            ocr_ready_dir = project_path / 'ocr-ready'
-            chi_srt_dir = project_path / 'chi-srt'
-            chi_srt_dir.mkdir(exist_ok=True)
+            ocr_ready_dir = project_path / "ocr-ready"
 
-            # Check each .mkv file for existing .srt
-            for mkv_file in project_path.glob('*.mkv'):
-                srt_name = mkv_file.stem + '.srt'
+            # Check each .mkv file for existing .ass
+            for mkv_file in project_path.glob("*.mkv"):
+                ass_name = mkv_file.stem + ".ass"
 
-                # Check if .srt exists in root or chi-srt folder
-                srt_in_root = project_path / srt_name
-                srt_in_chi = chi_srt_dir / srt_name
+                # Check if .ass exists in root or chi-ass folder
+                ass_in_root = project_path / ass_name
+                ass_in_chi = chi_ass_dir / ass_name
 
-                srt_file = None
-                if srt_in_root.exists() and srt_in_root.stat().st_size > 0:
-                    srt_file = srt_in_root
-                elif srt_in_chi.exists() and srt_in_chi.stat().st_size > 0:
-                    srt_file = srt_in_chi
+                ass_file = None
+                if ass_in_root.exists() and ass_in_root.stat().st_size > 0:
+                    ass_file = ass_in_root
+                elif ass_in_chi.exists() and ass_in_chi.stat().st_size > 0:
+                    ass_file = ass_in_chi
 
-                if srt_file:
+                if ass_file:
                     # Create ocr-ready directory only when needed
                     ocr_ready_dir.mkdir(exist_ok=True)
                     # Move .mkv to ocr-ready
                     shutil.move(str(mkv_file), str(ocr_ready_dir / mkv_file.name))
-                    # Move .srt to chi-srt (if not already there)
-                    if srt_file != srt_in_chi:
-                        shutil.move(str(srt_file), str(chi_srt_dir / srt_name))
+                    # Move .ass to chi-ass (if not already there)
+                    if ass_file != ass_in_chi:
+                        shutil.move(str(ass_file), str(chi_ass_dir / ass_name))
 
-                    self.output_received.emit(f"Skipping OCR for {mkv_file.name} (already has SRT)\n")
+                    self.output_received.emit(f"Skipping OCR for {mkv_file.name} (already has ASS)\n")
 
             # Continue to next subphase
             self.subphase += 1
@@ -161,35 +164,40 @@ class Pipeline(QObject):
 
         elif self.subphase == 1:
             # Run OCR on remaining files
-            crops = f"{self.config.crop_x},{self.config.crop_y}," \
-                    f"{self.config.crop_width},{self.config.crop_height}"
+            cmd = ["ocrp"]
 
-            cmd = [
-                'ocrp',
-                '--crops', crops,
-                '-b', str(self.config.brightness),
-                '--max', str(self.config.ocr_parallel)
-            ]
+            # Full frame and/or crop region (can be combined)
+            if self.config.fullframe:
+                cmd.append("--fullframe")
+            if self.config.crop_width > 0 and self.config.crop_height > 0:
+                crops = f"{self.config.crop_x},{self.config.crop_y},{self.config.crop_width},{self.config.crop_height}"
+                cmd.extend(["--crop", crops])
+
+            # Width parameter for downscaling
+            # if self.config.ocr_width > 0:
+            #     cmd.extend(["--width", str(self.config.ocr_width)])
+
+            cmd.extend(["-b", str(self.config.brightness)])
+            cmd.extend(["--max", str(self.config.ocr_parallel)])
 
             if self.config.time_start:
-                cmd.extend(['-ts', self.config.time_start])
+                cmd.extend(["-ts", self.config.time_start])
 
             if self.config.time_end:
-                cmd.extend(['-te', self.config.time_end])
+                cmd.extend(["-te", self.config.time_end])
 
             self.run_command(cmd, cwd=self.config.project_path)
 
         elif self.subphase == 2:
-            # Post-process: Move SRT files from root to chi-srt
-            chi_srt_dir = project_path / 'chi-srt'
-            for srt_file in project_path.glob('*.srt'):
-                shutil.move(str(srt_file), str(chi_srt_dir / srt_file.name))
-                self.output_received.emit(f"Moved {srt_file.name} to chi-srt/\n")
+            # Post-process: Move ASS files from root to chi-ass
+            for ass_file in project_path.glob("*.ass"):
+                shutil.move(str(ass_file), str(chi_ass_dir / ass_file.name))
+                self.output_received.emit(f"Moved {ass_file.name} to chi-ass/\n")
 
             # Move MKV files back from 'ocr-ready' to root
-            ocr_ready_dir = project_path / 'ocr-ready'
+            ocr_ready_dir = project_path / "ocr-ready"
             if ocr_ready_dir.exists():
-                for mkv_file in ocr_ready_dir.glob('*.mkv'):
+                for mkv_file in ocr_ready_dir.glob("*.mkv"):
                     shutil.move(str(mkv_file), str(project_path / mkv_file.name))
                     self.output_received.emit(f"Restored {mkv_file.name} to project root\n")
 
@@ -203,86 +211,31 @@ class Pipeline(QObject):
             self.run_next_phase()
 
     def phase_3(self):
-        """Phase 3: Format Conversion - Convert SRT to ASS."""
-        chi_srt = Path(self.config.project_path) / 'chi-srt'
+        """Phase 3: Quality Assurance - Run ass-qafix (twice) and ass-credits."""
+        chi_ass = Path(self.config.project_path) / "chi-ass"
 
         if self.subphase == 0:
-            # Convert all .srt files to .ass using ffmpeg
-            srt_files = list(chi_srt.glob('*.srt'))
-
-            if not srt_files:
-                # No SRT files to convert, skip to next phase
-                self.phase_completed.emit("Format Conversion")
-                self.current_phase += 1
-                self.subphase = 0
-                self.run_next_phase()
-                return
-
-            # Process first file
-            self.srt_files_to_convert = srt_files
-            self.current_srt_index = 0
-            self.convert_next_srt()
-
+            # Run ass-qafix first pass
+            cmd = ["ass-qafix", "--inplace"]
+            self.run_command(cmd, cwd=str(chi_ass))
         elif self.subphase == 1:
-            # Continue converting SRT files
-            self.current_srt_index += 1
-            if self.current_srt_index < len(self.srt_files_to_convert):
-                # Reset to 0 so on_process_finished brings us back to subphase 1
-                self.subphase = 0
-                self.convert_next_srt()
-            else:
-                # All conversions done, move to next subphase
-                self.subphase += 1
-                self.run_next_phase()
-
+            # Run ass-qafix second pass (sometimes first pass doesn't fix all issues)
+            cmd = ["ass-qafix", "--inplace"]
+            self.run_command(cmd, cwd=str(chi_ass))
         elif self.subphase == 2:
-            # Move files
-            chi_ass_dir = Path(self.config.project_path) / 'chi-ass'
-            for ass_file in chi_srt.glob('*.ass'):
-                shutil.move(str(ass_file), str(chi_ass_dir / ass_file.name))
-
-            self.phase_completed.emit("Format Conversion")
-            self.current_phase += 1
-            self.subphase = 0
-            self.run_next_phase()
-
-    def convert_next_srt(self):
-        """Convert current SRT file to ASS using ffmpeg."""
-        chi_srt = Path(self.config.project_path) / 'chi-srt'
-        srt_file = self.srt_files_to_convert[self.current_srt_index]
-        ass_file = srt_file.with_suffix('.ass')
-
-        cmd = [
-            'ffmpeg',
-            '-i', srt_file.name,
-            ass_file.name,
-            '-y'  # Overwrite without asking
-        ]
-
-        self.run_command(cmd, cwd=str(chi_srt))
-
-    def phase_4(self):
-        """Phase 4: Quality Assurance - Run ass-credits and ass-qafix."""
-        chi_ass = Path(self.config.project_path) / 'chi-ass'
-
-        if self.subphase == 0:
             # Run ass-credits if remove_credits is enabled
             if self.config.remove_credits:
-                cmd = ['ass-credits', '--yes']
+                cmd = ["ass-credits", "--yes"]
                 self.run_command(cmd, cwd=str(chi_ass))
             else:
-                # Skip ass-credits, proceed to ass-qafix
+                # Skip ass-credits, proceed to copy files
                 self.output_received.emit("Skipping ass-credits (disabled)\n")
                 self.subphase += 1
                 self.run_next_phase()
-        elif self.subphase == 1:
-            # Run ass-qafix
-            cmd = ['ass-qafix', '--inplace']
-            self.run_command(cmd, cwd=str(chi_ass))
-        elif self.subphase == 2:
+        elif self.subphase == 3:
             # Move to translate directory
-            translate_dir = Path(self.config.project_path) / 'translate'
-            for ass_file in chi_ass.glob('*.ass'):
+            translate_dir = Path(self.config.project_path) / "translate"
+            for ass_file in chi_ass.glob("*.ass"):
                 shutil.copy(str(ass_file), str(translate_dir / ass_file.name))
 
             self.phase_completed.emit("Quality Assurance")
@@ -290,17 +243,17 @@ class Pipeline(QObject):
             self.subphase = 0
             self.run_next_phase()
 
-    def phase_5(self):
-        """Phase 5: Translation."""
-        translate_dir = Path(self.config.project_path) / 'translate'
+    def phase_4(self):
+        """Phase 4: Translation."""
+        translate_dir = Path(self.config.project_path) / "translate"
 
         if self.subphase == 0:
-            cmd = ['subs-translator']
+            cmd = ["subs-translator"]
 
             # Check if glossary.json exists and is not empty
-            glossary_file = translate_dir / 'glossary.json'
+            glossary_file = translate_dir / "glossary.json"
             if glossary_file.exists() and glossary_file.stat().st_size > 0:
-                cmd.append('--only-translate')
+                cmd.append("--only-translate")
                 self.output_received.emit("Found existing glossary.json, using --only-translate mode\n")
 
             self.run_command(cmd, cwd=str(translate_dir))
@@ -310,64 +263,72 @@ class Pipeline(QObject):
             self.subphase = 0
             self.run_next_phase()
 
-    def phase_6(self):
-        """Phase 6: Cleanup - Remove Chinese .ass files."""
-        translate_dir = Path(self.config.project_path) / 'translate'
+    def phase_5(self):
+        """Phase 5: Cleanup - Remove Chinese .ass files."""
+        translate_dir = Path(self.config.project_path) / "translate"
 
         # Remove *.ass files (not *.eng.ass)
-        for ass_file in translate_dir.glob('*.ass'):
-            if not ass_file.name.endswith('.eng.ass'):
+        for ass_file in translate_dir.glob("*.ass"):
+            if not ass_file.name.endswith(".eng.ass"):
                 ass_file.unlink()
 
         self.phase_completed.emit("Cleanup")
         self.current_phase += 1
         self.run_next_phase()
 
-    def phase_7(self):
-        """Phase 7: Styling - Write header, run ass-header, and QA fix."""
-        translate_dir = Path(self.config.project_path) / 'translate'
-        eng_ass_dir = Path(self.config.project_path) / 'eng-ass'
+    def phase_6(self):
+        """Phase 6: Styling - Write header, run ass-header, compare, and QA fix (twice)."""
+        translate_dir = Path(self.config.project_path) / "translate"
+        eng_ass_dir = Path(self.config.project_path) / "eng-ass"
 
         if self.subphase == 0:
             # Ensure eng-ass directory exists (for projects started before this dir was added)
             eng_ass_dir.mkdir(exist_ok=True)
 
-            # Write header file to eng-ass
-            header_file = eng_ass_dir / 'header.txt'
-            with open(header_file, 'w', encoding='utf-8') as f:
+            # Write header file to translate directory
+            header_file = translate_dir / "header.txt"
+            with open(header_file, "w", encoding="utf-8") as f:
                 f.write(self.config.header_template)
 
             # Move *.eng.ass files from translate to eng-ass
-            for eng_file in translate_dir.glob('*.eng.ass'):
+            for eng_file in translate_dir.glob("*.eng.ass"):
                 shutil.move(str(eng_file), str(eng_ass_dir / eng_file.name))
                 self.output_received.emit(f"Moved {eng_file.name} to eng-ass/\n")
 
-            # Run ass-header in eng-ass
-            cmd = ['ass-header', 'header.txt']
+            # Run ass-header in eng-ass, referencing header in translate
+            cmd = ["ass-header", "../translate/header.txt"]
             self.run_command(cmd, cwd=str(eng_ass_dir))
         elif self.subphase == 1:
-            # Run ass-qafix on English files
-            cmd = ['ass-qafix', '--inplace']
-            self.run_command(cmd, cwd=str(eng_ass_dir))
+            # Run ass-compare QA check
+            cmd = ["ass-compare", "--chi", "chi-ass", "--eng", "eng-ass", "--no-color"]
+            self.run_command(cmd, cwd=self.config.project_path)
         elif self.subphase == 2:
+            # Run ass-qafix on English files - first pass
+            cmd = ["ass-qafix", "--inplace"]
+            self.run_command(cmd, cwd=str(eng_ass_dir))
+        elif self.subphase == 3:
+            # Run ass-qafix on English files - second pass (sometimes first pass doesn't fix all issues)
+            cmd = ["ass-qafix", "--inplace"]
+            self.run_command(cmd, cwd=str(eng_ass_dir))
+        elif self.subphase == 4:
             self.phase_completed.emit("Styling")
             self.current_phase += 1
             self.subphase = 0
             self.run_next_phase()
 
-    def phase_8(self):
-        """Phase 8: Embedding - Copy files and run submerge."""
-        eng_ass_dir = Path(self.config.project_path) / 'eng-ass'
+    def phase_7(self):
+        """Phase 7: Embedding - Copy files and run submerge."""
+        eng_ass_dir = Path(self.config.project_path) / "eng-ass"
         project_root = Path(self.config.project_path)
 
         if self.subphase == 0:
             # Copy *.eng.ass files from eng-ass to root
-            for eng_file in eng_ass_dir.glob('*.eng.ass'):
+            for eng_file in eng_ass_dir.glob("*.eng.ass"):
                 shutil.copy(str(eng_file), str(project_root / eng_file.name))
                 self.output_received.emit(f"Copied {eng_file.name} to project root\n")
 
             # Run submerge
-            cmd = ['submerge', '-p', str(self.global_config.parallel_workers_muxing)]
+            cmd = ["submerge", "-p", str(self.global_config.parallel_workers_muxing)]
             self.run_command(cmd, cwd=str(project_root))
         elif self.subphase == 1:
             self.phase_completed.emit("Embedding")
@@ -377,7 +338,7 @@ class Pipeline(QObject):
 
     def run_command(self, cmd: list, cwd: str = None):
         """Execute command and emit output signals."""
-        self.command_started.emit(' '.join(cmd))
+        self.command_started.emit(" ".join(cmd))
 
         self.process = QProcess(self)
         self.process.readyReadStandardOutput.connect(self.on_stdout)
@@ -391,12 +352,12 @@ class Pipeline(QObject):
 
     def on_stdout(self):
         """Handle stdout output."""
-        data = self.process.readAllStandardOutput().data().decode('utf-8')
+        data = self.process.readAllStandardOutput().data().decode("utf-8")
         self.output_received.emit(data)
 
     def on_stderr(self):
         """Handle stderr output."""
-        data = self.process.readAllStandardError().data().decode('utf-8')
+        data = self.process.readAllStandardError().data().decode("utf-8")
         self.output_received.emit(data)
 
     def on_process_finished(self, exit_code, exit_status):

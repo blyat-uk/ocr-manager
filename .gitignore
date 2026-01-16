@@ -35,7 +35,6 @@ wheels/
 
 # Project specific
 .translation-project/
-chi-srt/
 chi-ass/
 translate/
 Fonts/
