@@ -153,9 +153,9 @@ class TerminalOutputWidget(QWidget):
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertHtml(html)
-        self.text_edit.setTextCursor(cursor)
 
         if self.auto_scroll:
+            self.text_edit.setTextCursor(cursor)
             self.scroll_to_bottom()
 
     def clear(self):
