@@ -1,13 +1,12 @@
 """Crop region selector dialog with frame preview."""
 import tempfile
-import subprocess
 from pathlib import Path
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                               QLabel, QSlider, QComboBox, QWidget, QSpinBox)
 from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QRect
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
 
-from core.video_utils import get_video_duration
+from core.video_utils import get_video_duration, extract_frame
 
 
 class FrameLabel(QLabel):
@@ -321,10 +320,7 @@ class CropSelectorDialog(QDialog):
         frame_path = Path(self.temp_dir) / "crop_frame.png"
 
         try:
-            subprocess.run([
-                'ffmpeg', '-ss', timestamp, '-i', mkv_path,
-                '-vframes', '1', '-y', str(frame_path)
-            ], capture_output=True, check=True)
+            extract_frame(mkv_path, timestamp, str(frame_path))
 
             if frame_path.exists():
                 pixmap = QPixmap(str(frame_path))

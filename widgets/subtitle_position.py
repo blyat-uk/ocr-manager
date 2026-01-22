@@ -1,14 +1,13 @@
 """Subtitle position selector dialog with frame preview."""
 import re
 import tempfile
-import subprocess
 from pathlib import Path
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                               QLabel, QSlider, QComboBox, QSpinBox)
 from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QRect
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QFontMetrics
 
-from core.video_utils import get_video_duration
+from core.video_utils import get_video_duration, extract_frame
 
 
 class SubtitleFrameLabel(QLabel):
@@ -434,10 +433,7 @@ class SubtitlePositionDialog(QDialog):
         frame_path = Path(self.temp_dir) / "position_frame.png"
 
         try:
-            subprocess.run([
-                'ffmpeg', '-ss', timestamp, '-i', mkv_path,
-                '-vframes', '1', '-y', str(frame_path)
-            ], capture_output=True, check=True)
+            extract_frame(mkv_path, timestamp, str(frame_path))
 
             if frame_path.exists():
                 pixmap = QPixmap(str(frame_path))

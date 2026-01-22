@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPointF
 from PyQt6.QtGui import QPixmap, QPainter, QWheelEvent, QMouseEvent
 
-from core.video_utils import get_video_duration
+from core.video_utils import get_video_duration, extract_frame
 
 
 class ZoomableImageLabel(QLabel):
@@ -443,10 +443,7 @@ class BrightnessTesterDialog(QDialog):
         frame_path = self.temp_dir / "sub.png"
 
         try:
-            subprocess.run([
-                'ffmpeg', '-ss', timestamp, '-i', mkv_path,
-                '-vframes', '1', '-y', str(frame_path)
-            ], capture_output=True, check=True)
+            extract_frame(mkv_path, timestamp, str(frame_path))
 
             if frame_path.exists():
                 self.current_frame = str(frame_path)

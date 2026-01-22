@@ -28,34 +28,66 @@ class Pipeline(QObject):
         self.subphase = 0
         self.stop_at_phase = stop_at_phase  # None = run all, 0-6 = stop after that phase
 
-    def detect_resume_phase(self) -> int:
-        """Detect which phase to resume from based on file structure.
+    def get_mkv_stems(self) -> set[str]:
+        """Get stems of all MKV files in project root."""
+        project_path = Path(self.config.project_path)
+        return {f.stem for f in project_path.glob("*.mkv")}
 
-        Checkpoints (ass-* commands are idempotent):
-        - eng-ass/*.eng.ass exists → resume from Phase 7 (Embedding)
-        - translate/*.eng.ass exists → resume from Phase 5 (Cleanup)
-        - chi-ass/*.ass exists → resume from Phase 3 (QA)
-        """
+    def get_completed_stems(self, phase: str) -> set[str]:
+        """Get stems that have completed a given phase."""
         project_path = Path(self.config.project_path)
 
-        eng_ass = project_path / "eng-ass"
-        translate = project_path / "translate"
-        chi_ass = project_path / "chi-ass"
+        if phase == "ocr":
+            chi_ass = project_path / "chi-ass"
+            return {f.stem for f in chi_ass.glob("*.ass")} if chi_ass.exists() else set()
 
-        # Check 1: Styling complete? (files moved to eng-ass)
-        if eng_ass.exists() and list(eng_ass.glob("*.eng.ass")):
-            return 6  # Resume from Phase 7 (Embedding)
+        elif phase == "translation":
+            # Check both translate/ and eng-ass/ for .eng.ass files
+            completed = set()
+            translate = project_path / "translate"
+            eng_ass = project_path / "eng-ass"
+            if translate.exists():
+                completed.update(f.stem.replace(".eng", "") for f in translate.glob("*.eng.ass"))
+            if eng_ass.exists():
+                completed.update(f.stem.replace(".eng", "") for f in eng_ass.glob("*.eng.ass"))
+            return completed
 
-        # Check 2: Translation complete? (files still in translate)
-        if translate.exists() and list(translate.glob("*.eng.ass")):
+        elif phase == "styling":
+            eng_ass = project_path / "eng-ass"
+            return {f.stem.replace(".eng", "") for f in eng_ass.glob("*.eng.ass")} if eng_ass.exists() else set()
+
+        return set()
+
+    def detect_resume_phase(self) -> int:
+        """Detect which phase to resume from based on per-file completion.
+
+        Returns the earliest phase where ANY MKV file still needs processing.
+        """
+        all_mkvs = self.get_mkv_stems()
+        if not all_mkvs:
+            return 0  # No MKVs to process
+
+        ocr_done = self.get_completed_stems("ocr")
+        translation_done = self.get_completed_stems("translation")
+        styling_done = self.get_completed_stems("styling")
+
+        # Phase 2 (OCR): Any MKV without chi-ass/*.ass?
+        if all_mkvs - ocr_done:
+            return 0  # Start from Phase 1 (Preparation)
+
+        # Phase 3-4 (QA + Translation): Any OCR'd file without translation?
+        if ocr_done - translation_done:
+            return 2  # Resume from Phase 3 (QA)
+
+        # Phase 5-6 (Cleanup + Styling): Any translated without styled?
+        if translation_done - styling_done:
             return 4  # Resume from Phase 5 (Cleanup)
 
-        # Check 3: OCR complete? (files in chi-ass)
-        if chi_ass.exists() and list(chi_ass.glob("*.ass")):
-            return 2  # Resume from Phase 3 (QA) - idempotent
+        # Phase 7 (Embedding): All styled, check if ready for mux
+        if styling_done:
+            return 6  # Resume from Phase 7 (idempotent)
 
-        # Fresh start
-        return 0
+        return 0  # Fresh start
 
     def start(self):
         """Start pipeline execution, resuming from detected phase."""
@@ -233,10 +265,14 @@ class Pipeline(QObject):
                 self.subphase += 1
                 self.run_next_phase()
         elif self.subphase == 3:
-            # Move to translate directory
+            # Copy to translate directory (only files not already there)
             translate_dir = Path(self.config.project_path) / "translate"
             for ass_file in chi_ass.glob("*.ass"):
-                shutil.copy(str(ass_file), str(translate_dir / ass_file.name))
+                dest = translate_dir / ass_file.name
+                if not dest.exists():
+                    shutil.copy(str(ass_file), str(dest))
+                    self.output_received.emit(f"Copied {ass_file.name} to translate/\n")
+                # If dest exists, skip (already processed or in progress)
 
             self.phase_completed.emit("Quality Assurance")
             self.current_phase += 1
@@ -246,18 +282,47 @@ class Pipeline(QObject):
     def phase_4(self):
         """Phase 4: Translation."""
         translate_dir = Path(self.config.project_path) / "translate"
+        translate_done = Path(self.config.project_path) / "translate-done"
 
         if self.subphase == 0:
-            cmd = ["subs-translator"]
+            # Pre-process: Move already-translated files aside
+            for ass_file in list(translate_dir.glob("*.ass")):
+                if ass_file.name.endswith(".eng.ass"):
+                    continue
+                eng_file = translate_dir / (ass_file.stem + ".eng.ass")
+                if eng_file.exists():
+                    translate_done.mkdir(exist_ok=True)
+                    shutil.move(str(ass_file), str(translate_done / ass_file.name))
+                    shutil.move(str(eng_file), str(translate_done / eng_file.name))
+                    self.output_received.emit(f"Skipping {ass_file.stem} (already translated)\n")
 
-            # Check if glossary.json exists and is not empty
+            self.subphase += 1
+            self.run_next_phase()
+
+        elif self.subphase == 1:
+            # Check if any files need translation
+            remaining = [f for f in translate_dir.glob("*.ass") if not f.name.endswith(".eng.ass")]
+            if not remaining:
+                self.output_received.emit("No new files to translate\n")
+                self.subphase = 2  # Skip to restore step
+                self.run_next_phase()
+                return
+
+            cmd = ["subs-translator"]
             glossary_file = translate_dir / "glossary.json"
             if glossary_file.exists() and glossary_file.stat().st_size > 0:
                 cmd.append("--only-translate")
                 self.output_received.emit("Found existing glossary.json, using --only-translate mode\n")
-
             self.run_command(cmd, cwd=str(translate_dir))
-        elif self.subphase == 1:
+
+        elif self.subphase == 2:
+            # Post-process: Restore files from translate-done/
+            if translate_done.exists():
+                for f in translate_done.glob("*"):
+                    shutil.move(str(f), str(translate_dir / f.name))
+                if not any(translate_done.iterdir()):
+                    translate_done.rmdir()
+
             self.phase_completed.emit("Translation")
             self.current_phase += 1
             self.subphase = 0
@@ -290,12 +355,16 @@ class Pipeline(QObject):
             with open(header_file, "w", encoding="utf-8") as f:
                 f.write(self.config.header_template)
 
-            # Move *.eng.ass files from translate to eng-ass
+            # Move *.eng.ass files not already in eng-ass
             for eng_file in translate_dir.glob("*.eng.ass"):
-                shutil.move(str(eng_file), str(eng_ass_dir / eng_file.name))
-                self.output_received.emit(f"Moved {eng_file.name} to eng-ass/\n")
+                dest = eng_ass_dir / eng_file.name
+                if not dest.exists():
+                    shutil.move(str(eng_file), str(dest))
+                    self.output_received.emit(f"Moved {eng_file.name} to eng-ass/\n")
+                else:
+                    eng_file.unlink()  # Remove duplicate from translate/
 
-            # Run ass-header in eng-ass, referencing header in translate
+            # Run ass-header (idempotent)
             cmd = ["ass-header", "../translate/header.txt"]
             self.run_command(cmd, cwd=str(eng_ass_dir))
         elif self.subphase == 1:
@@ -322,12 +391,14 @@ class Pipeline(QObject):
         project_root = Path(self.config.project_path)
 
         if self.subphase == 0:
-            # Copy *.eng.ass files from eng-ass to root
+            # Copy *.eng.ass files not already in root
             for eng_file in eng_ass_dir.glob("*.eng.ass"):
-                shutil.copy(str(eng_file), str(project_root / eng_file.name))
-                self.output_received.emit(f"Copied {eng_file.name} to project root\n")
+                dest = project_root / eng_file.name
+                if not dest.exists():
+                    shutil.copy(str(eng_file), str(dest))
+                    self.output_received.emit(f"Copied {eng_file.name} to project root\n")
 
-            # Run submerge
+            # submerge handles incremental muxing
             cmd = ["submerge", "-p", str(self.global_config.parallel_workers_muxing)]
             self.run_command(cmd, cwd=str(project_root))
         elif self.subphase == 1:

@@ -1,23 +1,116 @@
 """Utility functions for video frame extraction."""
+import json
 import subprocess
+from dataclasses import dataclass
+from typing import Optional
+
+# Cache for HDR metadata to avoid repeated FFprobe calls
+_hdr_cache: dict[str, "HDRMetadata"] = {}
+
+
+@dataclass
+class HDRMetadata:
+    """HDR video metadata."""
+    is_hdr: bool
+    transfer: Optional[str] = None  # 'smpte2084' (PQ) or 'arib-std-b67' (HLG)
+    color_primaries: Optional[str] = None
+    color_space: Optional[str] = None
+
+
+def detect_hdr(video_path: str) -> HDRMetadata:
+    """Detect HDR metadata from video file.
+
+    Args:
+        video_path: Path to video file
+
+    Returns:
+        HDRMetadata with detection results
+    """
+    # Check cache first
+    if video_path in _hdr_cache:
+        return _hdr_cache[video_path]
+
+    try:
+        result = subprocess.run([
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=color_transfer,color_primaries,color_space',
+            '-of', 'json',
+            video_path
+        ], capture_output=True, text=True, check=True)
+
+        data = json.loads(result.stdout)
+        streams = data.get('streams', [])
+
+        if not streams:
+            metadata = HDRMetadata(is_hdr=False)
+            _hdr_cache[video_path] = metadata
+            return metadata
+
+        stream = streams[0]
+        transfer = stream.get('color_transfer')
+        primaries = stream.get('color_primaries')
+        color_space = stream.get('color_space')
+
+        # HDR transfer functions: PQ (HDR10/Dolby Vision) or HLG
+        hdr_transfers = {'smpte2084', 'arib-std-b67'}
+        is_hdr = transfer in hdr_transfers
+
+        metadata = HDRMetadata(
+            is_hdr=is_hdr,
+            transfer=transfer,
+            color_primaries=primaries,
+            color_space=color_space
+        )
+        _hdr_cache[video_path] = metadata
+        return metadata
+
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        metadata = HDRMetadata(is_hdr=False)
+        _hdr_cache[video_path] = metadata
+        return metadata
 
 
 def extract_frame(mkv_path: str, timestamp: str, output_path: str) -> bool:
     """Extract single frame from video at timestamp.
 
+    Automatically detects HDR content and applies tone mapping for correct
+    SDR display.
+
     Args:
         mkv_path: Path to MKV file
-        timestamp: Timestamp in HH:MM:SS format
+        timestamp: Timestamp string (HH:MM:SS or HH:MM:SS.cs)
         output_path: Where to save extracted frame (PNG)
 
     Returns:
         True if successful, False otherwise
     """
     try:
-        subprocess.run([
-            'ffmpeg', '-ss', timestamp, '-i', mkv_path,
-            '-vframes', '1', '-y', output_path
-        ], check=True, capture_output=True)
+        hdr = detect_hdr(mkv_path)
+
+        if hdr.is_hdr:
+            # Apply tone mapping for HDR content
+            # zscale converts HDR to linear, tonemap applies Hable curve,
+            # then convert to BT.709 SDR
+            if hdr.transfer == 'smpte2084':
+                # HDR10/PQ tone mapping
+                vf = 'zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable,zscale=t=bt709,format=yuv420p'
+            else:
+                # HLG tone mapping (arib-std-b67)
+                vf = 'zscale=t=linear,format=gbrpf32le,tonemap=hable,zscale=t=bt709,format=yuv420p'
+
+            subprocess.run([
+                'ffmpeg', '-ss', timestamp, '-i', mkv_path,
+                '-vf', vf,
+                '-vframes', '1', '-y', output_path
+            ], check=True, capture_output=True)
+        else:
+            # SDR video - no filter needed
+            subprocess.run([
+                'ffmpeg', '-ss', timestamp, '-i', mkv_path,
+                '-vframes', '1', '-y', output_path
+            ], check=True, capture_output=True)
+
         return True
     except subprocess.CalledProcessError:
         return False
