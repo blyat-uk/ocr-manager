@@ -1,15 +1,18 @@
 """Brightness tester dialog with visual previews."""
-import subprocess
 import shutil
 import uuid
 from pathlib import Path
+
+import cv2
+import numpy as np
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                               QLabel, QSlider, QComboBox, QSpinBox, QScrollArea,
                               QWidget, QMessageBox, QSizePolicy)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPointF
-from PyQt6.QtGui import QPixmap, QPainter, QWheelEvent, QMouseEvent
+from PyQt6.QtGui import QPixmap, QPainter, QWheelEvent, QMouseEvent, QImage
 
 from core.video_utils import get_video_duration, extract_frame
+from core.image_processing import apply_brightness_threshold
 
 
 class ZoomableImageLabel(QLabel):
@@ -151,19 +154,22 @@ class BrightnessTesterDialog(QDialog):
 
     brightness_selected = pyqtSignal(int)
 
-    def __init__(self, mkv_files: list, selected_episode: int = 0, timeline_position: int = 5000, brightness: int = 230, parent=None):
+    def __init__(self, mkv_files: list, selected_episode: int = 0, timeline_position: int = 5000,
+                 brightness: int = 230, crop_region: tuple = None, parent=None):
         super().__init__(parent)
         self.mkv_files = sorted(mkv_files)
         self.selected_episode = selected_episode
         self.initial_timeline_position = timeline_position
         self.initial_brightness = brightness
+        self.crop_region = crop_region  # (x, y, width, height) or None
         self.current_duration = 0
 
         # Create temp directory
         self.temp_dir = Path(f"/tmp/translator-{uuid.uuid4().hex[:8]}")
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
-        self.current_frame = None
+        self.current_frame = None  # Path to the extracted (and possibly cropped) frame
+        self.current_frame_array = None  # numpy array of the frame for preview generation
         self.selected_brightness = brightness
         self.initial_resize_done = False  # Track if initial auto-resize has been done
 
@@ -187,14 +193,13 @@ class BrightnessTesterDialog(QDialog):
 
         # Instructions
         instructions = QLabel("Move slider to find a frame with subtitles, then generate previews to find optimal brightness")
-        instructions.setStyleSheet("font-weight: bold; color: #0078d4;")
+        instructions.setObjectName("subheading")
         layout.addWidget(instructions)
 
         # Frame preview
         self.frame_preview = QLabel()
         self.frame_preview.setMinimumSize(400, 225)
         self.frame_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.frame_preview.setStyleSheet("background-color: #1e1e1e;")
         layout.addWidget(self.frame_preview)
 
         # Timeline slider
@@ -242,14 +247,6 @@ class BrightnessTesterDialog(QDialog):
         control_layout.addWidget(self.range_spin)
 
         generate_btn = QPushButton("Generate Previews")
-        generate_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                padding: 6px 12px;
-                font-weight: bold;
-            }
-        """)
         generate_btn.clicked.connect(self.on_generate_previews_clicked)
         control_layout.addWidget(generate_btn)
 
@@ -268,22 +265,7 @@ class BrightnessTesterDialog(QDialog):
         # Left arrow
         self.prev_btn = QPushButton("<")
         self.prev_btn.setFixedSize(50, 100)
-        self.prev_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 24px;
-                font-weight: bold;
-                background-color: #333;
-                color: white;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-            QPushButton:disabled {
-                background-color: #1a1a1a;
-                color: #555;
-            }
-        """)
+        self.prev_btn.setObjectName("secondary")
         self.prev_btn.clicked.connect(self.show_previous_preview)
         self.prev_btn.setEnabled(False)
         carousel_layout.addWidget(self.prev_btn)
@@ -291,28 +273,12 @@ class BrightnessTesterDialog(QDialog):
         # Zoomable image
         self.carousel_image = ZoomableImageLabel()
         self.carousel_image.setMinimumSize(800, 400)
-        self.carousel_image.setStyleSheet("background-color: #000;")
         carousel_layout.addWidget(self.carousel_image, 1)
 
         # Right arrow
         self.next_btn = QPushButton(">")
         self.next_btn.setFixedSize(50, 100)
-        self.next_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 24px;
-                font-weight: bold;
-                background-color: #333;
-                color: white;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-            QPushButton:disabled {
-                background-color: #1a1a1a;
-                color: #555;
-            }
-        """)
+        self.next_btn.setObjectName("secondary")
         self.next_btn.clicked.connect(self.show_next_preview)
         self.next_btn.setEnabled(False)
         carousel_layout.addWidget(self.next_btn)
@@ -322,20 +288,13 @@ class BrightnessTesterDialog(QDialog):
         # Brightness indicator
         self.brightness_indicator = QLabel("Brightness: --")
         self.brightness_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.brightness_indicator.setStyleSheet("""
-            QLabel {
-                font-size: 18px;
-                font-weight: bold;
-                color: #0078d4;
-                padding: 10px;
-            }
-        """)
+        self.brightness_indicator.setObjectName("heading")
         layout.addWidget(self.brightness_indicator)
 
         # Navigation indicator
         self.nav_indicator = QLabel("")
         self.nav_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.nav_indicator.setStyleSheet("color: #888;")
+        self.nav_indicator.setObjectName("muted")
         layout.addWidget(self.nav_indicator)
 
         # Buttons
@@ -348,18 +307,11 @@ class BrightnessTesterDialog(QDialog):
         button_layout.addStretch()
 
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
 
         apply_btn = QPushButton("Apply Selected Brightness")
-        apply_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-        """)
         apply_btn.clicked.connect(self.on_apply_clicked)
         button_layout.addWidget(apply_btn)
 
@@ -370,6 +322,8 @@ class BrightnessTesterDialog(QDialog):
             self.load_episode(self.episode_combo.currentIndex())
             # Update time label for initial position
             self.on_timeline_changed(self.initial_timeline_position)
+            # Auto-generate previews after a short delay to ensure frame is ready
+            QTimer.singleShot(100, self.on_generate_previews_clicked)
 
     def get_available_frame_size(self, pixmap: QPixmap) -> tuple[int, int]:
         """Calculate optimal frame size based on pixmap aspect ratio and available space."""
@@ -423,7 +377,7 @@ class BrightnessTesterDialog(QDialog):
         self.load_episode(index)
 
     def extract_current_frame(self):
-        """Extract frame at current timeline position."""
+        """Extract frame at current timeline position, applying crop if set."""
         if not self.mkv_files:
             return
 
@@ -439,15 +393,36 @@ class BrightnessTesterDialog(QDialog):
         centisecs = int((total_seconds - int(total_seconds)) * 100)
         timestamp = f"{hours:02d}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
 
-        # Extract frame as sub.png in temp directory
-        frame_path = self.temp_dir / "sub.png"
+        # Extract full frame first
+        full_frame_path = self.temp_dir / "full_frame.png"
+        display_frame_path = self.temp_dir / "sub.png"
 
         try:
-            extract_frame(mkv_path, timestamp, str(frame_path))
+            extract_frame(mkv_path, timestamp, str(full_frame_path))
 
-            if frame_path.exists():
-                self.current_frame = str(frame_path)
-                pixmap = QPixmap(str(frame_path))
+            if full_frame_path.exists():
+                # Load frame as numpy array
+                img = cv2.imread(str(full_frame_path))
+
+                # Apply crop if region is set
+                if self.crop_region is not None:
+                    x, y, w, h = self.crop_region
+                    # Ensure crop is within bounds
+                    img_h, img_w = img.shape[:2]
+                    x = max(0, min(x, img_w - 1))
+                    y = max(0, min(y, img_h - 1))
+                    w = min(w, img_w - x)
+                    h = min(h, img_h - y)
+                    img = img[y:y+h, x:x+w]
+
+                # Save the (possibly cropped) frame for display
+                cv2.imwrite(str(display_frame_path), img)
+
+                # Store the frame array for preview generation
+                self.current_frame_array = img
+                self.current_frame = str(display_frame_path)
+
+                pixmap = QPixmap(str(display_frame_path))
 
                 # Calculate and set optimal frame size
                 optimal_width, optimal_height = self.get_available_frame_size(pixmap)
@@ -472,8 +447,8 @@ class BrightnessTesterDialog(QDialog):
             print(f"Failed to extract frame: {e}")
 
     def on_generate_previews_clicked(self):
-        """Generate brightness preview gallery using sub-visualize."""
-        if not self.current_frame or not Path(self.current_frame).exists():
+        """Generate brightness preview gallery in-memory."""
+        if self.current_frame_array is None:
             QMessageBox.warning(self, "Error", "No frame extracted yet. Move the slider to extract a frame first.")
             return
 
@@ -487,28 +462,15 @@ class BrightnessTesterDialog(QDialog):
             if 0 <= b <= 255:
                 brightness_values.append(b)
 
-        # Run sub-visualize in temp directory
-        try:
-            result = subprocess.run(
-                ['sub-visualize', 'sub.png', '-b', str(base_brightness), '--span', str(range_value)],
-                cwd=str(self.temp_dir),
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode != 0:
-                print(f"sub-visualize stderr: {result.stderr}")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to run sub-visualize: {e}")
-            return
-
-        # Load generated preview images
+        # Generate preview images in-memory
         self.preview_images.clear()
         for brightness in brightness_values:
-            preview_path = self.temp_dir / f"sub_{brightness}.png"
-            if preview_path.exists():
-                pixmap = QPixmap(str(preview_path))
-                self.preview_images.append((brightness, pixmap))
+            # Apply brightness threshold
+            processed = apply_brightness_threshold(self.current_frame_array, brightness)
+
+            # Convert BGR numpy array to QPixmap
+            pixmap = self._numpy_to_pixmap(processed)
+            self.preview_images.append((brightness, pixmap))
 
         if not self.preview_images:
             QMessageBox.warning(self, "No Previews", "No preview images were generated.")
@@ -523,6 +485,15 @@ class BrightnessTesterDialog(QDialog):
         self.current_preview_index = middle_index
         self.show_current_preview(reset_zoom=should_reset_zoom)
         self.update_navigation_buttons()
+
+    def _numpy_to_pixmap(self, img: np.ndarray) -> QPixmap:
+        """Convert a BGR numpy array to QPixmap."""
+        # Convert BGR to RGB
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_img.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
 
     def show_current_preview(self, reset_zoom=False):
         """Display the current preview image in the carousel."""

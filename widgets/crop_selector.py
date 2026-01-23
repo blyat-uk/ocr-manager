@@ -184,14 +184,13 @@ class CropSelectorDialog(QDialog):
 
         # Instructions
         instructions = QLabel("Click and drag on the frame to draw a crop box around the subtitles")
-        instructions.setStyleSheet("font-weight: bold; color: #0078d4;")
+        instructions.setObjectName("subheading")
         layout.addWidget(instructions)
 
         # Frame display
         self.frame_label = FrameLabel()
         self.frame_label.setMinimumSize(400, 225)
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.frame_label.setStyleSheet("background-color: #1e1e1e;")
         layout.addWidget(self.frame_label)
 
         # Timeline controls
@@ -224,7 +223,6 @@ class CropSelectorDialog(QDialog):
 
         # Coordinates display
         self.coords_label = QLabel("Crop: (0, 0, 0, 0) - Draw a rectangle on the frame")
-        self.coords_label.setStyleSheet("font-family: monospace;")
         layout.addWidget(self.coords_label)
 
         # Update coordinates periodically
@@ -238,18 +236,11 @@ class CropSelectorDialog(QDialog):
         button_layout.addStretch()
 
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
 
         apply_btn = QPushButton("Apply Crop")
-        apply_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-        """)
         apply_btn.clicked.connect(self.on_apply_clicked)
         button_layout.addWidget(apply_btn)
 
