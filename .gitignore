@@ -39,6 +39,7 @@ chi-ass/
 translate/
 Fonts/
 *.mkv
+*.mp4
 *.eng.ass
 *.md
 !README.md
