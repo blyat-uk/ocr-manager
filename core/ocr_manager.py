@@ -6,7 +6,7 @@ from time import time
 
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 
-from core.config import Config
+from core.config import Config, FileConfig, FileConfigStore
 from core.ocr_worker import OCRWorker, FileStatus
 
 
@@ -63,9 +63,10 @@ class OCRManager(QObject):
     overall_progress = pyqtSignal(int, int)           # completed_files, total_files
     all_completed = pyqtSignal(int, int, float, float)  # successful, total, total_time, avg_time
 
-    def __init__(self, config: Config, parent=None):
+    def __init__(self, config: Config, file_config_store: FileConfigStore = None, parent=None):
         super().__init__(parent)
         self.config = config
+        self.file_config_store = file_config_store
         self.max_workers = config.ocr_parallel
 
         self._queue: list[Path] = []          # Pending files
@@ -108,7 +109,12 @@ class OCRManager(QObject):
 
     def _start_worker(self, video_path: Path):
         """Create and start a worker for a single video file."""
-        worker = OCRWorker(video_path, self._output_dir, self.config, self)
+        # Get per-file config if available
+        file_config = None
+        if self.file_config_store:
+            file_config = self.file_config_store.get(video_path.name)
+
+        worker = OCRWorker(video_path, self._output_dir, self.config, file_config, self)
 
         # Connect signals
         worker.status_changed.connect(self._on_worker_status_changed)

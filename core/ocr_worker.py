@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal, QProcess
 
-from core.config import Config
+from core.config import Config, FileConfig
 
 
 class FileStatus(Enum):
@@ -30,47 +30,69 @@ class OCRWorker(QObject):
     # tqdm progress pattern: "45%|..." or "Processing frames:  45%|..."
     TQDM_PATTERN = re.compile(r'(\d+)%\|')
 
-    def __init__(self, video_path: Path, output_dir: Path, config: Config, parent=None):
+    def __init__(self, video_path: Path, output_dir: Path, config: Config,
+                 file_config: FileConfig = None, parent=None):
         super().__init__(parent)
         self.video_path = video_path
         self.output_dir = output_dir
         self.config = config
+        self.file_config = file_config  # Per-file config overrides
         self.filename = video_path.name
         self.process = None
         self._last_percent = -1
 
     def build_command(self) -> list[str]:
-        """Build videocr.py command line arguments."""
+        """Build videocr.py command line arguments.
+
+        Uses per-file config when available, falling back to global config.
+        """
         # Output .ass file next to the video file (will be moved to output_dir after completion)
         output_path = self.video_path.parent / (self.video_path.stem + ".ass")
 
+        # Determine effective settings (per-file overrides global)
+        fc = self.file_config
+        gc = self.config
+
+        # Brightness: use file-specific if set, otherwise global
+        brightness = fc.brightness if (fc and fc.brightness is not None) else gc.brightness
+
+        # Crop: use file-specific if set, otherwise global
+        if fc and fc.has_custom_crop():
+            crop_x, crop_y, crop_w, crop_h = fc.crop_x, fc.crop_y, fc.crop_width, fc.crop_height
+        else:
+            crop_x, crop_y, crop_w, crop_h = gc.crop_x, gc.crop_y, gc.crop_width, gc.crop_height
+
+        # Time range: use file-specific if set, otherwise global
+        time_start = fc.time_start if (fc and fc.time_start) else gc.time_start
+        time_end = fc.time_end if (fc and fc.time_end) else gc.time_end
+
         cmd = [
-            self.config.videocr_python,
-            self.config.videocr_script,
+            gc.videocr_python,
+            gc.videocr_script,
             str(self.video_path),
             "-o", str(output_path),
-            "-l", self.config.ocr_lang,
-            "-c", str(self.config.conf_threshold),
-            "-s", str(self.config.sim_threshold),
-            "-b", str(self.config.brightness),
-            "--similar-image", str(self.config.similar_image),
-            "--skip", str(self.config.frames_to_skip),
+            "-l", gc.ocr_lang,
+            "-c", str(gc.conf_threshold),
+            "-s", str(gc.sim_threshold),
+            "-b", str(brightness),
+            "--similar-image", str(gc.similar_image),
+            "--skip", str(gc.frames_to_skip),
         ]
 
         # Crop region
-        if self.config.crop_width > 0 and self.config.crop_height > 0:
-            crop = f"{self.config.crop_x},{self.config.crop_y},{self.config.crop_width},{self.config.crop_height}"
+        if crop_w > 0 and crop_h > 0:
+            crop = f"{crop_x},{crop_y},{crop_w},{crop_h}"
             cmd.extend(["--crop", crop])
 
         # GPU option
-        if not self.config.use_gpu:
+        if not gc.use_gpu:
             cmd.append("--no-gpu")
 
         # Time range
-        if self.config.time_start:
-            cmd.extend(["-ts", self.config.time_start])
-        if self.config.time_end:
-            cmd.extend(["-te", self.config.time_end])
+        if time_start:
+            cmd.extend(["-ts", time_start])
+        if time_end:
+            cmd.extend(["-te", time_end])
 
         return cmd
 

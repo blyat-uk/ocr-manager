@@ -4,7 +4,7 @@ from itertools import chain
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal, QProcess
 
-from core.config import Config
+from core.config import Config, FileConfigStore
 from core.ocr_manager import OCRManager
 from core.ocr_worker import FileStatus
 
@@ -67,9 +67,10 @@ class Pipeline(QObject):
 
     PHASES = ["Create Directory", "OCR Extraction", "Quality Assurance"]
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, file_config_store: FileConfigStore = None):
         super().__init__()
         self.config = config
+        self.file_config_store = file_config_store
         self.process = None
         self.ocr_manager = None
         self.current_phase = 0
@@ -180,8 +181,8 @@ class Pipeline(QObject):
                 self.run_next_phase()
                 return
 
-            # Create and configure OCRManager
-            self.ocr_manager = OCRManager(self.config, self)
+            # Create and configure OCRManager with file config store
+            self.ocr_manager = OCRManager(self.config, self.file_config_store, self)
             self.ocr_manager.file_status_changed.connect(self.ocr_file_status.emit)
             self.ocr_manager.file_progress_updated.connect(self.ocr_file_progress.emit)
             self.ocr_manager.timing_updated.connect(self.ocr_timing_updated.emit)
