@@ -155,14 +155,24 @@ class BrightnessTesterDialog(QDialog):
     brightness_selected = pyqtSignal(int)
 
     def __init__(self, mkv_files: list, selected_episode: int = 0, timeline_position: int = 5000,
-                 brightness: int = 230, crop_region: tuple = None, parent=None):
+                 brightness: int = 230, crop_region: tuple = None, target_file: str = None, parent=None):
         super().__init__(parent)
         self.mkv_files = sorted(mkv_files)
-        self.selected_episode = selected_episode
+        self.target_file = target_file  # Pre-select this file if specified
         self.initial_timeline_position = timeline_position
         self.initial_brightness = brightness
         self.crop_region = crop_region  # (x, y, width, height) or None
         self.current_duration = 0
+
+        # Find target file index if specified, otherwise use selected_episode
+        if target_file:
+            self.selected_episode = 0
+            for i, f in enumerate(self.mkv_files):
+                if Path(f).name == target_file or f == target_file:
+                    self.selected_episode = i
+                    break
+        else:
+            self.selected_episode = selected_episode
 
         # Create temp directory
         self.temp_dir = Path(f"/tmp/translator-{uuid.uuid4().hex[:8]}")
@@ -549,8 +559,15 @@ class BrightnessTesterDialog(QDialog):
 
     def on_apply_clicked(self):
         """Apply brightness selection."""
-        self.brightness_selected.emit(self.brightness_spin.value())
+        brightness = self.brightness_spin.value()
+        self.brightness_selected.emit(brightness)
         self.accept()
+
+    def get_current_filename(self) -> str:
+        """Get the filename of the currently selected episode."""
+        if self.mkv_files and 0 <= self.episode_combo.currentIndex() < len(self.mkv_files):
+            return Path(self.mkv_files[self.episode_combo.currentIndex()]).name
+        return ""
 
     def closeEvent(self, event):
         """Clean up temp files."""

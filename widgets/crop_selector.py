@@ -153,12 +153,14 @@ class CropSelectorDialog(QDialog):
 
     crop_selected = pyqtSignal(int, int, int, int)
 
-    def __init__(self, mkv_files: list, existing_crop: tuple = None, timeline_position: int = 5000, parent=None):
+    def __init__(self, mkv_files: list, existing_crop: tuple = None, timeline_position: int = 5000,
+                 target_file: str = None, parent=None):
         super().__init__(parent)
         # Sort files naturally
         self.mkv_files = sorted(mkv_files)
         self.existing_crop = existing_crop
         self.initial_timeline_position = timeline_position
+        self.target_file = target_file  # Pre-select this file if specified
         self.temp_dir = tempfile.mkdtemp()
         self.current_duration = 0
         self.initial_resize_done = False  # Track if initial auto-resize has been done
@@ -174,7 +176,16 @@ class CropSelectorDialog(QDialog):
         self.setup_ui()
 
         if self.mkv_files:
-            self.load_episode(0)
+            # Find target file index if specified
+            initial_index = 0
+            if target_file:
+                for i, f in enumerate(self.mkv_files):
+                    if Path(f).name == target_file or f == target_file:
+                        initial_index = i
+                        break
+                self.episode_combo.setCurrentIndex(initial_index)
+
+            self.load_episode(initial_index)
             # Update time label for initial position
             self.on_timeline_changed(self.initial_timeline_position)
 
@@ -346,6 +357,12 @@ class CropSelectorDialog(QDialog):
         else:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Selection", "Please draw a crop rectangle on the frame first")
+
+    def get_current_filename(self) -> str:
+        """Get the filename of the currently selected episode."""
+        if self.mkv_files and 0 <= self.episode_combo.currentIndex() < len(self.mkv_files):
+            return Path(self.mkv_files[self.episode_combo.currentIndex()]).name
+        return ""
 
     def get_selected_episode(self) -> int:
         """Return the currently selected episode index."""
