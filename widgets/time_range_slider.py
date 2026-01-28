@@ -216,13 +216,33 @@ class TimeRangeSlider(QWidget):
         self._time_label.setMinimumWidth(90)
         layout.addWidget(self._time_label)
 
-    def set_duration(self, duration_seconds: int, reference_video: str = ""):
-        """Set the video duration and reference filename."""
+    def set_duration(self, duration_seconds: int, reference_video: str = "", reset_values: bool = False):
+        """Set the video duration and reference filename.
+
+        Args:
+            duration_seconds: Video duration in seconds
+            reference_video: Reference video filename for tooltip
+            reset_values: If True, reset slider to full range. If False (default),
+                         preserve existing values if they're within valid range.
+        """
+        old_duration = self._duration
         self._duration = max(1, duration_seconds)
         self._reference_video = reference_video
 
         self._slider.set_range(0, self._duration)
-        self._slider.set_values(0, self._duration)
+
+        # Only reset values if explicitly requested or duration changed significantly
+        if reset_values or old_duration == 0:
+            self._slider.set_values(0, self._duration)
+        else:
+            # Preserve existing values, clamped to new duration
+            start, end = self._slider.get_values()
+            # Clamp end to new duration
+            end = min(end, self._duration)
+            # Ensure start is still valid
+            start = min(start, end)
+            self._slider.set_values(start, end)
+
         self._update_labels()
 
     def set_values(self, start: int, end: int):
@@ -241,6 +261,23 @@ class TimeRangeSlider(QWidget):
         start_str = format_time(start) if start > 0 else ""
         end_str = format_time(end) if end < self._duration else ""
         return start_str, end_str
+
+    def set_time_range(self, start_str: str, end_str: str):
+        """Set time range from MM:SS strings."""
+        start = parse_time(start_str) if start_str else 0
+        end = parse_time(end_str) if end_str else self._duration
+
+        # Use defaults if parsing failed
+        if start is None:
+            start = 0
+        if end is None:
+            end = self._duration
+
+        # Clamp to valid range
+        start = max(0, min(start, self._duration))
+        end = max(start, min(end, self._duration))
+
+        self.set_values(start, end)
 
     def _on_range_changed(self, start: int, end: int):
         """Handle slider range change."""
