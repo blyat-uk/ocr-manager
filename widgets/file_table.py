@@ -1,0 +1,273 @@
+"""File table widget with resolution, config status, and progress columns."""
+
+from pathlib import Path
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
+    QProgressBar, QHeaderView, QLabel, QMenu, QAbstractItemView
+)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QAction
+
+from core.config import FileConfig, FileConfigStore
+from core.ocr_worker import FileStatus
+
+
+class FileTableWidget(QWidget):
+    """Table widget showing files with resolution, config status, and progress."""
+
+    # Signals
+    selection_changed = pyqtSignal(list)  # List of selected filenames
+    config_action_requested = pyqtSignal(str, str)  # action, filename
+
+    # Status colors (Catppuccin Mocha)
+    STATUS_COLORS = {
+        FileStatus.QUEUED: "#6c7086",      # overlay0
+        FileStatus.PROCESSING: "#89b4fa",  # blue
+        FileStatus.COMPLETED: "#a6e3a1",   # green
+        FileStatus.FAILED: "#f38ba8",      # red
+        FileStatus.DONE: "#a6e3a1",        # green (same as completed)
+    }
+
+    STATUS_TEXT = {
+        FileStatus.QUEUED: "Queued",
+        FileStatus.PROCESSING: "Processing",
+        FileStatus.COMPLETED: "Done",
+        FileStatus.FAILED: "Failed",
+        FileStatus.DONE: "Done",
+    }
+
+    # Config indicator colors
+    CONFIG_DEFAULT = "#6c7086"      # overlay0 - gray dot
+    CONFIG_CUSTOM = "#89b4fa"       # blue - custom config
+    CONFIG_INCOMPLETE = "#fab387"   # peach - missing required settings
+
+    # Column indices
+    COL_FILE = 0
+    COL_RESOLUTION = 1
+    COL_CONFIG = 2
+    COL_PROGRESS = 3
+    COL_STATUS = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._file_rows: dict[str, int] = {}  # filename -> row index
+        self._file_store: FileConfigStore | None = None
+        self._init_ui()
+
+    def _init_ui(self):
+        """Initialize the UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        # Header
+        header = QLabel("Files:")
+        layout.addWidget(header)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["File", "Res", "Config", "Progress", "Status"])
+
+        # Column sizing
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(self.COL_RESOLUTION, QHeaderView.ResizeMode.Fixed)
+        header_view.setSectionResizeMode(self.COL_CONFIG, QHeaderView.ResizeMode.Fixed)
+        header_view.setSectionResizeMode(self.COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
+        header_view.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_RESOLUTION, 60)
+        self.table.setColumnWidth(self.COL_CONFIG, 60)
+        self.table.setColumnWidth(self.COL_PROGRESS, 150)
+        self.table.setColumnWidth(self.COL_STATUS, 90)
+
+        # Table settings
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+
+        # Connect selection change
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        # Context menu
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+
+        layout.addWidget(self.table)
+
+    def set_file_store(self, store: FileConfigStore):
+        """Set the file config store for config status display."""
+        self._file_store = store
+
+    def set_files(self, filenames: list[str], initial_statuses: dict[str, FileStatus] = None):
+        """Initialize the table with file list and optional initial statuses."""
+        self._file_rows.clear()
+        self.table.setRowCount(len(filenames))
+
+        for row, filename in enumerate(filenames):
+            self._file_rows[filename] = row
+
+            # Determine initial status for this file
+            status = FileStatus.QUEUED
+            if initial_statuses and filename in initial_statuses:
+                status = initial_statuses[filename]
+
+            # File column
+            file_item = QTableWidgetItem(filename)
+            file_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, self.COL_FILE, file_item)
+
+            # Resolution column (will be updated by update_resolution)
+            res_item = QTableWidgetItem("?")
+            res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, self.COL_RESOLUTION, res_item)
+
+            # Config indicator column
+            config_item = QTableWidgetItem("")
+            config_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, self.COL_CONFIG, config_item)
+            self._update_config_indicator(filename)
+
+            # Progress bar
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(100 if status == FileStatus.DONE else 0)
+            progress_bar.setTextVisible(True)
+            progress_bar.setFormat("%p%")
+            self.table.setCellWidget(row, self.COL_PROGRESS, progress_bar)
+
+            # Status column
+            status_item = QTableWidgetItem(self.STATUS_TEXT[status])
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            status_item.setForeground(QColor(self.STATUS_COLORS[status]))
+            self.table.setItem(row, self.COL_STATUS, status_item)
+
+    def update_resolution(self, filename: str, label: str):
+        """Update resolution label for a file."""
+        if filename not in self._file_rows:
+            return
+
+        row = self._file_rows[filename]
+        res_item = self.table.item(row, self.COL_RESOLUTION)
+        if res_item:
+            res_item.setText(label)
+
+    def update_config_indicator(self, filename: str):
+        """Update the config indicator for a file."""
+        self._update_config_indicator(filename)
+
+    def _update_config_indicator(self, filename: str):
+        """Internal method to update config indicator."""
+        if filename not in self._file_rows:
+            return
+
+        row = self._file_rows[filename]
+        config_item = self.table.item(row, self.COL_CONFIG)
+        if not config_item:
+            return
+
+        # Determine indicator based on file config
+        has_custom = False
+        if self._file_store:
+            has_custom = self._file_store.has_custom(filename)
+
+        if has_custom:
+            config_item.setText("\u25cf")  # Filled circle
+            config_item.setForeground(QColor(self.CONFIG_CUSTOM))
+            config_item.setToolTip("Custom settings")
+        else:
+            config_item.setText("\u25cb")  # Empty circle
+            config_item.setForeground(QColor(self.CONFIG_DEFAULT))
+            config_item.setToolTip("Using defaults")
+
+    def update_status(self, filename: str, status: FileStatus):
+        """Update the status cell for a file."""
+        if filename not in self._file_rows:
+            return
+
+        row = self._file_rows[filename]
+        status_item = self.table.item(row, self.COL_STATUS)
+        if status_item:
+            status_item.setText(self.STATUS_TEXT[status])
+            color = self.STATUS_COLORS[status]
+            status_item.setForeground(QColor(color))
+
+    def update_progress(self, filename: str, percent: int):
+        """Update progress bar for a file."""
+        if filename not in self._file_rows:
+            return
+
+        row = self._file_rows[filename]
+        progress_bar = self.table.cellWidget(row, self.COL_PROGRESS)
+        if isinstance(progress_bar, QProgressBar):
+            progress_bar.setValue(percent)
+
+    def get_selected_filenames(self) -> list[str]:
+        """Get list of selected filenames."""
+        selected_rows = set()
+        for item in self.table.selectedItems():
+            selected_rows.add(item.row())
+
+        filenames = []
+        for filename, row in self._file_rows.items():
+            if row in selected_rows:
+                filenames.append(filename)
+
+        return filenames
+
+    def select_file(self, filename: str):
+        """Select a specific file in the table."""
+        if filename not in self._file_rows:
+            return
+
+        row = self._file_rows[filename]
+        self.table.selectRow(row)
+
+    def clear_selection(self):
+        """Clear current selection."""
+        self.table.clearSelection()
+
+    def _on_selection_changed(self):
+        """Handle selection change."""
+        filenames = self.get_selected_filenames()
+        self.selection_changed.emit(filenames)
+
+    def _show_context_menu(self, pos):
+        """Show context menu for right-click."""
+        item = self.table.itemAt(pos)
+        if not item:
+            return
+
+        selected = self.get_selected_filenames()
+        if not selected:
+            return
+
+        menu = QMenu(self)
+
+        # Copy settings action
+        copy_action = QAction("Copy Settings", self)
+        copy_action.triggered.connect(lambda: self.config_action_requested.emit("copy", selected[0]))
+        menu.addAction(copy_action)
+
+        # Paste settings action
+        paste_action = QAction("Paste Settings to Selected", self)
+        paste_action.triggered.connect(lambda: self.config_action_requested.emit("paste", ""))
+        menu.addAction(paste_action)
+
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def refresh_all_config_indicators(self):
+        """Refresh config indicators for all files."""
+        for filename in self._file_rows:
+            self._update_config_indicator(filename)
+
+    def clear(self):
+        """Clear the table."""
+        self.table.setRowCount(0)
+        self._file_rows.clear()
+
+    def get_all_filenames(self) -> list[str]:
+        """Get all filenames in the table."""
+        return list(self._file_rows.keys())
