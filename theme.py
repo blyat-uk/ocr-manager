@@ -562,6 +562,45 @@ QProgressBar::chunk {{
     background-color: {c.blue};
     border-radius: 4px;
 }}
+
+/* File config panel */
+QWidget#file-config-panel {{
+    background-color: {c.surface0};
+    border: 1px solid {c.surface1};
+    border-radius: 8px;
+}}
+
+/* Custom settings checkbox when checked */
+QCheckBox#custom-settings::indicator:checked {{
+    background-color: {c.blue};
+    border-color: {c.blue};
+}}
+
+/* Config indicator in table - custom icon */
+QTableWidget QLabel#config-custom {{
+    color: {c.blue};
+}}
+
+/* Config indicator in table - default icon */
+QTableWidget QLabel#config-default {{
+    color: {c.overlay0};
+}}
+
+/* Config indicator in table - incomplete icon */
+QTableWidget QLabel#config-incomplete {{
+    color: {c.peach};
+}}
+
+/* Selection in file table */
+QTableWidget::item:selected {{
+    background-color: {c.surface2};
+    color: {c.text};
+}}
+
+QTableWidget::item:selected:focus {{
+    background-color: {c.blue};
+    color: {c.crust};
+}}
 """
 
 
