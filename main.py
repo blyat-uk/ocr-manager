@@ -8,18 +8,18 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLineEdit, QPushButton,
                               QSpinBox, QLabel, QMessageBox,
                               QSlider, QSizePolicy, QFileDialog, QProgressBar)
-from PyQt6.QtCore import Qt, QFileSystemWatcher
+from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut
 
-from core.config import Config, validate_config
+from core.config import Config, validate_config, FileConfig, FileConfigStore, ProjectConfigManager
 from core.pipeline import Pipeline, get_video_files, detect_file_statuses
-from core.video_utils import get_video_duration
+from core.video_utils import VideoMetadataScanner
 from theme import apply_theme
 from widgets.crop_selector import CropSelectorDialog
 from widgets.brightness_tester import BrightnessTesterDialog
 from widgets.phase_indicator import PhaseIndicator
 from widgets.time_range_slider import TimeRangeSlider
-from widgets.progress_table import ProgressTableWidget
+from widgets.file_table import FileTableWidget
 from widgets.videocr_settings_dialog import VideoCRSettingsDialog
 
 
@@ -40,6 +40,10 @@ class MainWindow(QMainWindow):
         self.folder_watcher = None
         self.current_video_files = set()  # Track current video files for change detection
 
+        # Per-file configuration store
+        self.file_config_store = FileConfigStore()
+        self.clipboard_config: FileConfig | None = None  # For copy/paste
+
         # VideoCR settings (temporary, reset on app restart)
         self.videocr_settings = {
             'ocr_lang': 'ch',
@@ -47,6 +51,11 @@ class MainWindow(QMainWindow):
             'sim_threshold': '82',
             'similar_image': '0.3',
         }
+
+        # Config persistence
+        self._save_timer: QTimer | None = None
+        self._pending_time_range: tuple[str, str] | None = None
+        self._pending_file_configs: dict | None = None
 
         # UI components
         self.folder_btn = None
@@ -58,11 +67,15 @@ class MainWindow(QMainWindow):
         self.time_range_slider = None
         self.parallel_slider = None
         self.parallel_label = None
-        self.progress_table = None
+        self.file_table = None
         self.start_button = None
         self.phase_indicator = None
         self.overall_progress = None
         self.timing_label = None
+        self.loading_label = None
+
+        # Background scanner
+        self._metadata_scanner: VideoMetadataScanner | None = None
 
         self.init_ui()
         self.check_dependencies()
@@ -138,6 +151,12 @@ class MainWindow(QMainWindow):
 
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+Q"), self, self.close)
+
+        # Connect signals for auto-save
+        self.crop_input.textChanged.connect(self._schedule_save)
+        self.brightness_spin.valueChanged.connect(self._schedule_save)
+        self.time_range_slider.range_changed.connect(self._schedule_save)
+        self.parallel_slider.valueChanged.connect(self._schedule_save)
 
     def create_config_section(self) -> QWidget:
         """Create configuration section with OCR parameters."""
@@ -217,8 +236,124 @@ class MainWindow(QMainWindow):
         """Update parallel workers label."""
         self.parallel_label.setText(f"{value} workers")
 
+    def _schedule_save(self):
+        """Schedule a debounced save (300ms after last change)."""
+        if not self.project_path:
+            return
+        if self._save_timer is None:
+            self._save_timer = QTimer(self)
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(self._save_project_config)
+        self._save_timer.start(300)
+
+    def _save_project_config(self):
+        """Save current configuration to .ocr.json."""
+        if not self.project_path:
+            return
+
+        # Build global settings from UI
+        global_settings = {
+            'brightness': self.brightness_spin.value(),
+            'ocr_parallel': self.parallel_slider.value(),
+        }
+
+        # Crop region
+        crop_text = self.crop_input.text()
+        if crop_text:
+            try:
+                parts = [int(x.strip()) for x in crop_text.split(',')]
+                if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+                    global_settings['crop'] = {
+                        'x': parts[0], 'y': parts[1],
+                        'width': parts[2], 'height': parts[3]
+                    }
+            except ValueError:
+                pass
+
+        # Time range
+        time_start, time_end = self.time_range_slider.get_time_strings()
+        if time_start or time_end:
+            global_settings['time_range'] = {'start': time_start, 'end': time_end}
+
+        # VideoCR settings
+        videocr_settings = dict(self.videocr_settings)
+
+        # Save to file
+        config_manager = ProjectConfigManager(Path(self.project_path))
+        config_manager.save(global_settings, videocr_settings, self.file_config_store)
+
+    def _load_project_config(self):
+        """Load project configuration from .ocr.json if it exists."""
+        if not self.project_path:
+            return
+
+        config_manager = ProjectConfigManager(Path(self.project_path))
+        if not config_manager.exists():
+            return
+
+        global_settings, videocr_settings, file_configs = config_manager.load()
+
+        # Apply global settings to UI (block signals to avoid triggering saves)
+        if 'brightness' in global_settings:
+            self.brightness_spin.blockSignals(True)
+            self.brightness_spin.setValue(global_settings['brightness'])
+            self.brightness_spin.blockSignals(False)
+
+        if 'ocr_parallel' in global_settings:
+            self.parallel_slider.blockSignals(True)
+            self.parallel_slider.setValue(global_settings['ocr_parallel'])
+            self.parallel_slider.blockSignals(False)
+            self._on_parallel_changed(global_settings['ocr_parallel'])
+
+        if 'crop' in global_settings:
+            crop = global_settings['crop']
+            self.crop_input.blockSignals(True)
+            self.crop_input.setText(f"{crop['x']}, {crop['y']}, {crop['width']}, {crop['height']}")
+            self.crop_input.blockSignals(False)
+
+        # Store pending time range - will be applied after duration is set in refresh_file_list
+        if 'time_range' in global_settings:
+            tr = global_settings['time_range']
+            self._pending_time_range = (tr.get('start', ''), tr.get('end', ''))
+
+        # Apply videocr settings
+        if videocr_settings:
+            self.videocr_settings.update(videocr_settings)
+
+        # Store pending file configs - will be applied after files are scanned
+        if file_configs:
+            self._pending_file_configs = file_configs
+
+    def _apply_pending_file_configs(self):
+        """Apply pending per-file configurations after files are scanned."""
+        if not self._pending_file_configs:
+            return
+
+        for filename, cfg in self._pending_file_configs.items():
+            config = self.file_config_store.get(filename)
+            if not config:
+                continue  # File no longer exists
+
+            if 'crop' in cfg:
+                crop = cfg['crop']
+                config.set_crop(crop['x'], crop['y'], crop['width'], crop['height'])
+
+            if 'brightness' in cfg:
+                config.brightness = cfg['brightness']
+
+            if 'time_start' in cfg:
+                config.time_start = cfg['time_start']
+
+            if 'time_end' in cfg:
+                config.time_end = cfg['time_end']
+
+            # Update table indicator
+            self.file_table.update_config_indicator(filename)
+
+        self._pending_file_configs = None
+
     def create_pipeline_section(self) -> QWidget:
-        """Create pipeline status section with phase indicator and progress table."""
+        """Create pipeline status section with phase indicator and file table."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -235,9 +370,18 @@ class MainWindow(QMainWindow):
         self.phase_indicator.badge_clicked.connect(self.on_phase_badge_clicked)
         layout.addWidget(self.phase_indicator)
 
-        # Progress table
-        self.progress_table = ProgressTableWidget()
-        layout.addWidget(self.progress_table)
+        # Loading indicator (shown during metadata scan)
+        self.loading_label = QLabel("Scanning video files...")
+        self.loading_label.setObjectName("muted")
+        self.loading_label.setVisible(False)
+        layout.addWidget(self.loading_label)
+
+        # File table
+        self.file_table = FileTableWidget()
+        self.file_table.set_file_store(self.file_config_store)
+        self.file_table.selection_changed.connect(self.on_file_selection_changed)
+        self.file_table.config_action_requested.connect(self.on_config_action_requested)
+        layout.addWidget(self.file_table)
 
         return widget
 
@@ -261,6 +405,9 @@ class MainWindow(QMainWindow):
         self.folder_path_label.style().polish(self.folder_path_label)
         self.update_window_title()
 
+        # Hide previous run stats
+        self.timing_label.setVisible(False)
+
         # Set up folder watcher
         if self.folder_watcher:
             self.folder_watcher.removePaths(self.folder_watcher.directories())
@@ -269,13 +416,22 @@ class MainWindow(QMainWindow):
             self.folder_watcher.directoryChanged.connect(self.on_folder_changed)
         self.folder_watcher.addPath(directory)
 
+        # Load saved project configuration
+        self._load_project_config()
+
         # Scan and display video files
         self.refresh_file_list()
 
     def refresh_file_list(self):
-        """Scan folder for video files and update the progress table."""
+        """Scan folder for video files and update the file table."""
         if not self.project_path:
             return
+
+        # Stop any existing scanner
+        if self._metadata_scanner is not None:
+            self._metadata_scanner.stop()
+            self._metadata_scanner.wait()
+            self._metadata_scanner = None
 
         # Find video files (non-recursive) sorted by filename
         project_path = Path(self.project_path)
@@ -286,31 +442,62 @@ class MainWindow(QMainWindow):
         if new_video_set != self.current_video_files:
             self.current_video_files = new_video_set
 
-            # Populate progress table with sorted filenames and detected statuses
+            # Clear old configs for removed files
+            for old_filename in self.file_config_store.get_all_filenames():
+                if old_filename not in new_video_set:
+                    self.file_config_store.remove(old_filename)
+
+            # Populate file table with sorted filenames and detected statuses
             if video_files:
                 statuses = detect_file_statuses(project_path)
-                self.progress_table.set_files([f.name for f in video_files], statuses)
+                self.file_table.set_files([f.name for f in video_files], statuses)
+
+                # Show loading indicator and start background scan
+                self.loading_label.setVisible(True)
+                self._start_metadata_scan(video_files)
             else:
-                self.progress_table.clear()
+                self.file_table.clear()
+                self.file_config_store.clear()
+                self.loading_label.setVisible(False)
+        else:
+            # Files unchanged, but still need to apply pending configs
+            self._apply_pending_file_configs()
+
+    def _start_metadata_scan(self, video_files: list[Path]):
+        """Start background scan of video metadata."""
+        self._metadata_scanner = VideoMetadataScanner(video_files, self)
+        self._metadata_scanner.file_scanned.connect(self._on_file_metadata_scanned)
+        self._metadata_scanner.scan_complete.connect(self._on_metadata_scan_complete)
+        self._metadata_scanner.start()
+
+    def _on_file_metadata_scanned(self, filename: str, width: int, height: int, duration: int):
+        """Handle metadata scanned for a single file."""
+        config = self.file_config_store.get_or_create(filename)
+        config.resolution_width = width
+        config.resolution_height = height
+        config.duration_seconds = duration
+        self.file_table.update_resolution(filename, config.get_resolution_label())
+
+    def _on_metadata_scan_complete(self, longest_filename: str, longest_duration: int):
+        """Handle completion of metadata scan."""
+        self.loading_label.setVisible(False)
+        self._metadata_scanner = None
 
         # Update time range slider with longest video
-        if video_files:
-            longest_file = None
-            longest_duration = 0
-            for video in video_files:
-                try:
-                    duration = get_video_duration(str(video))
-                    if duration > longest_duration:
-                        longest_duration = duration
-                        longest_file = video
-                except Exception:
-                    continue
+        if longest_filename and longest_duration > 0:
+            self.time_range_slider.set_duration(longest_duration, longest_filename)
 
-            if longest_file and longest_duration > 0:
-                self.time_range_slider.set_duration(
-                    longest_duration,
-                    longest_file.name
-                )
+            # Apply pending time range after duration is set
+            if self._pending_time_range:
+                start_str, end_str = self._pending_time_range
+                self._pending_time_range = None
+                # Block signals to avoid triggering save
+                self.time_range_slider.blockSignals(True)
+                self.time_range_slider.set_time_range(start_str, end_str)
+                self.time_range_slider.blockSignals(False)
+
+        # Apply pending per-file configs after files are scanned
+        self._apply_pending_file_configs()
 
     def on_folder_changed(self, path: str):
         """Handle folder content changes."""
@@ -318,14 +505,90 @@ class MainWindow(QMainWindow):
         if not self.is_running:
             self.refresh_file_list()
 
+    def on_file_selection_changed(self, filenames: list[str]):
+        """Handle file selection change - update inputs to reflect selected files' config."""
+        if not filenames:
+            # No selection - keep current values as global defaults
+            return
+
+        # Check if first selected file has custom config
+        first_file = filenames[0]
+        config = self.file_config_store.get(first_file)
+
+        if config and config.has_custom_crop():
+            crop = config.get_crop_tuple()
+            self.crop_input.setText(f"{crop[0]}, {crop[1]}, {crop[2]}, {crop[3]}")
+        else:
+            self.crop_input.clear()
+
+        if config and config.has_custom_brightness():
+            self.brightness_spin.setValue(config.brightness)
+        else:
+            self.brightness_spin.setValue(230)  # Default
+
+    def _get_target_files(self) -> list[str]:
+        """Get target files for config changes: selected files or all if none selected."""
+        selected = self.file_table.get_selected_filenames()
+        if selected:
+            return selected
+        return self.file_table.get_all_filenames()
+
+    def _apply_crop_to_files(self, x: int, y: int, w: int, h: int, filenames: list[str]):
+        """Apply crop settings to specified files."""
+        for filename in filenames:
+            config = self.file_config_store.get_or_create(filename)
+            config.set_crop(x, y, w, h)
+            self.file_table.update_config_indicator(filename)
+        self._schedule_save()
+
+    def _apply_brightness_to_files(self, brightness: int, filenames: list[str]):
+        """Apply brightness setting to specified files."""
+        for filename in filenames:
+            config = self.file_config_store.get_or_create(filename)
+            config.brightness = brightness
+            self.file_table.update_config_indicator(filename)
+        self._schedule_save()
+
+    def on_config_action_requested(self, action: str, filename: str):
+        """Handle config action from file table context menu (copy/paste)."""
+        selected = self.file_table.get_selected_filenames()
+
+        if action == "copy" and filename:
+            # Copy settings from the specified file
+            config = self.file_config_store.get(filename)
+            if config:
+                self.clipboard_config = FileConfig(
+                    filename="clipboard",
+                    crop_x=config.crop_x,
+                    crop_y=config.crop_y,
+                    crop_width=config.crop_width,
+                    crop_height=config.crop_height,
+                    brightness=config.brightness,
+                    time_start=config.time_start,
+                    time_end=config.time_end
+                )
+
+        elif action == "paste" and self.clipboard_config:
+            # Paste settings to all selected files
+            for f in selected:
+                self.file_config_store.copy_settings_to_files(self.clipboard_config, [f])
+                self.file_table.update_config_indicator(f)
+            self._schedule_save()
+
     def on_crop_select_clicked(self):
         """Open crop selector dialog."""
         if not self.project_path:
             QMessageBox.warning(self, "Error", "Please select a project directory first")
             return
 
-        # Find video files
-        video_files = get_video_files(Path(self.project_path))
+        # Use selected files, or all files if none selected
+        project_path = Path(self.project_path)
+        selected = self.file_table.get_selected_filenames()
+        if selected:
+            video_files = [project_path / f for f in selected]
+        else:
+            video_files = get_video_files(project_path)
+
         if not video_files:
             QMessageBox.warning(self, "Error", "No video files found in project directory")
             return
@@ -341,15 +604,18 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
-        dialog = CropSelectorDialog([str(f) for f in video_files], existing_crop, self.last_timeline_position, self)
+        dialog = CropSelectorDialog([str(f) for f in video_files], existing_crop, self.last_timeline_position, parent=self)
         dialog.crop_selected.connect(self.on_crop_selected)
         if dialog.exec():
             self.last_selected_episode = dialog.get_selected_episode()
             self.last_timeline_position = dialog.get_timeline_position()
 
     def on_crop_selected(self, x: int, y: int, width: int, height: int):
-        """Handle crop selection."""
+        """Handle crop selection - apply to selected files or all if none selected."""
         self.crop_input.setText(f"{x}, {y}, {width}, {height}")
+        # Apply to target files
+        target_files = self._get_target_files()
+        self._apply_crop_to_files(x, y, width, height, target_files)
 
     def on_brightness_test_clicked(self):
         """Open brightness tester dialog."""
@@ -357,8 +623,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select a project directory first")
             return
 
-        # Find video files
-        video_files = get_video_files(Path(self.project_path))
+        # Use selected files, or all files if none selected
+        project_path = Path(self.project_path)
+        selected = self.file_table.get_selected_filenames()
+        if selected:
+            video_files = [project_path / f for f in selected]
+        else:
+            video_files = get_video_files(project_path)
+
         if not video_files:
             QMessageBox.warning(self, "Error", "No video files found in project directory")
             return
@@ -380,14 +652,17 @@ class MainWindow(QMainWindow):
             self.last_timeline_position,
             self.brightness_spin.value(),
             crop_region,
-            self
+            parent=self
         )
         dialog.brightness_selected.connect(self.on_brightness_selected)
         dialog.exec()
 
     def on_brightness_selected(self, brightness: int):
-        """Handle brightness selection."""
+        """Handle brightness selection - apply to selected files or all if none selected."""
         self.brightness_spin.setValue(brightness)
+        # Apply to target files
+        target_files = self._get_target_files()
+        self._apply_brightness_to_files(brightness, target_files)
 
     def on_phase_badge_clicked(self, index: int):
         """Handle phase badge click."""
@@ -403,6 +678,7 @@ class MainWindow(QMainWindow):
     def on_videocr_settings_changed(self, settings: dict):
         """Handle videocr settings changes."""
         self.videocr_settings.update(settings)
+        self._schedule_save()
 
     def _format_duration(self, seconds: float) -> str:
         """Format duration as human-readable string."""
@@ -480,15 +756,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Configuration Error", error_msg)
             return
 
-        # Create and start pipeline
-        self.pipeline = Pipeline(config)
+        # Create and start pipeline with file config store
+        self.pipeline = Pipeline(config, self.file_config_store)
         self.pipeline.error_occurred.connect(self.on_pipeline_error)
         self.pipeline.phase_started.connect(self.on_phase_started)
         self.pipeline.pipeline_finished.connect(self.on_pipeline_finished)
 
-        # Progress table signals (table is pre-populated on folder load)
-        self.pipeline.ocr_file_status.connect(self.progress_table.update_status)
-        self.pipeline.ocr_file_progress.connect(self.progress_table.update_progress)
+        # File table signals (table is pre-populated on folder load)
+        self.pipeline.ocr_file_status.connect(self.file_table.update_status)
+        self.pipeline.ocr_file_progress.connect(self.file_table.update_progress)
 
         # Timing signals
         self.pipeline.ocr_timing_updated.connect(self.on_timing_updated)
@@ -540,9 +816,8 @@ class MainWindow(QMainWindow):
         self.update_window_title()
         self.enable_ui()
 
-        # Hide progress widgets
+        # Hide progress bar but show stats in timing label
         self.overall_progress.setVisible(False)
-        self.timing_label.setVisible(False)
 
         # Refresh file list to update statuses from filesystem
         self.current_video_files = set()  # Force refresh
@@ -550,17 +825,20 @@ class MainWindow(QMainWindow):
 
         if success:
             self.phase_indicator.mark_complete()
-            # Build completion message with timing info
+            # Show completion stats in timing label
             total_time, avg_time = self.pipeline.get_ocr_timing()
             if total_time > 0:
                 total_str = self._format_duration(total_time)
                 avg_str = self._format_duration(avg_time)
-                completed = self.overall_progress.value()
-                msg = f"Total: {total_str} | Files: {completed} | Avg: {avg_str}/file"
+                self.timing_label.setText(f"Finished in {total_str}  •  Average {avg_str}/file")
+                self.timing_label.setVisible(True)
+                msg = f"Finished in {total_str} | Avg: {avg_str}/file"
             else:
+                self.timing_label.setVisible(False)
                 msg = "All phases completed"
             self._send_notification("OCR Complete", msg)
         else:
+            self.timing_label.setVisible(False)
             self._send_notification("OCR Failed", "Pipeline encountered an error", "critical")
 
     def on_pipeline_stopped(self):
@@ -591,6 +869,7 @@ class MainWindow(QMainWindow):
         self.brightness_test_btn.setEnabled(False)
         self.time_range_slider.setEnabled(False)
         self.parallel_slider.setEnabled(False)
+        # Note: file_table is not disabled to allow scrolling during processing
 
     def enable_ui(self):
         """Re-enable UI after processing."""
@@ -629,10 +908,17 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 if self.pipeline:
                     self.pipeline.stop()
+                if self._metadata_scanner:
+                    self._metadata_scanner.stop()
+                    self._metadata_scanner.wait()
                 event.accept()
             else:
                 event.ignore()
         else:
+            # Stop metadata scanner if running
+            if self._metadata_scanner:
+                self._metadata_scanner.stop()
+                self._metadata_scanner.wait()
             event.accept()
 
 
