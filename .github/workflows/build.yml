@@ -12,11 +12,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            output_name: ocr-manager-linux
+            build_name: ocr-manager-linux
+            artifact_name: ocr-manager-linux
           - os: macos-latest
-            output_name: ocr-manager-macos
+            build_name: ocr-manager-macos
+            artifact_name: ocr-manager-macos
           - os: windows-latest
-            output_name: ocr-manager-windows.exe
+            build_name: ocr-manager-windows
+            artifact_name: ocr-manager-windows.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -35,8 +38,9 @@ jobs:
           pip install "PyQt6>=6.5.0" "opencv-python>=4.8.0" "numpy>=1.24.0" "pyinstaller>=6.0.0"
 
       - name: Build with PyInstaller
+        shell: bash
         run: |
-          pyinstaller --clean --name "${{ matrix.output_name }}" --onefile --noconsole \
+          pyinstaller --clean --name "${{ matrix.build_name }}" --onefile --noconsole \
             --hidden-import=cv2 \
             --hidden-import=numpy \
             --exclude-module=PyQt6.QtBluetooth \
@@ -63,11 +67,15 @@ jobs:
             --exclude-module=unittest \
             main.py
 
+      - name: List dist contents
+        shell: bash
+        run: ls -la dist/
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.output_name }}
-          path: dist/${{ matrix.output_name }}
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
 
   release:
     needs: build
