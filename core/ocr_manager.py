@@ -58,6 +58,7 @@ class OCRManager(QObject):
     """Manages parallel OCR workers with queue-based concurrency."""
 
     file_status_changed = pyqtSignal(str, object)   # filename, FileStatus
+    file_status_text_changed = pyqtSignal(str, str)  # filename, status_text
     file_progress_updated = pyqtSignal(str, int)    # filename, percent
     timing_updated = pyqtSignal(float, float, float)  # elapsed, eta, avg_per_file
     overall_progress = pyqtSignal(int, int)           # completed_files, total_files
@@ -118,6 +119,7 @@ class OCRManager(QObject):
 
         # Connect signals
         worker.status_changed.connect(self._on_worker_status_changed)
+        worker.status_text_changed.connect(self._on_worker_status_text_changed)
         worker.progress_updated.connect(self._on_worker_progress)
         worker.finished.connect(self._on_worker_finished)
 
@@ -128,6 +130,10 @@ class OCRManager(QObject):
     def _on_worker_status_changed(self, filename: str, status: FileStatus):
         """Forward status change signal."""
         self.file_status_changed.emit(filename, status)
+
+    def _on_worker_status_text_changed(self, filename: str, status_text: str):
+        """Forward status text change signal."""
+        self.file_status_text_changed.emit(filename, status_text)
 
     def _on_worker_progress(self, filename: str, percent: int):
         """Forward progress update signal."""

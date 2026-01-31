@@ -1,12 +1,15 @@
-# No pip dependencies required - all packages are installed system-wide
+# Runtime dependencies
+PyQt6>=6.5.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Build dependencies (optional - only needed to create executables)
+# pyinstaller>=6.0.0
+
+# External tools required (not Python packages):
+# - ffmpeg (must be in PATH)
+# - ffprobe (must be in PATH, usually comes with ffmpeg)
 #
-# System Requirements:
-# - Python 3.13
-# - python-pyqt6 6.10.0 (system package)
-# - python-opencv-cuda 4.12.0 (system package)
-# - ffmpeg 8.0.1
-# - ffprobe 8.0.1
-#
-# CLI Tools (must be in PATH):
+# CLI Tools for full OCR pipeline (optional):
 # - ocrp, ass-credits, ass-header, ass-qafix, sub-visualize
 # - subs-translator, submerge, srt-to-ass

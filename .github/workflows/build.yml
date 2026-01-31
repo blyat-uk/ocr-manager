@@ -1,0 +1,97 @@
+name: Build Executables
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            output_name: ocr-manager-linux
+          - os: macos-latest
+            output_name: ocr-manager-macos
+          - os: windows-latest
+            output_name: ocr-manager-windows.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "PyQt6>=6.5.0" "opencv-python>=4.8.0" "numpy>=1.24.0" "pyinstaller>=6.0.0"
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --clean --name "${{ matrix.output_name }}" --onefile --noconsole \
+            --hidden-import=cv2 \
+            --hidden-import=numpy \
+            --exclude-module=PyQt6.QtBluetooth \
+            --exclude-module=PyQt6.QtDBus \
+            --exclude-module=PyQt6.QtDesigner \
+            --exclude-module=PyQt6.QtHelp \
+            --exclude-module=PyQt6.QtMultimedia \
+            --exclude-module=PyQt6.QtNetwork \
+            --exclude-module=PyQt6.QtNfc \
+            --exclude-module=PyQt6.QtOpenGL \
+            --exclude-module=PyQt6.QtPositioning \
+            --exclude-module=PyQt6.QtQml \
+            --exclude-module=PyQt6.QtQuick \
+            --exclude-module=PyQt6.QtRemoteObjects \
+            --exclude-module=PyQt6.QtSensors \
+            --exclude-module=PyQt6.QtSerialPort \
+            --exclude-module=PyQt6.QtSql \
+            --exclude-module=PyQt6.QtTest \
+            --exclude-module=PyQt6.QtWebChannel \
+            --exclude-module=PyQt6.QtWebEngine \
+            --exclude-module=PyQt6.QtWebSockets \
+            --exclude-module=PyQt6.QtXml \
+            --exclude-module=tkinter \
+            --exclude-module=unittest \
+            main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output_name }}
+          path: dist/${{ matrix.output_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ocr-manager-linux
+            dist/ocr-manager-macos
+            dist/ocr-manager-windows.exe
+          draft: false
+          prerelease: false

@@ -58,6 +58,7 @@ class Pipeline(QObject):
 
     # Progress table signals (Phase 2)
     ocr_file_status = pyqtSignal(str, object)   # filename, FileStatus
+    ocr_file_status_text = pyqtSignal(str, str)  # filename, status_text (e.g., "Extracting dialogue")
     ocr_file_progress = pyqtSignal(str, int)    # filename, percent
     ocr_files_detected = pyqtSignal(list)       # list of filenames for table init
 
@@ -184,6 +185,7 @@ class Pipeline(QObject):
             # Create and configure OCRManager with file config store
             self.ocr_manager = OCRManager(self.config, self.file_config_store, self)
             self.ocr_manager.file_status_changed.connect(self.ocr_file_status.emit)
+            self.ocr_manager.file_status_text_changed.connect(self.ocr_file_status_text.emit)
             self.ocr_manager.file_progress_updated.connect(self.ocr_file_progress.emit)
             self.ocr_manager.timing_updated.connect(self.ocr_timing_updated.emit)
             self.ocr_manager.overall_progress.connect(self.ocr_overall_progress.emit)

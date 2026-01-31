@@ -24,11 +24,12 @@ class OCRWorker(QObject):
     """Wraps QProcess for single video file OCR with progress parsing."""
 
     status_changed = pyqtSignal(str, object)  # filename, FileStatus
+    status_text_changed = pyqtSignal(str, str)  # filename, status_text (e.g., "Extracting dialogue")
     progress_updated = pyqtSignal(str, int)   # filename, percent 0-100
     finished = pyqtSignal(str, bool)          # filename, success
 
-    # tqdm progress pattern: "45%|..." or "Processing frames:  45%|..."
-    TQDM_PATTERN = re.compile(r'(\d+)%\|')
+    # tqdm progress pattern: "Extracting dialogue:  45%|..." captures title and percentage
+    TQDM_PATTERN = re.compile(r'([^:\r\n]+):\s*(\d+)%\|')
 
     def __init__(self, video_path: Path, output_dir: Path, config: Config,
                  file_config: FileConfig = None, parent=None):
@@ -40,6 +41,7 @@ class OCRWorker(QObject):
         self.filename = video_path.name
         self.process = None
         self._last_percent = -1
+        self._current_phase = ""  # Track current progress bar title
 
     def build_command(self) -> list[str]:
         """Build videocr.py command line arguments.
@@ -94,6 +96,19 @@ class OCRWorker(QObject):
         if time_end:
             cmd.extend(["-te", time_end])
 
+        # Label detection
+        if not gc.labels_enabled:
+            cmd.append("--no-labels")
+        else:
+            if gc.labels_only:
+                cmd.append("--only-labels")
+            if gc.label_min_duration != 1.0:
+                cmd.extend(["--label-min-duration", str(gc.label_min_duration)])
+            if gc.label_max_duration != 8.0:
+                cmd.extend(["--label-max-duration", str(gc.label_max_duration)])
+            if gc.label_conf_threshold != 95:
+                cmd.extend(["--label-conf-threshold", str(gc.label_conf_threshold)])
+
         return cmd
 
     def start(self):
@@ -124,14 +139,25 @@ class OCRWorker(QObject):
         self._parse_progress(data)
 
     def _parse_progress(self, data: str):
-        """Parse tqdm progress from output data."""
+        """Parse tqdm progress from output data, extracting title and percentage."""
         match = self.TQDM_PATTERN.search(data)
         if match:
-            percent = int(match.group(1))
+            title = match.group(1).strip()
+            percent = int(match.group(2))
+
+            # Check if we've moved to a new phase (new progress bar title)
+            if title != self._current_phase:
+                self._current_phase = title
+                self._last_percent = -1  # Reset progress for new phase
+                self.status_text_changed.emit(self.filename, title)
+
+            # Cap progress at 99% during processing (100% only on successful completion)
+            display_percent = min(percent, 99)
+
             # Only emit if percentage changed (avoid spam)
-            if percent != self._last_percent:
-                self._last_percent = percent
-                self.progress_updated.emit(self.filename, percent)
+            if display_percent != self._last_percent:
+                self._last_percent = display_percent
+                self.progress_updated.emit(self.filename, display_percent)
 
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
         """Handle process completion."""

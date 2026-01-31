@@ -5,7 +5,7 @@ import sys
 import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                              QHBoxLayout, QLineEdit, QPushButton,
+                              QHBoxLayout, QLineEdit, QPushButton, QCheckBox,
                               QSpinBox, QLabel, QMessageBox,
                               QSlider, QSizePolicy, QFileDialog, QProgressBar)
 from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
@@ -21,6 +21,7 @@ from widgets.phase_indicator import PhaseIndicator
 from widgets.time_range_slider import TimeRangeSlider
 from widgets.file_table import FileTableWidget
 from widgets.videocr_settings_dialog import VideoCRSettingsDialog
+from widgets.label_settings_dialog import LabelSettingsDialog
 
 
 class MainWindow(QMainWindow):
@@ -52,6 +53,14 @@ class MainWindow(QMainWindow):
             'similar_image': '0.3',
         }
 
+        # Label detection settings
+        self.label_settings = {
+            'labels_only': False,
+            'label_min_duration': '1.0',
+            'label_max_duration': '8.0',
+            'label_conf_threshold': '95',
+        }
+
         # Config persistence
         self._save_timer: QTimer | None = None
         self._pending_time_range: tuple[str, str] | None = None
@@ -68,6 +77,8 @@ class MainWindow(QMainWindow):
         self.parallel_slider = None
         self.parallel_label = None
         self.file_table = None
+        self.labels_checkbox = None
+        self.labels_settings_btn = None
         self.start_button = None
         self.phase_indicator = None
         self.overall_progress = None
@@ -155,8 +166,9 @@ class MainWindow(QMainWindow):
         # Connect signals for auto-save
         self.crop_input.textChanged.connect(self._schedule_save)
         self.brightness_spin.valueChanged.connect(self._schedule_save)
-        self.time_range_slider.range_changed.connect(self._schedule_save)
+        self.time_range_slider.range_changed.connect(self._on_time_range_changed)
         self.parallel_slider.valueChanged.connect(self._schedule_save)
+        self.labels_checkbox.toggled.connect(self._schedule_save)
 
     def create_config_section(self) -> QWidget:
         """Create configuration section with OCR parameters."""
@@ -205,6 +217,23 @@ class MainWindow(QMainWindow):
         brightness_layout.addWidget(self.brightness_test_btn)
         brightness_layout.addStretch()
         layout.addLayout(brightness_layout)
+
+        # Labels row
+        labels_layout = QHBoxLayout()
+        labels_label = QLabel("Labels:")
+        labels_label.setMinimumWidth(label_width)
+        labels_layout.addWidget(labels_label)
+        self.labels_checkbox = QCheckBox("Enable label detection")
+        self.labels_checkbox.setChecked(True)
+        self.labels_checkbox.toggled.connect(self._on_labels_toggled)
+        labels_layout.addWidget(self.labels_checkbox)
+        self.labels_settings_btn = QPushButton("\u2699")
+        self.labels_settings_btn.setObjectName("secondary")
+        self.labels_settings_btn.setFixedWidth(32)
+        self.labels_settings_btn.clicked.connect(self._open_label_settings)
+        labels_layout.addWidget(self.labels_settings_btn)
+        labels_layout.addStretch()
+        layout.addLayout(labels_layout)
 
         # Time range slider
         self.time_range_slider = TimeRangeSlider()
@@ -255,6 +284,7 @@ class MainWindow(QMainWindow):
         global_settings = {
             'brightness': self.brightness_spin.value(),
             'ocr_parallel': self.parallel_slider.value(),
+            'labels_enabled': self.labels_checkbox.isChecked(),
         }
 
         # Crop region
@@ -278,9 +308,12 @@ class MainWindow(QMainWindow):
         # VideoCR settings
         videocr_settings = dict(self.videocr_settings)
 
+        # Label settings
+        labels_settings = dict(self.label_settings)
+
         # Save to file
         config_manager = ProjectConfigManager(Path(self.project_path))
-        config_manager.save(global_settings, videocr_settings, self.file_config_store)
+        config_manager.save(global_settings, videocr_settings, self.file_config_store, labels_settings)
 
     def _load_project_config(self):
         """Load project configuration from .ocr.json if it exists."""
@@ -291,7 +324,7 @@ class MainWindow(QMainWindow):
         if not config_manager.exists():
             return
 
-        global_settings, videocr_settings, file_configs = config_manager.load()
+        global_settings, videocr_settings, file_configs, labels_settings = config_manager.load()
 
         # Apply global settings to UI (block signals to avoid triggering saves)
         if 'brightness' in global_settings:
@@ -319,6 +352,20 @@ class MainWindow(QMainWindow):
         # Apply videocr settings
         if videocr_settings:
             self.videocr_settings.update(videocr_settings)
+
+        # Apply label settings
+        if labels_settings:
+            self.label_settings.update(labels_settings)
+
+        if 'labels_enabled' in global_settings:
+            self.labels_checkbox.blockSignals(True)
+            self.labels_checkbox.setChecked(global_settings['labels_enabled'])
+            self.labels_checkbox.blockSignals(False)
+            self.labels_settings_btn.setEnabled(global_settings['labels_enabled'])
+            # Update crop enabled state
+            if global_settings['labels_enabled'] and self.label_settings.get('labels_only', False):
+                self.crop_input.setEnabled(False)
+                self.crop_select_btn.setEnabled(False)
 
         # Store pending file configs - will be applied after files are scanned
         if file_configs:
@@ -526,6 +573,15 @@ class MainWindow(QMainWindow):
         else:
             self.brightness_spin.setValue(230)  # Default
 
+        if config and config.has_custom_time_range():
+            self.time_range_slider.set_time_range(
+                config.time_start or "",
+                config.time_end or ""
+            )
+        else:
+            # Reset to full duration
+            self.time_range_slider.set_time_range("", "")
+
     def _get_target_files(self) -> list[str]:
         """Get target files for config changes: selected files or all if none selected."""
         selected = self.file_table.get_selected_filenames()
@@ -548,6 +604,21 @@ class MainWindow(QMainWindow):
             config.brightness = brightness
             self.file_table.update_config_indicator(filename)
         self._schedule_save()
+
+    def _apply_time_range_to_files(self, start_str: str, end_str: str, filenames: list[str]):
+        """Apply time range setting to specified files."""
+        for filename in filenames:
+            config = self.file_config_store.get_or_create(filename)
+            config.time_start = start_str if start_str else None
+            config.time_end = end_str if end_str else None
+            self.file_table.update_config_indicator(filename)
+        self._schedule_save()
+
+    def _on_time_range_changed(self, start: int, end: int):
+        """Handle time range slider change - apply to selected files or all if none selected."""
+        start_str, end_str = self.time_range_slider.get_time_strings()
+        target_files = self._get_target_files()
+        self._apply_time_range_to_files(start_str, end_str, target_files)
 
     def on_config_action_requested(self, action: str, filename: str):
         """Handle config action from file table context menu (copy/paste)."""
@@ -680,6 +751,36 @@ class MainWindow(QMainWindow):
         self.videocr_settings.update(settings)
         self._schedule_save()
 
+    def _on_labels_toggled(self, checked: bool):
+        """Handle labels checkbox toggle."""
+        self.labels_settings_btn.setEnabled(checked)
+        # If labels unchecked, re-enable crop controls
+        # If labels checked and labels_only, dim crop controls
+        if not checked:
+            self.crop_input.setEnabled(True)
+            self.crop_select_btn.setEnabled(True)
+        elif self.label_settings.get('labels_only', False):
+            self.crop_input.setEnabled(False)
+            self.crop_select_btn.setEnabled(False)
+
+    def _open_label_settings(self):
+        """Open label settings dialog."""
+        dialog = LabelSettingsDialog(self.label_settings, self)
+        dialog.settings_changed.connect(self._on_label_settings_changed)
+        dialog.exec()
+
+    def _on_label_settings_changed(self, settings: dict):
+        """Handle label settings changes."""
+        self.label_settings.update(settings)
+        # Update crop enabled state based on labels_only
+        if self.label_settings.get('labels_only', False):
+            self.crop_input.setEnabled(False)
+            self.crop_select_btn.setEnabled(False)
+        else:
+            self.crop_input.setEnabled(True)
+            self.crop_select_btn.setEnabled(True)
+        self._schedule_save()
+
     def _format_duration(self, seconds: float) -> str:
         """Format duration as human-readable string."""
         if seconds < 60:
@@ -739,6 +840,13 @@ class MainWindow(QMainWindow):
         config.sim_threshold = int(self.videocr_settings['sim_threshold'])
         config.similar_image = float(self.videocr_settings['similar_image'])
 
+        # Apply label settings
+        config.labels_enabled = self.labels_checkbox.isChecked()
+        config.labels_only = self.label_settings.get('labels_only', False)
+        config.label_min_duration = float(self.label_settings.get('label_min_duration', '1.0'))
+        config.label_max_duration = float(self.label_settings.get('label_max_duration', '8.0'))
+        config.label_conf_threshold = int(self.label_settings.get('label_conf_threshold', '95'))
+
         # Parse crop values
         crop_text = self.crop_input.text()
         if crop_text:
@@ -764,6 +872,7 @@ class MainWindow(QMainWindow):
 
         # File table signals (table is pre-populated on folder load)
         self.pipeline.ocr_file_status.connect(self.file_table.update_status)
+        self.pipeline.ocr_file_status_text.connect(self.file_table.update_status_text)
         self.pipeline.ocr_file_progress.connect(self.file_table.update_progress)
 
         # Timing signals
@@ -869,17 +978,23 @@ class MainWindow(QMainWindow):
         self.brightness_test_btn.setEnabled(False)
         self.time_range_slider.setEnabled(False)
         self.parallel_slider.setEnabled(False)
+        self.labels_checkbox.setEnabled(False)
+        self.labels_settings_btn.setEnabled(False)
         # Note: file_table is not disabled to allow scrolling during processing
 
     def enable_ui(self):
         """Re-enable UI after processing."""
         self.folder_btn.setEnabled(True)
-        self.crop_input.setEnabled(True)
-        self.crop_select_btn.setEnabled(True)
         self.brightness_spin.setEnabled(True)
         self.brightness_test_btn.setEnabled(True)
         self.time_range_slider.setEnabled(True)
         self.parallel_slider.setEnabled(True)
+        self.labels_checkbox.setEnabled(True)
+        self.labels_settings_btn.setEnabled(self.labels_checkbox.isChecked())
+        # Respect labels_only for crop controls
+        labels_only = self.labels_checkbox.isChecked() and self.label_settings.get('labels_only', False)
+        self.crop_input.setEnabled(not labels_only)
+        self.crop_select_btn.setEnabled(not labels_only)
 
     def check_dependencies(self):
         """Check if required CLI tools are available."""

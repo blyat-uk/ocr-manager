@@ -37,9 +37,21 @@ class FileTableWidget(QWidget):
     }
 
     # Config indicator colors
-    CONFIG_DEFAULT = "#6c7086"      # overlay0 - gray dot
-    CONFIG_CUSTOM = "#89b4fa"       # blue - custom config
-    CONFIG_INCOMPLETE = "#fab387"   # peach - missing required settings
+    CONFIG_DEFAULT = "#6c7086"      # overlay0 - gray dot (no custom config)
+
+    # Color palette for distinct config groups (Catppuccin Mocha)
+    CONFIG_COLORS = [
+        "#89b4fa",  # blue
+        "#a6e3a1",  # green
+        "#f9e2af",  # yellow
+        "#cba6f7",  # mauve
+        "#fab387",  # peach
+        "#94e2d5",  # teal
+        "#f38ba8",  # red
+        "#eba0ac",  # maroon
+        "#89dceb",  # sky
+        "#f5c2e7",  # pink
+    ]
 
     # Column indices
     COL_FILE = 0
@@ -52,6 +64,7 @@ class FileTableWidget(QWidget):
         super().__init__(parent)
         self._file_rows: dict[str, int] = {}  # filename -> row index
         self._file_store: FileConfigStore | None = None
+        self._signature_colors: dict[tuple, str] = {}  # config signature -> color
         self._init_ui()
 
     def _init_ui(self):
@@ -79,7 +92,7 @@ class FileTableWidget(QWidget):
         self.table.setColumnWidth(self.COL_RESOLUTION, 60)
         self.table.setColumnWidth(self.COL_CONFIG, 60)
         self.table.setColumnWidth(self.COL_PROGRESS, 150)
-        self.table.setColumnWidth(self.COL_STATUS, 90)
+        self.table.setColumnWidth(self.COL_STATUS, 180)
 
         # Table settings
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -155,11 +168,15 @@ class FileTableWidget(QWidget):
             res_item.setText(label)
 
     def update_config_indicator(self, filename: str):
-        """Update the config indicator for a file."""
-        self._update_config_indicator(filename)
+        """Update the config indicator for a file.
+
+        Since colors are based on matching configs across files,
+        we refresh all indicators when any file's config changes.
+        """
+        self.refresh_all_config_indicators()
 
     def _update_config_indicator(self, filename: str):
-        """Internal method to update config indicator."""
+        """Internal method to update a single config indicator using cached colors."""
         if filename not in self._file_rows:
             return
 
@@ -168,19 +185,36 @@ class FileTableWidget(QWidget):
         if not config_item:
             return
 
-        # Determine indicator based on file config
-        has_custom = False
-        if self._file_store:
-            has_custom = self._file_store.has_custom(filename)
+        # Get file config and signature
+        config = self._file_store.get(filename) if self._file_store else None
 
-        if has_custom:
+        if config and config.has_any_custom():
+            signature = config.config_signature()
+            color = self._signature_colors.get(signature, self.CONFIG_COLORS[0])
             config_item.setText("\u25cf")  # Filled circle
-            config_item.setForeground(QColor(self.CONFIG_CUSTOM))
-            config_item.setToolTip("Custom settings")
+            config_item.setForeground(QColor(color))
+            config_item.setToolTip(self._format_config_tooltip(config))
         else:
             config_item.setText("\u25cb")  # Empty circle
             config_item.setForeground(QColor(self.CONFIG_DEFAULT))
             config_item.setToolTip("Using defaults")
+
+    def _format_config_tooltip(self, config: FileConfig) -> str:
+        """Format tooltip showing custom config details."""
+        parts = []
+        if config.has_custom_crop():
+            crop = config.get_crop_tuple()
+            parts.append(f"Crop: {crop[0]},{crop[1]} {crop[2]}x{crop[3]}")
+        if config.has_custom_brightness():
+            parts.append(f"Brightness: {config.brightness}")
+        if config.has_custom_time_range():
+            time_parts = []
+            if config.time_start:
+                time_parts.append(f"from {config.time_start}")
+            if config.time_end:
+                time_parts.append(f"to {config.time_end}")
+            parts.append(f"Time: {' '.join(time_parts)}")
+        return "Custom: " + ", ".join(parts) if parts else "Custom settings"
 
     def update_status(self, filename: str, status: FileStatus):
         """Update the status cell for a file."""
@@ -193,6 +227,20 @@ class FileTableWidget(QWidget):
             status_item.setText(self.STATUS_TEXT[status])
             color = self.STATUS_COLORS[status]
             status_item.setForeground(QColor(color))
+
+    def update_status_text(self, filename: str, text: str):
+        """Update the status cell with custom text (e.g., 'Extracting dialogue').
+
+        Uses the PROCESSING color (blue) since this is only called during processing.
+        """
+        if filename not in self._file_rows:
+            return
+
+        row = self._file_rows[filename]
+        status_item = self.table.item(row, self.COL_STATUS)
+        if status_item:
+            status_item.setText(text)
+            status_item.setForeground(QColor(self.STATUS_COLORS[FileStatus.PROCESSING]))
 
     def update_progress(self, filename: str, percent: int):
         """Update progress bar for a file."""
@@ -259,7 +307,26 @@ class FileTableWidget(QWidget):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def refresh_all_config_indicators(self):
-        """Refresh config indicators for all files."""
+        """Refresh config indicators for all files.
+
+        Computes config signatures, assigns colors to unique signatures,
+        then updates all indicators.
+        """
+        # Collect unique signatures from files with custom configs
+        unique_signatures: list[tuple] = []
+        for filename in self._file_rows:
+            config = self._file_store.get(filename) if self._file_store else None
+            if config and config.has_any_custom():
+                sig = config.config_signature()
+                if sig not in unique_signatures:
+                    unique_signatures.append(sig)
+
+        # Assign colors to signatures (stable ordering based on first appearance)
+        self._signature_colors = {}
+        for i, sig in enumerate(unique_signatures):
+            self._signature_colors[sig] = self.CONFIG_COLORS[i % len(self.CONFIG_COLORS)]
+
+        # Update all indicators
         for filename in self._file_rows:
             self._update_config_indicator(filename)
 

@@ -41,6 +41,18 @@ class FileConfig:
         """Check if file has any custom settings."""
         return self.has_custom_crop() or self.has_custom_brightness() or self.has_custom_time_range()
 
+    def config_signature(self) -> tuple:
+        """Return a hashable signature of custom config values for comparison.
+
+        Files with the same signature have identical custom configurations.
+        Returns None tuple elements for unset values to distinguish from set values.
+        """
+        return (
+            self.crop_x, self.crop_y, self.crop_width, self.crop_height,
+            self.brightness,
+            self.time_start, self.time_end
+        )
+
     def get_crop_tuple(self) -> Optional[tuple[int, int, int, int]]:
         """Get crop as tuple (x, y, w, h) or None if not set."""
         if self.has_custom_crop():
@@ -189,30 +201,31 @@ class ProjectConfigManager:
         """Check if config file exists."""
         return self.config_file.exists()
 
-    def load(self) -> tuple[dict, dict, dict]:
-        """Load config. Returns (global_settings, videocr_settings, file_configs).
+    def load(self) -> tuple[dict, dict, dict, dict]:
+        """Load config. Returns (global_settings, videocr_settings, file_configs, labels_settings).
 
         Returns empty dicts if file doesn't exist or is invalid.
         """
         if not self.exists():
-            return {}, {}, {}
+            return {}, {}, {}, {}
 
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"Failed to load config file: {e}")
-            return {}, {}, {}
+            return {}, {}, {}, {}
 
         # Extract sections with defaults
         global_settings = data.get('global', {})
         videocr_settings = data.get('videocr', {})
         file_configs = data.get('files', {})
+        labels_settings = data.get('labels', {})
 
-        return global_settings, videocr_settings, file_configs
+        return global_settings, videocr_settings, file_configs, labels_settings
 
     def save(self, global_settings: dict, videocr_settings: dict,
-             file_store: 'FileConfigStore'):
+             file_store: 'FileConfigStore', labels_settings: dict = None):
         """Save current configuration to .ocr.json."""
         # Build file configs from store
         file_configs = {}
@@ -246,6 +259,10 @@ class ProjectConfigManager:
         if file_configs:
             data['files'] = file_configs
 
+        # Labels section
+        if labels_settings:
+            data['labels'] = labels_settings
+
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -266,6 +283,13 @@ class Config:
     time_end: str = ""
     ocr_parallel: int = 4
 
+    # Label detection
+    labels_enabled: bool = True
+    labels_only: bool = False
+    label_min_duration: float = 1.0
+    label_max_duration: float = 8.0
+    label_conf_threshold: int = 95
+
     # videocr configuration
     videocr_python: str = "/mnt/FAST/Code/videocr-PaddleOCR-original/.venv/bin/python"
     videocr_script: str = "/mnt/FAST/Code/videocr-PaddleOCR-original/videocr.py"
@@ -282,6 +306,6 @@ class Config:
 
 def validate_config(config: Config) -> tuple[bool, str]:
     """Validate configuration completeness."""
-    if config.crop_width == 0 or config.crop_height == 0:
+    if not config.labels_only and (config.crop_width == 0 or config.crop_height == 0):
         return False, "Crop region not set"
     return True, ""
