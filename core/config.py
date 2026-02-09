@@ -197,6 +197,11 @@ class ProjectConfigManager:
         self.project_path = Path(project_path)
         self.config_file = self.project_path / self.CONFIG_FILENAME
 
+    @property
+    def config_path(self) -> Path:
+        """Get the config file path."""
+        return self.config_file
+
     def exists(self) -> bool:
         """Check if config file exists."""
         return self.config_file.exists()
@@ -224,9 +229,12 @@ class ProjectConfigManager:
 
         return global_settings, videocr_settings, file_configs, labels_settings
 
-    def save(self, global_settings: dict, videocr_settings: dict,
-             file_store: 'FileConfigStore', labels_settings: dict = None):
-        """Save current configuration to .ocr.json."""
+    def build_save_data(self, global_settings: dict, videocr_settings: dict,
+                        file_store: 'FileConfigStore', labels_settings: dict = None) -> dict:
+        """Build the save data dict without writing to disk.
+
+        Returns the dict that would be saved to .ocr.json.
+        """
         # Build file configs from store
         file_configs = {}
         for filename in file_store.get_all_filenames():
@@ -262,6 +270,13 @@ class ProjectConfigManager:
         # Labels section
         if labels_settings:
             data['labels'] = labels_settings
+
+        return data
+
+    def save(self, global_settings: dict, videocr_settings: dict,
+             file_store: 'FileConfigStore', labels_settings: dict = None):
+        """Save current configuration to .ocr.json."""
+        data = self.build_save_data(global_settings, videocr_settings, file_store, labels_settings)
 
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
