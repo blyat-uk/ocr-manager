@@ -6,14 +6,17 @@ import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLineEdit, QPushButton, QCheckBox,
-                              QSpinBox, QLabel, QMessageBox,
+                              QSpinBox, QLabel, QMessageBox, QToolButton,
                               QSlider, QSizePolicy, QFileDialog, QProgressBar)
-from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QSize, QFileSystemWatcher, QTimer
+from PyQt6.QtGui import QKeySequence, QShortcut, QIcon
 
 from core.config import Config, validate_config, FileConfig, FileConfigStore, ProjectConfigManager
+from core.config_saver import AsyncConfigSaver
+from core.log_store import LogStore
 from core.pipeline import Pipeline, get_video_files, detect_file_statuses
 from core.video_utils import VideoMetadataScanner
+from resources import get_icon_path
 from theme import apply_theme
 from widgets.crop_selector import CropSelectorDialog
 from widgets.brightness_tester import BrightnessTesterDialog
@@ -22,6 +25,7 @@ from widgets.time_range_slider import TimeRangeSlider
 from widgets.file_table import FileTableWidget
 from widgets.videocr_settings_dialog import VideoCRSettingsDialog
 from widgets.label_settings_dialog import LabelSettingsDialog
+from widgets.logs_dialog import LogsDialog
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +69,7 @@ class MainWindow(QMainWindow):
         self._save_timer: QTimer | None = None
         self._pending_time_range: tuple[str, str] | None = None
         self._pending_file_configs: dict | None = None
+        self._async_saver: AsyncConfigSaver | None = None
 
         # UI components
         self.folder_btn = None
@@ -83,7 +88,12 @@ class MainWindow(QMainWindow):
         self.phase_indicator = None
         self.overall_progress = None
         self.timing_label = None
+        self.logs_btn = None
         self.loading_label = None
+
+        # Log store and dialog
+        self.log_store = LogStore(self)
+        self._logs_dialog: LogsDialog | None = None
 
         # Background scanner
         self._metadata_scanner: VideoMetadataScanner | None = None
@@ -151,6 +161,13 @@ class MainWindow(QMainWindow):
         self.timing_label.setVisible(False)
         button_layout.addWidget(self.timing_label)
 
+        # Logs button (hidden until pipeline runs)
+        self.logs_btn = QPushButton("Logs")
+        self.logs_btn.setObjectName("secondary")
+        self.logs_btn.setVisible(False)
+        self.logs_btn.clicked.connect(self._on_logs_clicked)
+        button_layout.addWidget(self.logs_btn)
+
         button_layout.addStretch()
 
         self.start_button = QPushButton("Start Processing")
@@ -166,7 +183,7 @@ class MainWindow(QMainWindow):
         # Connect signals for auto-save
         self.crop_input.textChanged.connect(self._schedule_save)
         self.brightness_spin.valueChanged.connect(self._schedule_save)
-        self.time_range_slider.range_changed.connect(self._on_time_range_changed)
+        self.time_range_slider.range_committed.connect(self._on_time_range_changed)
         self.parallel_slider.valueChanged.connect(self._schedule_save)
         self.labels_checkbox.toggled.connect(self._schedule_save)
 
@@ -227,9 +244,9 @@ class MainWindow(QMainWindow):
         self.labels_checkbox.setChecked(True)
         self.labels_checkbox.toggled.connect(self._on_labels_toggled)
         labels_layout.addWidget(self.labels_checkbox)
-        self.labels_settings_btn = QPushButton("\u2699")
-        self.labels_settings_btn.setObjectName("secondary")
-        self.labels_settings_btn.setFixedWidth(32)
+        self.labels_settings_btn = QToolButton()
+        self.labels_settings_btn.setIcon(QIcon(str(get_icon_path("settings"))))
+        self.labels_settings_btn.setIconSize(QSize(18, 18))
         self.labels_settings_btn.clicked.connect(self._open_label_settings)
         labels_layout.addWidget(self.labels_settings_btn)
         labels_layout.addStretch()
@@ -276,11 +293,11 @@ class MainWindow(QMainWindow):
         self._save_timer.start(300)
 
     def _save_project_config(self):
-        """Save current configuration to .ocr.json."""
+        """Save current configuration to .ocr.json asynchronously."""
         if not self.project_path:
             return
 
-        # Build global settings from UI
+        # Build global settings from UI (fast, on main thread)
         global_settings = {
             'brightness': self.brightness_spin.value(),
             'ocr_parallel': self.parallel_slider.value(),
@@ -311,9 +328,16 @@ class MainWindow(QMainWindow):
         # Label settings
         labels_settings = dict(self.label_settings)
 
-        # Save to file
+        # Build save data using ProjectConfigManager's format
         config_manager = ProjectConfigManager(Path(self.project_path))
-        config_manager.save(global_settings, videocr_settings, self.file_config_store, labels_settings)
+        save_data = config_manager.build_save_data(
+            global_settings, videocr_settings, self.file_config_store, labels_settings
+        )
+
+        # Save asynchronously to prevent GUI blocking
+        if self._async_saver is None:
+            self._async_saver = AsyncConfigSaver(self)
+        self._async_saver.save(str(config_manager.config_path), save_data)
 
     def _load_project_config(self):
         """Load project configuration from .ocr.json if it exists."""
@@ -452,8 +476,9 @@ class MainWindow(QMainWindow):
         self.folder_path_label.style().polish(self.folder_path_label)
         self.update_window_title()
 
-        # Hide previous run stats
+        # Hide previous run stats and logs button
         self.timing_label.setVisible(False)
+        self.logs_btn.setVisible(False)
 
         # Set up folder watcher
         if self.folder_watcher:
@@ -882,6 +907,14 @@ class MainWindow(QMainWindow):
         # Stopped signal
         self.pipeline.pipeline_stopped.connect(self.on_pipeline_stopped)
 
+        # Log signals
+        self.pipeline.ocr_log_output.connect(self._on_ocr_log_output)
+        self.pipeline.output_received.connect(self._on_pipeline_log_output)
+
+        # Clear previous logs and show button
+        self.log_store.clear()
+        self.logs_btn.setVisible(True)
+
         # Update UI
         self.is_running = True
         self.start_button.setText("Stop")
@@ -969,6 +1002,22 @@ class MainWindow(QMainWindow):
         self.current_video_files = set()  # Force refresh
         self.refresh_file_list()
 
+    def _on_ocr_log_output(self, filename: str, text: str):
+        """Accumulate per-file OCR output in the log store."""
+        self.log_store.append(filename, text)
+
+    def _on_pipeline_log_output(self, text: str):
+        """Accumulate Phase 3 (QA) output in the log store."""
+        self.log_store.append(LogStore.QA_KEY, text)
+
+    def _on_logs_clicked(self):
+        """Open or raise the logs dialog."""
+        if self._logs_dialog is None or not self._logs_dialog.isVisible():
+            self._logs_dialog = LogsDialog(self.log_store, self)
+        self._logs_dialog.show()
+        self._logs_dialog.raise_()
+        self._logs_dialog.activateWindow()
+
     def disable_ui(self):
         """Disable UI during processing."""
         self.folder_btn.setEnabled(False)
@@ -998,7 +1047,7 @@ class MainWindow(QMainWindow):
 
     def check_dependencies(self):
         """Check if required CLI tools are available."""
-        tools = ['ass-qafix', 'ffmpeg']
+        tools = ['ffmpeg']
 
         missing = []
         for tool in tools:
@@ -1026,6 +1075,8 @@ class MainWindow(QMainWindow):
                 if self._metadata_scanner:
                     self._metadata_scanner.stop()
                     self._metadata_scanner.wait()
+                if self._async_saver:
+                    self._async_saver.stop()
                 event.accept()
             else:
                 event.ignore()
@@ -1034,6 +1085,9 @@ class MainWindow(QMainWindow):
             if self._metadata_scanner:
                 self._metadata_scanner.stop()
                 self._metadata_scanner.wait()
+            # Stop async saver thread
+            if self._async_saver:
+                self._async_saver.stop()
             event.accept()
 
 
