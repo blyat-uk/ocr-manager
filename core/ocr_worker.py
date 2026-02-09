@@ -27,6 +27,7 @@ class OCRWorker(QObject):
     status_text_changed = pyqtSignal(str, str)  # filename, status_text (e.g., "Extracting dialogue")
     progress_updated = pyqtSignal(str, int)   # filename, percent 0-100
     finished = pyqtSignal(str, bool)          # filename, success
+    raw_output = pyqtSignal(str, str)         # filename, raw_text
 
     # tqdm progress pattern: "Extracting dialogue:  45%|..." captures title and percentage
     TQDM_PATTERN = re.compile(r'([^:\r\n]+):\s*(\d+)%\|')
@@ -131,6 +132,7 @@ class OCRWorker(QObject):
     def _on_output(self):
         """Handle merged stdout/stderr output."""
         data = self.process.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self.raw_output.emit(self.filename, data)
         self._parse_progress(data)
 
     def _on_stderr(self):
