@@ -1,5 +1,6 @@
 """Pipeline execution and workflow management."""
 
+import shutil
 from itertools import chain
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal, QProcess
@@ -25,11 +26,11 @@ def detect_file_statuses(project_path: Path) -> dict[str, FileStatus]:
     Returns:
         Dict mapping filename to FileStatus.DONE or FileStatus.QUEUED
     """
-    chi_ass = project_path / "chi-ass"
+    chi_dir = project_path / "chi"
     completed_stems = set()
 
-    if chi_ass.exists():
-        for ass_file in chi_ass.glob("*.ass"):
+    if chi_dir.exists():
+        for ass_file in chi_dir.glob("*.ass"):
             # Only count non-empty ASS files as completed
             if ass_file.stat().st_size > 0:
                 completed_stems.add(ass_file.stem)
@@ -65,6 +66,7 @@ class Pipeline(QObject):
     # Timing signals (Phase 2)
     ocr_timing_updated = pyqtSignal(float, float, float)  # elapsed, eta, avg
     ocr_overall_progress = pyqtSignal(int, int)           # completed, total
+    ocr_log_output = pyqtSignal(str, str)                 # filename, raw_text
 
     PHASES = ["Create Directory", "OCR Extraction", "Quality Assurance"]
 
@@ -87,17 +89,17 @@ class Pipeline(QObject):
         return {f.stem for f in get_video_files(project_path)}
 
     def get_completed_stems(self) -> set[str]:
-        """Get stems that have completed OCR (have .ass files in chi-ass/)."""
+        """Get stems that have completed OCR (have .ass files in chi/)."""
         project_path = Path(self.config.project_path)
-        chi_ass = project_path / "chi-ass"
-        return {f.stem for f in chi_ass.glob("*.ass")} if chi_ass.exists() else set()
+        chi_dir = project_path / "chi"
+        return {f.stem for f in chi_dir.glob("*.ass")} if chi_dir.exists() else set()
 
     def detect_resume_phase(self) -> int:
         """Detect which phase to resume from based on per-file completion.
 
         Returns:
-            0 - Start from beginning (no chi-ass/ or incomplete OCR)
-            2 - Resume at QA (all videos have corresponding .ass in chi-ass/)
+            0 - Start from beginning (no chi/ or incomplete OCR)
+            2 - Resume at QA (all videos have corresponding .ass in chi/)
         """
         all_videos = self.get_video_stems()
         if not all_videos:
@@ -129,9 +131,10 @@ class Pipeline(QObject):
         self.run_next_phase()
 
     def ensure_directories(self):
-        """Ensure chi-ass directory exists."""
+        """Ensure output directories exist."""
         project_path = Path(self.config.project_path)
-        (project_path / "chi-ass").mkdir(exist_ok=True)
+        for subdir in ("chi", "eng", "translate"):
+            (project_path / subdir).mkdir(exist_ok=True)
 
     def run_next_phase(self):
         """Execute next phase in sequence."""
@@ -147,9 +150,9 @@ class Pipeline(QObject):
         phase_method()
 
     def phase_1(self):
-        """Phase 1: Create Directory - Create chi-ass/ folder."""
+        """Phase 1: Create Directory - Create output folders."""
         self.ensure_directories()
-        self.output_received.emit("Created chi-ass/ directory\n")
+        self.output_received.emit("Created chi/, eng/, translate/ directories\n")
 
         self.phase_completed.emit("Create Directory")
         self.current_phase += 1
@@ -158,7 +161,7 @@ class Pipeline(QObject):
     def phase_2(self):
         """Phase 2: OCR Extraction - uses embedded OCRManager."""
         project_path = Path(self.config.project_path)
-        chi_ass_dir = project_path / "chi-ass"
+        chi_dir = project_path / "chi"
 
         if self.subphase == 0:
             # Detect which files need processing
@@ -187,12 +190,13 @@ class Pipeline(QObject):
             self.ocr_manager.file_status_changed.connect(self.ocr_file_status.emit)
             self.ocr_manager.file_status_text_changed.connect(self.ocr_file_status_text.emit)
             self.ocr_manager.file_progress_updated.connect(self.ocr_file_progress.emit)
+            self.ocr_manager.file_log_output.connect(self.ocr_log_output.emit)
             self.ocr_manager.timing_updated.connect(self.ocr_timing_updated.emit)
             self.ocr_manager.overall_progress.connect(self.ocr_overall_progress.emit)
             self.ocr_manager.all_completed.connect(self._on_ocr_completed)
 
             # Set files and start processing
-            self.ocr_manager.set_files(pending_videos, chi_ass_dir)
+            self.ocr_manager.set_files(pending_videos, chi_dir)
             self.ocr_manager.start()
 
         elif self.subphase == 1:
@@ -222,16 +226,23 @@ class Pipeline(QObject):
 
     def phase_3(self):
         """Phase 3: Quality Assurance - Run ass-qafix twice."""
-        chi_ass = Path(self.config.project_path) / "chi-ass"
+        chi_dir = Path(self.config.project_path) / "chi"
+
+        if self.subphase == 0 and not shutil.which('ass-qafix'):
+            self.phase_completed.emit("Quality Assurance (skipped - ass-qafix not found)")
+            self.current_phase += 1
+            self.subphase = 0
+            self.run_next_phase()
+            return
 
         if self.subphase == 0:
             # Run ass-qafix first pass
             cmd = ["ass-qafix", "--inplace"]
-            self.run_command(cmd, cwd=str(chi_ass))
+            self.run_command(cmd, cwd=str(chi_dir))
         elif self.subphase == 1:
             # Run ass-qafix second pass (sometimes first pass doesn't fix all issues)
             cmd = ["ass-qafix", "--inplace"]
-            self.run_command(cmd, cwd=str(chi_ass))
+            self.run_command(cmd, cwd=str(chi_dir))
         elif self.subphase == 2:
             self.phase_completed.emit("Quality Assurance")
             self.current_phase += 1

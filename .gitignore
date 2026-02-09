@@ -35,7 +35,8 @@ wheels/
 
 # Project specific
 .translation-project/
-chi-ass/
+chi/
+eng/
 translate/
 Fonts/
 *.mkv
