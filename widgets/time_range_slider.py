@@ -28,7 +28,8 @@ def parse_time(time_str: str) -> int | None:
 class RangeSlider(QWidget):
     """Custom dual-handle range slider."""
 
-    range_changed = pyqtSignal(int, int)  # start_seconds, end_seconds
+    range_changed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires during drag)
+    range_committed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires on mouse release)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -168,7 +169,9 @@ class RangeSlider(QWidget):
             self._update_handle(event.position().x())
 
     def mouseReleaseEvent(self, event):
-        """Stop dragging."""
+        """Stop dragging and emit committed value."""
+        if self._dragging is not None:
+            self.range_committed.emit(self._start_value, self._end_value)
         self._dragging = None
 
     def _update_handle(self, x: float):
@@ -189,7 +192,8 @@ class RangeSlider(QWidget):
 class TimeRangeSlider(QWidget):
     """Time range slider with labels and reference video info."""
 
-    range_changed = pyqtSignal(int, int)  # start_seconds, end_seconds
+    range_changed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires during drag)
+    range_committed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires on mouse release)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -210,6 +214,7 @@ class TimeRangeSlider(QWidget):
 
         self._slider = RangeSlider()
         self._slider.range_changed.connect(self._on_range_changed)
+        self._slider.range_committed.connect(self._on_range_committed)
         layout.addWidget(self._slider, 1)
 
         self._time_label = QLabel("00:00 - 00:00")
@@ -280,9 +285,13 @@ class TimeRangeSlider(QWidget):
         self.set_values(start, end)
 
     def _on_range_changed(self, start: int, end: int):
-        """Handle slider range change."""
+        """Handle slider range change (during drag)."""
         self._update_labels()
         self.range_changed.emit(start, end)
+
+    def _on_range_committed(self, start: int, end: int):
+        """Handle slider range commit (on mouse release)."""
+        self.range_committed.emit(start, end)
 
     def _update_labels(self):
         """Update time display labels and tooltip."""
