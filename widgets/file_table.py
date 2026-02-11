@@ -2,8 +2,8 @@
 
 from pathlib import Path
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QProgressBar, QHeaderView, QLabel, QMenu, QAbstractItemView
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QProgressBar, QHeaderView, QLabel, QMenu, QAbstractItemView, QPushButton
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QAction
@@ -109,6 +109,16 @@ class FileTableWidget(QWidget):
         self.table.customContextMenuRequested.connect(self._show_context_menu)
 
         layout.addWidget(self.table)
+
+        # Bottom bar with unselect button
+        bottom_layout = QHBoxLayout()
+        self.unselect_btn = QPushButton("Unselect all")
+        self.unselect_btn.setObjectName("secondary")
+        self.unselect_btn.setVisible(False)
+        self.unselect_btn.clicked.connect(self.clear_selection)
+        bottom_layout.addWidget(self.unselect_btn)
+        bottom_layout.addStretch()
+        layout.addLayout(bottom_layout)
 
     def set_file_store(self, store: FileConfigStore):
         """Set the file config store for config status display."""
@@ -280,6 +290,7 @@ class FileTableWidget(QWidget):
     def _on_selection_changed(self):
         """Handle selection change."""
         filenames = self.get_selected_filenames()
+        self.unselect_btn.setVisible(len(filenames) > 0)
         self.selection_changed.emit(filenames)
 
     def _show_context_menu(self, pos):
