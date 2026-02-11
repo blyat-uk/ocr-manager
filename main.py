@@ -182,7 +182,7 @@ class MainWindow(QMainWindow):
 
         # Connect signals for auto-save
         self.crop_input.textChanged.connect(self._schedule_save)
-        self.brightness_spin.valueChanged.connect(self._schedule_save)
+        self.brightness_spin.valueChanged.connect(self._on_brightness_changed)
         self.time_range_slider.range_committed.connect(self._on_time_range_changed)
         self.parallel_slider.valueChanged.connect(self._schedule_save)
         self.labels_checkbox.toggled.connect(self._schedule_save)
@@ -593,10 +593,12 @@ class MainWindow(QMainWindow):
         else:
             self.crop_input.clear()
 
+        self.brightness_spin.blockSignals(True)
         if config and config.has_custom_brightness():
             self.brightness_spin.setValue(config.brightness)
         else:
             self.brightness_spin.setValue(230)  # Default
+        self.brightness_spin.blockSignals(False)
 
         if config and config.has_custom_time_range():
             self.time_range_slider.set_time_range(
@@ -638,6 +640,11 @@ class MainWindow(QMainWindow):
             config.time_end = end_str if end_str else None
             self.file_table.update_config_indicator(filename)
         self._schedule_save()
+
+    def _on_brightness_changed(self, value: int):
+        """Handle brightness spinbox change - apply to selected files or all if none selected."""
+        target_files = self._get_target_files()
+        self._apply_brightness_to_files(value, target_files)
 
     def _on_time_range_changed(self, start: int, end: int):
         """Handle time range slider change - apply to selected files or all if none selected."""
