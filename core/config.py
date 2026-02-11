@@ -84,22 +84,10 @@ class FileConfig:
         self.time_end = None
 
     def get_resolution_label(self) -> str:
-        """Get friendly resolution label (e.g., '1080p', '4K')."""
+        """Get resolution label from video height (e.g., '1080p', '800p')."""
         if self.resolution_height == 0:
             return "?"
-        h = self.resolution_height
-        if h >= 2160:
-            return "4K"
-        elif h >= 1440:
-            return "1440p"
-        elif h >= 1080:
-            return "1080p"
-        elif h >= 720:
-            return "720p"
-        elif h >= 480:
-            return "480p"
-        else:
-            return f"{h}p"
+        return f"{self.resolution_height}p"
 
 
 class FileConfigStore:
