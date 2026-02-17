@@ -18,6 +18,7 @@ class FileTableWidget(QWidget):
     # Signals
     selection_changed = pyqtSignal(list)  # List of selected filenames
     config_action_requested = pyqtSignal(str, str)  # action, filename
+    file_double_clicked = pyqtSignal(str)  # filename
 
     # Status colors (Catppuccin Mocha)
     STATUS_COLORS = {
@@ -101,8 +102,9 @@ class FileTableWidget(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
 
-        # Connect selection change
+        # Connect selection change and double-click
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.doubleClicked.connect(self._on_double_clicked)
 
         # Context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -286,6 +288,14 @@ class FileTableWidget(QWidget):
     def clear_selection(self):
         """Clear current selection."""
         self.table.clearSelection()
+
+    def _on_double_clicked(self, index):
+        """Handle double-click on a table row."""
+        row = index.row()
+        for filename, r in self._file_rows.items():
+            if r == row:
+                self.file_double_clicked.emit(filename)
+                return
 
     def _on_selection_changed(self):
         """Handle selection change."""

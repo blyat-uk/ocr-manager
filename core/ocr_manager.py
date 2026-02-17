@@ -61,6 +61,7 @@ class OCRManager(QObject):
     file_status_text_changed = pyqtSignal(str, str)  # filename, status_text
     file_progress_updated = pyqtSignal(str, int)    # filename, percent
     file_log_output = pyqtSignal(str, str)           # filename, raw_text
+    file_subtitle_detected = pyqtSignal(str, float, float, str)  # filename, start, end, text
     timing_updated = pyqtSignal(float, float, float)  # elapsed, eta, avg_per_file
     overall_progress = pyqtSignal(int, int)           # completed_files, total_files
     all_completed = pyqtSignal(int, int, float, float)  # successful, total, total_time, avg_time
@@ -123,6 +124,7 @@ class OCRManager(QObject):
         worker.status_text_changed.connect(self._on_worker_status_text_changed)
         worker.progress_updated.connect(self._on_worker_progress)
         worker.raw_output.connect(self.file_log_output.emit)
+        worker.subtitle_detected.connect(self.file_subtitle_detected.emit)
         worker.finished.connect(self._on_worker_finished)
 
         self._active_workers[video_path.name] = worker
