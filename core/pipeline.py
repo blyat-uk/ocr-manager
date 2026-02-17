@@ -67,13 +67,16 @@ class Pipeline(QObject):
     ocr_timing_updated = pyqtSignal(float, float, float)  # elapsed, eta, avg
     ocr_overall_progress = pyqtSignal(int, int)           # completed, total
     ocr_log_output = pyqtSignal(str, str)                 # filename, raw_text
+    ocr_subtitle_detected = pyqtSignal(str, float, float, str)  # filename, start, end, text
 
     PHASES = ["Create Directory", "OCR Extraction", "Quality Assurance"]
 
-    def __init__(self, config: Config, file_config_store: FileConfigStore = None):
+    def __init__(self, config: Config, file_config_store: FileConfigStore = None,
+                 selected_files: list[str] = None):
         super().__init__()
         self.config = config
         self.file_config_store = file_config_store
+        self.selected_files = selected_files
         self.process = None
         self.ocr_manager = None
         self.current_phase = 0
@@ -171,6 +174,11 @@ class Pipeline(QObject):
                 if statuses.get(f.name) == FileStatus.QUEUED
             ]
 
+            # Filter to only selected files if specified
+            if self.selected_files:
+                selected_set = set(self.selected_files)
+                pending_videos = [f for f in pending_videos if f.name in selected_set]
+
             # Log skipped files
             skipped_count = sum(1 for s in statuses.values() if s == FileStatus.DONE)
             if skipped_count > 0:
@@ -191,6 +199,7 @@ class Pipeline(QObject):
             self.ocr_manager.file_status_text_changed.connect(self.ocr_file_status_text.emit)
             self.ocr_manager.file_progress_updated.connect(self.ocr_file_progress.emit)
             self.ocr_manager.file_log_output.connect(self.ocr_log_output.emit)
+            self.ocr_manager.file_subtitle_detected.connect(self.ocr_subtitle_detected.emit)
             self.ocr_manager.timing_updated.connect(self.ocr_timing_updated.emit)
             self.ocr_manager.overall_progress.connect(self.ocr_overall_progress.emit)
             self.ocr_manager.all_completed.connect(self._on_ocr_completed)

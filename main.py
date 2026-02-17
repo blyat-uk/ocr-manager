@@ -26,6 +26,7 @@ from widgets.file_table import FileTableWidget
 from widgets.videocr_settings_dialog import VideoCRSettingsDialog
 from widgets.label_settings_dialog import LabelSettingsDialog
 from widgets.logs_dialog import LogsDialog
+from widgets.subtitle_preview_dialog import SubtitlePreviewDialog
 
 
 class MainWindow(QMainWindow):
@@ -57,12 +58,16 @@ class MainWindow(QMainWindow):
             'similar_image': '0.3',
         }
 
+        # Label mask crops (list of (x, y, w, h) tuples)
+        self.label_mask_crops: list[tuple] = []
+
         # Label detection settings
         self.label_settings = {
             'labels_only': False,
-            'label_min_duration': '1.0',
-            'label_max_duration': '8.0',
+            'label_min_duration': '0.5',
+            'label_max_duration': '5.0',
             'label_conf_threshold': '95',
+            'label_conf_threshold_min': '80',
         }
 
         # Config persistence
@@ -94,6 +99,7 @@ class MainWindow(QMainWindow):
         # Log store and dialog
         self.log_store = LogStore(self)
         self._logs_dialog: LogsDialog | None = None
+        self._subtitle_preview: SubtitlePreviewDialog | None = None
 
         # Background scanner
         self._metadata_scanner: VideoMetadataScanner | None = None
@@ -327,6 +333,8 @@ class MainWindow(QMainWindow):
 
         # Label settings
         labels_settings = dict(self.label_settings)
+        if self.label_mask_crops:
+            labels_settings['mask_crops'] = [list(m) for m in self.label_mask_crops]
 
         # Build save data using ProjectConfigManager's format
         config_manager = ProjectConfigManager(Path(self.project_path))
@@ -379,7 +387,12 @@ class MainWindow(QMainWindow):
 
         # Apply label settings
         if labels_settings:
-            self.label_settings.update(labels_settings)
+            # Extract mask_crops before updating label_settings dict
+            if 'mask_crops' in labels_settings:
+                self.label_mask_crops = [tuple(m) for m in labels_settings['mask_crops']]
+            else:
+                self.label_mask_crops = []
+            self.label_settings.update({k: v for k, v in labels_settings.items() if k != 'mask_crops'})
 
         if 'labels_enabled' in global_settings:
             self.labels_checkbox.blockSignals(True)
@@ -452,6 +465,7 @@ class MainWindow(QMainWindow):
         self.file_table.set_file_store(self.file_config_store)
         self.file_table.selection_changed.connect(self.on_file_selection_changed)
         self.file_table.config_action_requested.connect(self.on_config_action_requested)
+        self.file_table.file_double_clicked.connect(self._on_file_double_clicked)
         layout.addWidget(self.file_table)
 
         return widget
@@ -579,6 +593,8 @@ class MainWindow(QMainWindow):
 
     def on_file_selection_changed(self, filenames: list[str]):
         """Handle file selection change - update inputs to reflect selected files' config."""
+        self._update_start_button_label()
+
         if not filenames:
             # No selection - keep current values as global defaults
             return
@@ -608,6 +624,16 @@ class MainWindow(QMainWindow):
         else:
             # Reset to full duration
             self.time_range_slider.set_time_range("", "")
+
+    def _update_start_button_label(self):
+        """Update start button text to reflect selection count."""
+        if self.is_running:
+            return
+        selected = self.file_table.get_selected_filenames()
+        if selected:
+            self.start_button.setText(f"Start Processing ({len(selected)})")
+        else:
+            self.start_button.setText("Start Processing")
 
     def _get_target_files(self) -> list[str]:
         """Get target files for config changes: selected files or all if none selected."""
@@ -707,11 +733,18 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
-        dialog = CropSelectorDialog([str(f) for f in video_files], existing_crop, self.last_timeline_position, parent=self)
+        dialog = CropSelectorDialog(
+            [str(f) for f in video_files], existing_crop, self.last_timeline_position,
+            labels_enabled=self.labels_checkbox.isChecked(),
+            existing_masks=self.label_mask_crops if self.label_mask_crops else None,
+            parent=self
+        )
         dialog.crop_selected.connect(self.on_crop_selected)
         if dialog.exec():
             self.last_selected_episode = dialog.get_selected_episode()
             self.last_timeline_position = dialog.get_timeline_position()
+            self.label_mask_crops = dialog.get_label_masks()
+            self._schedule_save()
 
     def on_crop_selected(self, x: int, y: int, width: int, height: int):
         """Handle crop selection - apply to selected files or all if none selected."""
@@ -875,9 +908,11 @@ class MainWindow(QMainWindow):
         # Apply label settings
         config.labels_enabled = self.labels_checkbox.isChecked()
         config.labels_only = self.label_settings.get('labels_only', False)
-        config.label_min_duration = float(self.label_settings.get('label_min_duration', '1.0'))
-        config.label_max_duration = float(self.label_settings.get('label_max_duration', '8.0'))
+        config.label_min_duration = float(self.label_settings.get('label_min_duration', '0.5'))
+        config.label_max_duration = float(self.label_settings.get('label_max_duration', '5.0'))
         config.label_conf_threshold = int(self.label_settings.get('label_conf_threshold', '95'))
+        config.label_conf_threshold_min = int(self.label_settings.get('label_conf_threshold_min', '80'))
+        config.label_mask_crops = list(self.label_mask_crops)
 
         # Parse crop values
         crop_text = self.crop_input.text()
@@ -897,7 +932,9 @@ class MainWindow(QMainWindow):
             return
 
         # Create and start pipeline with file config store
-        self.pipeline = Pipeline(config, self.file_config_store)
+        selected_files = self.file_table.get_selected_filenames()
+        self.pipeline = Pipeline(config, self.file_config_store,
+                                 selected_files=selected_files or None)
         self.pipeline.error_occurred.connect(self.on_pipeline_error)
         self.pipeline.phase_started.connect(self.on_phase_started)
         self.pipeline.pipeline_finished.connect(self.on_pipeline_finished)
@@ -918,8 +955,13 @@ class MainWindow(QMainWindow):
         self.pipeline.ocr_log_output.connect(self._on_ocr_log_output)
         self.pipeline.output_received.connect(self._on_pipeline_log_output)
 
-        # Clear previous logs and show button
+        # Subtitle preview signal
+        self.pipeline.ocr_subtitle_detected.connect(self._on_subtitle_detected)
+
+        # Clear previous logs and subtitle data, show button
         self.log_store.clear()
+        if self._subtitle_preview:
+            self._subtitle_preview.clear_all()
         self.logs_btn.setVisible(True)
 
         # Update UI
@@ -957,7 +999,7 @@ class MainWindow(QMainWindow):
     def on_pipeline_finished(self, success: bool):
         """Handle pipeline completion."""
         self.is_running = False
-        self.start_button.setText("Start Processing")
+        self._update_start_button_label()
         self.start_button.setObjectName("primary-action")
         # Force style refresh
         self.start_button.style().unpolish(self.start_button)
@@ -993,7 +1035,7 @@ class MainWindow(QMainWindow):
     def on_pipeline_stopped(self):
         """Handle user-initiated pipeline stop."""
         self.is_running = False
-        self.start_button.setText("Start Processing")
+        self._update_start_button_label()
         self.start_button.setObjectName("primary-action")
         # Force style refresh
         self.start_button.style().unpolish(self.start_button)
@@ -1024,6 +1066,20 @@ class MainWindow(QMainWindow):
         self._logs_dialog.show()
         self._logs_dialog.raise_()
         self._logs_dialog.activateWindow()
+
+    def _on_file_double_clicked(self, filename: str):
+        """Open subtitle preview dialog for the double-clicked file."""
+        if self._subtitle_preview is None or not self._subtitle_preview.isVisible():
+            self._subtitle_preview = SubtitlePreviewDialog(self)
+        self._subtitle_preview.show_file(filename)
+        self._subtitle_preview.show()
+        self._subtitle_preview.raise_()
+        self._subtitle_preview.activateWindow()
+
+    def _on_subtitle_detected(self, filename: str, start: float, end: float, text: str):
+        """Forward subtitle detection to preview dialog."""
+        if self._subtitle_preview is not None:
+            self._subtitle_preview.on_subtitle_detected(filename, start, end, text)
 
     def disable_ui(self):
         """Disable UI during processing."""
