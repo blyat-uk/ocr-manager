@@ -35,13 +35,13 @@ class LabelSettingsDialog(QDialog):
         form.setSpacing(8)
 
         self.min_duration_input = QLineEdit(
-            str(self.current_settings.get('label_min_duration', '1.0'))
+            str(self.current_settings.get('label_min_duration', '0.5'))
         )
         self.min_duration_input.setPlaceholderText("seconds")
         form.addRow("Min Duration:", self.min_duration_input)
 
         self.max_duration_input = QLineEdit(
-            str(self.current_settings.get('label_max_duration', '8.0'))
+            str(self.current_settings.get('label_max_duration', '5.0'))
         )
         self.max_duration_input.setPlaceholderText("seconds")
         form.addRow("Max Duration:", self.max_duration_input)
@@ -51,6 +51,12 @@ class LabelSettingsDialog(QDialog):
         )
         self.conf_threshold_input.setPlaceholderText("0-100")
         form.addRow("Confidence:", self.conf_threshold_input)
+
+        self.conf_threshold_min_input = QLineEdit(
+            str(self.current_settings.get('label_conf_threshold_min', '80'))
+        )
+        self.conf_threshold_min_input.setPlaceholderText("0-100")
+        form.addRow("Confidence Min.:", self.conf_threshold_min_input)
 
         layout.addLayout(form)
         layout.addStretch()
@@ -74,9 +80,10 @@ class LabelSettingsDialog(QDialog):
         """Apply settings and close dialog."""
         settings = {
             'labels_only': self.labels_only_check.isChecked(),
-            'label_min_duration': self.min_duration_input.text().strip() or '1.0',
-            'label_max_duration': self.max_duration_input.text().strip() or '8.0',
+            'label_min_duration': self.min_duration_input.text().strip() or '0.5',
+            'label_max_duration': self.max_duration_input.text().strip() or '5.0',
             'label_conf_threshold': self.conf_threshold_input.text().strip() or '95',
+            'label_conf_threshold_min': self.conf_threshold_min_input.text().strip() or '80',
         }
         self.settings_changed.emit(settings)
         self.accept()

@@ -3,7 +3,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -289,9 +289,11 @@ class Config:
     # Label detection
     labels_enabled: bool = True
     labels_only: bool = False
-    label_min_duration: float = 1.0
-    label_max_duration: float = 8.0
+    label_min_duration: float = 0.5
+    label_max_duration: float = 5.0
     label_conf_threshold: int = 95
+    label_conf_threshold_min: int = 80
+    label_mask_crops: list[Any] = field(default_factory=list)
 
     # videocr configuration
     videocr_python: str = "/mnt/FAST/Code/videocr-PaddleOCR-original/.venv/bin/python"

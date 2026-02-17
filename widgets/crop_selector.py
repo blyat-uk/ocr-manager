@@ -4,7 +4,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                               QLabel, QSlider, QComboBox, QWidget, QSpinBox)
 from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QRect
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QBrush
 
 from core.video_utils import get_video_duration, extract_frame
 
@@ -24,6 +24,14 @@ class FrameLabel(QLabel):
         self.pixmap_offset = QPoint(0, 0)
         self.stored_crop = None  # Store original crop coordinates for resize
         self.click_y = 0  # Store Y position of initial click for centered drawing
+
+        # Mask state (right-click drawing, only when labels enabled)
+        self.masks: list[QRect] = []  # Display-coord masks
+        self.stored_masks: list[tuple] = []  # Original video-coord masks
+        self.labels_enabled: bool = False
+        self.drawing_mask: bool = False
+        self.mask_start_point = None
+        self.mask_current_point = None
 
     def set_frame(self, pixmap: QPixmap, existing_crop: tuple = None):
         """Set the frame pixmap and optionally set existing crop."""
@@ -46,6 +54,16 @@ class FrameLabel(QLabel):
         self.end_point = None
         self.crop_rect = QRect()
 
+        # Restore masks from stored_masks (original video coords)
+        self.masks = []
+        for mask in self.stored_masks:
+            x, y, w, h = mask
+            display_x = int(x / self.scale_factor)
+            display_y = int(y / self.scale_factor)
+            display_w = int(w / self.scale_factor)
+            display_h = int(h / self.scale_factor)
+            self.masks.append(QRect(display_x, display_y, display_w, display_h))
+
         # If existing crop coordinates available (either passed or stored), draw them
         crop_to_draw = existing_crop if existing_crop else self.stored_crop
         if crop_to_draw and len(crop_to_draw) == 4:
@@ -61,14 +79,14 @@ class FrameLabel(QLabel):
             self.end_point = QPoint(display_x + display_w, display_y + display_h)
             self.update_display()
         else:
-            self.setPixmap(self.scaled_pixmap)
+            self.update_display()
 
     def to_pixmap_coords(self, pos: QPoint) -> QPoint:
         """Convert label coordinates to pixmap coordinates."""
         return QPoint(pos.x() - self.pixmap_offset.x(), pos.y() - self.pixmap_offset.y())
 
     def mousePressEvent(self, event):
-        """Start drawing rectangle from horizontal center."""
+        """Start drawing rectangle from horizontal center (left) or mask (right)."""
         if event.button() == Qt.MouseButton.LeftButton:
             # Clear stored crop when user starts drawing a new one
             self.stored_crop = None
@@ -79,6 +97,20 @@ class FrameLabel(QLabel):
             self.start_point = QPoint(center_x, self.click_y)
             self.end_point = QPoint(center_x, self.click_y)
             self.drawing = True
+        elif event.button() == Qt.MouseButton.RightButton and self.labels_enabled:
+            pos = self.to_pixmap_coords(event.pos())
+            # Hit-test existing masks - remove if clicked inside one
+            for i, mask in enumerate(self.masks):
+                if mask.contains(pos):
+                    self.masks.pop(i)
+                    # Update stored_masks
+                    self.stored_masks = self.get_mask_coordinates()
+                    self.update_display()
+                    return
+            # Start drawing a new mask
+            self.drawing_mask = True
+            self.mask_start_point = pos
+            self.mask_current_point = pos
 
     def mouseMoveEvent(self, event):
         """Update rectangle while drawing - expands symmetrically from center."""
@@ -89,6 +121,9 @@ class FrameLabel(QLabel):
             dx = abs(pos.x() - center_x)
             self.start_point = QPoint(center_x - dx, self.click_y)
             self.end_point = QPoint(center_x + dx, pos.y())
+            self.update_display()
+        elif self.drawing_mask:
+            self.mask_current_point = self.to_pixmap_coords(event.pos())
             self.update_display()
 
     def mouseReleaseEvent(self, event):
@@ -103,30 +138,64 @@ class FrameLabel(QLabel):
             self.update_display()
             # Store the crop in original video coordinates so it persists across frame changes
             self.stored_crop = self.get_crop_coordinates()
+        elif event.button() == Qt.MouseButton.RightButton and self.drawing_mask:
+            self.mask_current_point = self.to_pixmap_coords(event.pos())
+            self.drawing_mask = False
+            # Build the finalized mask rect
+            sp = self.mask_start_point
+            ep = self.mask_current_point
+            x1 = max(0, min(sp.x(), ep.x()))
+            y1 = max(0, min(sp.y(), ep.y()))
+            x2 = min(self.scaled_pixmap.width(), max(sp.x(), ep.x()))
+            y2 = min(self.scaled_pixmap.height(), max(sp.y(), ep.y()))
+            mask_rect = QRect(x1, y1, x2 - x1, y2 - y1)
+            if mask_rect.width() > 2 and mask_rect.height() > 2:
+                self.masks.append(mask_rect)
+                self.stored_masks = self.get_mask_coordinates()
+            self.mask_start_point = None
+            self.mask_current_point = None
+            self.update_display()
 
     def update_display(self):
-        """Redraw the frame with the crop rectangle."""
+        """Redraw the frame with masks and crop rectangle."""
         if self.scaled_pixmap is None:
             return
 
+        display = QPixmap(self.scaled_pixmap)
+        painter = QPainter(display)
+
+        # 1. Draw finalized masks as filled black rectangles
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0)))
+        for mask in self.masks:
+            painter.drawRect(mask)
+
+        # 2. Draw in-progress mask as semi-transparent black
+        if self.drawing_mask and self.mask_start_point and self.mask_current_point:
+            sp = self.mask_start_point
+            ep = self.mask_current_point
+            x1 = max(0, min(sp.x(), ep.x()))
+            y1 = max(0, min(sp.y(), ep.y()))
+            x2 = min(self.scaled_pixmap.width(), max(sp.x(), ep.x()))
+            y2 = min(self.scaled_pixmap.height(), max(sp.y(), ep.y()))
+            painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+            painter.drawRect(QRect(x1, y1, x2 - x1, y2 - y1))
+
+        # 3. Draw crop rectangle outline on top
         if self.start_point and self.end_point:
-            # Calculate rectangle in pixmap coordinates
             x1 = max(0, min(self.start_point.x(), self.end_point.x()))
             y1 = max(0, min(self.start_point.y(), self.end_point.y()))
             x2 = min(self.scaled_pixmap.width(), max(self.start_point.x(), self.end_point.x()))
             y2 = min(self.scaled_pixmap.height(), max(self.start_point.y(), self.end_point.y()))
             self.crop_rect = QRect(x1, y1, x2 - x1, y2 - y1)
 
-            # Draw rectangle on pixmap
-            display = QPixmap(self.scaled_pixmap)
-            painter = QPainter(display)
             pen = QPen(QColor(255, 0, 0), 3)
             painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.crop_rect)
-            painter.end()
-            self.setPixmap(display)
-        else:
-            self.setPixmap(self.scaled_pixmap)
+
+        painter.end()
+        self.setPixmap(display)
 
     def get_crop_coordinates(self) -> tuple:
         """Get crop coordinates scaled to original video resolution."""
@@ -141,6 +210,21 @@ class FrameLabel(QLabel):
 
         return (x, y, w, h)
 
+    def get_mask_coordinates(self) -> list[tuple]:
+        """Get all mask coordinates scaled to original video resolution."""
+        result = []
+        for mask in self.masks:
+            x = int(mask.x() * self.scale_factor)
+            y = int(mask.y() * self.scale_factor)
+            w = int(mask.width() * self.scale_factor)
+            h = int(mask.height() * self.scale_factor)
+            result.append((x, y, w, h))
+        return result
+
+    def set_masks(self, masks: list[tuple]):
+        """Restore masks from original video coordinates."""
+        self.stored_masks = list(masks) if masks else []
+
     def resizeEvent(self, event):
         """Handle resize."""
         super().resizeEvent(event)
@@ -154,13 +238,16 @@ class CropSelectorDialog(QDialog):
     crop_selected = pyqtSignal(int, int, int, int)
 
     def __init__(self, mkv_files: list, existing_crop: tuple = None, timeline_position: int = 5000,
-                 target_file: str = None, parent=None):
+                 target_file: str = None, labels_enabled: bool = False,
+                 existing_masks: list[tuple] = None, parent=None):
         super().__init__(parent)
         # Sort files naturally
         self.mkv_files = sorted(mkv_files)
         self.existing_crop = existing_crop
         self.initial_timeline_position = timeline_position
         self.target_file = target_file  # Pre-select this file if specified
+        self.labels_enabled = labels_enabled
+        self.existing_masks = existing_masks
         self.temp_dir = tempfile.mkdtemp()
         self.current_duration = 0
         self.initial_resize_done = False  # Track if initial auto-resize has been done
@@ -194,12 +281,16 @@ class CropSelectorDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # Instructions
-        instructions = QLabel("Click and drag on the frame to draw a crop box around the subtitles")
+        instructions_text = "Click and drag on the frame to draw a crop box around the subtitles"
+        if self.labels_enabled:
+            instructions_text += "  |  Right-click to draw label masks"
+        instructions = QLabel(instructions_text)
         instructions.setObjectName("subheading")
         layout.addWidget(instructions)
 
         # Frame display
         self.frame_label = FrameLabel()
+        self.frame_label.labels_enabled = self.labels_enabled
         self.frame_label.setMinimumSize(400, 225)
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.frame_label)
@@ -331,6 +422,11 @@ class CropSelectorDialog(QDialog):
                 optimal_width, optimal_height = self.get_available_frame_size(pixmap)
                 self.frame_label.setFixedSize(optimal_width, optimal_height)
 
+                # Pass existing masks on first load only
+                if self.existing_masks is not None:
+                    self.frame_label.set_masks(self.existing_masks)
+                    self.existing_masks = None
+
                 # Pass existing crop on first load only
                 self.frame_label.set_frame(pixmap, self.existing_crop)
                 # Clear existing_crop after first use so it doesn't re-apply on frame changes
@@ -346,7 +442,10 @@ class CropSelectorDialog(QDialog):
     def update_coordinates(self):
         """Update coordinate display."""
         x, y, w, h = self.frame_label.get_crop_coordinates()
-        self.coords_label.setText(f"Crop: ({x}, {y}, {w}, {h})")
+        text = f"Crop: {x},{y},{w},{h}"
+        for i, mask in enumerate(self.frame_label.get_mask_coordinates(), 1):
+            text += f"  |  Mask {i}: {mask[0]},{mask[1]},{mask[2]},{mask[3]}"
+        self.coords_label.setText(text)
 
     def on_apply_clicked(self):
         """Apply crop selection and close."""
@@ -367,6 +466,10 @@ class CropSelectorDialog(QDialog):
     def get_selected_episode(self) -> int:
         """Return the currently selected episode index."""
         return self.episode_combo.currentIndex()
+
+    def get_label_masks(self) -> list[tuple]:
+        """Get label mask coordinates in original video resolution."""
+        return self.frame_label.get_mask_coordinates()
 
     def get_timeline_position(self) -> int:
         """Return the current timeline slider position (0-1000)."""

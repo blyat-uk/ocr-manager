@@ -28,9 +28,11 @@ class OCRWorker(QObject):
     progress_updated = pyqtSignal(str, int)   # filename, percent 0-100
     finished = pyqtSignal(str, bool)          # filename, success
     raw_output = pyqtSignal(str, str)         # filename, raw_text
+    subtitle_detected = pyqtSignal(str, float, float, str)  # filename, start, end, text
 
     # tqdm progress pattern: "Extracting dialogue:  45%|..." captures title and percentage
     TQDM_PATTERN = re.compile(r'([^:\r\n]+):\s*(\d+)%\|')
+    SUB_PATTERN = re.compile(r'^\[SUB\]([0-9.]+)\|([0-9.]+)\|(.+)$', re.MULTILINE)
 
     def __init__(self, video_path: Path, output_dir: Path, config: Config,
                  file_config: FileConfig = None, parent=None):
@@ -103,12 +105,12 @@ class OCRWorker(QObject):
         else:
             if gc.labels_only:
                 cmd.append("--only-labels")
-            if gc.label_min_duration != 1.0:
-                cmd.extend(["--label-min-duration", str(gc.label_min_duration)])
-            if gc.label_max_duration != 8.0:
-                cmd.extend(["--label-max-duration", str(gc.label_max_duration)])
-            if gc.label_conf_threshold != 95:
-                cmd.extend(["--label-conf-threshold", str(gc.label_conf_threshold)])
+            cmd.extend(["--label-min-duration", str(gc.label_min_duration)])
+            cmd.extend(["--label-max-duration", str(gc.label_max_duration)])
+            cmd.extend(["--label-conf-threshold", str(gc.label_conf_threshold)])
+            cmd.extend(["--label-conf-threshold-min", str(gc.label_conf_threshold_min)])
+            for mask in gc.label_mask_crops:
+                cmd.extend(["--label-mask-crops", f"{mask[0]},{mask[1]},{mask[2]},{mask[3]}"])
 
         return cmd
 
@@ -133,12 +135,21 @@ class OCRWorker(QObject):
         """Handle merged stdout/stderr output."""
         data = self.process.readAllStandardOutput().data().decode("utf-8", errors="replace")
         self.raw_output.emit(self.filename, data)
+        self._parse_subtitles(data)
         self._parse_progress(data)
 
     def _on_stderr(self):
         """Handle stderr output (tqdm writes here)."""
         data = self.process.readAllStandardError().data().decode("utf-8", errors="replace")
         self._parse_progress(data)
+
+    def _parse_subtitles(self, data: str):
+        """Parse [SUB] lines from output and emit subtitle_detected signals."""
+        for match in self.SUB_PATTERN.finditer(data):
+            start = float(match.group(1))
+            end = float(match.group(2))
+            text = match.group(3)
+            self.subtitle_detected.emit(self.filename, start, end, text)
 
     def _parse_progress(self, data: str):
         """Parse tqdm progress from output data, extracting title and percentage."""
