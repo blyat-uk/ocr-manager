@@ -1,0 +1,410 @@
+"""Video capture adapters with optional GPU acceleration."""
+import cv2
+import numpy as np
+import subprocess
+import json
+import shutil
+
+# Try PyAV first (FFmpeg bindings with hardware acceleration support)
+try:
+    import av
+    PYAV_AVAILABLE = True
+except ImportError:
+    PYAV_AVAILABLE = False
+
+# Check if FFmpeg is available
+FFMPEG_AVAILABLE = shutil.which('ffmpeg') is not None and shutil.which('ffprobe') is not None
+
+
+class FFmpegNVDECCapture:
+    """Video capture using FFmpeg subprocess with NVDEC hardware acceleration.
+
+    Uses NVIDIA's dedicated video decoder hardware for fast decoding.
+    Falls back to CPU decoding if NVDEC is not available.
+    """
+
+    def __init__(self, video_path, use_gpu=True):
+        self.path = video_path
+        self.use_gpu = use_gpu
+        self.proc = None
+        self._pos = 0
+        self._frame_count = None
+        self._fps = None
+        self._width = None
+        self._height = None
+        self._frame_size = None
+        self._seek_pos = 0
+        self._last_pts = None  # Estimated PTS in seconds
+
+    def _probe_video(self):
+        """Get video metadata using ffprobe."""
+        cmd = [
+            'ffprobe', '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format', '-show_streams',
+            self.path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise IOError(f'Cannot probe video {self.path}')
+
+        data = json.loads(result.stdout)
+        video_stream = next((s for s in data['streams'] if s['codec_type'] == 'video'), None)
+        if not video_stream:
+            raise IOError(f'No video stream found in {self.path}')
+
+        self._width = int(video_stream['width'])
+        self._height = int(video_stream['height'])
+        self._frame_size = self._width * self._height * 3  # BGR24
+
+        # Get FPS
+        if 'avg_frame_rate' in video_stream:
+            num, den = map(int, video_stream['avg_frame_rate'].split('/'))
+            self._fps = num / den if den else 25.0
+        else:
+            self._fps = 25.0
+
+        # Get frame count
+        if 'nb_frames' in video_stream:
+            self._frame_count = int(video_stream['nb_frames'])
+        elif 'duration' in data['format']:
+            duration = float(data['format']['duration'])
+            self._frame_count = int(duration * self._fps)
+        else:
+            self._frame_count = 100000  # Fallback
+
+    def _start_ffmpeg(self, seek_time=None):
+        """Start FFmpeg subprocess with optional seek."""
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+
+        # Add hardware acceleration
+        if self.use_gpu:
+            cmd.extend(['-hwaccel', 'cuda'])
+
+        # Add seek before input (fast seek)
+        if seek_time and seek_time > 0:
+            cmd.extend(['-ss', str(seek_time)])
+
+        cmd.extend([
+            '-i', self.path,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-'
+        ])
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=self._frame_size * 10  # Buffer 10 frames
+        )
+
+    def __enter__(self):
+        if not FFMPEG_AVAILABLE:
+            # Fall back to OpenCV
+            self.cap = cv2.VideoCapture(self.path)
+            if not self.cap.isOpened():
+                raise IOError(f'Cannot open video {self.path}')
+            return self.cap
+
+        self._probe_video()
+        self._start_ffmpeg()
+        self._pos = 0
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not FFMPEG_AVAILABLE:
+            self.cap.release()
+            return
+        if self.proc:
+            self.proc.stdout.close()
+            self.proc.terminate()
+            self.proc.wait()
+            self.proc = None
+
+    def get(self, prop):
+        """Get video property (compatible with cv2.VideoCapture.get)."""
+        if not FFMPEG_AVAILABLE:
+            return self.cap.get(prop)
+
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return self._frame_count
+        elif prop == cv2.CAP_PROP_FPS:
+            return self._fps
+        elif prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return self._height
+        elif prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return self._width
+        elif prop == cv2.CAP_PROP_POS_FRAMES:
+            return self._pos
+        return 0
+
+    def set(self, prop, value):
+        """Set video property (compatible with cv2.VideoCapture.set)."""
+        if not FFMPEG_AVAILABLE:
+            return self.cap.set(prop, value)
+
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            target_pos = int(value)
+            if target_pos != self._pos and target_pos > 0:
+                # Restart FFmpeg with seek
+                if self.proc:
+                    self.proc.stdout.close()
+                    self.proc.terminate()
+                    self.proc.wait()
+                seek_time = target_pos / self._fps
+                self._start_ffmpeg(seek_time)
+                self._pos = target_pos
+            return True
+        return False
+
+    def read(self):
+        """Read next frame from FFmpeg pipe.
+
+        Returns:
+            tuple: (success, frame) where frame is BGR numpy array
+        """
+        if not FFMPEG_AVAILABLE:
+            ret, frame = self.cap.read()
+            if ret:
+                self._last_pts = self._pos / self._fps if self._fps else None
+            return ret, frame
+
+        try:
+            raw = self.proc.stdout.read(self._frame_size)
+            if len(raw) != self._frame_size:
+                return False, None
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._height, self._width, 3)
+            self._pos += 1
+            # Estimate PTS from frame position (FFmpeg subprocess doesn't expose true PTS)
+            self._last_pts = self._pos / self._fps if self._fps else None
+            return True, frame
+        except Exception:
+            return False, None
+
+    def get_last_pts(self) -> float:
+        """Get estimated PTS of the last read frame in seconds."""
+        return self._last_pts
+
+    def get_stream_start_time(self) -> float:
+        """Get the stream's start_time (estimated as 0 for FFmpeg pipe)."""
+        # FFmpeg subprocess doesn't expose start_time directly
+        # Return 0 as we can't reliably get this info through the pipe
+        return 0.0
+
+
+class PyAVCapture:
+    """Video capture using PyAV with optional CUDA hardware acceleration.
+
+    Uses FFmpeg's NVDEC for hardware-accelerated video decoding on NVIDIA GPUs.
+    """
+
+    def __init__(self, video_path, use_gpu=True):
+        self.path = video_path
+        self.use_gpu = use_gpu
+        self.container = None
+        self.stream = None
+        self._pos = 0
+        self._frame_count = None
+        self._fps = None
+        self._width = None
+        self._height = None
+        # Auto-downscaling for 4K+ videos
+        self._scale_factor = 1.0
+        self._output_width = None
+        self._output_height = None
+        # PTS tracking - canonical timestamp source
+        self._last_pts = None  # Last frame's PTS in seconds
+
+    def __enter__(self):
+        if not PYAV_AVAILABLE:
+            # Fall back to OpenCV
+            self.cap = cv2.VideoCapture(self.path)
+            if not self.cap.isOpened():
+                raise IOError(f'Cannot open video {self.path}')
+            return self.cap
+
+        # Open container
+        self.container = av.open(self.path)
+        self.stream = self.container.streams.video[0]
+
+        # Enable threading for faster decoding
+        self.stream.thread_type = 'AUTO'
+
+        # Cache video properties
+        self._fps = float(self.stream.average_rate) if self.stream.average_rate else 25.0
+        if self.stream.frames:
+            self._frame_count = self.stream.frames
+        elif self.stream.duration and self.stream.time_base:
+            duration_sec = float(self.stream.duration * self.stream.time_base)
+            self._frame_count = int(duration_sec * self._fps)
+        elif self.container.duration:
+            # Use container duration (in microseconds)
+            duration_sec = self.container.duration / 1_000_000
+            self._frame_count = int(duration_sec * self._fps)
+        else:
+            # Estimate based on file size (rough fallback, avoids counting)
+            self._frame_count = 100000  # Large number, will stop at actual end
+        self._width = self.stream.width
+        self._height = self.stream.height
+
+        # No auto-downscaling in adapter - video.py handles resize after crop
+        # This is more efficient: crop first, then resize only the subtitle region
+        self._scale_factor = 1.0
+
+        self._pos = 0
+        self._frame_generator = self.container.decode(video=0)
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not PYAV_AVAILABLE:
+            self.cap.release()
+            return
+        if self.container:
+            self.container.close()
+            self.container = None
+
+    def get(self, prop):
+        """Get video property (compatible with cv2.VideoCapture.get)."""
+        if not PYAV_AVAILABLE:
+            return self.cap.get(prop)
+
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return self._frame_count
+        elif prop == cv2.CAP_PROP_FPS:
+            return self._fps
+        elif prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return self._height
+        elif prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return self._width
+        elif prop == cv2.CAP_PROP_POS_FRAMES:
+            return self._pos
+        return 0
+
+    def get_scale_factor(self):
+        """Get the downscaling factor (1.0 = no scaling, <1.0 = downscaled)."""
+        if not PYAV_AVAILABLE:
+            return 1.0
+        return self._scale_factor
+
+    def set(self, prop, value):
+        """Set video property (compatible with cv2.VideoCapture.set)."""
+        if not PYAV_AVAILABLE:
+            return self.cap.set(prop, value)
+
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            target_pos = int(value)
+            if target_pos > 0:
+                # Seek to timestamp - PyAV seeks to nearest keyframe
+                target_pts = int(target_pos / self._fps / self.stream.time_base)
+                self.container.seek(target_pts, stream=self.stream)
+                self._frame_generator = self.container.decode(video=0)
+
+                # Skip frames until we reach the target position
+                # PyAV seek lands on keyframe, which may be before target
+                for frame in self._frame_generator:
+                    frame_pos = int(round(frame.pts * float(self.stream.time_base) * self._fps))
+                    if frame_pos >= target_pos:
+                        # Found target frame - store it for next read()
+                        self._pos = frame_pos
+                        self._pending_frame = frame
+                        return True
+                # Reached end without finding target
+                self._pos = target_pos
+            return True
+        return False
+
+    def read(self):
+        """Read next frame (compatible with cv2.VideoCapture.read).
+
+        Returns:
+            tuple: (success, frame) where frame is BGR numpy array at native resolution
+        """
+        if not PYAV_AVAILABLE:
+            ret, frame = self.cap.read()
+            if ret:
+                # OpenCV fallback: estimate PTS from frame position
+                self._last_pts = self._pos / self._fps if self._fps else None
+            return ret, frame
+
+        try:
+            # Check if we have a pending frame from seek
+            if hasattr(self, '_pending_frame') and self._pending_frame is not None:
+                frame = self._pending_frame
+                self._pending_frame = None
+            else:
+                frame = next(self._frame_generator)
+
+            # Store canonical PTS timestamp in seconds (ground truth for timing)
+            self._last_pts = float(frame.pts * self.stream.time_base)
+
+            # Calculate frame position from PTS (for compatibility)
+            self._pos = int(round(self._last_pts * self._fps))
+
+            # Convert to BGR numpy array (no downscaling - video.py handles resize after crop)
+            img = frame.to_ndarray(format='bgr24')
+
+            return True, img
+        except StopIteration:
+            return False, None
+        except Exception:
+            return False, None
+
+    def get_last_pts(self) -> float:
+        """Get the PTS (presentation timestamp) of the last read frame in seconds.
+
+        This is the canonical timing source for subtitle synchronization.
+        Returns None if no frame has been read yet.
+        """
+        return self._last_pts
+
+    def get_stream_start_time(self) -> float:
+        """Get the stream's start_time in seconds.
+
+        Videos can have non-zero start_time (e.g., 0.042s or 0.080s) which offsets
+        all PTS values. This should be subtracted from PTS to normalize timestamps.
+        """
+        if not PYAV_AVAILABLE or self.stream is None:
+            return 0.0
+        # stream.start_time is in time_base units
+        if self.stream.start_time is not None:
+            return float(self.stream.start_time * self.stream.time_base)
+        return 0.0
+
+
+# Use PyAV as default (fastest in practice), fall back to OpenCV
+# Note: FFmpegNVDECCapture has fast hardware decode but pipe overhead makes it slower
+if PYAV_AVAILABLE:
+    Capture = PyAVCapture
+elif FFMPEG_AVAILABLE:
+    Capture = FFmpegNVDECCapture
+else:
+    # Fallback to OpenCV wrapper
+    class OpenCVCapture:
+        def __init__(self, video_path, use_gpu=True):
+            self.path = video_path
+            self._last_pts = None
+        def __enter__(self):
+            self.cap = cv2.VideoCapture(self.path)
+            if not self.cap.isOpened():
+                raise IOError(f'Cannot open video {self.path}')
+            return self
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.cap.release()
+        def get(self, prop):
+            return self.cap.get(prop)
+        def set(self, prop, value):
+            return self.cap.set(prop, value)
+        def read(self):
+            ret, frame = self.cap.read()
+            if ret:
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
+                self._last_pts = pos / fps if fps else None
+            return ret, frame
+        def get_last_pts(self) -> float:
+            return self._last_pts
+        def get_stream_start_time(self) -> float:
+            return 0.0  # OpenCV doesn't expose start_time
+    Capture = OpenCVCapture
