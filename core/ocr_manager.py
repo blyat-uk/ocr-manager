@@ -117,7 +117,7 @@ class OCRManager(QObject):
         if self.file_config_store:
             file_config = self.file_config_store.get(video_path.name)
 
-        worker = OCRWorker(video_path, self._output_dir, self.config, file_config, self)
+        worker = OCRWorker(video_path, self._output_dir, self.config, file_config)
 
         # Connect signals
         worker.status_changed.connect(self._on_worker_status_changed)
@@ -148,9 +148,13 @@ class OCRManager(QObject):
         # Record timing before cleanup
         self._timing.finish_file(filename)
 
-        # Remove from active workers
+        # Remove from active workers and clean up QThread
         if filename in self._active_workers:
             worker = self._active_workers.pop(filename)
+            if hasattr(worker, '_thread') and worker._thread:
+                worker._thread.quit()
+                worker._thread.wait(5000)
+                worker._thread.deleteLater()
             worker.deleteLater()
 
         # Track results
@@ -179,9 +183,20 @@ class OCRManager(QObject):
         self._queue.clear()
 
         # Copy to list to avoid modification during iteration
-        # (worker.stop() may trigger finished signal synchronously)
-        for worker in list(self._active_workers.values()):
+        workers = list(self._active_workers.values())
+
+        # Signal all workers to cancel
+        for worker in workers:
             worker.stop()
+
+        # Wait for threads to finish and clean up
+        for worker in workers:
+            if hasattr(worker, '_thread') and worker._thread:
+                worker._thread.quit()
+                if not worker._thread.wait(5000):
+                    worker._thread.terminate()
+                worker._thread.deleteLater()
+            worker.deleteLater()
 
         self._active_workers.clear()
 

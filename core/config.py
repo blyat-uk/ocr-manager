@@ -296,8 +296,6 @@ class Config:
     label_mask_crops: list[Any] = field(default_factory=list)
 
     # videocr configuration
-    videocr_python: str = "/mnt/FAST/Code/videocr-PaddleOCR-original/.venv/bin/python"
-    videocr_script: str = "/mnt/FAST/Code/videocr-PaddleOCR-original/videocr.py"
     ocr_lang: str = "ch"
     conf_threshold: int = 95
     sim_threshold: int = 82

@@ -1,12 +1,12 @@
-"""Single file OCR worker with QProcess and tqdm progress parsing."""
+"""Single file OCR worker using QThread and direct videocr API calls."""
 
-import re
 import shutil
-import subprocess
+import traceback
 from enum import Enum
 from pathlib import Path
+from threading import Event
 
-from PyQt6.QtCore import QObject, pyqtSignal, QProcess
+from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from core.config import Config, FileConfig
 
@@ -21,7 +21,7 @@ class FileStatus(Enum):
 
 
 class OCRWorker(QObject):
-    """Wraps QProcess for single video file OCR with progress parsing."""
+    """Runs videocr OCR directly via QThread with cooperative cancellation."""
 
     status_changed = pyqtSignal(str, object)  # filename, FileStatus
     status_text_changed = pyqtSignal(str, str)  # filename, status_text (e.g., "Extracting dialogue")
@@ -29,10 +29,6 @@ class OCRWorker(QObject):
     finished = pyqtSignal(str, bool)          # filename, success
     raw_output = pyqtSignal(str, str)         # filename, raw_text
     subtitle_detected = pyqtSignal(str, float, float, str)  # filename, start, end, text
-
-    # tqdm progress pattern: "Extracting dialogue:  45%|..." captures title and percentage
-    TQDM_PATTERN = re.compile(r'([^:\r\n]+):\s*(\d+)%\|')
-    SUB_PATTERN = re.compile(r'^\[SUB\]([0-9.]+)\|([0-9.]+)\|(.+)$', re.MULTILINE)
 
     def __init__(self, video_path: Path, output_dir: Path, config: Config,
                  file_config: FileConfig = None, parent=None):
@@ -42,19 +38,16 @@ class OCRWorker(QObject):
         self.config = config
         self.file_config = file_config  # Per-file config overrides
         self.filename = video_path.name
-        self.process = None
+        self._cancel_event = Event()
+        self._thread = None
         self._last_percent = -1
-        self._current_phase = ""  # Track current progress bar title
+        self._current_phase = ""  # Track current progress phase name
 
-    def build_command(self) -> list[str]:
-        """Build videocr.py command line arguments.
+    def _build_ocr_kwargs(self) -> dict:
+        """Build kwargs dict for videocr API from Config/FileConfig.
 
         Uses per-file config when available, falling back to global config.
         """
-        # Output .ass file next to the video file (will be moved to output_dir after completion)
-        output_path = self.video_path.parent / (self.video_path.stem + ".ass")
-
-        # Determine effective settings (per-file overrides global)
         fc = self.file_config
         gc = self.config
 
@@ -71,112 +64,107 @@ class OCRWorker(QObject):
         time_start = fc.time_start if (fc and fc.time_start) else gc.time_start
         time_end = fc.time_end if (fc and fc.time_end) else gc.time_end
 
-        cmd = [
-            gc.videocr_python,
-            gc.videocr_script,
-            str(self.video_path),
-            "-o", str(output_path),
-            "-l", gc.ocr_lang,
-            "-c", str(gc.conf_threshold),
-            "-s", str(gc.sim_threshold),
-            "-b", str(brightness),
-            "--similar-image", str(gc.similar_image),
-            "--skip", str(gc.frames_to_skip),
-        ]
+        kwargs = {
+            'video_path': str(self.video_path),
+            'file_path': str(self.video_path.parent / (self.video_path.stem + ".ass")),
+            'lang': gc.ocr_lang,
+            'conf_threshold': gc.conf_threshold,
+            'sim_threshold': gc.sim_threshold,
+            'brightness_threshold': brightness,
+            'similar_image_threshold': gc.similar_image,
+            'frames_to_skip': gc.frames_to_skip,
+            'use_gpu': gc.use_gpu,
+            'time_start': time_start or '0:00',
+            'time_end': time_end or '',
+        }
 
         # Crop region
         if crop_w > 0 and crop_h > 0:
-            crop = f"{crop_x},{crop_y},{crop_w},{crop_h}"
-            cmd.extend(["--crop", crop])
-
-        # GPU option
-        if not gc.use_gpu:
-            cmd.append("--no-gpu")
-
-        # Time range
-        if time_start:
-            cmd.extend(["-ts", time_start])
-        if time_end:
-            cmd.extend(["-te", time_end])
+            kwargs['crop_x'] = crop_x
+            kwargs['crop_y'] = crop_y
+            kwargs['crop_width'] = crop_w
+            kwargs['crop_height'] = crop_h
 
         # Label detection
         if not gc.labels_enabled:
-            cmd.append("--no-labels")
+            kwargs['detect_labels'] = False
         else:
+            kwargs['detect_labels'] = True
             if gc.labels_only:
-                cmd.append("--only-labels")
-            cmd.extend(["--label-min-duration", str(gc.label_min_duration)])
-            cmd.extend(["--label-max-duration", str(gc.label_max_duration)])
-            cmd.extend(["--label-conf-threshold", str(gc.label_conf_threshold)])
-            cmd.extend(["--label-conf-threshold-min", str(gc.label_conf_threshold_min)])
-            for mask in gc.label_mask_crops:
-                cmd.extend(["--label-mask-crops", f"{mask[0]},{mask[1]},{mask[2]},{mask[3]}"])
+                kwargs['only_labels'] = True
+            kwargs['label_min_duration'] = gc.label_min_duration
+            kwargs['label_max_duration'] = gc.label_max_duration
+            kwargs['label_conf_threshold'] = gc.label_conf_threshold
+            kwargs['label_conf_threshold_min'] = gc.label_conf_threshold_min
+            if gc.label_mask_crops:
+                kwargs['label_mask_crops'] = [
+                    (mask[0], mask[1], mask[2], mask[3])
+                    for mask in gc.label_mask_crops
+                ]
 
-        return cmd
+        return kwargs
 
     def start(self):
-        """Start the OCR process."""
+        """Start the OCR in a background QThread."""
         self.status_changed.emit(self.filename, FileStatus.PROCESSING)
 
-        cmd = self.build_command()
+        self._thread = QThread()
+        self.moveToThread(self._thread)
+        self._thread.started.connect(self._run_ocr)
+        self._thread.start()
 
-        self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.process.readyReadStandardOutput.connect(self._on_output)
-        self.process.readyReadStandardError.connect(self._on_stderr)
-        self.process.finished.connect(self._on_finished)
+    def _on_progress(self, phase_name: str, percent: int):
+        """Progress callback invoked from videocr (runs in worker thread).
 
-        # Set working directory to project path
-        self.process.setWorkingDirectory(str(self.video_path.parent))
+        Emits signals with dedup logic matching the old tqdm parser.
+        """
+        # Cap progress at 99% during processing (100% only on successful completion)
+        display_percent = min(percent, 99)
 
-        self.process.start(cmd[0], cmd[1:])
+        # Check if we've moved to a new phase
+        if phase_name != self._current_phase:
+            self._current_phase = phase_name
+            self._last_percent = -1  # Reset progress for new phase
+            self.status_text_changed.emit(self.filename, phase_name)
 
-    def _on_output(self):
-        """Handle merged stdout/stderr output."""
-        data = self.process.readAllStandardOutput().data().decode("utf-8", errors="replace")
-        self.raw_output.emit(self.filename, data)
-        self._parse_subtitles(data)
-        self._parse_progress(data)
+        # Only emit if percentage changed (avoid spam)
+        if display_percent != self._last_percent:
+            self._last_percent = display_percent
+            self.progress_updated.emit(self.filename, display_percent)
 
-    def _on_stderr(self):
-        """Handle stderr output (tqdm writes here)."""
-        data = self.process.readAllStandardError().data().decode("utf-8", errors="replace")
-        self._parse_progress(data)
+    def _on_subtitle(self, start: float, end: float, text: str):
+        """Subtitle callback invoked from videocr (runs in worker thread)."""
+        self.subtitle_detected.emit(self.filename, start, end, text)
 
-    def _parse_subtitles(self, data: str):
-        """Parse [SUB] lines from output and emit subtitle_detected signals."""
-        for match in self.SUB_PATTERN.finditer(data):
-            start = float(match.group(1))
-            end = float(match.group(2))
-            text = match.group(3)
-            self.subtitle_detected.emit(self.filename, start, end, text)
+    def _run_ocr(self):
+        """Execute videocr directly (runs in QThread)."""
+        success = False
+        try:
+            # Lazy import to avoid loading PaddleOCR at app startup
+            from videocr.api import save_subtitles_to_file
 
-    def _parse_progress(self, data: str):
-        """Parse tqdm progress from output data, extracting title and percentage."""
-        match = self.TQDM_PATTERN.search(data)
-        if match:
-            title = match.group(1).strip()
-            percent = int(match.group(2))
+            kwargs = self._build_ocr_kwargs()
 
-            # Check if we've moved to a new phase (new progress bar title)
-            if title != self._current_phase:
-                self._current_phase = title
-                self._last_percent = -1  # Reset progress for new phase
-                self.status_text_changed.emit(self.filename, title)
+            self.raw_output.emit(self.filename, f"Starting OCR: {self.filename}\n")
 
-            # Cap progress at 99% during processing (100% only on successful completion)
-            display_percent = min(percent, 99)
+            save_subtitles_to_file(
+                **kwargs,
+                progress_callback=self._on_progress,
+                subtitle_callback=self._on_subtitle,
+                cancel_event=self._cancel_event,
+            )
 
-            # Only emit if percentage changed (avoid spam)
-            if display_percent != self._last_percent:
-                self._last_percent = display_percent
-                self.progress_updated.emit(self.filename, display_percent)
+            # Check if cancelled
+            if self._cancel_event.is_set():
+                self.raw_output.emit(self.filename, "OCR cancelled.\n")
+                # Clean up partial output file
+                ass_source = self.video_path.parent / (self.video_path.stem + ".ass")
+                if ass_source.exists():
+                    ass_source.unlink(missing_ok=True)
+                self.status_changed.emit(self.filename, FileStatus.FAILED)
+                self.finished.emit(self.filename, False)
+                return
 
-    def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
-        """Handle process completion."""
-        success = exit_code == 0 and exit_status == QProcess.ExitStatus.NormalExit
-
-        if success:
             # Move .ass file from video directory to output directory
             ass_source = self.video_path.parent / (self.video_path.stem + ".ass")
             ass_dest = self.output_dir / (self.video_path.stem + ".ass")
@@ -184,34 +172,18 @@ class OCRWorker(QObject):
             if ass_source.exists():
                 shutil.move(str(ass_source), str(ass_dest))
 
+            success = True
+            self.raw_output.emit(self.filename, "OCR completed successfully.\n")
             self.status_changed.emit(self.filename, FileStatus.COMPLETED)
             self.progress_updated.emit(self.filename, 100)
-        else:
+
+        except Exception as e:
+            error_msg = f"OCR failed: {e}\n{traceback.format_exc()}"
+            self.raw_output.emit(self.filename, error_msg)
             self.status_changed.emit(self.filename, FileStatus.FAILED)
 
         self.finished.emit(self.filename, success)
 
     def stop(self):
-        """Stop the OCR process and all child processes."""
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
-            pid = self.process.processId()
-
-            # Kill child processes first using pkill
-            try:
-                subprocess.run(["pkill", "-TERM", "-P", str(pid)],
-                               capture_output=True, timeout=2)
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
-
-            # Terminate main process
-            self.process.terminate()
-            self.process.waitForFinished(3000)
-
-            # Force kill if still running
-            if self.process.state() == QProcess.ProcessState.Running:
-                try:
-                    subprocess.run(["pkill", "-KILL", "-P", str(pid)],
-                                   capture_output=True, timeout=2)
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    pass
-                self.process.kill()
+        """Request cooperative cancellation."""
+        self._cancel_event.set()
