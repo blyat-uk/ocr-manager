@@ -217,6 +217,17 @@ class ProjectConfigManager:
 
         return global_settings, videocr_settings, file_configs, labels_settings
 
+    def load_section(self, key: str) -> dict:
+        """Load a single top-level section from the config file."""
+        if not self.exists():
+            return {}
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+        return data.get(key, {})
+
     def build_save_data(self, global_settings: dict, videocr_settings: dict,
                         file_store: 'FileConfigStore', labels_settings: dict = None) -> dict:
         """Build the save data dict without writing to disk.

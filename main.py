@@ -5,27 +5,25 @@ import sys
 import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                              QHBoxLayout, QLineEdit, QPushButton, QCheckBox,
-                              QSpinBox, QLabel, QMessageBox, QToolButton,
+                              QHBoxLayout, QGridLayout, QLineEdit, QPushButton,
+                              QCheckBox, QSpinBox, QLabel, QMessageBox, QGroupBox,
                               QSlider, QSizePolicy, QFileDialog, QProgressBar,
                               QProgressDialog)
-from PyQt6.QtCore import Qt, QSize, QFileSystemWatcher, QTimer
-from PyQt6.QtGui import QKeySequence, QShortcut, QIcon
+from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer, QSize
+from PyQt6.QtGui import QKeySequence, QShortcut
+import qtawesome as qta
 
 from core.config import Config, validate_config, FileConfig, FileConfigStore, ProjectConfigManager
 from core.config_saver import AsyncConfigSaver
 from core.log_store import LogStore
 from core.pipeline import Pipeline, get_video_files, detect_file_statuses
 from core.video_utils import VideoMetadataScanner
-from resources import get_icon_path
 from theme import apply_theme
 from widgets.crop_selector import CropSelectorDialog
 from widgets.brightness_tester import BrightnessTesterDialog
-from widgets.phase_indicator import PhaseIndicator
 from widgets.time_range_slider import TimeRangeSlider
 from widgets.file_table import FileTableWidget
-from widgets.videocr_settings_dialog import VideoCRSettingsDialog
-from widgets.label_settings_dialog import LabelSettingsDialog
+from widgets.settings_dialog import SettingsDialog
 from widgets.logs_dialog import LogsDialog
 from widgets.subtitle_preview_dialog import SubtitlePreviewDialog
 from core.audio_analysis import AudioAnalysisWorker
@@ -65,11 +63,15 @@ class MainWindow(QMainWindow):
 
         # Label detection settings
         self.label_settings = {
-            'labels_only': False,
             'label_min_duration': '0.5',
             'label_max_duration': '5.0',
             'label_conf_threshold': '95',
             'label_conf_threshold_min': '80',
+        }
+
+        # Autodetect settings
+        self.autodetect_settings = {
+            'min_segment_length': '30',
         }
 
         # Config persistence
@@ -81,6 +83,8 @@ class MainWindow(QMainWindow):
         # UI components
         self.folder_btn = None
         self.folder_path_label = None
+        self.settings_btn = None
+        self.settings_summary_label = None
         self.crop_input = None
         self.crop_select_btn = None
         self.brightness_spin = None
@@ -89,16 +93,15 @@ class MainWindow(QMainWindow):
         self.parallel_slider = None
         self.parallel_label = None
         self.file_table = None
+        self.dialogue_checkbox = None
         self.labels_checkbox = None
-        self.labels_settings_btn = None
+        self.processing_warning = None
         self.start_button = None
-        self.phase_indicator = None
         self.overall_progress = None
         self.timing_label = None
         self.logs_btn = None
         self.loading_label = None
         self.auto_time_range_btn = None
-        self.auto_threshold_spin = None
         self._audio_analysis_worker = None
         self._audio_progress_dialog = None
 
@@ -131,21 +134,32 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(12)
-        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(12, 8, 12, 8)
 
-        # Folder selection row
+        # Folder selection row: Open Folder + path + summary + settings cog
         folder_layout = QHBoxLayout()
-        self.folder_btn = QPushButton("Select Folder")
-        self.folder_btn.setObjectName("secondary")
+        self.folder_btn = QPushButton("Open Folder")
         self.folder_btn.clicked.connect(self.on_folder_select_clicked)
         folder_layout.addWidget(self.folder_btn)
         self.folder_path_label = QLabel("No folder selected")
-        self.folder_path_label.setObjectName("muted")
         folder_layout.addWidget(self.folder_path_label, 1)
+
+        self.settings_summary_label = QLabel("")
+        self.settings_summary_label.setStyleSheet("color: rgba(255,255,255,0.45); font-size: 12px;")
+        folder_layout.addWidget(self.settings_summary_label)
+
+        self.settings_btn = QPushButton()
+        self.settings_btn.setIcon(qta.icon("mdi.cog", color='white'))
+        self.settings_btn.setIconSize(QSize(22, 22))
+        self.settings_btn.setToolTip("Settings")
+        self.settings_btn.setFixedSize(QSize(30, 30))
+        self.settings_btn.clicked.connect(self._open_settings)
+        folder_layout.addWidget(self.settings_btn)
+
         main_layout.addLayout(folder_layout)
 
-        # Configuration section
+        # Configuration section — 3 QGroupBox cards
         config_widget = self.create_config_section()
         main_layout.addWidget(config_widget)
 
@@ -153,10 +167,18 @@ class MainWindow(QMainWindow):
         pipeline_widget = self.create_pipeline_section()
         main_layout.addWidget(pipeline_widget, 1)
 
-        # Bottom bar: progress/timing on left, start button on right
+        # Bottom bar: logs icon, progress, start button
         button_layout = QHBoxLayout()
 
-        # Progress bar (hidden until processing starts)
+        self.logs_btn = QPushButton()
+        self.logs_btn.setIcon(qta.icon("mdi.text-box-outline", color='white'))
+        self.logs_btn.setIconSize(QSize(22, 22))
+        self.logs_btn.setToolTip("View Logs")
+        self.logs_btn.setFixedSize(QSize(30, 30))
+        self.logs_btn.setVisible(False)
+        self.logs_btn.clicked.connect(self._on_logs_clicked)
+        button_layout.addWidget(self.logs_btn)
+
         self.overall_progress = QProgressBar()
         self.overall_progress.setRange(0, 100)
         self.overall_progress.setValue(0)
@@ -167,23 +189,14 @@ class MainWindow(QMainWindow):
         self.overall_progress.setVisible(False)
         button_layout.addWidget(self.overall_progress)
 
-        # Timing label (hidden until processing starts)
-        self.timing_label = QLabel("")
-        self.timing_label.setObjectName("muted")
-        self.timing_label.setVisible(False)
-        button_layout.addWidget(self.timing_label)
-
-        # Logs button (hidden until pipeline runs)
-        self.logs_btn = QPushButton("Logs")
-        self.logs_btn.setObjectName("secondary")
-        self.logs_btn.setVisible(False)
-        self.logs_btn.clicked.connect(self._on_logs_clicked)
-        button_layout.addWidget(self.logs_btn)
-
         button_layout.addStretch()
 
+        self.timing_label = QLabel("Elapsed: --")
+        button_layout.addWidget(self.timing_label)
+
         self.start_button = QPushButton("Start Processing")
-        self.start_button.setObjectName("primary-action")
+        self.start_button.setCheckable(True)
+        self.start_button.setChecked(True)
         self.start_button.clicked.connect(self.on_start_processing_clicked)
         button_layout.addWidget(self.start_button)
 
@@ -197,121 +210,110 @@ class MainWindow(QMainWindow):
         self.brightness_spin.valueChanged.connect(self._on_brightness_changed)
         self.time_range_slider.range_committed.connect(self._on_time_range_changed)
         self.parallel_slider.valueChanged.connect(self._schedule_save)
+        self.dialogue_checkbox.toggled.connect(self._schedule_save)
         self.labels_checkbox.toggled.connect(self._schedule_save)
 
+        # Initial summary
+        self._update_settings_summary()
+
+    def _make_icon_btn(self, icon_name: str, tooltip: str, size: int = 28) -> QPushButton:
+        """Create an icon-only button using qtawesome."""
+        btn = QPushButton()
+        btn.setIcon(qta.icon(icon_name, color='white'))
+        btn.setIconSize(QSize(size, size))
+        btn.setToolTip(tooltip)
+        btn.setFixedSize(QSize(size + 8, size + 8))
+        return btn
+
     def create_config_section(self) -> QWidget:
-        """Create configuration section with OCR parameters."""
+        """Create configuration section with 3 QGroupBox cards."""
         widget = QWidget()
         widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(4)
 
-        # Fixed label width for alignment
-        label_width = 90
-        button_width = 70
+        # Card 1: Crop & Brightness (grid for vertical alignment)
+        crop_group = QGroupBox("Crop && Brightness")
+        crop_grid = QGridLayout(crop_group)
+        crop_grid.setContentsMargins(8, 4, 8, 4)
+        crop_grid.setVerticalSpacing(4)
+        crop_grid.setHorizontalSpacing(6)
 
-        # Crop region row
-        crop_layout = QHBoxLayout()
-        crop_label = QLabel("Crop Region:")
-        crop_label.setMinimumWidth(label_width)
-        crop_layout.addWidget(crop_label)
+        crop_grid.addWidget(QLabel("Crop"), 0, 0, Qt.AlignmentFlag.AlignRight)
         self.crop_input = QLineEdit()
-        self.crop_input.setPlaceholderText("x, y, width, height")
-        self.crop_input.setMaximumWidth(180)
-        crop_layout.addWidget(self.crop_input)
-        self.crop_select_btn = QPushButton("Select")
-        self.crop_select_btn.setObjectName("secondary")
-        self.crop_select_btn.setMinimumWidth(button_width)
+        self.crop_input.setPlaceholderText("x, y, w, h")
+        self.crop_input.setFixedWidth(250)
+        crop_grid.addWidget(self.crop_input, 0, 1)
+        self.crop_select_btn = self._make_icon_btn("mdi.crop", "Pick Crop")
         self.crop_select_btn.clicked.connect(self.on_crop_select_clicked)
-        crop_layout.addWidget(self.crop_select_btn)
-        crop_layout.addStretch()
-        layout.addLayout(crop_layout)
+        crop_grid.addWidget(self.crop_select_btn, 0, 2)
 
-        # Brightness row (aligned with crop row)
-        brightness_layout = QHBoxLayout()
-        brightness_label = QLabel("Brightness:")
-        brightness_label.setMinimumWidth(label_width)
-        brightness_layout.addWidget(brightness_label)
+        crop_grid.addWidget(QLabel("Brightness"), 1, 0, Qt.AlignmentFlag.AlignRight)
         self.brightness_spin = QSpinBox()
         self.brightness_spin.setRange(0, 255)
         self.brightness_spin.setValue(230)
-        self.brightness_spin.setMinimumWidth(180)
-        self.brightness_spin.setMaximumWidth(180)
-        brightness_layout.addWidget(self.brightness_spin)
-        self.brightness_test_btn = QPushButton("Test")
-        self.brightness_test_btn.setObjectName("secondary")
-        self.brightness_test_btn.setMinimumWidth(button_width)
+        self.brightness_spin.setFixedWidth(250)
+        crop_grid.addWidget(self.brightness_spin, 1, 1)
+        self.brightness_test_btn = self._make_icon_btn("mdi.brightness-6", "Preview Brightness")
         self.brightness_test_btn.clicked.connect(self.on_brightness_test_clicked)
-        brightness_layout.addWidget(self.brightness_test_btn)
-        brightness_layout.addStretch()
-        layout.addLayout(brightness_layout)
+        crop_grid.addWidget(self.brightness_test_btn, 1, 2)
 
-        # Labels row
-        labels_layout = QHBoxLayout()
-        labels_label = QLabel("Labels:")
-        labels_label.setMinimumWidth(label_width)
-        labels_layout.addWidget(labels_label)
-        self.labels_checkbox = QCheckBox("Enable label detection")
-        self.labels_checkbox.setChecked(True)
-        self.labels_checkbox.toggled.connect(self._on_labels_toggled)
-        labels_layout.addWidget(self.labels_checkbox)
-        self.labels_settings_btn = QToolButton()
-        self.labels_settings_btn.setIcon(QIcon(str(get_icon_path("settings"))))
-        self.labels_settings_btn.setIconSize(QSize(18, 18))
-        self.labels_settings_btn.clicked.connect(self._open_label_settings)
-        labels_layout.addWidget(self.labels_settings_btn)
-        labels_layout.addStretch()
-        layout.addLayout(labels_layout)
+        crop_grid.setColumnStretch(3, 1)
+        layout.addWidget(crop_group)
 
-        # Time range row: slider + Auto button
+        # Card 2: Time Range
+        time_group = QGroupBox("Time Range")
+        time_row = QHBoxLayout(time_group)
+        time_row.setContentsMargins(8, 4, 8, 4)
         self.time_range_slider = TimeRangeSlider()
-        time_range_layout = QHBoxLayout()
-        time_range_layout.setContentsMargins(0, 0, 0, 0)
-        time_range_layout.addWidget(self.time_range_slider, 1)
-        self.auto_time_range_btn = QPushButton("Auto")
-        self.auto_time_range_btn.setObjectName("secondary")
-        self.auto_time_range_btn.setToolTip(
-            "Use audio fingerprinting to detect intros/outros\n"
-            "and automatically set time ranges per file"
-        )
-        self.auto_time_range_btn.setFixedWidth(60)
+        time_row.addWidget(self.time_range_slider, 1)
+        self.auto_time_range_btn = self._make_icon_btn("mdi.auto-fix", "Autodetect time ranges")
         self.auto_time_range_btn.clicked.connect(self._on_auto_time_range_clicked)
-        time_range_layout.addWidget(self.auto_time_range_btn)
-        self.auto_threshold_spin = QSpinBox()
-        self.auto_threshold_spin.setRange(0, 300)
-        self.auto_threshold_spin.setValue(30)
-        self.auto_threshold_spin.setSuffix("s")
-        self.auto_threshold_spin.setToolTip("Minimum length (seconds) for a repeating segment to be detected")
-        self.auto_threshold_spin.setFixedWidth(70)
-        time_range_layout.addWidget(self.auto_threshold_spin)
-        layout.addLayout(time_range_layout)
+        time_row.addWidget(self.auto_time_range_btn)
+        layout.addWidget(time_group)
 
-        # Parallel workers slider row
-        parallel_layout = QHBoxLayout()
-        parallel_label = QLabel("Parallel:")
-        parallel_label.setMinimumWidth(label_width)
-        parallel_layout.addWidget(parallel_label)
+        # Card 3: Processing
+        proc_group = QGroupBox("Processing")
+        proc_layout = QVBoxLayout(proc_group)
+        proc_layout.setContentsMargins(8, 4, 8, 4)
+        proc_layout.setSpacing(4)
 
+        self.dialogue_checkbox = QCheckBox("Dialogue")
+        self.dialogue_checkbox.setChecked(True)
+        self.dialogue_checkbox.toggled.connect(self._on_processing_checkboxes_changed)
+        proc_layout.addWidget(self.dialogue_checkbox)
+
+        self.labels_checkbox = QCheckBox("Labels")
+        self.labels_checkbox.setChecked(True)
+        self.labels_checkbox.toggled.connect(self._on_processing_checkboxes_changed)
+        proc_layout.addWidget(self.labels_checkbox)
+
+        self.processing_warning = QLabel("At least one of Dialogue or Labels must be enabled")
+        self.processing_warning.setStyleSheet("color: #f38ba8; font-size: 12px;")
+        self.processing_warning.setVisible(False)
+        proc_layout.addWidget(self.processing_warning)
+
+        parallel_row = QHBoxLayout()
+        parallel_row.addWidget(QLabel("Parallel"))
         self.parallel_slider = QSlider(Qt.Orientation.Horizontal)
         self.parallel_slider.setRange(1, 8)
         self.parallel_slider.setValue(4)
         self.parallel_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.parallel_slider.setTickInterval(1)
         self.parallel_slider.valueChanged.connect(self._on_parallel_changed)
-        parallel_layout.addWidget(self.parallel_slider)
+        parallel_row.addWidget(self.parallel_slider, 1)
+        self.parallel_label = QLabel("4")
+        parallel_row.addWidget(self.parallel_label)
+        proc_layout.addLayout(parallel_row)
 
-        self.parallel_label = QLabel("4 workers")
-        self.parallel_label.setMinimumWidth(70)
-        parallel_layout.addWidget(self.parallel_label)
-
-        layout.addLayout(parallel_layout)
+        layout.addWidget(proc_group)
 
         return widget
 
     def _on_parallel_changed(self, value: int):
         """Update parallel workers label."""
-        self.parallel_label.setText(f"{value} workers")
+        self.parallel_label.setText(str(value))
 
     def _schedule_save(self):
         """Schedule a debounced save (300ms after last change)."""
@@ -332,6 +334,7 @@ class MainWindow(QMainWindow):
         global_settings = {
             'brightness': self.brightness_spin.value(),
             'ocr_parallel': self.parallel_slider.value(),
+            'dialogue_enabled': self.dialogue_checkbox.isChecked(),
             'labels_enabled': self.labels_checkbox.isChecked(),
         }
 
@@ -361,11 +364,16 @@ class MainWindow(QMainWindow):
         if self.label_mask_crops:
             labels_settings['mask_crops'] = [list(m) for m in self.label_mask_crops]
 
+        # Autodetect settings
+        autodetect_settings = dict(self.autodetect_settings)
+
         # Build save data using ProjectConfigManager's format
         config_manager = ProjectConfigManager(Path(self.project_path))
         save_data = config_manager.build_save_data(
             global_settings, videocr_settings, self.file_config_store, labels_settings
         )
+        if autodetect_settings:
+            save_data['autodetect'] = autodetect_settings
 
         # Save asynchronously to prevent GUI blocking
         if self._async_saver is None:
@@ -382,6 +390,11 @@ class MainWindow(QMainWindow):
             return
 
         global_settings, videocr_settings, file_configs, labels_settings = config_manager.load()
+
+        # Load autodetect settings (not covered by ProjectConfigManager.load())
+        autodetect_settings = config_manager.load_section('autodetect')
+        if autodetect_settings:
+            self.autodetect_settings.update(autodetect_settings)
 
         # Apply global settings to UI (block signals to avoid triggering saves)
         if 'brightness' in global_settings:
@@ -419,19 +432,25 @@ class MainWindow(QMainWindow):
                 self.label_mask_crops = []
             self.label_settings.update({k: v for k, v in labels_settings.items() if k != 'mask_crops'})
 
+        if 'dialogue_enabled' in global_settings:
+            self.dialogue_checkbox.blockSignals(True)
+            self.dialogue_checkbox.setChecked(global_settings['dialogue_enabled'])
+            self.dialogue_checkbox.blockSignals(False)
+
         if 'labels_enabled' in global_settings:
             self.labels_checkbox.blockSignals(True)
             self.labels_checkbox.setChecked(global_settings['labels_enabled'])
             self.labels_checkbox.blockSignals(False)
-            self.labels_settings_btn.setEnabled(global_settings['labels_enabled'])
-            # Update crop enabled state
-            if global_settings['labels_enabled'] and self.label_settings.get('labels_only', False):
-                self.crop_input.setEnabled(False)
-                self.crop_select_btn.setEnabled(False)
+
+        # Sync UI state from loaded checkboxes
+        self._on_processing_checkboxes_changed()
 
         # Store pending file configs - will be applied after files are scanned
         if file_configs:
             self._pending_file_configs = file_configs
+
+        # Update summary with loaded settings
+        self._update_settings_summary()
 
     def _apply_pending_file_configs(self):
         """Apply pending per-file configurations after files are scanned."""
@@ -468,22 +487,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # Pipeline status section
-        status_layout = QHBoxLayout()
-        status_layout.addWidget(QLabel("Pipeline Status:"))
-        status_layout.addStretch()
-        layout.addLayout(status_layout)
-
-        # Phase indicator (index 1 = "OCR Extraction" is clickable for settings)
-        self.phase_indicator = PhaseIndicator(Pipeline.PHASES, clickable_indices=[1])
-        self.phase_indicator.badge_clicked.connect(self.on_phase_badge_clicked)
-        layout.addWidget(self.phase_indicator)
-
-        # Loading indicator (shown during metadata scan)
-        self.loading_label = QLabel("Scanning video files...")
-        self.loading_label.setObjectName("muted")
+        # Status row: loading label
+        status_row = QHBoxLayout()
+        self.loading_label = QLabel("Scanning...")
         self.loading_label.setVisible(False)
-        layout.addWidget(self.loading_label)
+        status_row.addWidget(self.loading_label)
+        status_row.addStretch()
+        layout.addLayout(status_row)
 
         # File table
         self.file_table = FileTableWidget()
@@ -510,14 +520,12 @@ class MainWindow(QMainWindow):
         """Set project directory and initialize time range slider."""
         self.project_path = directory
         self.folder_path_label.setText(directory)
-        self.folder_path_label.setObjectName("")  # Remove muted style
-        self.folder_path_label.style().unpolish(self.folder_path_label)
-        self.folder_path_label.style().polish(self.folder_path_label)
         self.update_window_title()
 
-        # Hide previous run stats and logs button
-        self.timing_label.setVisible(False)
+        # Reset previous run stats and hide logs/progress
+        self.timing_label.setText("Elapsed: --")
         self.logs_btn.setVisible(False)
+        self.overall_progress.setVisible(False)
 
         # Set up folder watcher
         if self.folder_watcher:
@@ -730,7 +738,7 @@ class MainWindow(QMainWindow):
         # Create and start worker
         self._audio_analysis_worker = AudioAnalysisWorker(
             self.project_path, filenames,
-            min_segment_sec=self.auto_threshold_spin.value()
+            min_segment_sec=int(self.autodetect_settings['min_segment_length'])
         )
         self._audio_analysis_worker.phase_changed.connect(self._on_audio_phase_changed)
         self._audio_analysis_worker.file_progress.connect(self._on_audio_file_progress)
@@ -944,51 +952,45 @@ class MainWindow(QMainWindow):
         target_files = self._get_target_files()
         self._apply_brightness_to_files(brightness, target_files)
 
-    def on_phase_badge_clicked(self, index: int):
-        """Handle phase badge click."""
-        if index == 1:  # OCR Extraction
-            self.open_videocr_settings()
-
-    def open_videocr_settings(self):
-        """Open the videocr settings dialog."""
-        dialog = VideoCRSettingsDialog(self.videocr_settings, self)
-        dialog.settings_changed.connect(self.on_videocr_settings_changed)
+    def _open_settings(self):
+        """Open the unified settings dialog."""
+        dialog = SettingsDialog(
+            self.videocr_settings, self.label_settings,
+            self.autodetect_settings, self
+        )
+        dialog.settings_changed.connect(self._on_settings_changed)
         dialog.exec()
 
-    def on_videocr_settings_changed(self, settings: dict):
-        """Handle videocr settings changes."""
-        self.videocr_settings.update(settings)
+    def _on_settings_changed(self, ocr: dict, label: dict, autodetect: dict):
+        """Handle unified settings changes."""
+        self.videocr_settings.update(ocr)
+        self.label_settings.update(label)
+        self.autodetect_settings.update(autodetect)
+        self._update_settings_summary()
         self._schedule_save()
 
-    def _on_labels_toggled(self, checked: bool):
-        """Handle labels checkbox toggle."""
-        self.labels_settings_btn.setEnabled(checked)
-        # If labels unchecked, re-enable crop controls
-        # If labels checked and labels_only, dim crop controls
-        if not checked:
-            self.crop_input.setEnabled(True)
-            self.crop_select_btn.setEnabled(True)
-        elif self.label_settings.get('labels_only', False):
-            self.crop_input.setEnabled(False)
-            self.crop_select_btn.setEnabled(False)
+    def _update_settings_summary(self):
+        """Update the muted settings summary label in the folder row."""
+        s = self.videocr_settings
+        text = f"{s['ocr_lang']} | {s['conf_threshold']} | {s['sim_threshold']} | {s['similar_image']}"
+        self.settings_summary_label.setText(text)
 
-    def _open_label_settings(self):
-        """Open label settings dialog."""
-        dialog = LabelSettingsDialog(self.label_settings, self)
-        dialog.settings_changed.connect(self._on_label_settings_changed)
-        dialog.exec()
+    def _is_labels_only(self) -> bool:
+        """Labels-only mode: Labels checked, Dialogue unchecked."""
+        return self.labels_checkbox.isChecked() and not self.dialogue_checkbox.isChecked()
 
-    def _on_label_settings_changed(self, settings: dict):
-        """Handle label settings changes."""
-        self.label_settings.update(settings)
-        # Update crop enabled state based on labels_only
-        if self.label_settings.get('labels_only', False):
-            self.crop_input.setEnabled(False)
-            self.crop_select_btn.setEnabled(False)
-        else:
-            self.crop_input.setEnabled(True)
-            self.crop_select_btn.setEnabled(True)
-        self._schedule_save()
+    def _on_processing_checkboxes_changed(self):
+        """Handle Dialogue/Labels checkbox changes."""
+        both_off = not self.dialogue_checkbox.isChecked() and not self.labels_checkbox.isChecked()
+        self.processing_warning.setVisible(both_off)
+        if not self.is_running:
+            self.start_button.setEnabled(not both_off)
+
+        # Update crop enabled state
+        labels_only = self._is_labels_only()
+        self.crop_input.setEnabled(not labels_only)
+        self.crop_select_btn.setEnabled(not labels_only)
+
 
     def _format_duration(self, seconds: float) -> str:
         """Format duration as human-readable string."""
@@ -1026,6 +1028,9 @@ class MainWindow(QMainWindow):
 
     def on_start_processing_clicked(self):
         """Start or stop pipeline processing."""
+        # Undo Qt's auto-toggle — we manage checked state explicitly
+        self.start_button.setChecked(not self.start_button.isChecked())
+
         if self.is_running:
             # Stop pipeline
             if self.pipeline:
@@ -1051,7 +1056,7 @@ class MainWindow(QMainWindow):
 
         # Apply label settings
         config.labels_enabled = self.labels_checkbox.isChecked()
-        config.labels_only = self.label_settings.get('labels_only', False)
+        config.labels_only = self._is_labels_only()
         config.label_min_duration = float(self.label_settings.get('label_min_duration', '0.5'))
         config.label_max_duration = float(self.label_settings.get('label_max_duration', '5.0'))
         config.label_conf_threshold = int(self.label_settings.get('label_conf_threshold', '95'))
@@ -1080,7 +1085,6 @@ class MainWindow(QMainWindow):
         self.pipeline = Pipeline(config, self.file_config_store,
                                  selected_files=selected_files or None)
         self.pipeline.error_occurred.connect(self.on_pipeline_error)
-        self.pipeline.phase_started.connect(self.on_phase_started)
         self.pipeline.pipeline_finished.connect(self.on_pipeline_finished)
 
         # File table signals (table is pre-populated on folder load)
@@ -1102,94 +1106,76 @@ class MainWindow(QMainWindow):
         # Subtitle preview signal
         self.pipeline.ocr_subtitle_detected.connect(self._on_subtitle_detected)
 
-        # Clear previous logs and subtitle data, show button
+        # Clear previous logs and subtitle data, enable logs button
         self.log_store.clear()
         if self._subtitle_preview:
             self._subtitle_preview.clear_all()
         self.logs_btn.setVisible(True)
+        self.overall_progress.setVisible(True)
 
         # Update UI
         self.is_running = True
         self.start_button.setText("Stop")
-        self.start_button.setObjectName("danger-action")
-        # Force style refresh
-        self.start_button.style().unpolish(self.start_button)
-        self.start_button.style().polish(self.start_button)
+        self.start_button.setChecked(False)
+        self.start_button.setStyleSheet("background-color: #f38ba8; color: #000;")
         self.update_window_title()
         self.disable_ui()
 
-        # Show progress widgets and reset them
+        # Reset progress widgets
         self.overall_progress.setValue(0)
-        self.overall_progress.setVisible(True)
         self.timing_label.setText("Elapsed: 0s  •  Remaining: calculating...")
-        self.timing_label.setVisible(True)
-
-        # Reset phase indicator (table keeps its pre-loaded DONE/QUEUED statuses)
-        self.phase_indicator.reset()
 
         # Start pipeline
         self.pipeline.start()
 
-    def on_phase_started(self, phase_index: int, phase_name: str):
-        """Handle phase start - update phase indicator."""
-        self.phase_indicator.set_active_phase(phase_index)
-
     def on_pipeline_error(self, error_msg: str):
         """Handle pipeline errors."""
-        # Mark current phase as error
-        if self.pipeline:
-            self.phase_indicator.mark_error(self.pipeline.current_phase)
+        pass
 
     def on_pipeline_finished(self, success: bool):
         """Handle pipeline completion."""
         self.is_running = False
         self._update_start_button_label()
-        self.start_button.setObjectName("primary-action")
-        # Force style refresh
-        self.start_button.style().unpolish(self.start_button)
-        self.start_button.style().polish(self.start_button)
+        self.start_button.setChecked(True)
+        self.start_button.setStyleSheet("")  # Reset to theme default
         self.update_window_title()
         self.enable_ui()
 
-        # Hide progress bar but show stats in timing label
-        self.overall_progress.setVisible(False)
+        # Reset progress bar
+        self.overall_progress.setValue(0)
 
         # Refresh file list to update statuses from filesystem
         self.current_video_files = set()  # Force refresh
         self.refresh_file_list()
 
         if success:
-            self.phase_indicator.mark_complete()
             # Show completion stats in timing label
             total_time, avg_time = self.pipeline.get_ocr_timing()
             if total_time > 0:
                 total_str = self._format_duration(total_time)
                 avg_str = self._format_duration(avg_time)
                 self.timing_label.setText(f"Finished in {total_str}  •  Average {avg_str}/file")
-                self.timing_label.setVisible(True)
                 msg = f"Finished in {total_str} | Avg: {avg_str}/file"
             else:
-                self.timing_label.setVisible(False)
+                self.timing_label.setText("Elapsed: --")
                 msg = "All phases completed"
             self._send_notification("OCR Complete", msg)
         else:
-            self.timing_label.setVisible(False)
+            self.timing_label.setText("Elapsed: --")
             self._send_notification("OCR Failed", "Pipeline encountered an error", "critical")
 
     def on_pipeline_stopped(self):
         """Handle user-initiated pipeline stop."""
         self.is_running = False
         self._update_start_button_label()
-        self.start_button.setObjectName("primary-action")
-        # Force style refresh
-        self.start_button.style().unpolish(self.start_button)
-        self.start_button.style().polish(self.start_button)
+        self.start_button.setChecked(True)
+        self.start_button.setStyleSheet("")  # Reset to theme default
         self.update_window_title()
         self.enable_ui()
 
-        # Hide progress widgets
-        self.overall_progress.setVisible(False)
-        self.timing_label.setVisible(False)
+        # Reset progress widgets
+        self.overall_progress.setValue(0)
+        self.timing_label.setText("Elapsed: --")
 
         # Refresh file list to update statuses from filesystem
         self.current_video_files = set()  # Force refresh
@@ -1234,8 +1220,9 @@ class MainWindow(QMainWindow):
         self.brightness_test_btn.setEnabled(False)
         self.time_range_slider.setEnabled(False)
         self.parallel_slider.setEnabled(False)
+        self.dialogue_checkbox.setEnabled(False)
         self.labels_checkbox.setEnabled(False)
-        self.labels_settings_btn.setEnabled(False)
+        self.settings_btn.setEnabled(False)
         if self.auto_time_range_btn:
             self.auto_time_range_btn.setEnabled(False)
         # Note: file_table is not disabled to allow scrolling during processing
@@ -1247,12 +1234,13 @@ class MainWindow(QMainWindow):
         self.brightness_test_btn.setEnabled(True)
         self.time_range_slider.setEnabled(True)
         self.parallel_slider.setEnabled(True)
+        self.dialogue_checkbox.setEnabled(True)
         self.labels_checkbox.setEnabled(True)
-        self.labels_settings_btn.setEnabled(self.labels_checkbox.isChecked())
+        self.settings_btn.setEnabled(True)
         if self.auto_time_range_btn:
             self.auto_time_range_btn.setEnabled(True)
         # Respect labels_only for crop controls
-        labels_only = self.labels_checkbox.isChecked() and self.label_settings.get('labels_only', False)
+        labels_only = self._is_labels_only()
         self.crop_input.setEnabled(not labels_only)
         self.crop_select_btn.setEnabled(not labels_only)
 
@@ -1311,7 +1299,6 @@ class MainWindow(QMainWindow):
 def main():
     """Application entry point."""
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
 
     # Apply dark theme
     apply_theme(app)
