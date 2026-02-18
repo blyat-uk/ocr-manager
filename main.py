@@ -7,7 +7,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLineEdit, QPushButton, QCheckBox,
                               QSpinBox, QLabel, QMessageBox, QToolButton,
-                              QSlider, QSizePolicy, QFileDialog, QProgressBar)
+                              QSlider, QSizePolicy, QFileDialog, QProgressBar,
+                              QProgressDialog)
 from PyQt6.QtCore import Qt, QSize, QFileSystemWatcher, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut, QIcon
 
@@ -27,6 +28,7 @@ from widgets.videocr_settings_dialog import VideoCRSettingsDialog
 from widgets.label_settings_dialog import LabelSettingsDialog
 from widgets.logs_dialog import LogsDialog
 from widgets.subtitle_preview_dialog import SubtitlePreviewDialog
+from core.audio_analysis import AudioAnalysisWorker
 
 
 class MainWindow(QMainWindow):
@@ -95,6 +97,10 @@ class MainWindow(QMainWindow):
         self.timing_label = None
         self.logs_btn = None
         self.loading_label = None
+        self.auto_time_range_btn = None
+        self.auto_threshold_spin = None
+        self._audio_analysis_worker = None
+        self._audio_progress_dialog = None
 
         # Log store and dialog
         self.log_store = LogStore(self)
@@ -258,9 +264,28 @@ class MainWindow(QMainWindow):
         labels_layout.addStretch()
         layout.addLayout(labels_layout)
 
-        # Time range slider
+        # Time range row: slider + Auto button
         self.time_range_slider = TimeRangeSlider()
-        layout.addWidget(self.time_range_slider)
+        time_range_layout = QHBoxLayout()
+        time_range_layout.setContentsMargins(0, 0, 0, 0)
+        time_range_layout.addWidget(self.time_range_slider, 1)
+        self.auto_time_range_btn = QPushButton("Auto")
+        self.auto_time_range_btn.setObjectName("secondary")
+        self.auto_time_range_btn.setToolTip(
+            "Use audio fingerprinting to detect intros/outros\n"
+            "and automatically set time ranges per file"
+        )
+        self.auto_time_range_btn.setFixedWidth(60)
+        self.auto_time_range_btn.clicked.connect(self._on_auto_time_range_clicked)
+        time_range_layout.addWidget(self.auto_time_range_btn)
+        self.auto_threshold_spin = QSpinBox()
+        self.auto_threshold_spin.setRange(0, 300)
+        self.auto_threshold_spin.setValue(30)
+        self.auto_threshold_spin.setSuffix("s")
+        self.auto_threshold_spin.setToolTip("Minimum length (seconds) for a repeating segment to be detected")
+        self.auto_threshold_spin.setFixedWidth(70)
+        time_range_layout.addWidget(self.auto_threshold_spin)
+        layout.addLayout(time_range_layout)
 
         # Parallel workers slider row
         parallel_layout = QHBoxLayout()
@@ -678,6 +703,125 @@ class MainWindow(QMainWindow):
         target_files = self._get_target_files()
         self._apply_time_range_to_files(start_str, end_str, target_files)
 
+    def _on_auto_time_range_clicked(self):
+        """Run audio fingerprint analysis to auto-detect intros/outros."""
+        if not self.project_path:
+            QMessageBox.warning(self, "Error", "Please select a project directory first")
+            return
+
+        filenames = self.file_table.get_all_filenames()
+        if len(filenames) < 2:
+            QMessageBox.warning(
+                self, "Not Enough Files",
+                "Audio fingerprint analysis requires at least 2 video files\n"
+                "to detect repeating segments (intros/outros)."
+            )
+            return
+
+        # Create progress dialog
+        self._audio_progress_dialog = QProgressDialog(
+            "Preparing audio analysis...", "Cancel", 0, len(filenames), self
+        )
+        self._audio_progress_dialog.setWindowTitle("Audio Analysis")
+        self._audio_progress_dialog.setMinimumWidth(400)
+        self._audio_progress_dialog.setModal(True)
+        self._audio_progress_dialog.canceled.connect(self._on_audio_analysis_cancelled)
+
+        # Create and start worker
+        self._audio_analysis_worker = AudioAnalysisWorker(
+            self.project_path, filenames,
+            min_segment_sec=self.auto_threshold_spin.value()
+        )
+        self._audio_analysis_worker.phase_changed.connect(self._on_audio_phase_changed)
+        self._audio_analysis_worker.file_progress.connect(self._on_audio_file_progress)
+        self._audio_analysis_worker.analysis_progress.connect(self._on_audio_analysis_msg)
+        self._audio_analysis_worker.error.connect(self._on_audio_analysis_error)
+        self._audio_analysis_worker.finished.connect(self._on_audio_analysis_finished)
+
+        self.auto_time_range_btn.setEnabled(False)
+        self._audio_analysis_worker.start()
+
+    def _on_audio_phase_changed(self, phase: str):
+        """Update progress dialog label for phase change."""
+        if self._audio_progress_dialog:
+            self._audio_progress_dialog.setLabelText(phase)
+
+    def _on_audio_file_progress(self, filename: str, current: int, total: int):
+        """Update progress dialog for file processing."""
+        if self._audio_progress_dialog:
+            self._audio_progress_dialog.setMaximum(total)
+            self._audio_progress_dialog.setValue(current)
+            self._audio_progress_dialog.setLabelText(
+                f"Fingerprinting: {filename} ({current}/{total})"
+            )
+
+    def _on_audio_analysis_msg(self, msg: str):
+        """Update progress dialog with analysis status."""
+        if self._audio_progress_dialog:
+            self._audio_progress_dialog.setMaximum(0)  # Indeterminate
+            self._audio_progress_dialog.setLabelText(f"Analyzing: {msg.strip()}")
+
+    def _on_audio_analysis_error(self, msg: str):
+        """Handle audio analysis error."""
+        self._cleanup_audio_analysis()
+        QMessageBox.critical(self, "Audio Analysis Error", msg)
+
+    def _on_audio_analysis_cancelled(self):
+        """Handle user cancellation of audio analysis."""
+        if self._audio_analysis_worker:
+            self._audio_analysis_worker.cancel()
+        self._cleanup_audio_analysis()
+
+    def _on_audio_analysis_finished(self, results: dict):
+        """Apply auto-detected time ranges to file configs."""
+        self._cleanup_audio_analysis()
+
+        if not results:
+            QMessageBox.information(
+                self, "Audio Analysis",
+                "No repeating segments (intros/outros) were detected."
+            )
+            return
+
+        # Apply results to FileConfig entries
+        applied = 0
+        for filename, (time_start, time_end) in results.items():
+            if time_start is not None or time_end is not None:
+                config = self.file_config_store.get_or_create(filename)
+                if time_start is not None:
+                    config.time_start = time_start
+                if time_end is not None:
+                    config.time_end = time_end
+                self.file_table.update_config_indicator(filename)
+                applied += 1
+
+        self._schedule_save()
+
+        # Show summary
+        parts = []
+        for filename, (time_start, time_end) in results.items():
+            flags = []
+            if time_start:
+                flags.append(f"start={time_start}")
+            if time_end:
+                flags.append(f"end={time_end}")
+            if flags:
+                parts.append(f"  {filename}: {', '.join(flags)}")
+
+        summary = f"Set time ranges for {applied} file(s):\n\n" + "\n".join(parts)
+        QMessageBox.information(self, "Audio Analysis Complete", summary)
+
+    def _cleanup_audio_analysis(self):
+        """Clean up audio analysis worker and dialog."""
+        if self._audio_analysis_worker:
+            self._audio_analysis_worker.cleanup()
+            self._audio_analysis_worker = None
+        if self._audio_progress_dialog:
+            self._audio_progress_dialog.close()
+            self._audio_progress_dialog = None
+        if self.auto_time_range_btn:
+            self.auto_time_range_btn.setEnabled(True)
+
     def on_config_action_requested(self, action: str, filename: str):
         """Handle config action from file table context menu (copy/paste)."""
         selected = self.file_table.get_selected_filenames()
@@ -1092,6 +1236,8 @@ class MainWindow(QMainWindow):
         self.parallel_slider.setEnabled(False)
         self.labels_checkbox.setEnabled(False)
         self.labels_settings_btn.setEnabled(False)
+        if self.auto_time_range_btn:
+            self.auto_time_range_btn.setEnabled(False)
         # Note: file_table is not disabled to allow scrolling during processing
 
     def enable_ui(self):
@@ -1103,6 +1249,8 @@ class MainWindow(QMainWindow):
         self.parallel_slider.setEnabled(True)
         self.labels_checkbox.setEnabled(True)
         self.labels_settings_btn.setEnabled(self.labels_checkbox.isChecked())
+        if self.auto_time_range_btn:
+            self.auto_time_range_btn.setEnabled(True)
         # Respect labels_only for crop controls
         labels_only = self.labels_checkbox.isChecked() and self.label_settings.get('labels_only', False)
         self.crop_input.setEnabled(not labels_only)
@@ -1138,6 +1286,9 @@ class MainWindow(QMainWindow):
                 if self._metadata_scanner:
                     self._metadata_scanner.stop()
                     self._metadata_scanner.wait()
+                if self._audio_analysis_worker:
+                    self._audio_analysis_worker.cancel()
+                    self._audio_analysis_worker.cleanup()
                 if self._async_saver:
                     self._async_saver.stop()
                 event.accept()
@@ -1148,6 +1299,9 @@ class MainWindow(QMainWindow):
             if self._metadata_scanner:
                 self._metadata_scanner.stop()
                 self._metadata_scanner.wait()
+            if self._audio_analysis_worker:
+                self._audio_analysis_worker.cancel()
+                self._audio_analysis_worker.cleanup()
             # Stop async saver thread
             if self._async_saver:
                 self._async_saver.stop()
