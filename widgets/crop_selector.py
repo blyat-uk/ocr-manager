@@ -285,7 +285,6 @@ class CropSelectorDialog(QDialog):
         if self.labels_enabled:
             instructions_text += "  |  Right-click to draw label masks"
         instructions = QLabel(instructions_text)
-        instructions.setObjectName("subheading")
         layout.addWidget(instructions)
 
         # Frame display
@@ -338,7 +337,6 @@ class CropSelectorDialog(QDialog):
         button_layout.addStretch()
 
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
 

@@ -20,7 +20,6 @@ class FolderDropZone(QFrame):
         self._is_drag_over = False
 
         self.setAcceptDrops(True)
-        self.setObjectName("drop-zone")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._setup_ui()
@@ -36,11 +35,11 @@ class FolderDropZone(QFrame):
         hint_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._icon_label = QLabel("📁")
-        self._icon_label.setObjectName("drop-zone-icon")
+
         hint_layout.addWidget(self._icon_label)
 
         self._hint_label = QLabel("Drop folder here or click to browse")
-        self._hint_label.setObjectName("drop-zone-hint")
+
         hint_layout.addWidget(self._hint_label)
 
         layout.addLayout(hint_layout)
@@ -50,13 +49,12 @@ class FolderDropZone(QFrame):
         self._path_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._path_label = QLabel("")
-        self._path_label.setObjectName("drop-zone-path")
+
         self._path_label.setWordWrap(True)
         self._path_layout.addWidget(self._path_label)
 
         # Open folder button (hidden initially)
         self._open_btn = QPushButton("Open")
-        self._open_btn.setObjectName("secondary")
         self._open_btn.setFixedWidth(60)
         self._open_btn.clicked.connect(self._open_folder_in_manager)
         self._open_btn.setVisible(False)
@@ -104,14 +102,6 @@ class FolderDropZone(QFrame):
     def _set_drag_over(self, is_over: bool):
         """Update drag-over visual state."""
         self._is_drag_over = is_over
-        if is_over:
-            self.setProperty("dragOver", True)
-        else:
-            self.setProperty("dragOver", False)
-
-        # Force style refresh
-        self.style().unpolish(self)
-        self.style().polish(self)
 
     def _browse_folder(self):
         """Open folder browser dialog."""

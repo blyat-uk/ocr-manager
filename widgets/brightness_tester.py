@@ -203,7 +203,6 @@ class BrightnessTesterDialog(QDialog):
 
         # Instructions
         instructions = QLabel("Move slider to find a frame with subtitles, then generate previews to find optimal brightness")
-        instructions.setObjectName("subheading")
         layout.addWidget(instructions)
 
         # Frame preview
@@ -275,7 +274,6 @@ class BrightnessTesterDialog(QDialog):
         # Left arrow
         self.prev_btn = QPushButton("<")
         self.prev_btn.setFixedSize(50, 100)
-        self.prev_btn.setObjectName("secondary")
         self.prev_btn.clicked.connect(self.show_previous_preview)
         self.prev_btn.setEnabled(False)
         carousel_layout.addWidget(self.prev_btn)
@@ -288,7 +286,6 @@ class BrightnessTesterDialog(QDialog):
         # Right arrow
         self.next_btn = QPushButton(">")
         self.next_btn.setFixedSize(50, 100)
-        self.next_btn.setObjectName("secondary")
         self.next_btn.clicked.connect(self.show_next_preview)
         self.next_btn.setEnabled(False)
         carousel_layout.addWidget(self.next_btn)
@@ -298,13 +295,11 @@ class BrightnessTesterDialog(QDialog):
         # Brightness indicator
         self.brightness_indicator = QLabel("Brightness: --")
         self.brightness_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.brightness_indicator.setObjectName("heading")
         layout.addWidget(self.brightness_indicator)
 
         # Navigation indicator
         self.nav_indicator = QLabel("")
         self.nav_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.nav_indicator.setObjectName("muted")
         layout.addWidget(self.nav_indicator)
 
         # Buttons
@@ -317,7 +312,6 @@ class BrightnessTesterDialog(QDialog):
         button_layout.addStretch()
 
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
 

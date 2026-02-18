@@ -1,5 +1,7 @@
 """Dual-handle time range slider widget."""
 
+import os
+
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel
 from PyQt6.QtCore import Qt, pyqtSignal, QRect
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
@@ -100,10 +102,10 @@ class RangeSlider(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Colors from Catppuccin Mocha
-        track_color = QColor("#45475a")  # surface1
-        fill_color = QColor("#89b4fa")  # blue
-        handle_color = QColor("#89b4fa")  # blue
+        # Colors from qt-material theme
+        track_color = QColor(os.environ.get('QTMATERIAL_SECONDARYLIGHTCOLOR', '#4f5b62'))
+        fill_color = QColor(os.environ.get('QTMATERIAL_PRIMARYCOLOR', '#ffd740'))
+        handle_color = QColor(os.environ.get('QTMATERIAL_PRIMARYCOLOR', '#ffd740'))
 
         # Track dimensions
         y_center = self.height() // 2
@@ -130,7 +132,7 @@ class RangeSlider(QWidget):
 
         # Draw handles
         painter.setBrush(QBrush(handle_color))
-        painter.setPen(QPen(QColor("#1e1e2e"), 2))  # base color border
+        painter.setPen(QPen(QColor(os.environ.get('QTMATERIAL_SECONDARYDARKCOLOR', '#232629')), 2))
 
         # Start handle
         painter.drawEllipse(self._get_handle_rect(self._start_value))
@@ -207,10 +209,6 @@ class TimeRangeSlider(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-
-        self._label = QLabel("Time Range:")
-        self._label.setMinimumWidth(90)
-        layout.addWidget(self._label)
 
         self._slider = RangeSlider()
         self._slider.range_changed.connect(self._on_range_changed)
@@ -298,10 +296,10 @@ class TimeRangeSlider(QWidget):
         start, end = self._slider.get_values()
         self._time_label.setText(f"{format_time(start)} - {format_time(end)}")
 
-        # Set tooltip on label with video reference info
+        # Set tooltip on widget itself with video reference info
         if self._reference_video:
-            self._label.setToolTip(
+            self.setToolTip(
                 f"{self._reference_video} (duration: {format_time(self._duration)})"
             )
         else:
-            self._label.setToolTip(f"Duration: {format_time(self._duration)}")
+            self.setToolTip(f"Duration: {format_time(self._duration)}")

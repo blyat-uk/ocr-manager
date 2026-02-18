@@ -5,7 +5,6 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QWidget, QToolButton,
 from PyQt6.QtCore import Qt
 
 from core.log_store import LogStore
-from theme import MOCHA
 
 
 class LogEntry(QWidget):
@@ -24,22 +23,6 @@ class LogEntry(QWidget):
         self.header.setText(title)
         self.header.setCheckable(True)
         self.header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.header.setStyleSheet(f"""
-            QToolButton {{
-                background-color: {MOCHA.surface0};
-                border: none;
-                padding: 6px 10px;
-                text-align: left;
-                color: {MOCHA.text};
-                font-weight: bold;
-            }}
-            QToolButton:hover {{
-                background-color: {MOCHA.surface1};
-            }}
-            QToolButton:checked {{
-                border-left: 3px solid {MOCHA.blue};
-            }}
-        """)
         self.header.toggled.connect(self._on_toggled)
         layout.addWidget(self.header)
 
@@ -49,16 +32,7 @@ class LogEntry(QWidget):
         self.body.setVisible(False)
         self.body.setMinimumHeight(120)
         self.body.setMaximumHeight(300)
-        self.body.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: {MOCHA.crust};
-                color: {MOCHA.text};
-                border: none;
-                font-family: monospace;
-                font-size: 12px;
-                padding: 6px;
-            }}
-        """)
+        self.body.setStyleSheet("font-family: monospace; font-size: 12px;")
         layout.addWidget(self.body)
 
     def _on_toggled(self, checked: bool):

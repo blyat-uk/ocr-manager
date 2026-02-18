@@ -1,5 +1,6 @@
 """File table widget with resolution, config status, and progress columns."""
 
+import os
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -20,14 +21,16 @@ class FileTableWidget(QWidget):
     config_action_requested = pyqtSignal(str, str)  # action, filename
     file_double_clicked = pyqtSignal(str)  # filename
 
-    # Status colors (Catppuccin Mocha)
-    STATUS_COLORS = {
-        FileStatus.QUEUED: "#6c7086",      # overlay0
-        FileStatus.PROCESSING: "#89b4fa",  # blue
-        FileStatus.COMPLETED: "#a6e3a1",   # green
-        FileStatus.FAILED: "#f38ba8",      # red
-        FileStatus.DONE: "#a6e3a1",        # green (same as completed)
-    }
+    # Status colors (from qt-material theme)
+    @staticmethod
+    def _status_colors():
+        return {
+            FileStatus.QUEUED: os.environ.get('QTMATERIAL_SECONDARYLIGHTCOLOR', '#4f5b62'),
+            FileStatus.PROCESSING: os.environ.get('QTMATERIAL_PRIMARYCOLOR', '#ffd740'),
+            FileStatus.COMPLETED: '#a6e3a1',   # success green
+            FileStatus.FAILED: '#f38ba8',       # danger red
+            FileStatus.DONE: '#a6e3a1',         # success green
+        }
 
     STATUS_TEXT = {
         FileStatus.QUEUED: "Queued",
@@ -40,7 +43,7 @@ class FileTableWidget(QWidget):
     # Config indicator colors
     CONFIG_DEFAULT = "#6c7086"      # overlay0 - gray dot (no custom config)
 
-    # Color palette for distinct config groups (Catppuccin Mocha)
+    # Color palette for distinct config groups
     CONFIG_COLORS = [
         "#89b4fa",  # blue
         "#a6e3a1",  # green
@@ -115,7 +118,6 @@ class FileTableWidget(QWidget):
         # Bottom bar with unselect button
         bottom_layout = QHBoxLayout()
         self.unselect_btn = QPushButton("Unselect all")
-        self.unselect_btn.setObjectName("secondary")
         self.unselect_btn.setVisible(False)
         self.unselect_btn.clicked.connect(self.clear_selection)
         bottom_layout.addWidget(self.unselect_btn)
@@ -149,10 +151,10 @@ class FileTableWidget(QWidget):
             res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, self.COL_RESOLUTION, res_item)
 
-            # Config indicator column
-            config_item = QTableWidgetItem("")
-            config_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, self.COL_CONFIG, config_item)
+            # Config indicator column (uses QLabel widget to bypass stylesheet color override)
+            config_label = QLabel("")
+            config_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setCellWidget(row, self.COL_CONFIG, config_label)
             self._update_config_indicator(filename)
 
             # Progress bar
@@ -166,7 +168,7 @@ class FileTableWidget(QWidget):
             # Status column
             status_item = QTableWidgetItem(self.STATUS_TEXT[status])
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            status_item.setForeground(QColor(self.STATUS_COLORS[status]))
+            status_item.setForeground(QColor(self._status_colors()[status]))
             self.table.setItem(row, self.COL_STATUS, status_item)
 
     def update_resolution(self, filename: str, label: str):
@@ -193,8 +195,8 @@ class FileTableWidget(QWidget):
             return
 
         row = self._file_rows[filename]
-        config_item = self.table.item(row, self.COL_CONFIG)
-        if not config_item:
+        config_label = self.table.cellWidget(row, self.COL_CONFIG)
+        if not isinstance(config_label, QLabel):
             return
 
         # Get file config and signature
@@ -203,13 +205,13 @@ class FileTableWidget(QWidget):
         if config and config.has_any_custom():
             signature = config.config_signature()
             color = self._signature_colors.get(signature, self.CONFIG_COLORS[0])
-            config_item.setText("\u25cf")  # Filled circle
-            config_item.setForeground(QColor(color))
-            config_item.setToolTip(self._format_config_tooltip(config))
+            config_label.setText("\u25cf")  # Filled circle
+            config_label.setStyleSheet(f"color: {color}; background: transparent;")
+            config_label.setToolTip(self._format_config_tooltip(config))
         else:
-            config_item.setText("\u25cb")  # Empty circle
-            config_item.setForeground(QColor(self.CONFIG_DEFAULT))
-            config_item.setToolTip("Using defaults")
+            config_label.setText("\u25cb")  # Empty circle
+            config_label.setStyleSheet(f"color: {self.CONFIG_DEFAULT}; background: transparent;")
+            config_label.setToolTip("Using defaults")
 
     def _format_config_tooltip(self, config: FileConfig) -> str:
         """Format tooltip showing custom config details."""
@@ -237,7 +239,7 @@ class FileTableWidget(QWidget):
         status_item = self.table.item(row, self.COL_STATUS)
         if status_item:
             status_item.setText(self.STATUS_TEXT[status])
-            color = self.STATUS_COLORS[status]
+            color = self._status_colors()[status]
             status_item.setForeground(QColor(color))
 
     def update_status_text(self, filename: str, text: str):
@@ -252,7 +254,7 @@ class FileTableWidget(QWidget):
         status_item = self.table.item(row, self.COL_STATUS)
         if status_item:
             status_item.setText(text)
-            status_item.setForeground(QColor(self.STATUS_COLORS[FileStatus.PROCESSING]))
+            status_item.setForeground(QColor(self._status_colors()[FileStatus.PROCESSING]))
 
     def update_progress(self, filename: str, percent: int):
         """Update progress bar for a file."""

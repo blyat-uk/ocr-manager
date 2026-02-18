@@ -1,5 +1,7 @@
 """Progress table widget with embedded progress bars for OCR status."""
 
+import os
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QProgressBar, QHeaderView, QLabel
@@ -13,14 +15,16 @@ from core.ocr_worker import FileStatus
 class ProgressTableWidget(QWidget):
     """Table widget showing OCR progress for multiple files."""
 
-    # Status colors (Catppuccin Mocha)
-    STATUS_COLORS = {
-        FileStatus.QUEUED: "#6c7086",      # overlay0
-        FileStatus.PROCESSING: "#89b4fa",  # blue
-        FileStatus.COMPLETED: "#a6e3a1",   # green
-        FileStatus.FAILED: "#f38ba8",      # red
-        FileStatus.DONE: "#a6e3a1",        # green (same as completed)
-    }
+    # Status colors (from qt-material theme)
+    @staticmethod
+    def _status_colors():
+        return {
+            FileStatus.QUEUED: os.environ.get('QTMATERIAL_SECONDARYLIGHTCOLOR', '#4f5b62'),
+            FileStatus.PROCESSING: os.environ.get('QTMATERIAL_PRIMARYCOLOR', '#ffd740'),
+            FileStatus.COMPLETED: '#a6e3a1',   # success green
+            FileStatus.FAILED: '#f38ba8',       # danger red
+            FileStatus.DONE: '#a6e3a1',         # success green
+        }
 
     STATUS_TEXT = {
         FileStatus.QUEUED: "Queued",
@@ -95,7 +99,7 @@ class ProgressTableWidget(QWidget):
             # Status column
             status_item = QTableWidgetItem(self.STATUS_TEXT[status])
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            status_item.setForeground(QColor(self.STATUS_COLORS[status]))
+            status_item.setForeground(QColor(self._status_colors()[status]))
             self.table.setItem(row, 2, status_item)
 
     def update_status(self, filename: str, status: FileStatus):
@@ -109,7 +113,7 @@ class ProgressTableWidget(QWidget):
             status_item.setText(self.STATUS_TEXT[status])
 
             # Apply status color
-            color = self.STATUS_COLORS[status]
+            color = self._status_colors()[status]
             status_item.setForeground(QColor(color))
 
     def update_progress(self, filename: str, percent: int):

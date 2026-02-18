@@ -45,11 +45,9 @@ class SubtitlePreviewDialog(QDialog):
         # Header row
         header_layout = QHBoxLayout()
         self._file_label = QLabel("No file selected")
-        self._file_label.setObjectName("muted")
         header_layout.addWidget(self._file_label, 1)
 
         self._count_label = QLabel("")
-        self._count_label.setObjectName("muted")
         header_layout.addWidget(self._count_label)
 
         layout.addLayout(header_layout)
@@ -78,9 +76,6 @@ class SubtitlePreviewDialog(QDialog):
         """Switch display to the given file, rebuilding table from stored data."""
         self._current_file = filename
         self._file_label.setText(filename)
-        self._file_label.setObjectName("")
-        self._file_label.style().unpolish(self._file_label)
-        self._file_label.style().polish(self._file_label)
 
         entries = self._data.get(filename, [])
         self._rebuild_table(entries)
@@ -131,7 +126,4 @@ class SubtitlePreviewDialog(QDialog):
         self._current_file = None
         self._table.setRowCount(0)
         self._file_label.setText("No file selected")
-        self._file_label.setObjectName("muted")
-        self._file_label.style().unpolish(self._file_label)
-        self._file_label.style().polish(self._file_label)
         self._count_label.setText("")
