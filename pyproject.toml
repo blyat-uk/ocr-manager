@@ -7,6 +7,7 @@ dependencies = [
     "PyQt6>=6.5.0",
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
+    "scipy>=1.14.0",
     # videocr dependencies (now embedded)
     # Note: paddlepaddle-gpu is installed separately via Paddle's index
     "paddleocr==3.3.2",
