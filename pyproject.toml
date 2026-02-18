@@ -1,12 +1,22 @@
 [project]
 name = "ocr-manager"
-version = "1.0.0"
+version = "2.0.0"
 description = "Video OCR crop and brightness configuration tool"
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.13"
 dependencies = [
     "PyQt6>=6.5.0",
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
+    # videocr dependencies (now embedded)
+    # Note: paddlepaddle-gpu is installed separately via Paddle's index
+    "paddleocr==3.3.2",
+    "paddlex==3.3.10",
+    "thefuzz==0.22.1",
+    "python-Levenshtein==0.27.3",
+    "PyYAML==6.0.2",
+    "packaging==25.0",
+    "av==16.1.0",
+    "setuptools>=61.0",
 ]
 
 [project.optional-dependencies]
@@ -22,4 +32,4 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "widgets*"]
+include = ["core*", "widgets*", "videocr*"]

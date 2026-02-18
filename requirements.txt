@@ -3,6 +3,18 @@ PyQt6>=6.5.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 
+# videocr dependencies (now embedded)
+# Note: paddlepaddle-gpu must be installed separately via Paddle's index:
+#   pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+paddleocr==3.3.2
+paddlex==3.3.10
+thefuzz==0.22.1
+python-Levenshtein==0.27.3
+PyYAML==6.0.2
+packaging==25.0
+av==16.1.0
+setuptools>=61.0
+
 # Build dependencies (optional - only needed to create executables)
 # pyinstaller>=6.0.0
 
@@ -11,5 +23,4 @@ numpy>=1.24.0
 # - ffprobe (must be in PATH, usually comes with ffmpeg)
 #
 # CLI Tools for full OCR pipeline (optional):
-# - ocrp, ass-credits, ass-header, ass-qafix, sub-visualize
-# - subs-translator, submerge, srt-to-ass
+# - ass-qafix
