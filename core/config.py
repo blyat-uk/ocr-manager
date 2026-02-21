@@ -24,6 +24,7 @@ class FileConfig:
     resolution_width: int = 0
     resolution_height: int = 0
     duration_seconds: float = 0.0
+    subtitle_position: Optional[int] = None  # 0-10000 slider position where subtitle was detected
 
     def has_custom_crop(self) -> bool:
         """Check if file has custom crop settings."""
@@ -238,7 +239,11 @@ class ProjectConfigManager:
         file_configs = {}
         for filename in file_store.get_all_filenames():
             config = file_store.get(filename)
-            if config and config.has_any_custom():
+            if not config:
+                continue
+            has_custom = config.has_any_custom()
+            has_metadata = config.resolution_height > 0 or config.duration_seconds > 0
+            if has_custom or has_metadata:
                 file_data = {}
                 if config.has_custom_crop():
                     file_data['crop'] = {
@@ -253,6 +258,15 @@ class ProjectConfigManager:
                     file_data['time_start'] = config.time_start
                 if config.time_end:
                     file_data['time_end'] = config.time_end
+                if config.resolution_width > 0 and config.resolution_height > 0:
+                    file_data['resolution'] = {
+                        'width': config.resolution_width,
+                        'height': config.resolution_height,
+                    }
+                if config.duration_seconds > 0:
+                    file_data['duration'] = config.duration_seconds
+                if config.subtitle_position is not None:
+                    file_data['subtitle_position'] = config.subtitle_position
                 if file_data:
                     file_configs[filename] = file_data
 

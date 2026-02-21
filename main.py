@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QCheckBox, QSpinBox, QLabel, QMessageBox, QGroupBox,
                               QSlider, QSizePolicy, QFileDialog, QProgressBar,
                               QProgressDialog)
-from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer, QSize
+from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer, QSize, QSettings
 from PyQt6.QtGui import QKeySequence, QShortcut
 import qtawesome as qta
 
@@ -17,6 +17,7 @@ from core.config import Config, validate_config, FileConfig, FileConfigStore, Pr
 from core.config_saver import AsyncConfigSaver
 from core.log_store import LogStore
 from core.pipeline import Pipeline, get_video_files, detect_file_statuses
+from core.ocr_worker import FileStatus
 from core.video_utils import VideoMetadataScanner
 from theme import apply_theme
 from widgets.crop_selector import CropSelectorDialog
@@ -24,9 +25,11 @@ from widgets.brightness_tester import BrightnessTesterDialog
 from widgets.time_range_slider import TimeRangeSlider
 from widgets.file_table import FileTableWidget
 from widgets.settings_dialog import SettingsDialog
+from widgets.file_details_dialog import FileDetailsDialog, FileDetailsData
 from widgets.logs_dialog import LogsDialog
 from widgets.subtitle_preview_dialog import SubtitlePreviewDialog
 from core.audio_analysis import AudioAnalysisWorker
+from core.subtitle_detector import SubtitleDetectionWorker
 
 
 class MainWindow(QMainWindow):
@@ -74,6 +77,14 @@ class MainWindow(QMainWindow):
             'min_segment_length': '30',
         }
 
+        # Automation settings (auto-crop parameters)
+        self.automation_settings = {
+            'crop_width_fraction': '0.70',
+            'crop_vertical_padding': '0',
+            'crop_min_height_fraction': '0.05',
+            'bottom_half_cutoff': '0.50',
+        }
+
         # Config persistence
         self._save_timer: QTimer | None = None
         self._pending_time_range: tuple[str, str] | None = None
@@ -102,8 +113,11 @@ class MainWindow(QMainWindow):
         self.logs_btn = None
         self.loading_label = None
         self.auto_time_range_btn = None
+        self.detect_subtitle_btn = None
         self._audio_analysis_worker = None
         self._audio_progress_dialog = None
+        self._subtitle_detection_worker = None
+        self._subtitle_progress_dialog = None
 
         # Log store and dialog
         self.log_store = LogStore(self)
@@ -114,6 +128,7 @@ class MainWindow(QMainWindow):
         self._metadata_scanner: VideoMetadataScanner | None = None
 
         self.init_ui()
+        self._restore_geometry()
         self.check_dependencies()
 
     def update_window_title(self):
@@ -259,7 +274,11 @@ class MainWindow(QMainWindow):
         self.brightness_test_btn.clicked.connect(self.on_brightness_test_clicked)
         crop_grid.addWidget(self.brightness_test_btn, 1, 2)
 
-        crop_grid.setColumnStretch(3, 1)
+        self.detect_subtitle_btn = self._make_icon_btn("mdi.text-search", "Detect subtitle frames")
+        self.detect_subtitle_btn.clicked.connect(self._on_detect_subtitle_clicked)
+        crop_grid.addWidget(self.detect_subtitle_btn, 0, 3)
+
+        crop_grid.setColumnStretch(4, 1)
         layout.addWidget(crop_group)
 
         # Card 2: Time Range
@@ -375,6 +394,9 @@ class MainWindow(QMainWindow):
         if autodetect_settings:
             save_data['autodetect'] = autodetect_settings
 
+        # Automation settings (auto-crop parameters)
+        save_data['automation'] = dict(self.automation_settings)
+
         # Save asynchronously to prevent GUI blocking
         if self._async_saver is None:
             self._async_saver = AsyncConfigSaver(self)
@@ -395,6 +417,11 @@ class MainWindow(QMainWindow):
         autodetect_settings = config_manager.load_section('autodetect')
         if autodetect_settings:
             self.autodetect_settings.update(autodetect_settings)
+
+        # Load automation settings
+        automation_settings = config_manager.load_section('automation')
+        if automation_settings:
+            self.automation_settings.update(automation_settings)
 
         # Apply global settings to UI (block signals to avoid triggering saves)
         if 'brightness' in global_settings:
@@ -453,14 +480,12 @@ class MainWindow(QMainWindow):
         self._update_settings_summary()
 
     def _apply_pending_file_configs(self):
-        """Apply pending per-file configurations after files are scanned."""
+        """Apply pending per-file configurations (custom settings and cached metadata)."""
         if not self._pending_file_configs:
             return
 
         for filename, cfg in self._pending_file_configs.items():
-            config = self.file_config_store.get(filename)
-            if not config:
-                continue  # File no longer exists
+            config = self.file_config_store.get_or_create(filename)
 
             if 'crop' in cfg:
                 crop = cfg['crop']
@@ -474,6 +499,18 @@ class MainWindow(QMainWindow):
 
             if 'time_end' in cfg:
                 config.time_end = cfg['time_end']
+
+            if 'resolution' in cfg:
+                res = cfg['resolution']
+                config.resolution_width = res.get('width', 0)
+                config.resolution_height = res.get('height', 0)
+                self.file_table.update_resolution(filename, config.get_resolution_label())
+
+            if 'duration' in cfg:
+                config.duration_seconds = cfg['duration']
+
+            if 'subtitle_position' in cfg:
+                config.subtitle_position = cfg['subtitle_position']
 
             # Update table indicator
             self.file_table.update_config_indicator(filename)
@@ -501,23 +538,35 @@ class MainWindow(QMainWindow):
         self.file_table.selection_changed.connect(self.on_file_selection_changed)
         self.file_table.config_action_requested.connect(self.on_config_action_requested)
         self.file_table.file_double_clicked.connect(self._on_file_double_clicked)
+        self.file_table.file_details_requested.connect(self._on_file_details_requested)
         layout.addWidget(self.file_table)
 
         return widget
 
     def on_folder_select_clicked(self):
-        """Open folder browser dialog."""
+        """Open folder browser dialog using native system picker."""
         start_dir = self.project_path or "/mnt/FAST/work/"
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Project Directory",
-            start_dir
-        )
+        if shutil.which("kdialog"):
+            result = subprocess.run(
+                ["kdialog", "--getexistingdirectory", start_dir],
+                capture_output=True, text=True,
+            )
+            folder = result.stdout.strip() if result.returncode == 0 else ""
+        else:
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select Project Directory", start_dir,
+            )
         if folder:
             self.set_project_directory(folder)
 
     def set_project_directory(self, directory: str):
         """Set project directory and initialize time range slider."""
+        # Stop subtitle detection if running
+        if self._subtitle_detection_worker:
+            self._subtitle_detection_worker.cancel()
+            self._subtitle_detection_worker.cleanup()
+            self._subtitle_detection_worker = None
+
         self.project_path = directory
         self.folder_path_label.setText(directory)
         self.update_window_title()
@@ -571,9 +620,21 @@ class MainWindow(QMainWindow):
                 statuses = detect_file_statuses(project_path)
                 self.file_table.set_files([f.name for f in video_files], statuses)
 
-                # Show loading indicator and start background scan
-                self.loading_label.setVisible(True)
-                self._start_metadata_scan(video_files)
+                # Apply pending configs early so cached metadata is available
+                self._apply_pending_file_configs()
+
+                # Only scan files that don't already have cached resolution
+                files_to_scan = [
+                    f for f in video_files
+                    if not self._has_cached_metadata(f.name)
+                ]
+
+                if files_to_scan:
+                    self.loading_label.setVisible(True)
+                    self._start_metadata_scan(files_to_scan)
+                else:
+                    # All files have cached metadata, finalize immediately
+                    self._finalize_metadata()
             else:
                 self.file_table.clear()
                 self.file_config_store.clear()
@@ -581,6 +642,11 @@ class MainWindow(QMainWindow):
         else:
             # Files unchanged, but still need to apply pending configs
             self._apply_pending_file_configs()
+
+    def _has_cached_metadata(self, filename: str) -> bool:
+        """Check if a file already has cached resolution metadata."""
+        config = self.file_config_store.get(filename)
+        return config is not None and config.resolution_height > 0 and config.duration_seconds > 0
 
     def _start_metadata_scan(self, video_files: list[Path]):
         """Start background scan of video metadata."""
@@ -598,25 +664,38 @@ class MainWindow(QMainWindow):
         self.file_table.update_resolution(filename, config.get_resolution_label())
 
     def _on_metadata_scan_complete(self, longest_filename: str, longest_duration: int):
-        """Handle completion of metadata scan."""
+        """Handle completion of metadata scan (for newly scanned files)."""
         self.loading_label.setVisible(False)
         self._metadata_scanner = None
+        self._finalize_metadata()
 
-        # Update time range slider with longest video
+    def _get_longest_duration(self, filenames: list[str] | None = None) -> tuple[int, str]:
+        """Get the longest duration among specified files (or all files if None)."""
+        source = filenames if filenames else self.file_config_store.get_all_filenames()
+        longest_duration = 0
+        longest_filename = ""
+        for filename in source:
+            config = self.file_config_store.get(filename)
+            if config and config.duration_seconds > longest_duration:
+                longest_duration = int(config.duration_seconds)
+                longest_filename = filename
+        return longest_duration, longest_filename
+
+    def _finalize_metadata(self):
+        """Set time range slider from longest video across all files (cached + scanned)."""
+        longest_duration, longest_filename = self._get_longest_duration()
+
         if longest_filename and longest_duration > 0:
             self.time_range_slider.set_duration(longest_duration, longest_filename)
 
-            # Apply pending time range after duration is set
             if self._pending_time_range:
                 start_str, end_str = self._pending_time_range
                 self._pending_time_range = None
-                # Block signals to avoid triggering save
                 self.time_range_slider.blockSignals(True)
                 self.time_range_slider.set_time_range(start_str, end_str)
                 self.time_range_slider.blockSignals(False)
 
-        # Apply pending per-file configs after files are scanned
-        self._apply_pending_file_configs()
+        self._schedule_save()
 
     def on_folder_changed(self, path: str):
         """Handle folder content changes."""
@@ -627,6 +706,11 @@ class MainWindow(QMainWindow):
     def on_file_selection_changed(self, filenames: list[str]):
         """Handle file selection change - update inputs to reflect selected files' config."""
         self._update_start_button_label()
+
+        # Update slider duration: selected files or all files
+        duration, ref_name = self._get_longest_duration(filenames if filenames else None)
+        if ref_name and duration > 0:
+            self.time_range_slider.set_duration(duration, ref_name)
 
         if not filenames:
             # No selection - keep current values as global defaults
@@ -691,12 +775,23 @@ class MainWindow(QMainWindow):
             self.file_table.update_config_indicator(filename)
         self._schedule_save()
 
-    def _apply_time_range_to_files(self, start_str: str, end_str: str, filenames: list[str]):
-        """Apply time range setting to specified files."""
+    def _apply_time_range_to_files(self, start_str: str, end_str: str, filenames: list[str],
+                                    update_start: bool = True, update_end: bool = True):
+        """Apply time range setting to specified files.
+
+        Args:
+            start_str: Time start as MM:SS string (empty = beginning).
+            end_str: Time end as MM:SS string (empty = full duration).
+            filenames: Files to apply to.
+            update_start: Whether to update the start value.
+            update_end: Whether to update the end value.
+        """
         for filename in filenames:
             config = self.file_config_store.get_or_create(filename)
-            config.time_start = start_str if start_str else None
-            config.time_end = end_str if end_str else None
+            if update_start:
+                config.time_start = start_str if start_str else None
+            if update_end:
+                config.time_end = end_str if end_str else None
             self.file_table.update_config_indicator(filename)
         self._schedule_save()
 
@@ -705,11 +800,15 @@ class MainWindow(QMainWindow):
         target_files = self._get_target_files()
         self._apply_brightness_to_files(value, target_files)
 
-    def _on_time_range_changed(self, start: int, end: int):
-        """Handle time range slider change - apply to selected files or all if none selected."""
+    def _on_time_range_changed(self, start: int, end: int, handle: str):
+        """Handle time range slider change - only update the value that was dragged."""
         start_str, end_str = self.time_range_slider.get_time_strings()
         target_files = self._get_target_files()
-        self._apply_time_range_to_files(start_str, end_str, target_files)
+        self._apply_time_range_to_files(
+            start_str, end_str, target_files,
+            update_start=(handle == 'start'),
+            update_end=(handle == 'end'),
+        )
 
     def _on_auto_time_range_clicked(self):
         """Run audio fingerprint analysis to auto-detect intros/outros."""
@@ -733,6 +832,8 @@ class MainWindow(QMainWindow):
         self._audio_progress_dialog.setWindowTitle("Audio Analysis")
         self._audio_progress_dialog.setMinimumWidth(400)
         self._audio_progress_dialog.setModal(True)
+        self._audio_progress_dialog.setAutoClose(False)
+        self._audio_progress_dialog.setAutoReset(False)
         self._audio_progress_dialog.canceled.connect(self._on_audio_analysis_cancelled)
 
         # Create and start worker
@@ -753,6 +854,8 @@ class MainWindow(QMainWindow):
         """Update progress dialog label for phase change."""
         if self._audio_progress_dialog:
             self._audio_progress_dialog.setLabelText(phase)
+            if phase != "Fingerprinting":
+                self._audio_progress_dialog.setMaximum(0)  # Indeterminate spinner
 
     def _on_audio_file_progress(self, filename: str, current: int, total: int):
         """Update progress dialog for file processing."""
@@ -805,20 +908,6 @@ class MainWindow(QMainWindow):
 
         self._schedule_save()
 
-        # Show summary
-        parts = []
-        for filename, (time_start, time_end) in results.items():
-            flags = []
-            if time_start:
-                flags.append(f"start={time_start}")
-            if time_end:
-                flags.append(f"end={time_end}")
-            if flags:
-                parts.append(f"  {filename}: {', '.join(flags)}")
-
-        summary = f"Set time ranges for {applied} file(s):\n\n" + "\n".join(parts)
-        QMessageBox.information(self, "Audio Analysis Complete", summary)
-
     def _cleanup_audio_analysis(self):
         """Clean up audio analysis worker and dialog."""
         if self._audio_analysis_worker:
@@ -829,6 +918,95 @@ class MainWindow(QMainWindow):
             self._audio_progress_dialog = None
         if self.auto_time_range_btn:
             self.auto_time_range_btn.setEnabled(True)
+
+    def _on_detect_subtitle_clicked(self):
+        """Run subtitle detection to find frames with hardcoded subtitles."""
+        if not self.project_path:
+            QMessageBox.warning(self, "Error", "Please select a project directory first")
+            return
+
+        # Build list of (filename, full_path, duration) for files with known duration
+        video_files = []
+        for filename in self.file_table.get_all_filenames():
+            config = self.file_config_store.get(filename)
+            if config and config.duration_seconds > 0:
+                full_path = str(Path(self.project_path) / filename)
+                video_files.append((filename, full_path, config.duration_seconds))
+
+        if not video_files:
+            QMessageBox.warning(self, "Error", "No video files with known duration. Wait for scanning to finish.")
+            return
+
+        # Create progress dialog
+        self._subtitle_progress_dialog = QProgressDialog(
+            "Detecting subtitles...", "Cancel", 0, len(video_files), self
+        )
+        self._subtitle_progress_dialog.setWindowTitle("Subtitle Detection")
+        self._subtitle_progress_dialog.setMinimumWidth(400)
+        self._subtitle_progress_dialog.setModal(True)
+        self._subtitle_progress_dialog.setAutoClose(False)
+        self._subtitle_progress_dialog.setAutoReset(False)
+        self._subtitle_progress_dialog.canceled.connect(self._on_subtitle_detection_cancelled)
+
+        # Create and start worker
+        self._subtitle_detection_worker = SubtitleDetectionWorker(
+            video_files, automation_settings=self.automation_settings
+        )
+        self._subtitle_detection_worker.file_detected.connect(self._on_subtitle_file_detected)
+        self._subtitle_detection_worker.progress.connect(self._on_subtitle_detection_progress)
+        self._subtitle_detection_worker.error.connect(self._on_subtitle_detection_error)
+        self._subtitle_detection_worker.finished.connect(self._on_subtitle_detection_finished)
+
+        self.detect_subtitle_btn.setEnabled(False)
+        self._subtitle_detection_worker.start()
+
+    def _on_subtitle_file_detected(self, filename: str, slider_position: int,
+                                    crop_x: int, crop_y: int, crop_w: int, crop_h: int):
+        """Store detected subtitle position and auto-crop for a file."""
+        config = self.file_config_store.get_or_create(filename)
+        config.subtitle_position = slider_position
+        if crop_w > 0 and crop_h > 0:
+            config.set_crop(crop_x, crop_y, crop_w, crop_h)
+            self.file_table.update_config_indicator(filename)
+
+    def _on_subtitle_detection_progress(self, resolved: int, total: int):
+        """Update progress dialog."""
+        if not self._subtitle_progress_dialog:
+            return
+        self._subtitle_progress_dialog.setLabelText(
+            f"Detecting subtitles... ({resolved}/{total} files)"
+        )
+        self._subtitle_progress_dialog.setMaximum(total)
+        # setValue can trigger canceled signal (auto-close when value == max),
+        # which runs cleanup and sets dialog to None, so call it last
+        self._subtitle_progress_dialog.setValue(resolved)
+
+    def _on_subtitle_detection_error(self, msg: str):
+        """Handle subtitle detection error."""
+        self._cleanup_subtitle_detection()
+        QMessageBox.critical(self, "Subtitle Detection Error", msg)
+
+    def _on_subtitle_detection_cancelled(self):
+        """Handle user cancellation."""
+        if self._subtitle_detection_worker:
+            self._subtitle_detection_worker.cancel()
+        self._cleanup_subtitle_detection()
+
+    def _on_subtitle_detection_finished(self):
+        """Handle subtitle detection completion."""
+        self._schedule_save()
+        self._cleanup_subtitle_detection()
+
+    def _cleanup_subtitle_detection(self):
+        """Clean up subtitle detection worker and dialog."""
+        if self._subtitle_detection_worker:
+            self._subtitle_detection_worker.cleanup()
+            self._subtitle_detection_worker = None
+        if self._subtitle_progress_dialog:
+            self._subtitle_progress_dialog.close()
+            self._subtitle_progress_dialog = None
+        if self.detect_subtitle_btn:
+            self.detect_subtitle_btn.setEnabled(True)
 
     def on_config_action_requested(self, action: str, filename: str):
         """Handle config action from file table context menu (copy/paste)."""
@@ -885,10 +1063,16 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
+        # Build subtitle positions dict and resolve initial timeline position
+        subtitle_positions = self._get_subtitle_positions()
+        timeline_position = self._resolve_timeline_position(video_files)
+
         dialog = CropSelectorDialog(
-            [str(f) for f in video_files], existing_crop, self.last_timeline_position,
+            [str(f) for f in video_files], existing_crop, timeline_position,
             labels_enabled=self.labels_checkbox.isChecked(),
             existing_masks=self.label_mask_crops if self.label_mask_crops else None,
+            subtitle_positions=subtitle_positions,
+            durations=self._get_durations_dict(),
             parent=self
         )
         dialog.crop_selected.connect(self.on_crop_selected)
@@ -934,12 +1118,18 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
+        # Build subtitle positions dict and resolve initial timeline position
+        subtitle_positions = self._get_subtitle_positions()
+        timeline_position = self._resolve_timeline_position(video_files)
+
         dialog = BrightnessTesterDialog(
             [str(f) for f in video_files],
             self.last_selected_episode,
-            self.last_timeline_position,
+            timeline_position,
             self.brightness_spin.value(),
             crop_region,
+            subtitle_positions=subtitle_positions,
+            durations=self._get_durations_dict(),
             parent=self
         )
         dialog.brightness_selected.connect(self.on_brightness_selected)
@@ -952,20 +1142,49 @@ class MainWindow(QMainWindow):
         target_files = self._get_target_files()
         self._apply_brightness_to_files(brightness, target_files)
 
+    def _get_durations_dict(self) -> dict[str, float]:
+        """Build dict of filename -> duration_seconds for all files with known durations."""
+        durations = {}
+        for filename in self.file_config_store.get_all_filenames():
+            config = self.file_config_store.get(filename)
+            if config and config.duration_seconds > 0:
+                durations[filename] = config.duration_seconds
+        return durations
+
+    def _get_subtitle_positions(self) -> dict[str, int]:
+        """Build dict of filename -> subtitle_position for all files with detected positions."""
+        positions = {}
+        for filename in self.file_config_store.get_all_filenames():
+            config = self.file_config_store.get(filename)
+            if config and config.subtitle_position is not None:
+                positions[filename] = config.subtitle_position
+        return positions
+
+    def _resolve_timeline_position(self, video_files: list[Path]) -> int:
+        """Resolve timeline position: use first file's detected subtitle position, else fallback."""
+        if video_files:
+            first_name = video_files[0].name
+            config = self.file_config_store.get(first_name)
+            if config and config.subtitle_position is not None:
+                return config.subtitle_position
+        return self.last_timeline_position
+
     def _open_settings(self):
         """Open the unified settings dialog."""
         dialog = SettingsDialog(
             self.videocr_settings, self.label_settings,
-            self.autodetect_settings, self
+            self.autodetect_settings, self.automation_settings,
+            self
         )
         dialog.settings_changed.connect(self._on_settings_changed)
         dialog.exec()
 
-    def _on_settings_changed(self, ocr: dict, label: dict, autodetect: dict):
+    def _on_settings_changed(self, ocr: dict, label: dict, autodetect: dict, automation: dict):
         """Handle unified settings changes."""
         self.videocr_settings.update(ocr)
         self.label_settings.update(label)
         self.autodetect_settings.update(autodetect)
+        self.automation_settings.update(automation)
         self._update_settings_summary()
         self._schedule_save()
 
@@ -1080,8 +1299,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Configuration Error", error_msg)
             return
 
-        # Create and start pipeline with file config store
+        # Check for Done files that would be overwritten
         selected_files = self.file_table.get_selected_filenames()
+        project_path = Path(self.project_path)
+        file_statuses = detect_file_statuses(project_path)
+        targets = selected_files if selected_files else list(file_statuses.keys())
+        done_files = [f for f in targets if file_statuses.get(f) == FileStatus.DONE]
+
+        if done_files:
+            answer = QMessageBox.question(
+                self, "Overwrite Existing Files",
+                f"{len(done_files)} file(s) already have subtitle files that will be overwritten. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            chi_dir = project_path / "chi"
+            for fname in done_files:
+                ass_file = chi_dir / (Path(fname).stem + ".ass")
+                if ass_file.exists():
+                    ass_file.unlink()
+
+        # Create and start pipeline with file config store
         self.pipeline = Pipeline(config, self.file_config_store,
                                  selected_files=selected_files or None)
         self.pipeline.error_occurred.connect(self.on_pipeline_error)
@@ -1186,8 +1426,8 @@ class MainWindow(QMainWindow):
         self.log_store.append(filename, text)
 
     def _on_pipeline_log_output(self, text: str):
-        """Accumulate Phase 3 (QA) output in the log store."""
-        self.log_store.append(LogStore.QA_KEY, text)
+        """Accumulate pipeline status output in the log store."""
+        self.log_store.append("Pipeline", text)
 
     def _on_logs_clicked(self):
         """Open or raise the logs dialog."""
@@ -1205,6 +1445,72 @@ class MainWindow(QMainWindow):
         self._subtitle_preview.show()
         self._subtitle_preview.raise_()
         self._subtitle_preview.activateWindow()
+
+    def _on_file_details_requested(self, filename: str):
+        """Open read-only details dialog showing resolved settings for a file."""
+        fc = self.file_config_store.get(filename)
+
+        # Resolve per-file values mirroring OCRWorker._build_ocr_kwargs() logic
+        brightness_override = fc is not None and fc.has_custom_brightness()
+        brightness = fc.brightness if brightness_override else self.brightness_spin.value()
+
+        crop_override = fc is not None and fc.has_custom_crop()
+        if crop_override:
+            crop = fc.get_crop_tuple()
+        else:
+            crop_text = self.crop_input.text()
+            crop = None
+            if crop_text:
+                try:
+                    parts = [int(x.strip()) for x in crop_text.split(',')]
+                    if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+                        crop = tuple(parts)
+                except ValueError:
+                    pass
+
+        time_start_override = fc is not None and fc.time_start is not None
+        time_end_override = fc is not None and fc.time_end is not None
+        global_start, global_end = self.time_range_slider.get_time_strings()
+        time_start = fc.time_start if time_start_override else global_start
+        time_end = fc.time_end if time_end_override else global_end
+
+        # Resolution/duration from file config metadata
+        res_w = fc.resolution_width if fc else 0
+        res_h = fc.resolution_height if fc else 0
+        duration = fc.duration_seconds if fc else 0.0
+
+        data = FileDetailsData(
+            filename=filename,
+            resolution_width=res_w,
+            resolution_height=res_h,
+            duration_seconds=duration,
+            brightness=brightness,
+            brightness_is_override=brightness_override,
+            crop=crop,
+            crop_is_override=crop_override,
+            time_start=time_start,
+            time_start_is_override=time_start_override,
+            time_end=time_end,
+            time_end_is_override=time_end_override,
+            ocr_lang=self.videocr_settings.get('ocr_lang', 'ch'),
+            conf_threshold=int(self.videocr_settings.get('conf_threshold', '95')),
+            sim_threshold=int(self.videocr_settings.get('sim_threshold', '82')),
+            similar_image=float(self.videocr_settings.get('similar_image', '0.3')),
+            frames_to_skip=0,
+            use_gpu=True,
+            ocr_parallel=self.parallel_slider.value(),
+            dialogue_enabled=self.dialogue_checkbox.isChecked(),
+            labels_enabled=self.labels_checkbox.isChecked(),
+            labels_only=self._is_labels_only(),
+            label_min_duration=float(self.label_settings.get('label_min_duration', '0.5')),
+            label_max_duration=float(self.label_settings.get('label_max_duration', '5.0')),
+            label_conf_threshold=int(self.label_settings.get('label_conf_threshold', '95')),
+            label_conf_threshold_min=int(self.label_settings.get('label_conf_threshold_min', '80')),
+            mask_crops_count=len(self.label_mask_crops),
+        )
+
+        dialog = FileDetailsDialog(data, self)
+        dialog.exec()
 
     def _on_subtitle_detected(self, filename: str, start: float, end: float, text: str):
         """Forward subtitle detection to preview dialog."""
@@ -1225,6 +1531,8 @@ class MainWindow(QMainWindow):
         self.settings_btn.setEnabled(False)
         if self.auto_time_range_btn:
             self.auto_time_range_btn.setEnabled(False)
+        if self.detect_subtitle_btn:
+            self.detect_subtitle_btn.setEnabled(False)
         # Note: file_table is not disabled to allow scrolling during processing
 
     def enable_ui(self):
@@ -1239,10 +1547,24 @@ class MainWindow(QMainWindow):
         self.settings_btn.setEnabled(True)
         if self.auto_time_range_btn:
             self.auto_time_range_btn.setEnabled(True)
+        if self.detect_subtitle_btn:
+            self.detect_subtitle_btn.setEnabled(True)
         # Respect labels_only for crop controls
         labels_only = self._is_labels_only()
         self.crop_input.setEnabled(not labels_only)
         self.crop_select_btn.setEnabled(not labels_only)
+
+    def _restore_geometry(self):
+        """Restore window size and position from QSettings."""
+        settings = QSettings("OCRManager", "OCRTool")
+        geometry = settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+    def _save_geometry(self):
+        """Save window size and position to QSettings."""
+        settings = QSettings("OCRManager", "OCRTool")
+        settings.setValue("window/geometry", self.saveGeometry())
 
     def check_dependencies(self):
         """Check if required CLI tools are available."""
@@ -1262,6 +1584,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close."""
+        self._save_geometry()
         if self.is_running:
             reply = QMessageBox.question(
                 self, "Confirm Exit",
@@ -1277,6 +1600,9 @@ class MainWindow(QMainWindow):
                 if self._audio_analysis_worker:
                     self._audio_analysis_worker.cancel()
                     self._audio_analysis_worker.cleanup()
+                if self._subtitle_detection_worker:
+                    self._subtitle_detection_worker.cancel()
+                    self._subtitle_detection_worker.cleanup()
                 if self._async_saver:
                     self._async_saver.stop()
                 event.accept()
@@ -1290,6 +1616,9 @@ class MainWindow(QMainWindow):
             if self._audio_analysis_worker:
                 self._audio_analysis_worker.cancel()
                 self._audio_analysis_worker.cleanup()
+            if self._subtitle_detection_worker:
+                self._subtitle_detection_worker.cancel()
+                self._subtitle_detection_worker.cleanup()
             # Stop async saver thread
             if self._async_saver:
                 self._async_saver.stop()

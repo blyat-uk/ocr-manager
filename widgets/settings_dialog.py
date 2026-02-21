@@ -8,10 +8,11 @@ from PyQt6.QtCore import pyqtSignal
 class SettingsDialog(QDialog):
     """Unified settings dialog with OCR, Labels, and Autodetect sections."""
 
-    settings_changed = pyqtSignal(dict, dict, dict)  # ocr, label, autodetect
+    settings_changed = pyqtSignal(dict, dict, dict, dict)  # ocr, label, autodetect, automation
 
     def __init__(self, ocr_settings: dict, label_settings: dict,
-                 autodetect_settings: dict, parent=None):
+                 autodetect_settings: dict, automation_settings: dict | None = None,
+                 parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(380)
@@ -19,12 +20,65 @@ class SettingsDialog(QDialog):
         self._ocr = ocr_settings.copy()
         self._label = label_settings.copy()
         self._autodetect = autodetect_settings.copy()
+        self._automation = (automation_settings or {}).copy()
 
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
+
+        # --- Automation group ---
+        auto_group = QGroupBox("Automation")
+        auto_form = QFormLayout(auto_group)
+        auto_form.setSpacing(8)
+
+        self.detection_batch_input = QLineEdit(
+            str(self._automation.get('detection_batch_size', '10'))
+        )
+        self.detection_batch_input.setFixedWidth(60)
+        auto_form.addRow("Detection Batch Size:", self.detection_batch_input)
+
+        def _pct_value(key, default_frac):
+            """Convert stored float string to integer percentage for display."""
+            try:
+                return str(int(round(float(self._automation.get(key, str(default_frac))) * 100)))
+            except (ValueError, TypeError):
+                return str(int(round(default_frac * 100)))
+
+        self.crop_width_input = QLineEdit(_pct_value('crop_width_fraction', 0.70))
+        self.crop_width_input.setFixedWidth(60)
+        cw_row = QHBoxLayout()
+        cw_row.addWidget(self.crop_width_input)
+        cw_row.addWidget(QLabel("%"))
+        cw_row.addStretch()
+        auto_form.addRow("Crop Width:", cw_row)
+
+        self.vert_padding_input = QLineEdit(_pct_value('crop_vertical_padding', 0))
+        self.vert_padding_input.setFixedWidth(60)
+        vp_row = QHBoxLayout()
+        vp_row.addWidget(self.vert_padding_input)
+        vp_row.addWidget(QLabel("%"))
+        vp_row.addStretch()
+        auto_form.addRow("Vertical Padding:", vp_row)
+
+        self.min_crop_height_input = QLineEdit(_pct_value('crop_min_height_fraction', 0.05))
+        self.min_crop_height_input.setFixedWidth(60)
+        mh_row = QHBoxLayout()
+        mh_row.addWidget(self.min_crop_height_input)
+        mh_row.addWidget(QLabel("%"))
+        mh_row.addStretch()
+        auto_form.addRow("Min Crop Height:", mh_row)
+
+        self.bottom_cutoff_input = QLineEdit(_pct_value('bottom_half_cutoff', 0.50))
+        self.bottom_cutoff_input.setFixedWidth(60)
+        bc_row = QHBoxLayout()
+        bc_row.addWidget(self.bottom_cutoff_input)
+        bc_row.addWidget(QLabel("%"))
+        bc_row.addStretch()
+        auto_form.addRow("Bottom Half Cutoff:", bc_row)
+
+        layout.addWidget(auto_group)
 
         # --- OCR group ---
         ocr_group = QGroupBox("OCR")
@@ -116,6 +170,13 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
+    def _pct_to_frac(self, text: str, default: str) -> str:
+        """Convert a percentage string to a 0-1 float string."""
+        try:
+            return str(round(int(text) / 100, 2))
+        except (ValueError, TypeError):
+            return default
+
     def _on_apply(self):
         ocr = {
             'ocr_lang': self.ocr_lang_input.text().strip() or 'ch',
@@ -132,5 +193,12 @@ class SettingsDialog(QDialog):
         autodetect = {
             'min_segment_length': self.min_segment_input.text().strip() or '30',
         }
-        self.settings_changed.emit(ocr, label, autodetect)
+        automation = {
+            'detection_batch_size': self.detection_batch_input.text().strip() or '10',
+            'crop_width_fraction': self._pct_to_frac(self.crop_width_input.text().strip(), '0.70'),
+            'crop_vertical_padding': self._pct_to_frac(self.vert_padding_input.text().strip(), '0'),
+            'crop_min_height_fraction': self._pct_to_frac(self.min_crop_height_input.text().strip(), '0.05'),
+            'bottom_half_cutoff': self._pct_to_frac(self.bottom_cutoff_input.text().strip(), '0.50'),
+        }
+        self.settings_changed.emit(ocr, label, autodetect, automation)
         self.accept()

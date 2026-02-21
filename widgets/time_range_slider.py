@@ -31,7 +31,7 @@ class RangeSlider(QWidget):
     """Custom dual-handle range slider."""
 
     range_changed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires during drag)
-    range_committed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires on mouse release)
+    range_committed = pyqtSignal(int, int, str)  # start_seconds, end_seconds, handle ('start'/'end')
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -173,7 +173,7 @@ class RangeSlider(QWidget):
     def mouseReleaseEvent(self, event):
         """Stop dragging and emit committed value."""
         if self._dragging is not None:
-            self.range_committed.emit(self._start_value, self._end_value)
+            self.range_committed.emit(self._start_value, self._end_value, self._dragging)
         self._dragging = None
 
     def _update_handle(self, x: float):
@@ -195,7 +195,7 @@ class TimeRangeSlider(QWidget):
     """Time range slider with labels and reference video info."""
 
     range_changed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires during drag)
-    range_committed = pyqtSignal(int, int)  # start_seconds, end_seconds (fires on mouse release)
+    range_committed = pyqtSignal(int, int, str)  # start_seconds, end_seconds, handle ('start'/'end')
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -287,9 +287,9 @@ class TimeRangeSlider(QWidget):
         self._update_labels()
         self.range_changed.emit(start, end)
 
-    def _on_range_committed(self, start: int, end: int):
+    def _on_range_committed(self, start: int, end: int, handle: str):
         """Handle slider range commit (on mouse release)."""
-        self.range_committed.emit(start, end)
+        self.range_committed.emit(start, end, handle)
 
     def _update_labels(self):
         """Update time display labels and tooltip."""

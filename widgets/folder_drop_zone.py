@@ -1,5 +1,7 @@
 """Drag-and-drop folder selector widget."""
 
+import shutil
+import subprocess
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -104,15 +106,25 @@ class FolderDropZone(QFrame):
         self._is_drag_over = is_over
 
     def _browse_folder(self):
-        """Open folder browser dialog."""
+        """Open folder browser dialog using native system picker."""
         start_dir = self._folder_path or "/mnt/FAST/work/"
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Project Directory",
-            start_dir
-        )
+        folder = self._native_folder_dialog(start_dir)
         if folder:
             self.set_folder(folder)
+
+    def _native_folder_dialog(self, start_dir: str) -> str:
+        """Open a native folder dialog, falling back to Qt if unavailable."""
+        if shutil.which("kdialog"):
+            result = subprocess.run(
+                ["kdialog", "--getexistingdirectory", start_dir],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return ""
+        return QFileDialog.getExistingDirectory(
+            self, "Select Project Directory", start_dir,
+        )
 
     def _open_folder_in_manager(self):
         """Open folder in system file manager."""

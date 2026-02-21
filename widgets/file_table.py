@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QHeaderView, QLabel, QMenu, QAbstractItemView, QPushButton
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QAction
+from PyQt6.QtGui import QColor, QAction, QKeySequence, QShortcut
 
 from core.config import FileConfig, FileConfigStore
 from core.ocr_worker import FileStatus
@@ -20,6 +20,7 @@ class FileTableWidget(QWidget):
     selection_changed = pyqtSignal(list)  # List of selected filenames
     config_action_requested = pyqtSignal(str, str)  # action, filename
     file_double_clicked = pyqtSignal(str)  # filename
+    file_details_requested = pyqtSignal(str)  # filename
 
     # Status colors (from qt-material theme)
     @staticmethod
@@ -60,9 +61,12 @@ class FileTableWidget(QWidget):
     # Column indices
     COL_FILE = 0
     COL_RESOLUTION = 1
-    COL_CONFIG = 2
-    COL_PROGRESS = 3
-    COL_STATUS = 4
+    COL_TSTART = 2
+    COL_TEND = 3
+    COL_BRI = 4
+    COL_CONFIG = 5
+    COL_PROGRESS = 6
+    COL_STATUS = 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,18 +87,22 @@ class FileTableWidget(QWidget):
 
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["File", "Res", "Config", "Progress", "Status"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels([
+            "File", "Res", "TStart", "TEnd", "Bri", "Cfg", "Progress", "Status",
+        ])
 
         # Column sizing
         header_view = self.table.horizontalHeader()
         header_view.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(self.COL_RESOLUTION, QHeaderView.ResizeMode.Fixed)
-        header_view.setSectionResizeMode(self.COL_CONFIG, QHeaderView.ResizeMode.Fixed)
-        header_view.setSectionResizeMode(self.COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
-        header_view.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(self.COL_RESOLUTION, 60)
-        self.table.setColumnWidth(self.COL_CONFIG, 60)
+        for col in (self.COL_RESOLUTION, self.COL_TSTART, self.COL_TEND,
+                     self.COL_BRI, self.COL_CONFIG, self.COL_PROGRESS, self.COL_STATUS):
+            header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_RESOLUTION, 80)
+        self.table.setColumnWidth(self.COL_TSTART, 80)
+        self.table.setColumnWidth(self.COL_TEND, 80)
+        self.table.setColumnWidth(self.COL_BRI, 80)
+        self.table.setColumnWidth(self.COL_CONFIG, 65)
         self.table.setColumnWidth(self.COL_PROGRESS, 150)
         self.table.setColumnWidth(self.COL_STATUS, 180)
 
@@ -112,6 +120,12 @@ class FileTableWidget(QWidget):
         # Context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
+
+        # Keyboard shortcuts for copy/paste settings
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.table)
+        copy_shortcut.activated.connect(self._copy_settings)
+        paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self.table)
+        paste_shortcut.activated.connect(self._paste_settings)
 
         layout.addWidget(self.table)
 
@@ -151,6 +165,13 @@ class FileTableWidget(QWidget):
             res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, self.COL_RESOLUTION, res_item)
 
+            # TStart / TEnd / Bri columns (populated from FileConfig)
+            for col in (self.COL_TSTART, self.COL_TEND, self.COL_BRI):
+                item = QTableWidgetItem("-")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row, col, item)
+            self._update_file_config_columns(filename)
+
             # Config indicator column (uses QLabel widget to bypass stylesheet color override)
             config_label = QLabel("")
             config_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -181,12 +202,46 @@ class FileTableWidget(QWidget):
         if res_item:
             res_item.setText(label)
 
+    def update_file_config_columns(self, filename: str):
+        """Update TStart, TEnd, and Bri columns for a file from its FileConfig."""
+        self._update_file_config_columns(filename)
+
+    def _update_file_config_columns(self, filename: str):
+        """Internal: refresh TStart, TEnd, Bri cells from the file config store."""
+        if filename not in self._file_rows:
+            return
+        row = self._file_rows[filename]
+        config = self._file_store.get(filename) if self._file_store else None
+
+        tstart = self._format_time(config.time_start) if config and config.time_start else "-"
+        tend = self._format_time(config.time_end) if config and config.time_end else "-"
+        bri = str(config.brightness) if config and config.brightness is not None else "-"
+
+        for col, text in ((self.COL_TSTART, tstart), (self.COL_TEND, tend), (self.COL_BRI, bri)):
+            item = self.table.item(row, col)
+            if item:
+                item.setText(text)
+
+    @staticmethod
+    def _format_time(time_str: str) -> str:
+        """Format a time string (HH:MM:SS or MM:SS) to MM:ss for display."""
+        parts = time_str.split(":")
+        if len(parts) == 3:
+            # HH:MM:SS -> total minutes : seconds
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+            total_min = h * 60 + m
+            return f"{total_min}:{s:02d}"
+        if len(parts) == 2:
+            return time_str
+        return time_str
+
     def update_config_indicator(self, filename: str):
-        """Update the config indicator for a file.
+        """Update the config indicator and TStart/TEnd/Bri columns for a file.
 
         Since colors are based on matching configs across files,
         we refresh all indicators when any file's config changes.
         """
+        self._update_file_config_columns(filename)
         self.refresh_all_config_indicators()
 
     def _update_config_indicator(self, filename: str):
@@ -305,6 +360,18 @@ class FileTableWidget(QWidget):
         self.unselect_btn.setVisible(len(filenames) > 0)
         self.selection_changed.emit(filenames)
 
+    def _copy_settings(self):
+        """Handle Ctrl+C: copy settings from first selected file."""
+        selected = self.get_selected_filenames()
+        if selected:
+            self.config_action_requested.emit("copy", selected[0])
+
+    def _paste_settings(self):
+        """Handle Ctrl+V: paste settings to all selected files."""
+        selected = self.get_selected_filenames()
+        if selected:
+            self.config_action_requested.emit("paste", "")
+
     def _show_context_menu(self, pos):
         """Show context menu for right-click."""
         item = self.table.itemAt(pos)
@@ -326,6 +393,19 @@ class FileTableWidget(QWidget):
         paste_action = QAction("Paste Settings to Selected", self)
         paste_action.triggered.connect(lambda: self.config_action_requested.emit("paste", ""))
         menu.addAction(paste_action)
+
+        # Details action (targets the right-clicked row)
+        menu.addSeparator()
+        clicked_row = item.row()
+        clicked_filename = None
+        for filename, row in self._file_rows.items():
+            if row == clicked_row:
+                clicked_filename = filename
+                break
+        if clicked_filename:
+            details_action = QAction("Details", self)
+            details_action.triggered.connect(lambda _, f=clicked_filename: self.file_details_requested.emit(f))
+            menu.addAction(details_action)
 
         menu.exec(self.table.viewport().mapToGlobal(pos))
 

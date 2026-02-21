@@ -155,9 +155,13 @@ class BrightnessTesterDialog(QDialog):
     brightness_selected = pyqtSignal(int)
 
     def __init__(self, mkv_files: list, selected_episode: int = 0, timeline_position: int = 5000,
-                 brightness: int = 230, crop_region: tuple = None, target_file: str = None, parent=None):
+                 brightness: int = 230, crop_region: tuple = None, target_file: str = None,
+                 subtitle_positions: dict[str, int] = None,
+                 durations: dict[str, float] = None, parent=None):
         super().__init__(parent)
         self.mkv_files = sorted(mkv_files)
+        self.subtitle_positions = subtitle_positions or {}  # filename -> slider position
+        self.durations = durations or {}  # filename -> cached duration
         self.target_file = target_file  # Pre-select this file if specified
         self.initial_timeline_position = timeline_position
         self.initial_brightness = brightness
@@ -252,7 +256,7 @@ class BrightnessTesterDialog(QDialog):
         control_layout.addWidget(QLabel("Range:"))
         self.range_spin = QSpinBox()
         self.range_spin.setRange(1, 50)
-        self.range_spin.setValue(20)
+        self.range_spin.setValue(5)
         control_layout.addWidget(self.range_spin)
 
         generate_btn = QPushButton("Generate Previews")
@@ -359,11 +363,25 @@ class BrightnessTesterDialog(QDialog):
         """Load episode and extract initial frame."""
         if 0 <= index < len(self.mkv_files):
             mkv_path = self.mkv_files[index]
-            try:
-                self.current_duration = get_video_duration(mkv_path)
-            except:
-                self.current_duration = 600  # Default 10 minutes
+            filename = Path(mkv_path).name
+            if filename in self.durations and self.durations[filename] > 0:
+                self.current_duration = int(self.durations[filename])
+            else:
+                try:
+                    self.current_duration = get_video_duration(mkv_path)
+                except Exception:
+                    self.current_duration = 600  # Default 10 minutes
+
+            # Jump to detected subtitle position if available for this episode
+            if filename in self.subtitle_positions:
+                pos = self.subtitle_positions[filename]
+                self.timeline_slider.blockSignals(True)
+                self.timeline_slider.setValue(pos)
+                self.timeline_slider.blockSignals(False)
+                self.on_timeline_changed(pos)
+
             self.extract_current_frame()
+            self.on_generate_previews_clicked()
 
     def on_timeline_changed(self, value: int):
         """Update time label and trigger debounced frame extraction."""
