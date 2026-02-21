@@ -360,16 +360,18 @@ class PyAVCapture:
         return self._last_pts
 
     def get_stream_start_time(self) -> float:
-        """Get the stream's start_time in seconds.
+        """Get the container-level start_time in seconds.
 
-        Videos can have non-zero start_time (e.g., 0.042s or 0.080s) which offsets
-        all PTS values. This should be subtracted from PTS to normalize timestamps.
+        Players use PTS values directly for playback, offset only by the
+        container start_time (not the stream start_time). For MKV this is
+        typically 0; for MP4 it can be non-zero due to edit lists.
+        Stream start_time merely indicates when the first sample appears
+        and is NOT a playback offset to subtract.
         """
-        if not PYAV_AVAILABLE or self.stream is None:
+        if not PYAV_AVAILABLE or self.container is None:
             return 0.0
-        # stream.start_time is in time_base units
-        if self.stream.start_time is not None:
-            return float(self.stream.start_time * self.stream.time_base)
+        if self.container.start_time is not None:
+            return max(0.0, self.container.start_time / 1_000_000)  # microseconds -> seconds
         return 0.0
 
 

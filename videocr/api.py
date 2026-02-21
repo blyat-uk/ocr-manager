@@ -47,7 +47,8 @@ def get_subtitles(
         )
         det_engine = utils.create_detection_engine(det_model_dir, use_gpu)
 
-        # Get stream_start_time (set during run_ocr, or fetch independently)
+        # Get container-level start_time (set during run_ocr, or fetch independently).
+        # This is the playback offset; for MKV it's 0, for MP4 it may be non-zero.
         stream_start_time = getattr(v, '_stream_start_time', None)
         if stream_start_time is None:
             from .pyav_adapter import Capture

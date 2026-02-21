@@ -139,16 +139,12 @@ class Video:
         retry_count = [0]  # Mutable container for thread-safe counter
         retry_best = [None]  # Best (confidence, PredictedFrames) seen during retry
 
-        # Note: We no longer apply manual frame offset corrections based on container start_time.
-        # PyAV's PTS values are already normalized and provide accurate timing.
-        # Using PTS directly eliminates the need for manual offset calculations
-        # which could cause double-correction issues.
         adjusted_ocr_start = ocr_start
 
         with Capture(self.path) as v:
-            # Get the stream's start_time offset for PTS normalization
-            # Different videos have different start_times (e.g., 0.042s vs 0.080s)
-            # which must be subtracted from PTS to get correct timestamps
+            # Get the container-level start_time for PTS normalization.
+            # Players offset PTS only by container start_time (0 for MKV,
+            # possibly non-zero for MP4). Stream start_time is not used.
             self._stream_start_time = v.get_stream_start_time() if hasattr(v, 'get_stream_start_time') else 0.0
 
             # Seek to the actual frame we want
@@ -283,15 +279,14 @@ class Video:
         prev_lines = {}  # text -> index in entries
         frame_duration = 1.0 / self.fps  # Duration of one frame in seconds
 
-        # Get stream start_time offset (set during run_ocr)
-        # This normalizes PTS values so frame 0 starts at time 0
+        # Get container-level start_time offset (set during run_ocr)
+        # This normalizes PTS values relative to playback time
         stream_offset = getattr(self, '_stream_start_time', 0.0)
 
         for sub in self.pred_subs:
             # Prefer PTS-based timestamps (canonical) over frame-index-based
             if sub.pts_start is not None and sub.pts_end is not None:
-                # Normalize PTS by subtracting stream start_time offset
-                # This converts from absolute PTS to relative time from video start
+                # Normalize PTS by subtracting container start_time offset
                 adjusted_start = max(0, sub.pts_start - stream_offset)
                 adjusted_end = max(0, sub.pts_end - stream_offset) + frame_duration
                 start = utils.get_ass_timestamp_from_seconds(adjusted_start)
@@ -386,7 +381,7 @@ class Video:
             return
 
         limit = len(self.pred_frames) if emit_last else len(self.pred_frames) - 1
-        stream_offset = getattr(self, '_stream_start_time', 0.0)
+        container_offset = getattr(self, '_stream_start_time', 0.0)
         frame_duration = 1.0 / self.fps
 
         for i in range(self._last_emitted_idx, limit):
@@ -395,8 +390,8 @@ class Video:
                 continue
             if frame.pts_start is None or frame.pts_end is None:
                 continue
-            start = max(0, frame.pts_start - stream_offset)
-            end = max(0, frame.pts_end - stream_offset) + frame_duration
+            start = max(0, frame.pts_start - container_offset)
+            end = max(0, frame.pts_end - container_offset) + frame_duration
             if (end - start) < MIN_SUBTITLE_DURATION:
                 continue
             subtitle_callback(start, end, frame.text)

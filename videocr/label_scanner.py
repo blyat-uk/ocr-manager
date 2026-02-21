@@ -2050,7 +2050,7 @@ class LabelScanner:
             ocr: Full PaddleOCR engine for recognition.
             time_start: Start time string (e.g., "2:30") or empty.
             time_end: End time string or empty.
-            stream_start_time: Stream PTS offset to subtract for ASS timestamps.
+            stream_start_time: Container-level start_time offset to subtract for ASS timestamps.
             progress: Optional ProgressTracker for unified progress reporting.
             cancel_event: Optional threading.Event for cooperative cancellation.
 
@@ -2087,7 +2087,7 @@ class LabelScanner:
         # Post-processing: Merge adjacent labels at same position
         labels = self._merge_adjacent_labels(labels)
 
-        # Adjust PTS by subtracting stream_start_time
+        # Adjust PTS by subtracting container start_time offset
         for label in labels:
             label.start_pts = max(0, label.start_pts - stream_start_time)
             label.end_pts = max(0, label.end_pts - stream_start_time)

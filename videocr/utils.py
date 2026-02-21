@@ -1,10 +1,8 @@
 import contextlib
 import datetime
 import io
-import json
 import logging
 import os
-import subprocess
 import sys
 import warnings
 import yaml
@@ -68,33 +66,6 @@ def suppress_output():
                 logging.getLogger(logger_name).setLevel(level)
             root_logger.setLevel(old_root_level)
 
-
-def get_video_start_time(video_path: str) -> float:
-    """Get the video stream start_time using ffprobe.
-
-    Some HEVC streams have a non-zero start_time (e.g., 0.042s = 1 frame at 25fps)
-    which causes subtitle timestamps to be offset. OpenCV doesn't expose this
-    correctly, so we use ffprobe to get the actual value.
-
-    Returns:
-        Start time in seconds, or 0.0 if not available.
-    """
-    try:
-        cmd = [
-            'ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
-            '-show_entries', 'stream=start_time',
-            '-of', 'json', video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            streams = data.get('streams', [])
-            if streams:
-                start_time_str = streams[0].get('start_time', '0')
-                return float(start_time_str)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, ValueError, FileNotFoundError):
-        pass
-    return 0.0
 
 # convert time string to frame index
 def get_frame_index(time_str: str, fps: float):
