@@ -1,9 +1,8 @@
 """Pipeline execution and workflow management."""
 
-import shutil
 from itertools import chain
 from pathlib import Path
-from PyQt6.QtCore import QObject, pyqtSignal, QProcess
+from PyQt6.QtCore import QObject, pyqtSignal
 
 from core.config import Config, FileConfigStore
 from core.ocr_manager import OCRManager
@@ -49,7 +48,6 @@ class Pipeline(QObject):
     """Manages OCR workflow execution."""
 
     # Signals
-    command_started = pyqtSignal(str)
     output_received = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     phase_started = pyqtSignal(int, str)  # phase_index, phase_name
@@ -69,7 +67,7 @@ class Pipeline(QObject):
     ocr_log_output = pyqtSignal(str, str)                 # filename, raw_text
     ocr_subtitle_detected = pyqtSignal(str, float, float, str)  # filename, start, end, text
 
-    PHASES = ["Create Directory", "OCR Extraction", "Quality Assurance"]
+    PHASES = ["Create Directory", "OCR Extraction"]
 
     def __init__(self, config: Config, file_config_store: FileConfigStore = None,
                  selected_files: list[str] = None):
@@ -77,7 +75,6 @@ class Pipeline(QObject):
         self.config = config
         self.file_config_store = file_config_store
         self.selected_files = selected_files
-        self.process = None
         self.ocr_manager = None
         self.current_phase = 0
         self.subphase = 0
@@ -102,7 +99,7 @@ class Pipeline(QObject):
 
         Returns:
             0 - Start from beginning (no chi/ or incomplete OCR)
-            2 - Resume at QA (all videos have corresponding .ass in chi/)
+            1 - Resume at OCR extraction (some files already done, OCRManager skips them)
         """
         all_videos = self.get_video_stems()
         if not all_videos:
@@ -114,8 +111,9 @@ class Pipeline(QObject):
         if all_videos - ocr_done:
             return 0  # Start from Phase 0 (Create Directory)
 
-        # All videos have .ass files, resume at QA (phase 2)
-        return 2
+        # All videos have .ass files, resume at OCR extraction (phase 1)
+        # OCRManager will detect all files are done and skip immediately
+        return 1
 
     def start(self):
         """Start pipeline execution, resuming from detected phase."""
@@ -214,6 +212,26 @@ class Pipeline(QObject):
             self.subphase = 0
             self.run_next_phase()
 
+    def _disconnect_ocr_manager(self):
+        """Disconnect all signals from the OCR manager to break reference cycles."""
+        if self.ocr_manager is None:
+            return
+        mgr = self.ocr_manager
+        for sig, slot in (
+            (mgr.file_status_changed, self.ocr_file_status.emit),
+            (mgr.file_status_text_changed, self.ocr_file_status_text.emit),
+            (mgr.file_progress_updated, self.ocr_file_progress.emit),
+            (mgr.file_log_output, self.ocr_log_output.emit),
+            (mgr.file_subtitle_detected, self.ocr_subtitle_detected.emit),
+            (mgr.timing_updated, self.ocr_timing_updated.emit),
+            (mgr.overall_progress, self.ocr_overall_progress.emit),
+            (mgr.all_completed, self._on_ocr_completed),
+        ):
+            try:
+                sig.disconnect(slot)
+            except TypeError:
+                pass
+
     def _on_ocr_completed(self, successful: int, total: int, total_time: float, avg_time: float):
         """Handle OCR completion from OCRManager."""
         self.output_received.emit(f"\nOCR completed: {successful}/{total} files successful\n")
@@ -227,97 +245,25 @@ class Pipeline(QObject):
         self._ocr_avg_time = avg_time
 
         # Clean up OCR manager
+        self._disconnect_ocr_manager()
         self.ocr_manager = None
 
         # Continue to next phase
         self.subphase += 1
         self.phase_2()
 
-    def phase_3(self):
-        """Phase 3: Quality Assurance - Run ass-qafix twice."""
-        chi_dir = Path(self.config.project_path) / "chi"
-
-        if self.subphase == 0 and not shutil.which('ass-qafix'):
-            self.phase_completed.emit("Quality Assurance (skipped - ass-qafix not found)")
-            self.current_phase += 1
-            self.subphase = 0
-            self.run_next_phase()
-            return
-
-        if self.subphase == 0:
-            # Run ass-qafix first pass
-            cmd = ["ass-qafix", "--inplace"]
-            self.run_command(cmd, cwd=str(chi_dir))
-        elif self.subphase == 1:
-            # Run ass-qafix second pass (sometimes first pass doesn't fix all issues)
-            cmd = ["ass-qafix", "--inplace"]
-            self.run_command(cmd, cwd=str(chi_dir))
-        elif self.subphase == 2:
-            self.phase_completed.emit("Quality Assurance")
-            self.current_phase += 1
-            self.subphase = 0
-            self.run_next_phase()
-
-    def run_command(self, cmd: list, cwd: str = None):
-        """Execute command and emit output signals."""
-        self.command_started.emit(" ".join(cmd))
-
-        self.process = QProcess(self)
-        self.process.readyReadStandardOutput.connect(self.on_stdout)
-        self.process.readyReadStandardError.connect(self.on_stderr)
-        self.process.finished.connect(self.on_process_finished)
-
-        if cwd:
-            self.process.setWorkingDirectory(cwd)
-
-        self.process.start(cmd[0], cmd[1:])
-
-    def on_stdout(self):
-        """Handle stdout output."""
-        data = self.process.readAllStandardOutput().data().decode("utf-8")
-        self.output_received.emit(data)
-
-    def on_stderr(self):
-        """Handle stderr output."""
-        data = self.process.readAllStandardError().data().decode("utf-8")
-        self.output_received.emit(data)
-
-    def on_process_finished(self, exit_code, exit_status):
-        """Handle process completion."""
-        if exit_code != 0:
-            self.error_occurred.emit(f"Command failed with exit code {exit_code}")
-            self.pipeline_finished.emit(False)
-            return
-
-        # Advance subphase or phase
-        self.subphase += 1
-
-        # Check if we need to continue with subphases
-        phase_method = getattr(self, f"phase_{self.current_phase + 1}")
-        phase_method()
-
     def stop(self):
         """Stop pipeline execution."""
-        # Stop OCR manager if running
         if self.ocr_manager:
+            self._disconnect_ocr_manager()
             self.ocr_manager.stop()
             self.ocr_manager = None
 
-        # Stop QProcess if running
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
-            self.process.terminate()
-            self.process.waitForFinished(3000)
-            if self.process.state() == QProcess.ProcessState.Running:
-                self.process.kill()
-
-        # Notify UI that pipeline was stopped
         self.pipeline_stopped.emit()
 
     def is_running(self) -> bool:
         """Check if pipeline is running."""
-        if self.ocr_manager and self.ocr_manager.is_running():
-            return True
-        return self.process is not None and self.process.state() == QProcess.ProcessState.Running
+        return self.ocr_manager is not None and self.ocr_manager.is_running()
 
     def get_ocr_timing(self) -> tuple[float, float]:
         """Get OCR timing data (total_time, avg_time)."""

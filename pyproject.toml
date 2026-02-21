@@ -18,6 +18,8 @@ dependencies = [
     "packaging==25.0",
     "av==16.1.0",
     "setuptools>=61.0",
+    "rapidfuzz>=3.0.0",
+    "jieba3>=1.0.0",
 ]
 
 [project.optional-dependencies]

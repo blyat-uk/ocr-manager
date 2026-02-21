@@ -143,6 +143,16 @@ class OCRManager(QObject):
         """Forward progress update signal."""
         self.file_progress_updated.emit(filename, percent)
 
+    def _disconnect_worker(self, worker: OCRWorker):
+        """Disconnect all signals from a worker to break reference cycles."""
+        for sig in (worker.status_changed, worker.status_text_changed,
+                    worker.progress_updated, worker.raw_output,
+                    worker.subtitle_detected, worker.finished):
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+
     def _on_worker_finished(self, filename: str, success: bool):
         """Handle worker completion."""
         # Record timing before cleanup
@@ -151,10 +161,14 @@ class OCRManager(QObject):
         # Remove from active workers and clean up QThread
         if filename in self._active_workers:
             worker = self._active_workers.pop(filename)
-            if hasattr(worker, '_thread') and worker._thread:
+            self._disconnect_worker(worker)
+            if worker._thread is not None:
                 worker._thread.quit()
                 worker._thread.wait(5000)
+                # Move worker back to main thread so deleteLater works
+                worker.moveToThread(self.thread())
                 worker._thread.deleteLater()
+            worker.cleanup()
             worker.deleteLater()
 
         # Track results
@@ -191,11 +205,14 @@ class OCRManager(QObject):
 
         # Wait for threads to finish and clean up
         for worker in workers:
-            if hasattr(worker, '_thread') and worker._thread:
+            self._disconnect_worker(worker)
+            if worker._thread is not None:
                 worker._thread.quit()
                 if not worker._thread.wait(5000):
                     worker._thread.terminate()
+                worker.moveToThread(self.thread())
                 worker._thread.deleteLater()
+            worker.cleanup()
             worker.deleteLater()
 
         self._active_workers.clear()

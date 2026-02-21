@@ -170,6 +170,16 @@ class OCRWorker(QObject):
             ass_dest = self.output_dir / (self.video_path.stem + ".ass")
 
             if ass_source.exists():
+                # Run QA on the .ass file before moving
+                from core.ass_qafix import process_file
+                self.status_text_changed.emit(self.filename, "QA fixing")
+                stats = process_file(str(ass_source))
+                self.raw_output.emit(
+                    self.filename,
+                    f"QA: {stats.dialogue_lines} dialogues, "
+                    f"{stats.fixed_lines} fixed, "
+                    f"{stats.duplicates_removed} deduped\n",
+                )
                 shutil.move(str(ass_source), str(ass_dest))
 
             success = True
@@ -187,3 +197,17 @@ class OCRWorker(QObject):
     def stop(self):
         """Request cooperative cancellation."""
         self._cancel_event.set()
+
+    def cleanup(self):
+        """Release references to allow garbage collection."""
+        self.video_path = None
+        self.output_dir = None
+        self.config = None
+        self.file_config = None
+        self._cancel_event = None
+        if self._thread is not None:
+            try:
+                self._thread.started.disconnect(self._run_ocr)
+            except TypeError:
+                pass
+            self._thread = None

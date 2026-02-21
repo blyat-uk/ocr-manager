@@ -4,9 +4,9 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 
 class LogStore(QObject):
-    """Stores log text keyed by filename (or a fixed key for QA output)."""
+    """Stores log text keyed by filename (or a fixed key for pipeline output)."""
 
-    QA_KEY = "Quality Assurance"
+    MAX_PER_KEY = 512_000  # ~500 KB per key
 
     log_appended = pyqtSignal(str, str)  # key, new_text
 
@@ -21,6 +21,8 @@ class LogStore(QObject):
             self._logs[key] = ""
             self._order.append(key)
         self._logs[key] += text
+        if len(self._logs[key]) > self.MAX_PER_KEY:
+            self._logs[key] = self._logs[key][-self.MAX_PER_KEY:]
         self.log_appended.emit(key, text)
 
     def get(self, key: str) -> str:
