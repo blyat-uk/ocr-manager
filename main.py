@@ -713,7 +713,7 @@ class MainWindow(QMainWindow):
             self.time_range_slider.set_duration(duration, ref_name)
 
         if not filenames:
-            # No selection - keep current values as global defaults
+            self._sync_crop_input()
             return
 
         # Check if first selected file has custom config
@@ -751,6 +751,30 @@ class MainWindow(QMainWindow):
             self.start_button.setText(f"Start Processing ({len(selected)})")
         else:
             self.start_button.setText("Start Processing")
+
+    def _get_common_crop(self) -> tuple | None:
+        """Return the common crop if all files share the same value, else None."""
+        all_filenames = self.file_table.get_all_filenames()
+        if not all_filenames:
+            return None
+        crops = set()
+        for filename in all_filenames:
+            fc = self.file_config_store.get(filename)
+            if fc and fc.has_custom_crop():
+                crops.add(fc.get_crop_tuple())
+            else:
+                crops.add(None)
+        if len(crops) == 1:
+            return crops.pop()
+        return None
+
+    def _sync_crop_input(self):
+        """Update global crop input to reflect common crop or clear if mixed."""
+        common = self._get_common_crop()
+        if common:
+            self.crop_input.setText(f"{common[0]}, {common[1]}, {common[2]}, {common[3]}")
+        else:
+            self.crop_input.clear()
 
     def _get_target_files(self) -> list[str]:
         """Get target files for config changes: selected files or all if none selected."""
@@ -1067,27 +1091,67 @@ class MainWindow(QMainWindow):
         subtitle_positions = self._get_subtitle_positions()
         timeline_position = self._resolve_timeline_position(video_files)
 
+        # Build per-file crops dict from file config store
+        per_file_crops = {}
+        for f in video_files:
+            fc = self.file_config_store.get(f.name)
+            if fc and fc.has_custom_crop():
+                per_file_crops[f.name] = fc.get_crop_tuple()
+
         dialog = CropSelectorDialog(
             [str(f) for f in video_files], existing_crop, timeline_position,
             labels_enabled=self.labels_checkbox.isChecked(),
             existing_masks=self.label_mask_crops if self.label_mask_crops else None,
             subtitle_positions=subtitle_positions,
             durations=self._get_durations_dict(),
+            existing_crops=per_file_crops,
             parent=self
         )
-        dialog.crop_selected.connect(self.on_crop_selected)
         if dialog.exec():
             self.last_selected_episode = dialog.get_selected_episode()
             self.last_timeline_position = dialog.get_timeline_position()
             self.label_mask_crops = dialog.get_label_masks()
+
+            x, y, w, h = dialog.frame_label.get_crop_coordinates()
+            if w > 0 and h > 0:
+                current_filename = dialog.get_current_filename()
+                self._handle_crop_apply(x, y, w, h, current_filename)
+
             self._schedule_save()
 
-    def on_crop_selected(self, x: int, y: int, width: int, height: int):
-        """Handle crop selection - apply to selected files or all if none selected."""
-        self.crop_input.setText(f"{x}, {y}, {width}, {height}")
-        # Apply to target files
+    def _handle_crop_apply(self, x: int, y: int, w: int, h: int, current_filename: str):
+        """Apply crop with conflict detection when target files have different crops."""
+        new_crop = (x, y, w, h)
         target_files = self._get_target_files()
-        self._apply_crop_to_files(x, y, width, height, target_files)
+
+        files_with_different_crop = [
+            f for f in target_files
+            if f != current_filename
+            and (fc := self.file_config_store.get(f))
+            and fc.has_custom_crop()
+            and fc.get_crop_tuple() != new_crop
+        ]
+
+        if files_with_different_crop:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Apply Crop")
+            msg.setText(f"{len(files_with_different_crop)} file(s) have different crop values.")
+            apply_all = msg.addButton("Apply to All", QMessageBox.ButtonRole.AcceptRole)
+            apply_one = msg.addButton("This File Only", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+
+            clicked = msg.clickedButton()
+            if clicked == apply_all:
+                self._apply_crop_to_files(x, y, w, h, target_files)
+            elif clicked == apply_one:
+                self._apply_crop_to_files(x, y, w, h, [current_filename])
+            else:
+                return
+        else:
+            self._apply_crop_to_files(x, y, w, h, target_files)
+
+        self._sync_crop_input()
 
     def on_brightness_test_clicked(self):
         """Open brightness tester dialog."""
@@ -1107,16 +1171,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No video files found in project directory")
             return
 
-        # Parse crop coordinates if available
-        crop_region = None
-        crop_text = self.crop_input.text()
-        if crop_text:
-            try:
-                parts = [int(x.strip()) for x in crop_text.split(',')]
-                if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
-                    crop_region = tuple(parts)  # (x, y, width, height)
-            except ValueError:
-                pass
+        # Build per-file crops dict from file config store
+        per_file_crops = {}
+        for f in video_files:
+            fc = self.file_config_store.get(f.name)
+            if fc and fc.has_custom_crop():
+                per_file_crops[f.name] = fc.get_crop_tuple()
+
+        # Initial crop: from first file's config (or None)
+        first_name = video_files[0].name if video_files else None
+        crop_region = per_file_crops.get(first_name) if first_name else None
 
         # Build subtitle positions dict and resolve initial timeline position
         subtitle_positions = self._get_subtitle_positions()
@@ -1130,6 +1194,7 @@ class MainWindow(QMainWindow):
             crop_region,
             subtitle_positions=subtitle_positions,
             durations=self._get_durations_dict(),
+            existing_crops=per_file_crops,
             parent=self
         )
         dialog.brightness_selected.connect(self.on_brightness_selected)

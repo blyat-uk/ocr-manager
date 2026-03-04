@@ -157,11 +157,13 @@ class BrightnessTesterDialog(QDialog):
     def __init__(self, mkv_files: list, selected_episode: int = 0, timeline_position: int = 5000,
                  brightness: int = 230, crop_region: tuple = None, target_file: str = None,
                  subtitle_positions: dict[str, int] = None,
-                 durations: dict[str, float] = None, parent=None):
+                 durations: dict[str, float] = None,
+                 existing_crops: dict[str, tuple] = None, parent=None):
         super().__init__(parent)
         self.mkv_files = sorted(mkv_files)
         self.subtitle_positions = subtitle_positions or {}  # filename -> slider position
         self.durations = durations or {}  # filename -> cached duration
+        self.existing_crops = existing_crops or {}  # filename -> (x, y, w, h)
         self.target_file = target_file  # Pre-select this file if specified
         self.initial_timeline_position = timeline_position
         self.initial_brightness = brightness
@@ -364,6 +366,13 @@ class BrightnessTesterDialog(QDialog):
         if 0 <= index < len(self.mkv_files):
             mkv_path = self.mkv_files[index]
             filename = Path(mkv_path).name
+
+            # Update crop region for this episode
+            if filename in self.existing_crops:
+                self.crop_region = self.existing_crops[filename]
+            else:
+                self.crop_region = None
+
             if filename in self.durations and self.durations[filename] > 0:
                 self.current_duration = int(self.durations[filename])
             else:

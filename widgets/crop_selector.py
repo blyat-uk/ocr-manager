@@ -241,11 +241,13 @@ class CropSelectorDialog(QDialog):
                  target_file: str = None, labels_enabled: bool = False,
                  existing_masks: list[tuple] = None,
                  subtitle_positions: dict[str, int] = None,
-                 durations: dict[str, float] = None, parent=None):
+                 durations: dict[str, float] = None,
+                 existing_crops: dict[str, tuple] = None, parent=None):
         super().__init__(parent)
         # Sort files naturally
         self.mkv_files = sorted(mkv_files)
         self.existing_crop = existing_crop
+        self.per_file_crops: dict[str, tuple] = existing_crops or {}
         self.initial_timeline_position = timeline_position
         self.target_file = target_file  # Pre-select this file if specified
         self.labels_enabled = labels_enabled
@@ -442,10 +444,10 @@ class CropSelectorDialog(QDialog):
                     self.frame_label.set_masks(self.existing_masks)
                     self.existing_masks = None
 
-                # Pass existing crop on first load only
-                self.frame_label.set_frame(pixmap, self.existing_crop)
-                # Clear existing_crop after first use so it doesn't re-apply on frame changes
-                self.existing_crop = None
+                # Resolve crop: per-file crop takes priority, then global existing_crop
+                filename = Path(self.mkv_files[self.episode_combo.currentIndex()]).name
+                resolved_crop = self.per_file_crops.get(filename, self.existing_crop)
+                self.frame_label.set_frame(pixmap, resolved_crop)
 
                 # Only auto-resize dialog on initial frame load
                 if not self.initial_resize_done:
