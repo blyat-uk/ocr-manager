@@ -1,5 +1,6 @@
 """Background subtitle detection worker for finding frames with hardcoded subtitles."""
 import logging
+from statistics import median
 
 import cv2
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
@@ -25,6 +26,14 @@ CROP_WIDTH_FRACTION = 0.70       # 70% of video width
 CROP_VERTICAL_PADDING = 0        # No padding above/below text
 CROP_MIN_HEIGHT_FRACTION = 0.05  # Minimum crop height = 5% of video height
 BOTTOM_HALF_CUTOFF = 0.50        # Ignore boxes in the top half of the frame
+
+# Consensus constants
+MIN_CONSENSUS = 3                # Minimum resolved files to enable consensus validation
+MAX_CANDIDATES_EARLY = 5         # Frames to sample before consensus exists
+MAX_HEIGHT_RATIO = 1.5           # Reject if height > 1.5x consensus median
+Y_DEVIATION_FRAC = 0.10          # Reject if Y deviates by >10% of frame height
+MAX_OUTLIER_RETRIES = 10         # Max additional frames to try after outlier detection
+MAX_CROP_HEIGHT_FRAC = 0.25      # Hard ceiling: no crop taller than 25% of frame
 
 
 def _compute_crop_from_polys(polys, scores, orig_width, orig_height, downscaled_height,
@@ -108,6 +117,65 @@ def _compute_crop_from_polys(polys, scores, orig_width, orig_height, downscaled_
     crop_x = int((orig_width - crop_w) / 2)
 
     return (crop_x, crop_y, crop_w, crop_h)
+
+
+def _is_acceptable_crop(crop_y, crop_h, orig_height, consensus_crops):
+    """Check if a cropbox is consistent with the consensus pool.
+
+    Args:
+        crop_y: Crop Y position in pixels.
+        crop_h: Crop height in pixels.
+        orig_height: Original video frame height.
+        consensus_crops: List of (y_frac, h_frac) tuples from resolved files.
+
+    Returns:
+        True if the crop is within tolerance of the consensus.
+    """
+    if not consensus_crops:
+        return True
+
+    y_frac = crop_y / orig_height
+    h_frac = crop_h / orig_height
+
+    med_y = median(c[0] for c in consensus_crops)
+    med_h = median(c[1] for c in consensus_crops)
+
+    if med_h > 0 and h_frac > med_h * MAX_HEIGHT_RATIO:
+        return False
+    if abs(y_frac - med_y) > Y_DEVIATION_FRAC:
+        return False
+    return True
+
+
+def _pick_best_candidate(candidates, consensus_crops, orig_height):
+    """Pick the best candidate cropbox from a list.
+
+    Post-consensus: minimize combined deviation from consensus median.
+    Pre-consensus: pick the smallest crop height (tightest box).
+
+    Args:
+        candidates: List of (slider_pos, crop_x, crop_y, crop_w, crop_h) tuples.
+        consensus_crops: List of (y_frac, h_frac) tuples from resolved files.
+        orig_height: Original video frame height.
+
+    Returns:
+        The best candidate tuple, or None if candidates is empty.
+    """
+    if not candidates:
+        return None
+
+    if consensus_crops and len(consensus_crops) >= MIN_CONSENSUS:
+        med_y = median(c[0] for c in consensus_crops)
+        med_h = median(c[1] for c in consensus_crops)
+
+        def deviation(c):
+            y_frac = c[2] / orig_height
+            h_frac = c[4] / orig_height
+            return abs(y_frac - med_y) + abs(h_frac - med_h)
+
+        return min(candidates, key=deviation)
+    else:
+        return min(candidates, key=lambda c: c[4])
 
 
 class SubtitleDetectionWorker(QObject):
@@ -194,6 +262,7 @@ class SubtitleDetectionWorker(QObject):
 
             total = len(self._video_files)
             resolved_count = 0
+            consensus_crops = []  # list of (y_frac, h_frac) from resolved files
             self.progress.emit(resolved_count, total)
 
             next_file_idx = 0
@@ -217,6 +286,9 @@ class SubtitleDetectionWorker(QObject):
                             'orig_width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                             'orig_height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                             'step_idx': 0,
+                            'candidates': [],
+                            'text_hits': 0,
+                            'retry_count': 0,
                         })
                     except Exception as e:
                         logger.warning(f"Cannot open {filename} for subtitle detection: {e}")
@@ -271,6 +343,9 @@ class SubtitleDetectionWorker(QObject):
 
                     for idx, item in enumerate(results):
                         info, probe_sec = frame_info[idx]
+                        if info in newly_resolved:
+                            continue
+
                         scores = item.get("dt_scores", [])
                         polys = item.get("dt_polys", [])
 
@@ -283,35 +358,97 @@ class SubtitleDetectionWorker(QObject):
                         elif polys is not None and len(polys) > 0:
                             has_text = True
 
-                        if has_text:
-                            duration = info['duration']
-                            slider_pos = int((probe_sec / duration) * 10000) if duration > 0 else 5000
-                            slider_pos = max(0, min(10000, slider_pos))
+                        if not has_text:
+                            continue
 
-                            orig_w = info['orig_width']
-                            orig_h = info['orig_height']
-                            downscaled_h = min(TARGET_HEIGHT, orig_h)
-                            crop_result = _compute_crop_from_polys(
-                                polys, scores, orig_w, orig_h, downscaled_h,
-                                crop_width_frac=crop_width_frac,
-                                vert_padding=vert_padding,
-                                min_height_frac=min_height_frac,
-                                bottom_cutoff=bottom_cutoff,
+                        duration = info['duration']
+                        slider_pos = int((probe_sec / duration) * 10000) if duration > 0 else 5000
+                        slider_pos = max(0, min(10000, slider_pos))
+
+                        orig_w = info['orig_width']
+                        orig_h = info['orig_height']
+                        downscaled_h = min(TARGET_HEIGHT, orig_h)
+                        crop_result = _compute_crop_from_polys(
+                            polys, scores, orig_w, orig_h, downscaled_h,
+                            crop_width_frac=crop_width_frac,
+                            vert_padding=vert_padding,
+                            min_height_frac=min_height_frac,
+                            bottom_cutoff=bottom_cutoff,
+                        )
+                        if not crop_result:
+                            continue
+
+                        cx, cy, cw, ch = crop_result
+
+                        # Absolute safety ceiling: reject crops taller than 25% of frame
+                        if ch / orig_h > MAX_CROP_HEIGHT_FRAC:
+                            logger.debug(
+                                f"{info['filename']}: rejected crop h={ch} "
+                                f"({ch/orig_h:.1%} of frame, ceiling {MAX_CROP_HEIGHT_FRAC:.0%})"
                             )
-                            if crop_result:
-                                cx, cy, cw, ch = crop_result
-                            else:
-                                cx, cy, cw, ch = 0, 0, 0, 0
+                            continue
 
-                            self.file_detected.emit(info['filename'], slider_pos, cx, cy, cw, ch)
-                            newly_resolved.append(info)
+                        info['text_hits'] += 1
+                        candidate = (slider_pos, cx, cy, cw, ch)
+                        info['candidates'].append(candidate)
+
+                        has_consensus = len(consensus_crops) >= MIN_CONSENSUS
+
+                        if has_consensus:
+                            # Mode B: post-consensus — check against pool
+                            if _is_acceptable_crop(cy, ch, orig_h, consensus_crops):
+                                # Fast path: matches consensus, resolve immediately
+                                self.file_detected.emit(info['filename'], slider_pos, cx, cy, cw, ch)
+                                consensus_crops.append((cy / orig_h, ch / orig_h))
+                                newly_resolved.append(info)
+                                resolved_count += 1
+                                self.progress.emit(resolved_count, total)
+                            else:
+                                # Outlier — keep probing
+                                info['retry_count'] += 1
+                                if info['retry_count'] >= MAX_OUTLIER_RETRIES:
+                                    best = _pick_best_candidate(info['candidates'], consensus_crops, orig_h)
+                                    if best:
+                                        self.file_detected.emit(
+                                            info['filename'], best[0], best[1], best[2], best[3], best[4]
+                                        )
+                                        consensus_crops.append((best[2] / orig_h, best[4] / orig_h))
+                                        newly_resolved.append(info)
+                                        resolved_count += 1
+                                        self.progress.emit(resolved_count, total)
+                        else:
+                            # Mode A: pre-consensus — collect candidates
+                            if info['text_hits'] >= MAX_CANDIDATES_EARLY:
+                                best = _pick_best_candidate(info['candidates'], consensus_crops, orig_h)
+                                if best:
+                                    self.file_detected.emit(
+                                        info['filename'], best[0], best[1], best[2], best[3], best[4]
+                                    )
+                                    consensus_crops.append((best[2] / orig_h, best[4] / orig_h))
+                                    newly_resolved.append(info)
+                                    resolved_count += 1
+                                    self.progress.emit(resolved_count, total)
+
+                # Handle exhausted files that have candidates but weren't resolved
+                for info in exhausted:
+                    if info in newly_resolved:
+                        continue
+                    if info['candidates']:
+                        orig_h = info['orig_height']
+                        best = _pick_best_candidate(info['candidates'], consensus_crops, orig_h)
+                        if best:
+                            self.file_detected.emit(
+                                info['filename'], best[0], best[1], best[2], best[3], best[4]
+                            )
+                            consensus_crops.append((best[2] / orig_h, best[4] / orig_h))
                             resolved_count += 1
                             self.progress.emit(resolved_count, total)
 
                 # Close and remove resolved/exhausted files
                 for info in newly_resolved + exhausted:
                     close_file(info)
-                    active.remove(info)
+                    if info in active:
+                        active.remove(info)
 
                 # Advance probe step for remaining active files
                 for info in active:
