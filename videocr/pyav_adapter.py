@@ -15,6 +15,46 @@ except ImportError:
 # Check if FFmpeg is available
 FFMPEG_AVAILABLE = shutil.which('ffmpeg') is not None and shutil.which('ffprobe') is not None
 
+# HDR transfer characteristic constants (from ITU-T H.273)
+_TRC_SMPTE2084 = 16   # PQ (HDR10)
+_TRC_ARIB_STD_B67 = 18  # HLG
+
+_ZSCALE_AVAILABLE = None  # Lazy-cached
+
+
+def _has_zscale() -> bool:
+    """Check if system FFmpeg has zscale filter (requires zimg)."""
+    global _ZSCALE_AVAILABLE
+    if _ZSCALE_AVAILABLE is None:
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-filters'],
+                capture_output=True, text=True, timeout=5
+            )
+            _ZSCALE_AVAILABLE = 'zscale' in result.stdout
+        except Exception:
+            _ZSCALE_AVAILABLE = False
+    return _ZSCALE_AVAILABLE
+
+
+def _build_ffmpeg_tonemap_vf(transfer: str) -> str:
+    """Build FFmpeg -vf filter chain for HDR→SDR tone mapping.
+
+    Args:
+        transfer: color_transfer string from ffprobe (e.g. 'smpte2084', 'arib-std-b67')
+
+    Returns:
+        Filter chain string for -vf argument.
+    """
+    if _has_zscale():
+        # PQ needs npl=100 (nominal peak luminance); HLG does not
+        zscale_linear = 'zscale=t=linear:npl=100' if transfer == 'smpte2084' else 'zscale=t=linear'
+        return (
+            f'{zscale_linear},format=gbrpf32le,'
+            'tonemap=hable,zscale=t=bt709,format=bgr24'
+        )
+    return 'format=gbrpf32le,tonemap=hable,format=bgr24'
+
 
 class FFmpegNVDECCapture:
     """Video capture using FFmpeg subprocess with NVDEC hardware acceleration.
@@ -35,6 +75,7 @@ class FFmpegNVDECCapture:
         self._frame_size = None
         self._seek_pos = 0
         self._last_pts = None  # Estimated PTS in seconds
+        self._hdr_transfer = None  # Color transfer from ffprobe
 
     def _probe_video(self):
         """Get video metadata using ffprobe."""
@@ -64,6 +105,9 @@ class FFmpegNVDECCapture:
         else:
             self._fps = 25.0
 
+        # Detect HDR transfer characteristics
+        self._hdr_transfer = video_stream.get('color_transfer')
+
         # Get frame count
         if 'nb_frames' in video_stream:
             self._frame_count = int(video_stream['nb_frames'])
@@ -85,8 +129,13 @@ class FFmpegNVDECCapture:
         if seek_time and seek_time > 0:
             cmd.extend(['-ss', str(seek_time)])
 
+        cmd.extend(['-i', self.path])
+
+        # Inject HDR→SDR tone mapping if needed
+        if self._hdr_transfer in ('smpte2084', 'arib-std-b67'):
+            cmd.extend(['-vf', _build_ffmpeg_tonemap_vf(self._hdr_transfer)])
+
         cmd.extend([
-            '-i', self.path,
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
             '-'
@@ -215,6 +264,8 @@ class PyAVCapture:
         self._output_height = None
         # PTS tracking - canonical timestamp source
         self._last_pts = None  # Last frame's PTS in seconds
+        # HDR tone mapping filter graph (None for SDR)
+        self._tonemap_graph = None
 
     def __enter__(self):
         if not PYAV_AVAILABLE:
@@ -255,7 +306,42 @@ class PyAVCapture:
         self._pos = 0
         self._frame_generator = self.container.decode(video=0)
 
+        # Set up HDR tone mapping if needed
+        self._setup_tonemap_graph()
+
         return self
+
+    def _setup_tonemap_graph(self):
+        """Build a PyAV filter graph for HDR→SDR tone mapping if the stream is HDR."""
+        try:
+            trc = self.stream.codec_context.color_trc
+            if trc not in (_TRC_SMPTE2084, _TRC_ARIB_STD_B67):
+                return  # SDR — no tone mapping needed
+
+            # PQ needs npl=100 (nominal peak luminance); HLG does not
+            zscale_linear_args = 't=linear:npl=100' if trc == _TRC_SMPTE2084 else 't=linear'
+
+            graph = av.filter.Graph()
+            buf = graph.add_buffer(template=self.stream)
+            linearize = graph.add('zscale', zscale_linear_args)
+            fmt_in = graph.add('format', 'gbrpf32le')
+            tonemap = graph.add('tonemap', 'hable')
+            bt709 = graph.add('zscale', 't=bt709')
+            fmt_out = graph.add('format', 'bgr24')
+            sink = graph.add('buffersink')
+
+            buf.link_to(linearize)
+            linearize.link_to(fmt_in)
+            fmt_in.link_to(tonemap)
+            tonemap.link_to(bt709)
+            bt709.link_to(fmt_out)
+            fmt_out.link_to(sink)
+
+            graph.configure()
+            self._tonemap_graph = graph
+        except Exception:
+            # Graceful fallback: if filter graph setup fails, proceed without tone mapping
+            self._tonemap_graph = None
 
     def __exit__(self, exc_type, exc_value, traceback):
         if not PYAV_AVAILABLE:
@@ -342,8 +428,13 @@ class PyAVCapture:
             # Calculate frame position from PTS (for compatibility)
             self._pos = int(round(self._last_pts * self._fps))
 
-            # Convert to BGR numpy array (no downscaling - video.py handles resize after crop)
-            img = frame.to_ndarray(format='bgr24')
+            # Apply HDR→SDR tone mapping if graph is set up, otherwise direct convert
+            if self._tonemap_graph is not None:
+                self._tonemap_graph.vpush(frame)
+                frame = self._tonemap_graph.vpull()
+                img = frame.to_ndarray()
+            else:
+                img = frame.to_ndarray(format='bgr24')
 
             return True, img
         except StopIteration:
