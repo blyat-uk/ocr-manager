@@ -21,6 +21,12 @@ _TRC_ARIB_STD_B67 = 18  # HLG
 
 _ZSCALE_AVAILABLE = None  # Lazy-cached
 
+# Downscale 4K+ to 1080p at decode level for performance.
+# Frames arrive pre-scaled so the OCR pipeline processes the same pixel count
+# regardless of source resolution.  get(CAP_PROP_FRAME_*) still returns native
+# dimensions; only read() produces scaled frames.
+DECODE_TARGET_HEIGHT = 1080
+
 
 def _has_zscale() -> bool:
     """Check if system FFmpeg has zscale filter (requires zimg)."""
@@ -63,15 +69,19 @@ class FFmpegNVDECCapture:
     Falls back to CPU decoding if NVDEC is not available.
     """
 
-    def __init__(self, video_path, use_gpu=True):
+    def __init__(self, video_path, use_gpu=True, decode_target_height=None):
         self.path = video_path
         self.use_gpu = use_gpu
+        self._decode_target_height = decode_target_height
         self.proc = None
         self._pos = 0
         self._frame_count = None
         self._fps = None
         self._width = None
         self._height = None
+        self._output_width = None
+        self._output_height = None
+        self._scale_factor = 1.0
         self._frame_size = None
         self._seek_pos = 0
         self._last_pts = None  # Estimated PTS in seconds
@@ -131,9 +141,14 @@ class FFmpegNVDECCapture:
 
         cmd.extend(['-i', self.path])
 
-        # Inject HDR→SDR tone mapping if needed
+        # Build combined -vf chain (tone mapping + scaling)
+        vf_parts = []
         if self._hdr_transfer in ('smpte2084', 'arib-std-b67'):
-            cmd.extend(['-vf', _build_ffmpeg_tonemap_vf(self._hdr_transfer)])
+            vf_parts.append(_build_ffmpeg_tonemap_vf(self._hdr_transfer))
+        if self._scale_factor < 1.0:
+            vf_parts.append(f'scale={self._output_width}:{self._output_height}')
+        if vf_parts:
+            cmd.extend(['-vf', ','.join(vf_parts)])
 
         cmd.extend([
             '-f', 'rawvideo',
@@ -157,6 +172,19 @@ class FFmpegNVDECCapture:
             return self.cap
 
         self._probe_video()
+
+        # Compute decode-level scaling for high-res videos
+        if (self._decode_target_height is not None
+                and self._height > self._decode_target_height):
+            self._scale_factor = self._decode_target_height / self._height
+            self._output_width = int(self._width * self._scale_factor)
+            self._output_width += self._output_width % 2  # Ensure even
+            self._output_height = self._decode_target_height
+            self._frame_size = self._output_width * self._output_height * 3
+        else:
+            self._output_width = self._width
+            self._output_height = self._height
+
         self._start_ffmpeg()
         self._pos = 0
         return self
@@ -223,7 +251,7 @@ class FFmpegNVDECCapture:
             raw = self.proc.stdout.read(self._frame_size)
             if len(raw) != self._frame_size:
                 return False, None
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._height, self._width, 3)
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._output_height, self._output_width, 3)
             self._pos += 1
             # Estimate PTS from frame position (FFmpeg subprocess doesn't expose true PTS)
             self._last_pts = self._pos / self._fps if self._fps else None
@@ -234,6 +262,10 @@ class FFmpegNVDECCapture:
     def get_last_pts(self) -> float:
         """Get estimated PTS of the last read frame in seconds."""
         return self._last_pts
+
+    def get_scale_factor(self):
+        """Get the downscaling factor (1.0 = no scaling, <1.0 = downscaled)."""
+        return self._scale_factor
 
     def get_stream_start_time(self) -> float:
         """Get the stream's start_time (estimated as 0 for FFmpeg pipe)."""
@@ -248,9 +280,10 @@ class PyAVCapture:
     Uses FFmpeg's NVDEC for hardware-accelerated video decoding on NVIDIA GPUs.
     """
 
-    def __init__(self, video_path, use_gpu=True):
+    def __init__(self, video_path, use_gpu=True, decode_target_height=None):
         self.path = video_path
         self.use_gpu = use_gpu
+        self._decode_target_height = decode_target_height
         self.container = None
         self.stream = None
         self._pos = 0
@@ -258,14 +291,13 @@ class PyAVCapture:
         self._fps = None
         self._width = None
         self._height = None
-        # Auto-downscaling for 4K+ videos
         self._scale_factor = 1.0
         self._output_width = None
         self._output_height = None
         # PTS tracking - canonical timestamp source
         self._last_pts = None  # Last frame's PTS in seconds
-        # HDR tone mapping filter graph (None for SDR)
-        self._tonemap_graph = None
+        # Combined filter graph for tone mapping and/or scaling (None = fast path)
+        self._filter_graph = None
 
     def __enter__(self):
         if not PYAV_AVAILABLE:
@@ -299,49 +331,78 @@ class PyAVCapture:
         self._width = self.stream.width
         self._height = self.stream.height
 
-        # No auto-downscaling in adapter - video.py handles resize after crop
-        # This is more efficient: crop first, then resize only the subtitle region
-        self._scale_factor = 1.0
+        # Compute decode-level scaling for high-res videos
+        if (self._decode_target_height is not None
+                and self._height > self._decode_target_height):
+            self._scale_factor = self._decode_target_height / self._height
+            self._output_width = int(self._width * self._scale_factor)
+            self._output_width += self._output_width % 2  # Ensure even
+            self._output_height = self._decode_target_height
+        else:
+            self._scale_factor = 1.0
+            self._output_width = self._width
+            self._output_height = self._height
 
         self._pos = 0
         self._frame_generator = self.container.decode(video=0)
 
-        # Set up HDR tone mapping if needed
-        self._setup_tonemap_graph()
+        # Set up combined filter graph (tone mapping + scaling)
+        self._setup_filter_graph()
 
         return self
 
-    def _setup_tonemap_graph(self):
-        """Build a PyAV filter graph for HDR→SDR tone mapping if the stream is HDR."""
+    def _setup_filter_graph(self):
+        """Build a unified PyAV filter graph for HDR tone mapping and/or downscaling."""
+        needs_tonemap = False
+        trc = None
         try:
             trc = self.stream.codec_context.color_trc
-            if trc not in (_TRC_SMPTE2084, _TRC_ARIB_STD_B67):
-                return  # SDR — no tone mapping needed
+            needs_tonemap = trc in (_TRC_SMPTE2084, _TRC_ARIB_STD_B67)
+        except Exception:
+            pass
 
-            # PQ needs npl=100 (nominal peak luminance); HLG does not
-            zscale_linear_args = 't=linear:npl=100' if trc == _TRC_SMPTE2084 else 't=linear'
+        needs_scale = self._scale_factor < 1.0
 
+        if not needs_tonemap and not needs_scale:
+            self._filter_graph = None
+            return
+
+        try:
             graph = av.filter.Graph()
             buf = graph.add_buffer(template=self.stream)
-            linearize = graph.add('zscale', zscale_linear_args)
-            fmt_in = graph.add('format', 'gbrpf32le')
-            tonemap = graph.add('tonemap', 'hable')
-            bt709 = graph.add('zscale', 't=bt709')
-            fmt_out = graph.add('format', 'bgr24')
-            sink = graph.add('buffersink')
+            last = buf
 
-            buf.link_to(linearize)
-            linearize.link_to(fmt_in)
-            fmt_in.link_to(tonemap)
-            tonemap.link_to(bt709)
-            bt709.link_to(fmt_out)
-            fmt_out.link_to(sink)
+            if needs_tonemap:
+                zscale_linear_args = 't=linear:npl=100' if trc == _TRC_SMPTE2084 else 't=linear'
+                linearize = graph.add('zscale', zscale_linear_args)
+                fmt_in = graph.add('format', 'gbrpf32le')
+                tonemap = graph.add('tonemap', 'hable')
+                bt709 = graph.add('zscale', 't=bt709')
+                last.link_to(linearize)
+                linearize.link_to(fmt_in)
+                fmt_in.link_to(tonemap)
+                tonemap.link_to(bt709)
+                last = bt709
+
+            # Scale after tone mapping (operates on uint8 bgr24 for efficiency)
+            fmt_out = graph.add('format', 'bgr24')
+            last.link_to(fmt_out)
+            last = fmt_out
+
+            if needs_scale:
+                scale = graph.add('scale', f'{self._output_width}:{self._output_height}')
+                last.link_to(scale)
+                last = scale
+
+            sink = graph.add('buffersink')
+            last.link_to(sink)
 
             graph.configure()
-            self._tonemap_graph = graph
+            self._filter_graph = graph
         except Exception:
-            # Graceful fallback: if filter graph setup fails, proceed without tone mapping
-            self._tonemap_graph = None
+            # Graceful fallback: proceed without filtering
+            self._filter_graph = None
+            self._scale_factor = 1.0
 
     def __exit__(self, exc_type, exc_value, traceback):
         if not PYAV_AVAILABLE:
@@ -405,7 +466,8 @@ class PyAVCapture:
         """Read next frame (compatible with cv2.VideoCapture.read).
 
         Returns:
-            tuple: (success, frame) where frame is BGR numpy array at native resolution
+            tuple: (success, frame) where frame is BGR numpy array
+                   (downscaled if decode_target_height was set)
         """
         if not PYAV_AVAILABLE:
             ret, frame = self.cap.read()
@@ -428,10 +490,10 @@ class PyAVCapture:
             # Calculate frame position from PTS (for compatibility)
             self._pos = int(round(self._last_pts * self._fps))
 
-            # Apply HDR→SDR tone mapping if graph is set up, otherwise direct convert
-            if self._tonemap_graph is not None:
-                self._tonemap_graph.vpush(frame)
-                frame = self._tonemap_graph.vpull()
+            # Apply filter graph (tone mapping + scaling) if set up
+            if self._filter_graph is not None:
+                self._filter_graph.vpush(frame)
+                frame = self._filter_graph.vpull()
                 img = frame.to_ndarray()
             else:
                 img = frame.to_ndarray(format='bgr24')
@@ -475,13 +537,28 @@ elif FFMPEG_AVAILABLE:
 else:
     # Fallback to OpenCV wrapper
     class OpenCVCapture:
-        def __init__(self, video_path, use_gpu=True):
+        def __init__(self, video_path, use_gpu=True, decode_target_height=None):
             self.path = video_path
+            self._decode_target_height = decode_target_height
             self._last_pts = None
+            self._scale_factor = 1.0
+            self._output_width = None
+            self._output_height = None
         def __enter__(self):
             self.cap = cv2.VideoCapture(self.path)
             if not self.cap.isOpened():
                 raise IOError(f'Cannot open video {self.path}')
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            if (self._decode_target_height is not None
+                    and h > self._decode_target_height):
+                self._scale_factor = self._decode_target_height / h
+                self._output_width = int(w * self._scale_factor)
+                self._output_width += self._output_width % 2
+                self._output_height = self._decode_target_height
+            else:
+                self._output_width = w
+                self._output_height = h
             return self
         def __exit__(self, exc_type, exc_value, traceback):
             self.cap.release()
@@ -495,9 +572,15 @@ else:
                 fps = self.cap.get(cv2.CAP_PROP_FPS)
                 pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
                 self._last_pts = pos / fps if fps else None
+                if self._scale_factor < 1.0:
+                    frame = cv2.resize(frame,
+                                       (self._output_width, self._output_height),
+                                       interpolation=cv2.INTER_AREA)
             return ret, frame
         def get_last_pts(self) -> float:
             return self._last_pts
+        def get_scale_factor(self):
+            return self._scale_factor
         def get_stream_start_time(self) -> float:
             return 0.0  # OpenCV doesn't expose start_time
     Capture = OpenCVCapture

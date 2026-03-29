@@ -9,7 +9,7 @@ import time
 from . import utils
 from .models import PredictedFrames, PredictedSubtitle
 
-from .pyav_adapter import Capture
+from .pyav_adapter import Capture, DECODE_TARGET_HEIGHT
 
 # Batch size for OCR processing - higher values = faster but more GPU memory
 # 64 is optimal for most cases
@@ -112,6 +112,18 @@ class Video:
                     crop_x_end = inferred_x + inferred_width
                     crop_y_end = inferred_y + inferred_height
 
+        # Decode-level downscaling for 4K+ videos
+        decode_height = DECODE_TARGET_HEIGHT if self.height > DECODE_TARGET_HEIGHT else None
+
+        # Scale crop coordinates from native to decode resolution
+        if decode_height is not None:
+            scale_factor = decode_height / self.height
+            if crop_x_start is not None:
+                crop_x_start = int(crop_x_start * scale_factor)
+                crop_y_start = int(crop_y_start * scale_factor)
+                crop_x_end = int(crop_x_end * scale_factor)
+                crop_y_end = int(crop_y_end * scale_factor)
+
         # get frames from ocr_start to ocr_end using producer-consumer pattern
         modulo = frames_to_skip + 1
         frames_to_process = (num_ocr_frames + modulo - 1) // modulo
@@ -122,7 +134,11 @@ class Video:
 
         # Create queue for producer-consumer communication
         # Dynamic buffer sizing based on frame size and RAM budget
-        frame_bytes = self.width * self.height * 3  # BGR24
+        if decode_height is not None:
+            buf_w = int(self.width * (decode_height / self.height))
+            frame_bytes = buf_w * decode_height * 3
+        else:
+            frame_bytes = self.width * self.height * 3  # BGR24
         buffer_frames = max(BATCH_SIZE * 2, MAX_BUFFER_BYTES // frame_bytes)
         frame_queue = Queue(maxsize=buffer_frames)
 
@@ -141,7 +157,7 @@ class Video:
 
         adjusted_ocr_start = ocr_start
 
-        with Capture(self.path) as v:
+        with Capture(self.path, decode_target_height=decode_height) as v:
             # Get the container-level start_time for PTS normalization.
             # Players offset PTS only by container start_time (0 for MKV,
             # possibly non-zero for MP4). Stream start_time is not used.
@@ -429,13 +445,13 @@ class Video:
                         progress.update(1)
                     continue
 
-                # Apply crop at native resolution
+                # Apply crop (coordinates pre-scaled if decode downscaling is active)
                 if not self.use_fullframe:
                     if crop_x_end is not None and crop_y_end is not None:
                         frame = frame[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
                     else:
                         # only use bottom third of the frame by default
-                        frame = frame[2 * self.height // 3 :, :]
+                        frame = frame[2 * frame.shape[0] // 3 :, :]
 
                 # Downscale for faster OCR, but ensure minimum height for accuracy
                 # Scale is based on crop region size, not original video size
