@@ -1,7 +1,7 @@
 """Read-only file details dialog showing resolved OCR settings."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
@@ -22,10 +22,8 @@ class FileDetailsData:
     brightness_is_override: bool = False
     crop: Optional[tuple[int, int, int, int]] = None  # (x, y, w, h) or None
     crop_is_override: bool = False
-    time_start: str = ""
-    time_start_is_override: bool = False
-    time_end: str = ""
-    time_end_is_override: bool = False
+    time_ranges: list[tuple[str, str]] = field(default_factory=list)
+    time_ranges_is_override: bool = False
 
     # Global-only OCR settings
     ocr_lang: str = "ch"
@@ -111,8 +109,16 @@ class FileDetailsDialog(QDialog):
         pf_form.addRow("Crop Region:", self._val_label(crop_text, d.crop_is_override))
 
         pf_form.addRow("Brightness:", self._val_label(str(d.brightness), d.brightness_is_override))
-        pf_form.addRow("Time Start:", self._val_label(d.time_start or "0:00", d.time_start_is_override))
-        pf_form.addRow("Time End:", self._val_label(d.time_end or "(full duration)", d.time_end_is_override))
+
+        if d.time_ranges:
+            range_strs = [
+                f"{r[0] or '0:00'} - {r[1] or '(full duration)'}"
+                for r in d.time_ranges
+            ]
+            time_text = ", ".join(range_strs)
+        else:
+            time_text = "Full duration"
+        pf_form.addRow("Time Ranges:", self._val_label(time_text, d.time_ranges_is_override))
 
         layout.addWidget(pf_group)
 

@@ -61,12 +61,11 @@ class FileTableWidget(QWidget):
     # Column indices
     COL_FILE = 0
     COL_RESOLUTION = 1
-    COL_TSTART = 2
-    COL_TEND = 3
-    COL_BRI = 4
-    COL_CONFIG = 5
-    COL_PROGRESS = 6
-    COL_STATUS = 7
+    COL_TIME = 2
+    COL_BRI = 3
+    COL_CONFIG = 4
+    COL_PROGRESS = 5
+    COL_STATUS = 6
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -87,20 +86,19 @@ class FileTableWidget(QWidget):
 
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels([
-            "File", "Res", "TStart", "TEnd", "Bri", "Cfg", "Progress", "Status",
+            "File", "Res", "Time", "Bri", "Cfg", "Progress", "Status",
         ])
 
         # Column sizing
         header_view = self.table.horizontalHeader()
         header_view.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
-        for col in (self.COL_RESOLUTION, self.COL_TSTART, self.COL_TEND,
+        for col in (self.COL_RESOLUTION, self.COL_TIME,
                      self.COL_BRI, self.COL_CONFIG, self.COL_PROGRESS, self.COL_STATUS):
             header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(self.COL_RESOLUTION, 80)
-        self.table.setColumnWidth(self.COL_TSTART, 80)
-        self.table.setColumnWidth(self.COL_TEND, 80)
+        self.table.setColumnWidth(self.COL_TIME, 120)
         self.table.setColumnWidth(self.COL_BRI, 80)
         self.table.setColumnWidth(self.COL_CONFIG, 65)
         self.table.setColumnWidth(self.COL_PROGRESS, 150)
@@ -165,8 +163,8 @@ class FileTableWidget(QWidget):
             res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, self.COL_RESOLUTION, res_item)
 
-            # TStart / TEnd / Bri columns (populated from FileConfig)
-            for col in (self.COL_TSTART, self.COL_TEND, self.COL_BRI):
+            # Time / Bri columns (populated from FileConfig)
+            for col in (self.COL_TIME, self.COL_BRI):
                 item = QTableWidgetItem("-")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, col, item)
@@ -203,31 +201,49 @@ class FileTableWidget(QWidget):
             res_item.setText(label)
 
     def update_file_config_columns(self, filename: str):
-        """Update TStart, TEnd, and Bri columns for a file from its FileConfig."""
+        """Update Time and Bri columns for a file from its FileConfig."""
         self._update_file_config_columns(filename)
 
     def _update_file_config_columns(self, filename: str):
-        """Internal: refresh TStart, TEnd, Bri cells from the file config store."""
+        """Internal: refresh Time, Bri cells from the file config store."""
         if filename not in self._file_rows:
             return
         row = self._file_rows[filename]
         config = self._file_store.get(filename) if self._file_store else None
 
-        tstart = self._format_time(config.time_start) if config and config.time_start else "-"
-        tend = self._format_time(config.time_end) if config and config.time_end else "-"
+        time_text = "-"
+        time_tooltip = ""
+        if config and config.has_custom_time_range():
+            ranges = config.time_ranges
+            if len(ranges) == 1:
+                s = self._format_time(ranges[0][0]) if ranges[0][0] else "0:00"
+                e = self._format_time(ranges[0][1]) if ranges[0][1] else "end"
+                time_text = f"{s}-{e}"
+            else:
+                time_text = f"{len(ranges)} ranges"
+                time_tooltip = ", ".join(
+                    f"{self._format_time(r[0]) if r[0] else '0:00'}-{self._format_time(r[1]) if r[1] else 'end'}"
+                    for r in ranges
+                )
+
         bri = str(config.brightness) if config and config.brightness is not None else "-"
 
-        for col, text in ((self.COL_TSTART, tstart), (self.COL_TEND, tend), (self.COL_BRI, bri)):
-            item = self.table.item(row, col)
-            if item:
-                item.setText(text)
+        time_item = self.table.item(row, self.COL_TIME)
+        if time_item:
+            time_item.setText(time_text)
+            time_item.setToolTip(time_tooltip)
+
+        bri_item = self.table.item(row, self.COL_BRI)
+        if bri_item:
+            bri_item.setText(bri)
 
     @staticmethod
     def _format_time(time_str: str) -> str:
         """Format a time string (HH:MM:SS or MM:SS) to MM:ss for display."""
+        if not time_str:
+            return ""
         parts = time_str.split(":")
         if len(parts) == 3:
-            # HH:MM:SS -> total minutes : seconds
             h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
             total_min = h * 60 + m
             return f"{total_min}:{s:02d}"
@@ -236,7 +252,7 @@ class FileTableWidget(QWidget):
         return time_str
 
     def update_config_indicator(self, filename: str):
-        """Update the config indicator and TStart/TEnd/Bri columns for a file.
+        """Update the config indicator and Time/Bri columns for a file.
 
         Since colors are based on matching configs across files,
         we refresh all indicators when any file's config changes.
@@ -277,12 +293,12 @@ class FileTableWidget(QWidget):
         if config.has_custom_brightness():
             parts.append(f"Brightness: {config.brightness}")
         if config.has_custom_time_range():
-            time_parts = []
-            if config.time_start:
-                time_parts.append(f"from {config.time_start}")
-            if config.time_end:
-                time_parts.append(f"to {config.time_end}")
-            parts.append(f"Time: {' '.join(time_parts)}")
+            range_strs = []
+            for r in config.time_ranges:
+                s = r[0] or "0:00"
+                e = r[1] or "end"
+                range_strs.append(f"{s}-{e}")
+            parts.append(f"Time: {', '.join(range_strs)}")
         return "Custom: " + ", ".join(parts) if parts else "Custom settings"
 
     def update_status(self, filename: str, status: FileStatus):

@@ -23,6 +23,7 @@ from theme import apply_theme
 from widgets.crop_selector import CropSelectorDialog
 from widgets.brightness_tester import BrightnessTesterDialog
 from widgets.time_range_slider import TimeRangeSlider
+from widgets.time_range_chips import TimeRangeChipsWidget
 from widgets.file_table import FileTableWidget
 from widgets.settings_dialog import SettingsDialog
 from widgets.file_details_dialog import FileDetailsDialog, FileDetailsData
@@ -75,6 +76,7 @@ class MainWindow(QMainWindow):
         # Autodetect settings
         self.autodetect_settings = {
             'min_segment_length': '30',
+            'merge_repeating_silences': 'false',
         }
 
         # Automation settings (auto-crop parameters)
@@ -101,6 +103,8 @@ class MainWindow(QMainWindow):
         self.brightness_spin = None
         self.brightness_test_btn = None
         self.time_range_slider = None
+        self.time_range_chips = None
+        self._active_range_index: int = -1
         self.parallel_slider = None
         self.parallel_label = None
         self.file_table = None
@@ -283,13 +287,23 @@ class MainWindow(QMainWindow):
 
         # Card 2: Time Range
         time_group = QGroupBox("Time Range")
-        time_row = QHBoxLayout(time_group)
-        time_row.setContentsMargins(8, 4, 8, 4)
+        time_layout = QVBoxLayout(time_group)
+        time_layout.setContentsMargins(8, 4, 8, 4)
+        time_layout.setSpacing(4)
+        # Row 1: slider + auto-detect
+        slider_row = QHBoxLayout()
         self.time_range_slider = TimeRangeSlider()
-        time_row.addWidget(self.time_range_slider, 1)
+        slider_row.addWidget(self.time_range_slider, 1)
         self.auto_time_range_btn = self._make_icon_btn("mdi.auto-fix", "Autodetect time ranges")
         self.auto_time_range_btn.clicked.connect(self._on_auto_time_range_clicked)
-        time_row.addWidget(self.auto_time_range_btn)
+        slider_row.addWidget(self.auto_time_range_btn)
+        time_layout.addLayout(slider_row)
+        # Row 2: range chips
+        self.time_range_chips = TimeRangeChipsWidget()
+        self.time_range_chips.range_selected.connect(self._on_range_chip_selected)
+        self.time_range_chips.range_removed.connect(self._on_range_chip_removed)
+        self.time_range_chips.add_clicked.connect(self._on_add_range_clicked)
+        time_layout.addWidget(self.time_range_chips)
         layout.addWidget(time_group)
 
         # Card 3: Processing
@@ -370,7 +384,7 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
-        # Time range
+        # Time range (global: single range from slider, used as default for files without custom ranges)
         time_start, time_end = self.time_range_slider.get_time_strings()
         if time_start or time_end:
             global_settings['time_range'] = {'start': time_start, 'end': time_end}
@@ -494,11 +508,17 @@ class MainWindow(QMainWindow):
             if 'brightness' in cfg:
                 config.brightness = cfg['brightness']
 
-            if 'time_start' in cfg:
-                config.time_start = cfg['time_start']
-
-            if 'time_end' in cfg:
-                config.time_end = cfg['time_end']
+            # Time ranges: new format or backward compat from old time_start/time_end
+            if 'time_ranges' in cfg:
+                config.time_ranges = [
+                    (r.get('start') or None, r.get('end') or None)
+                    for r in cfg['time_ranges']
+                ]
+            elif 'time_start' in cfg or 'time_end' in cfg:
+                start = cfg.get('time_start')
+                end = cfg.get('time_end')
+                if start or end:
+                    config.time_ranges = [(start or None, end or None)]
 
             if 'resolution' in cfg:
                 res = cfg['resolution']
@@ -734,13 +754,18 @@ class MainWindow(QMainWindow):
         self.brightness_spin.blockSignals(False)
 
         if config and config.has_custom_time_range():
-            self.time_range_slider.set_time_range(
-                config.time_start or "",
-                config.time_end or ""
-            )
+            # Load first range into slider, populate chips
+            r = config.time_ranges[0]
+            self.time_range_slider.set_time_range(r[0] or "", r[1] or "")
+            self._active_range_index = 0
+            self.time_range_chips.set_ranges(config.time_ranges)
+            self.time_range_chips.set_active(0)
         else:
-            # Reset to full duration
+            # Reset to full duration, clear chips
             self.time_range_slider.set_time_range("", "")
+            self._active_range_index = -1
+            self.time_range_chips.set_ranges([])
+            self.time_range_chips.set_active(-1)
 
     def _update_start_button_label(self):
         """Update start button text to reflect selection count."""
@@ -799,40 +824,112 @@ class MainWindow(QMainWindow):
             self.file_table.update_config_indicator(filename)
         self._schedule_save()
 
-    def _apply_time_range_to_files(self, start_str: str, end_str: str, filenames: list[str],
-                                    update_start: bool = True, update_end: bool = True):
-        """Apply time range setting to specified files.
-
-        Args:
-            start_str: Time start as MM:SS string (empty = beginning).
-            end_str: Time end as MM:SS string (empty = full duration).
-            filenames: Files to apply to.
-            update_start: Whether to update the start value.
-            update_end: Whether to update the end value.
-        """
-        for filename in filenames:
-            config = self.file_config_store.get_or_create(filename)
-            if update_start:
-                config.time_start = start_str if start_str else None
-            if update_end:
-                config.time_end = end_str if end_str else None
-            self.file_table.update_config_indicator(filename)
-        self._schedule_save()
-
     def _on_brightness_changed(self, value: int):
         """Handle brightness spinbox change - apply to selected files or all if none selected."""
         target_files = self._get_target_files()
         self._apply_brightness_to_files(value, target_files)
 
     def _on_time_range_changed(self, start: int, end: int, handle: str):
-        """Handle time range slider change - only update the value that was dragged."""
+        """Handle time range slider commit - update the active range in file configs."""
+        if self._active_range_index < 0:
+            # No active range being edited - slider is in "preview" mode before Add
+            return
+
         start_str, end_str = self.time_range_slider.get_time_strings()
         target_files = self._get_target_files()
-        self._apply_time_range_to_files(
-            start_str, end_str, target_files,
-            update_start=(handle == 'start'),
-            update_end=(handle == 'end'),
-        )
+        for filename in target_files:
+            config = self.file_config_store.get_or_create(filename)
+            if self._active_range_index < len(config.time_ranges):
+                config.set_time_range(
+                    self._active_range_index,
+                    start_str or None,
+                    end_str or None,
+                )
+                self.file_table.update_config_indicator(filename)
+        self._refresh_time_range_chips()
+        self._schedule_save()
+
+    def _on_add_range_clicked(self):
+        """Capture current slider values as a new time range."""
+        start_str, end_str = self.time_range_slider.get_time_strings()
+        # Don't add empty/full-duration ranges
+        if not start_str and not end_str:
+            return
+
+        target_files = self._get_target_files()
+        for filename in target_files:
+            config = self.file_config_store.get_or_create(filename)
+            config.add_time_range(start_str or None, end_str or None)
+            self.file_table.update_config_indicator(filename)
+
+        self._refresh_time_range_chips()
+        # Select the newly added range
+        first_file = target_files[0] if target_files else None
+        if first_file:
+            fc = self.file_config_store.get(first_file)
+            if fc:
+                # Find index of the range we just added (sorted list)
+                new_range = (start_str or None, end_str or None)
+                for i, r in enumerate(fc.time_ranges):
+                    if r == new_range:
+                        self._active_range_index = i
+                        self.time_range_chips.set_active(i)
+                        break
+        self._schedule_save()
+
+    def _on_range_chip_selected(self, index: int):
+        """Load the selected range into the slider."""
+        self._active_range_index = index
+        target_files = self._get_target_files()
+        first_file = target_files[0] if target_files else None
+        if first_file:
+            fc = self.file_config_store.get(first_file)
+            if fc and index < len(fc.time_ranges):
+                r = fc.time_ranges[index]
+                self.time_range_slider.blockSignals(True)
+                self.time_range_slider.set_time_range(r[0] or "", r[1] or "")
+                self.time_range_slider.blockSignals(False)
+
+    def _on_range_chip_removed(self, index: int):
+        """Remove a time range from file configs."""
+        target_files = self._get_target_files()
+        for filename in target_files:
+            config = self.file_config_store.get_or_create(filename)
+            config.remove_time_range(index)
+            self.file_table.update_config_indicator(filename)
+
+        # Adjust active index
+        first_file = target_files[0] if target_files else None
+        fc = self.file_config_store.get(first_file) if first_file else None
+        remaining = len(fc.time_ranges) if fc else 0
+        if remaining == 0:
+            self._active_range_index = -1
+            self.time_range_slider.set_time_range("", "")
+        elif index >= remaining:
+            self._active_range_index = remaining - 1
+        else:
+            self._active_range_index = index
+
+        self._refresh_time_range_chips()
+        # Load the new active range into slider
+        if self._active_range_index >= 0 and fc and self._active_range_index < len(fc.time_ranges):
+            r = fc.time_ranges[self._active_range_index]
+            self.time_range_slider.blockSignals(True)
+            self.time_range_slider.set_time_range(r[0] or "", r[1] or "")
+            self.time_range_slider.blockSignals(False)
+        self._schedule_save()
+
+    def _refresh_time_range_chips(self):
+        """Rebuild chip display from the first target file's config."""
+        target_files = self._get_target_files()
+        first_file = target_files[0] if target_files else None
+        if first_file:
+            fc = self.file_config_store.get(first_file)
+            ranges = fc.time_ranges if fc else []
+        else:
+            ranges = []
+        self.time_range_chips.set_ranges(ranges)
+        self.time_range_chips.set_active(self._active_range_index)
 
     def _on_auto_time_range_clicked(self):
         """Run audio fingerprint analysis to auto-detect intros/outros."""
@@ -863,7 +960,10 @@ class MainWindow(QMainWindow):
         # Create and start worker
         self._audio_analysis_worker = AudioAnalysisWorker(
             self.project_path, filenames,
-            min_segment_sec=int(self.autodetect_settings['min_segment_length'])
+            min_segment_sec=int(self.autodetect_settings['min_segment_length']),
+            merge_repeating_silences=(
+                self.autodetect_settings.get('merge_repeating_silences', 'false').lower() == 'true'
+            ),
         )
         self._audio_analysis_worker.phase_changed.connect(self._on_audio_phase_changed)
         self._audio_analysis_worker.file_progress.connect(self._on_audio_file_progress)
@@ -918,15 +1018,11 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Apply results to FileConfig entries
         applied = 0
-        for filename, (time_start, time_end) in results.items():
-            if time_start is not None or time_end is not None:
+        for filename, ranges in results.items():
+            if ranges:
                 config = self.file_config_store.get_or_create(filename)
-                if time_start is not None:
-                    config.time_start = time_start
-                if time_end is not None:
-                    config.time_end = time_end
+                config.time_ranges = ranges
                 self.file_table.update_config_indicator(filename)
                 applied += 1
 
@@ -1047,8 +1143,7 @@ class MainWindow(QMainWindow):
                     crop_width=config.crop_width,
                     crop_height=config.crop_height,
                     brightness=config.brightness,
-                    time_start=config.time_start,
-                    time_end=config.time_end
+                    time_ranges=list(config.time_ranges),
                 )
 
         elif action == "paste" and self.clipboard_config:
@@ -1329,7 +1424,9 @@ class MainWindow(QMainWindow):
         # Build config from UI
         config = Config(project_path=self.project_path)
         config.brightness = self.brightness_spin.value()
-        config.time_start, config.time_end = self.time_range_slider.get_time_strings()
+        time_start, time_end = self.time_range_slider.get_time_strings()
+        if time_start or time_end:
+            config.time_ranges = [(time_start, time_end)]
         config.ocr_parallel = self.parallel_slider.value()
 
         # Apply videocr settings
@@ -1533,11 +1630,15 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     pass
 
-        time_start_override = fc is not None and fc.time_start is not None
-        time_end_override = fc is not None and fc.time_end is not None
-        global_start, global_end = self.time_range_slider.get_time_strings()
-        time_start = fc.time_start if time_start_override else global_start
-        time_end = fc.time_end if time_end_override else global_end
+        time_ranges_override = fc is not None and fc.has_custom_time_range()
+        if time_ranges_override:
+            time_ranges = list(fc.time_ranges)
+        else:
+            global_start, global_end = self.time_range_slider.get_time_strings()
+            if global_start or global_end:
+                time_ranges = [(global_start, global_end)]
+            else:
+                time_ranges = []
 
         # Resolution/duration from file config metadata
         res_w = fc.resolution_width if fc else 0
@@ -1553,10 +1654,8 @@ class MainWindow(QMainWindow):
             brightness_is_override=brightness_override,
             crop=crop,
             crop_is_override=crop_override,
-            time_start=time_start,
-            time_start_is_override=time_start_override,
-            time_end=time_end,
-            time_end_is_override=time_end_override,
+            time_ranges=time_ranges,
+            time_ranges_is_override=time_ranges_override,
             ocr_lang=self.videocr_settings.get('ocr_lang', 'ch'),
             conf_threshold=int(self.videocr_settings.get('conf_threshold', '95')),
             sim_threshold=int(self.videocr_settings.get('sim_threshold', '82')),
@@ -1590,6 +1689,7 @@ class MainWindow(QMainWindow):
         self.brightness_spin.setEnabled(False)
         self.brightness_test_btn.setEnabled(False)
         self.time_range_slider.setEnabled(False)
+        self.time_range_chips.setEnabled(False)
         self.parallel_slider.setEnabled(False)
         self.dialogue_checkbox.setEnabled(False)
         self.labels_checkbox.setEnabled(False)
@@ -1606,6 +1706,7 @@ class MainWindow(QMainWindow):
         self.brightness_spin.setEnabled(True)
         self.brightness_test_btn.setEnabled(True)
         self.time_range_slider.setEnabled(True)
+        self.time_range_chips.setEnabled(True)
         self.parallel_slider.setEnabled(True)
         self.dialogue_checkbox.setEnabled(True)
         self.labels_checkbox.setEnabled(True)
