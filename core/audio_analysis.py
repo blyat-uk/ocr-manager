@@ -15,13 +15,11 @@ from core.audio_finder.matching.iterative import run_analysis
 
 logger = logging.getLogger(__name__)
 
-# Threshold: if a segment starts within this many seconds of 0:00, treat as intro
-INTRO_THRESHOLD_SEC = 30.0
-# Threshold: if a segment ends within this many seconds of file end, treat as outro
-OUTRO_THRESHOLD_SEC = 30.0
-
 # Default minimum repeating-segment length (seconds)
 DEFAULT_MIN_SEGMENT_SEC = 30.0
+
+# Minimum gap duration (seconds) to be considered a "keep" range
+MIN_GAP_SEC = 5.0
 
 
 class AudioAnalysisWorker(QObject):
@@ -37,7 +35,7 @@ class AudioAnalysisWorker(QObject):
         file_progress(str, int, int): filename, current (1-based), total
         analysis_progress(str): Status messages from iterative analysis
         error(str): Error message
-        finished(dict): {filename: (time_start_mmss | None, time_end_mmss | None)}
+        finished(dict): {filename: [(start_mmss | None, end_mmss | None), ...]}
     """
 
     phase_changed = pyqtSignal(str)
@@ -47,11 +45,13 @@ class AudioAnalysisWorker(QObject):
     finished = pyqtSignal(dict)
 
     def __init__(self, project_path: str, video_files: list[str],
-                 min_segment_sec: float = DEFAULT_MIN_SEGMENT_SEC):
+                 min_segment_sec: float = DEFAULT_MIN_SEGMENT_SEC,
+                 merge_repeating_silences: bool = False):
         super().__init__()
         self._project_path = project_path
         self._video_files = video_files
         self._min_segment_sec = min_segment_sec
+        self._merge_repeating_silences = merge_repeating_silences
         self._cancel_requested = False
         self._thread: QThread | None = None
 
@@ -156,15 +156,98 @@ class AudioAnalysisWorker(QObject):
 
         run_analysis(cfg, tag_id, profile_id, on_progress=on_progress)
 
+    @staticmethod
+    def _secs_to_mmss(seconds: float) -> str:
+        """Convert seconds to MM:SS string."""
+        minutes = int(seconds) // 60
+        secs = int(seconds) % 60
+        return f"{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def _merge_silence_gaps(
+        file_skip_blocks: dict[int, list[tuple[float, float]]],
+        position_tolerance_sec: float = 5.0,
+        max_gap_duration_sec: float = 30.0,
+        min_file_ratio: float = 0.5,
+    ) -> dict[int, list[tuple[float, float]]]:
+        """Bridge silence gaps between skip blocks when they appear consistently across files.
+
+        For each file, examines gaps between consecutive skip blocks. If a gap appears
+        at a similar time position in more than min_file_ratio of files, the adjacent
+        skip blocks are merged (bridging the silence gap).
+        """
+        # Collect all gaps: (file_id, gap_index, gap_start, gap_end, midpoint)
+        all_gaps: list[tuple[int, int, float, float, float]] = []
+        for fid, blocks in file_skip_blocks.items():
+            for i in range(len(blocks) - 1):
+                gap_start = blocks[i][1]
+                gap_end = blocks[i + 1][0]
+                gap_duration = gap_end - gap_start
+                if gap_duration <= max_gap_duration_sec:
+                    midpoint = (gap_start + gap_end) / 2.0
+                    all_gaps.append((fid, i, gap_start, gap_end, midpoint))
+
+        if not all_gaps:
+            return file_skip_blocks
+
+        num_files = len(file_skip_blocks)
+        min_file_count = max(2, int(num_files * min_file_ratio))
+
+        # Cluster gaps by midpoint position across files
+        all_gaps.sort(key=lambda g: g[4])
+        clusters: list[list[tuple[int, int, float, float, float]]] = []
+        current_cluster: list[tuple[int, int, float, float, float]] = [all_gaps[0]]
+
+        for gap in all_gaps[1:]:
+            if gap[4] - current_cluster[0][4] <= position_tolerance_sec * 2:
+                cluster_fids = {g[0] for g in current_cluster}
+                if gap[0] not in cluster_fids:
+                    current_cluster.append(gap)
+                else:
+                    clusters.append(current_cluster)
+                    current_cluster = [gap]
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [gap]
+        clusters.append(current_cluster)
+
+        # Identify gaps that appear in enough files
+        gaps_to_bridge: set[tuple[int, int]] = set()
+        for cluster in clusters:
+            unique_files = {g[0] for g in cluster}
+            if len(unique_files) >= min_file_count:
+                for fid, gap_idx, _, _, _ in cluster:
+                    gaps_to_bridge.add((fid, gap_idx))
+
+        if not gaps_to_bridge:
+            return file_skip_blocks
+
+        # Merge skip blocks across bridged gaps
+        result: dict[int, list[tuple[float, float]]] = {}
+        for fid, blocks in file_skip_blocks.items():
+            new_blocks: list[tuple[float, float]] = []
+            i = 0
+            while i < len(blocks):
+                start, end = blocks[i]
+                while i < len(blocks) - 1 and (fid, i) in gaps_to_bridge:
+                    end = max(end, blocks[i + 1][1])
+                    i += 1
+                new_blocks.append((start, end))
+                i += 1
+            result[fid] = new_blocks
+
+        return result
+
     def _compute_time_ranges(
         self, cfg: AnalysisConfig, tag_id: int, profile_id: int
-    ) -> dict[str, tuple[str | None, str | None]]:
-        """Determine per-file content windows from segment matches.
+    ) -> dict[str, list[tuple[str | None, str | None]]]:
+        """Determine per-file keep ranges by inverting detected repeating segments.
 
-        Returns {filename: (time_start_mmss | None, time_end_mmss | None)}.
+        All detected segments (intros, outros, mid-episode bumpers, etc.) are
+        merged into "skip" blocks. The gaps between them become "keep" ranges.
+
+        Returns {filename: [(start_mmss | None, end_mmss | None), ...]}.
         """
-        results: dict[str, tuple[str | None, str | None]] = {}
-
         with get_conn(cfg.db_path) as conn:
             segments = repo.get_segments_for_tag(conn, tag_id, profile_id)
             files = repo.get_files_for_tag(conn, tag_id)
@@ -184,36 +267,52 @@ class AudioAnalysisWorker(QObject):
                 fid = match["file_id"]
                 file_matches.setdefault(fid, []).append(match)
 
-        # For each file, sort matches by start_sec and determine intro/outro
+        # Phase A: Build per-file merged skip blocks
+        file_skip_blocks: dict[int, list[tuple[float, float]]] = {}
         for fid, matches in file_matches.items():
+            if fid not in file_info:
+                continue
+            matches.sort(key=lambda m: m["start_sec"])
+            merged: list[tuple[float, float]] = []
+            for m in matches:
+                s, e = m["start_sec"], m["end_sec"]
+                if merged and s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+            file_skip_blocks[fid] = merged
+
+        # Phase B: Optionally bridge silence gaps across files
+        if self._merge_repeating_silences and len(file_skip_blocks) >= 2:
+            file_skip_blocks = self._merge_silence_gaps(file_skip_blocks)
+
+        # Phase C: Compute keep ranges from skip blocks
+        results: dict[str, list[tuple[str | None, str | None]]] = {}
+        for fid, merged in file_skip_blocks.items():
             info = file_info.get(fid)
             if not info:
                 continue
 
             filename = info["path"]
             duration = info["duration_sec"]
-            matches.sort(key=lambda m: m["start_sec"])
 
-            time_start: str | None = None
-            time_end: str | None = None
+            keep_ranges: list[tuple[str | None, str | None]] = []
+            cursor = 0.0
 
-            # Check for intro: first match starts near beginning
-            first = matches[0]
-            if first["start_sec"] <= INTRO_THRESHOLD_SEC:
-                end_sec = first["end_sec"]
-                minutes = int(end_sec) // 60
-                secs = int(end_sec) % 60
-                time_start = f"{minutes:02d}:{secs:02d}"
+            for skip_start, skip_end in merged:
+                gap = skip_start - cursor
+                if gap >= MIN_GAP_SEC:
+                    start_str = self._secs_to_mmss(cursor) if cursor > 0 else None
+                    end_str = self._secs_to_mmss(skip_start)
+                    keep_ranges.append((start_str, end_str))
+                cursor = skip_end
 
-            # Check for outro: last match ends near file end
-            last = matches[-1]
-            if duration > 0 and (duration - last["end_sec"]) <= OUTRO_THRESHOLD_SEC:
-                start_sec = last["start_sec"]
-                minutes = int(start_sec) // 60
-                secs = int(start_sec) % 60
-                time_end = f"{minutes:02d}:{secs:02d}"
+            # Gap after last skip block to end of file
+            if duration > 0 and (duration - cursor) >= MIN_GAP_SEC:
+                start_str = self._secs_to_mmss(cursor) if cursor > 0 else None
+                keep_ranges.append((start_str, None))
 
-            if time_start is not None or time_end is not None:
-                results[filename] = (time_start, time_end)
+            if keep_ranges:
+                results[filename] = keep_ranges
 
         return results

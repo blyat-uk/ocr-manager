@@ -1,7 +1,8 @@
 """Unified settings dialog combining OCR, Label, and Autodetect settings."""
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                              QLineEdit, QPushButton, QFormLayout, QGroupBox)
+                              QLineEdit, QPushButton, QFormLayout, QGroupBox,
+                              QCheckBox)
 from PyQt6.QtCore import pyqtSignal
 
 
@@ -152,6 +153,16 @@ class SettingsDialog(QDialog):
         seg_row.addStretch()
         autodetect_form.addRow("Min Segment Length:", seg_row)
 
+        self.merge_silences_checkbox = QCheckBox("Merge repeating silences")
+        self.merge_silences_checkbox.setChecked(
+            self._autodetect.get('merge_repeating_silences', 'false').lower() == 'true'
+        )
+        self.merge_silences_checkbox.setToolTip(
+            "Bridge silence gaps between detected repeating segments "
+            "when the gap appears at the same position across multiple files"
+        )
+        autodetect_form.addRow("", self.merge_silences_checkbox)
+
         layout.addWidget(autodetect_group)
 
         layout.addStretch()
@@ -192,6 +203,7 @@ class SettingsDialog(QDialog):
         }
         autodetect = {
             'min_segment_length': self.min_segment_input.text().strip() or '30',
+            'merge_repeating_silences': str(self.merge_silences_checkbox.isChecked()).lower(),
         }
         automation = {
             'detection_batch_size': self.detection_batch_input.text().strip() or '10',
