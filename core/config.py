@@ -18,8 +18,7 @@ class FileConfig:
     crop_width: Optional[int] = None
     crop_height: Optional[int] = None
     brightness: Optional[int] = None
-    time_start: Optional[str] = None
-    time_end: Optional[str] = None
+    time_ranges: list[tuple[Optional[str], Optional[str]]] = field(default_factory=list)
     # Auto-populated metadata
     resolution_width: int = 0
     resolution_height: int = 0
@@ -35,8 +34,8 @@ class FileConfig:
         return self.brightness is not None
 
     def has_custom_time_range(self) -> bool:
-        """Check if file has custom time range."""
-        return self.time_start is not None or self.time_end is not None
+        """Check if file has custom time ranges."""
+        return len(self.time_ranges) > 0
 
     def has_any_custom(self) -> bool:
         """Check if file has any custom settings."""
@@ -51,8 +50,38 @@ class FileConfig:
         return (
             self.crop_x, self.crop_y, self.crop_width, self.crop_height,
             self.brightness,
-            self.time_start, self.time_end
+            tuple(tuple(r) for r in self.time_ranges),
         )
+
+    def add_time_range(self, start: Optional[str], end: Optional[str]):
+        """Add a time range, keeping the list sorted by start time."""
+        self.time_ranges.append((start, end))
+        self._sort_time_ranges()
+
+    def remove_time_range(self, index: int):
+        """Remove a time range by index."""
+        if 0 <= index < len(self.time_ranges):
+            del self.time_ranges[index]
+
+    def set_time_range(self, index: int, start: Optional[str], end: Optional[str]):
+        """Update a specific time range by index."""
+        if 0 <= index < len(self.time_ranges):
+            self.time_ranges[index] = (start, end)
+            self._sort_time_ranges()
+
+    def _sort_time_ranges(self):
+        """Sort time ranges by start time (using MM:SS string comparison via seconds)."""
+        def _to_seconds(t: Optional[str]) -> int:
+            if not t:
+                return 0
+            parts = t.split(':')
+            try:
+                if len(parts) == 2:
+                    return int(parts[0]) * 60 + int(parts[1])
+            except ValueError:
+                pass
+            return 0
+        self.time_ranges.sort(key=lambda r: _to_seconds(r[0]))
 
     def get_crop_tuple(self) -> Optional[tuple[int, int, int, int]]:
         """Get crop as tuple (x, y, w, h) or None if not set."""
@@ -81,8 +110,7 @@ class FileConfig:
         self.crop_width = None
         self.crop_height = None
         self.brightness = None
-        self.time_start = None
-        self.time_end = None
+        self.time_ranges = []
 
     def get_resolution_label(self) -> str:
         """Get resolution label from video height (e.g., '1080p', '800p')."""
@@ -152,8 +180,7 @@ class FileConfigStore:
             if source.has_custom_brightness():
                 target.brightness = source.brightness
             if source.has_custom_time_range():
-                target.time_start = source.time_start
-                target.time_end = source.time_end
+                target.time_ranges = list(source.time_ranges)
 
     def copy_to_same_resolution(self, source_filename: str) -> list[str]:
         """Copy settings from source file to all files with same resolution.
@@ -254,10 +281,11 @@ class ProjectConfigManager:
                     }
                 if config.has_custom_brightness():
                     file_data['brightness'] = config.brightness
-                if config.time_start:
-                    file_data['time_start'] = config.time_start
-                if config.time_end:
-                    file_data['time_end'] = config.time_end
+                if config.has_custom_time_range():
+                    file_data['time_ranges'] = [
+                        {'start': r[0] or '', 'end': r[1] or ''}
+                        for r in config.time_ranges
+                    ]
                 if config.resolution_width > 0 and config.resolution_height > 0:
                     file_data['resolution'] = {
                         'width': config.resolution_width,
@@ -307,8 +335,7 @@ class Config:
     crop_width: int = 0
     crop_height: int = 0
     brightness: int = 230
-    time_start: str = ""
-    time_end: str = ""
+    time_ranges: list[tuple[str, str]] = field(default_factory=list)
     ocr_parallel: int = 4
 
     # Label detection
@@ -334,6 +361,4 @@ class Config:
 
 def validate_config(config: Config) -> tuple[bool, str]:
     """Validate configuration completeness."""
-    if not config.labels_only and (config.crop_width == 0 or config.crop_height == 0):
-        return False, "Crop region not set"
     return True, ""

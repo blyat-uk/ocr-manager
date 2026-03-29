@@ -1,5 +1,6 @@
 """Single file OCR worker using QThread and direct videocr API calls."""
 
+import re
 import shutil
 import traceback
 from enum import Enum
@@ -47,6 +48,7 @@ class OCRWorker(QObject):
         """Build kwargs dict for videocr API from Config/FileConfig.
 
         Uses per-file config when available, falling back to global config.
+        Does NOT include time_start/time_end — see _get_time_ranges().
         """
         fc = self.file_config
         gc = self.config
@@ -60,13 +62,8 @@ class OCRWorker(QObject):
         else:
             crop_x, crop_y, crop_w, crop_h = gc.crop_x, gc.crop_y, gc.crop_width, gc.crop_height
 
-        # Time range: use file-specific if set, otherwise global
-        time_start = fc.time_start if (fc and fc.time_start) else gc.time_start
-        time_end = fc.time_end if (fc and fc.time_end) else gc.time_end
-
         kwargs = {
             'video_path': str(self.video_path),
-            'file_path': str(self.video_path.parent / (self.video_path.stem + ".ass")),
             'lang': gc.ocr_lang,
             'conf_threshold': gc.conf_threshold,
             'sim_threshold': gc.sim_threshold,
@@ -74,8 +71,6 @@ class OCRWorker(QObject):
             'similar_image_threshold': gc.similar_image,
             'frames_to_skip': gc.frames_to_skip,
             'use_gpu': gc.use_gpu,
-            'time_start': time_start or '0:00',
-            'time_end': time_end or '',
         }
 
         # Crop region
@@ -103,6 +98,20 @@ class OCRWorker(QObject):
                 ]
 
         return kwargs
+
+    def _get_time_ranges(self) -> list[tuple[str, str]]:
+        """Resolve time ranges: per-file overrides global.
+
+        Returns list of (start, end) tuples. Empty list means full duration.
+        """
+        fc = self.file_config
+        gc = self.config
+
+        if fc and fc.has_custom_time_range():
+            return [(r[0] or '0:00', r[1] or '') for r in fc.time_ranges]
+        if gc.time_ranges:
+            return [(r[0] or '0:00', r[1] or '') for r in gc.time_ranges]
+        return []
 
     def start(self):
         """Start the OCR in a background QThread."""
@@ -136,29 +145,75 @@ class OCRWorker(QObject):
         """Subtitle callback invoked from videocr (runs in worker thread)."""
         self.subtitle_detected.emit(self.filename, start, end, text)
 
+    def _make_progress_callback(self, range_index: int, total_ranges: int):
+        """Create a progress callback that scales percent across multiple ranges."""
+        if total_ranges <= 1:
+            return self._on_progress
+
+        base = int(range_index * 100 / total_ranges)
+        span = int(100 / total_ranges)
+
+        def scaled_progress(phase_name: str, percent: int):
+            scaled = base + int(percent * span / 100)
+            self._on_progress(phase_name, scaled)
+
+        return scaled_progress
+
     def _run_ocr(self):
         """Execute videocr directly (runs in QThread)."""
         success = False
         try:
             # Lazy import to avoid loading PaddleOCR at app startup
-            from videocr.api import save_subtitles_to_file
+            from videocr.api import get_subtitles, save_subtitles_to_file
 
             kwargs = self._build_ocr_kwargs()
+            time_ranges = self._get_time_ranges()
+            ass_source = self.video_path.parent / (self.video_path.stem + ".ass")
 
             self.raw_output.emit(self.filename, f"Starting OCR: {self.filename}\n")
 
-            save_subtitles_to_file(
-                **kwargs,
-                progress_callback=self._on_progress,
-                subtitle_callback=self._on_subtitle,
-                cancel_event=self._cancel_event,
-            )
+            if len(time_ranges) <= 1:
+                # Single range (or full duration): existing behavior
+                t_start = time_ranges[0][0] if time_ranges else '0:00'
+                t_end = time_ranges[0][1] if time_ranges else ''
+                save_subtitles_to_file(
+                    **kwargs,
+                    file_path=str(ass_source),
+                    time_start=t_start,
+                    time_end=t_end,
+                    progress_callback=self._on_progress,
+                    subtitle_callback=self._on_subtitle,
+                    cancel_event=self._cancel_event,
+                )
+            else:
+                # Multiple ranges: run each, merge ASS outputs
+                ass_parts = []
+                for i, (t_start, t_end) in enumerate(time_ranges):
+                    if self._cancel_event.is_set():
+                        break
+                    self.raw_output.emit(
+                        self.filename,
+                        f"Range {i + 1}/{len(time_ranges)}: {t_start} - {t_end or 'end'}\n",
+                    )
+                    result = get_subtitles(
+                        **kwargs,
+                        time_start=t_start,
+                        time_end=t_end,
+                        progress_callback=self._make_progress_callback(i, len(time_ranges)),
+                        subtitle_callback=self._on_subtitle,
+                        cancel_event=self._cancel_event,
+                    )
+                    if result:
+                        ass_parts.append(result)
+
+                if ass_parts and not self._cancel_event.is_set():
+                    merged = _merge_ass_outputs(ass_parts)
+                    with open(ass_source, 'w', encoding='utf-8') as f:
+                        f.write(merged)
 
             # Check if cancelled
             if self._cancel_event.is_set():
                 self.raw_output.emit(self.filename, "OCR cancelled.\n")
-                # Clean up partial output file
-                ass_source = self.video_path.parent / (self.video_path.stem + ".ass")
                 if ass_source.exists():
                     ass_source.unlink(missing_ok=True)
                 self.status_changed.emit(self.filename, FileStatus.FAILED)
@@ -166,7 +221,6 @@ class OCRWorker(QObject):
                 return
 
             # Move .ass file from video directory to output directory
-            ass_source = self.video_path.parent / (self.video_path.stem + ".ass")
             ass_dest = self.output_dir / (self.video_path.stem + ".ass")
 
             if ass_source.exists():
@@ -211,3 +265,53 @@ class OCRWorker(QObject):
             except TypeError:
                 pass
             self._thread = None
+
+
+# ASS timestamp pattern: H:MM:SS.CC
+_ASS_TIME_RE = re.compile(r'(\d+):(\d{2}):(\d{2})\.(\d{2})')
+
+
+def _ass_time_to_centiseconds(ts: str) -> int:
+    """Convert ASS timestamp H:MM:SS.CC to centiseconds for sorting."""
+    m = _ASS_TIME_RE.match(ts)
+    if not m:
+        return 0
+    h, mn, s, cs = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    return h * 360000 + mn * 6000 + s * 100 + cs
+
+
+def _merge_ass_outputs(ass_strings: list[str]) -> str:
+    """Merge multiple ASS outputs into one, combining dialogue lines sorted by time.
+
+    Takes the header from the first output and extracts Dialogue lines from all.
+    """
+    if len(ass_strings) == 1:
+        return ass_strings[0]
+
+    # Split first output into header and dialogue lines
+    header_lines = []
+    all_dialogues = []
+
+    for i, ass_text in enumerate(ass_strings):
+        for line in ass_text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith('Dialogue:'):
+                all_dialogues.append(stripped)
+            elif i == 0:
+                # Only keep header from the first output
+                header_lines.append(line)
+
+    # Sort dialogues by start timestamp
+    def _sort_key(dialogue_line: str) -> int:
+        # Dialogue: 0,H:MM:SS.CC,H:MM:SS.CC,...
+        parts = dialogue_line.split(',', 2)
+        if len(parts) >= 2:
+            return _ass_time_to_centiseconds(parts[1].strip())
+        return 0
+
+    all_dialogues.sort(key=_sort_key)
+
+    header = ''.join(header_lines)
+    if not header.endswith('\n'):
+        header += '\n'
+    return header + '\n'.join(all_dialogues) + '\n'
