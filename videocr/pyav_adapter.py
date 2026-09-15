@@ -88,6 +88,7 @@ class FFmpegNVDECCapture:
         self._seek_pos = 0
         self._last_pts = None  # Estimated PTS in seconds
         self._hdr_transfer = None  # Color transfer from ffprobe
+        self._container_start_time = 0.0
 
     def _probe_video(self):
         """Get video metadata using ffprobe."""
@@ -128,6 +129,12 @@ class FFmpegNVDECCapture:
             self._frame_count = int(duration * self._fps)
         else:
             self._frame_count = 100000  # Fallback
+
+        fmt = data.get("format", {})
+        try:
+            self._container_start_time = max(0.0, float(fmt.get("start_time", 0.0)))
+        except (TypeError, ValueError):
+            self._container_start_time = 0.0
 
     def _start_ffmpeg(self, seek_time=None):
         """Start FFmpeg subprocess with optional seek."""
@@ -215,7 +222,7 @@ class FFmpegNVDECCapture:
         elif prop == cv2.CAP_PROP_FRAME_WIDTH:
             return self._width
         elif prop == cv2.CAP_PROP_POS_FRAMES:
-            return self._pos
+            return self._seek_pos + self._pos
         return 0
 
     def set(self, prop, value):
@@ -225,7 +232,7 @@ class FFmpegNVDECCapture:
 
         if prop == cv2.CAP_PROP_POS_FRAMES:
             target_pos = int(value)
-            if target_pos != self._pos and target_pos > 0:
+            if target_pos != (self._seek_pos + self._pos) and target_pos > 0:
                 # Restart FFmpeg with seek
                 if self.proc:
                     self.proc.stdout.close()
@@ -233,7 +240,8 @@ class FFmpegNVDECCapture:
                     self.proc.wait()
                 seek_time = target_pos / self._fps
                 self._start_ffmpeg(seek_time)
-                self._pos = target_pos
+                self._seek_pos = target_pos
+                self._pos = 0
             return True
         return False
 
@@ -254,9 +262,13 @@ class FFmpegNVDECCapture:
             if len(raw) != self._frame_size:
                 return False, None
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._output_height, self._output_width, 3)
+            # PTS of THIS frame is derived from its index, which is the position
+            # before the increment. Add the seek origin and the container start.
+            self._last_pts = (
+                (self._seek_pos + self._pos) / self._fps + self._container_start_time
+                if self._fps else None
+            )
             self._pos += 1
-            # Estimate PTS from frame position (FFmpeg subprocess doesn't expose true PTS)
-            self._last_pts = self._pos / self._fps if self._fps else None
             return True, frame
         except Exception:
             return False, None
@@ -270,10 +282,8 @@ class FFmpegNVDECCapture:
         return self._scale_factor
 
     def get_stream_start_time(self) -> float:
-        """Get the stream's start_time (estimated as 0 for FFmpeg pipe)."""
-        # FFmpeg subprocess doesn't expose start_time directly
-        # Return 0 as we can't reliably get this info through the pipe
-        return 0.0
+        """Container-level start_time in seconds (0 for most MKV, non-zero for some MP4)."""
+        return getattr(self, "_container_start_time", 0.0)
 
 
 class PyAVCapture:
