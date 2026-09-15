@@ -852,9 +852,6 @@ class MainWindow(QMainWindow):
     def _on_add_range_clicked(self):
         """Capture current slider values as a new time range."""
         start_str, end_str = self.time_range_slider.get_time_strings()
-        # Don't add empty/full-duration ranges
-        if not start_str and not end_str:
-            return
 
         target_files = self._get_target_files()
         for filename in target_files:
