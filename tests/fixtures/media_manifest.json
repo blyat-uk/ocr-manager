@@ -1,0 +1,17 @@
+{
+  "root": "/mnt/FAST/work",
+  "projects": {
+    "slay": {
+      "dir": "Slay the Gods S2",
+      "file": "ZS2_-_11_[1080p]TXHBR.mp4",
+      "crop": [288, 786, 1344, 53],
+      "brightness": 209
+    },
+    "xwz": {
+      "dir": "XWZ",
+      "file": null,
+      "crop": null,
+      "brightness": null
+    }
+  }
+}
