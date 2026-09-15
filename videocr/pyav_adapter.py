@@ -9,8 +9,10 @@ import shutil
 try:
     import av
     PYAV_AVAILABLE = True
-except ImportError:
+    PYAV_IMPORT_ERROR = None
+except Exception as exc:  # ImportError, or a linker error from an ABI mismatch
     PYAV_AVAILABLE = False
+    PYAV_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 # Check if FFmpeg is available
 FFMPEG_AVAILABLE = shutil.which('ffmpeg') is not None and shutil.which('ffprobe') is not None
@@ -584,3 +586,34 @@ else:
         def get_stream_start_time(self) -> float:
             return 0.0  # OpenCV doesn't expose start_time
     Capture = OpenCVCapture
+
+
+ALLOW_FALLBACK_ENV = "OCR_ALLOW_FFMPEG_FALLBACK"
+
+
+def capture_backend_name() -> str:
+    """Name of the capture backend actually in use."""
+    if Capture is PyAVCapture:
+        return "pyav"
+    if FFMPEG_AVAILABLE and Capture is FFmpegNVDECCapture:
+        return "ffmpeg"
+    return "opencv"
+
+
+def assert_reference_backend() -> None:
+    """Raise unless the bit-exact reference backend (PyAV) is in use.
+
+    The ffmpeg-subprocess fallback is not bit-exact and estimates timestamps,
+    so it must never be used for OCR without an explicit opt-in.
+    """
+    import os
+    if PYAV_AVAILABLE:
+        return
+    if os.environ.get(ALLOW_FALLBACK_ENV) == "1":
+        return
+    raise RuntimeError(
+        "PyAV is unavailable, so video would be decoded by the non-bit-exact "
+        f"fallback backend. Fix with: .venv/bin/pip install -U --only-binary=:all: av\n"
+        f"Import error was: {PYAV_IMPORT_ERROR}\n"
+        f"To proceed anyway (output will differ), set {ALLOW_FALLBACK_ENV}=1."
+    )

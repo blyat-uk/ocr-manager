@@ -1745,6 +1745,17 @@ class MainWindow(QMainWindow):
                 f"Please install them before using this application."
             )
 
+        from videocr.pyav_adapter import PYAV_AVAILABLE, PYAV_IMPORT_ERROR
+        if not PYAV_AVAILABLE:
+            QMessageBox.critical(
+                self, "Video backend degraded",
+                "PyAV is not available, so video will be decoded by a fallback "
+                "backend that is not bit-exact and estimates timestamps.\n\n"
+                "Fix it with:\n"
+                "    .venv/bin/pip install -U --only-binary=:all: av\n\n"
+                f"Import error: {PYAV_IMPORT_ERROR}"
+            )
+
     def closeEvent(self, event):
         """Handle window close."""
         self._save_geometry()
