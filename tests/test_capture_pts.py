@@ -47,26 +47,32 @@ def test_container_start_time_is_reported(synthetic_video):
 
 
 def test_fallback_reseek_to_same_frame_is_not_a_noop(synthetic_video):
-    """set() must compare against the absolute position (seek_pos + pos),
-    not the frames-read-since-last-seek counter. Otherwise a second seek to
-    a frame number that happens to equal the current relative offset (or a
-    repeat seek to the same absolute frame) silently no-ops and the reader
-    is left at the wrong position."""
+    """set() must compare the seek target against the absolute position
+    (seek_pos + pos), not against the frames-read-since-last-seek counter.
+
+    Seek to frame 2, read twice (so the relative "frames since seek"
+    counter reaches 2 -- the same number as the frame we're about to
+    re-seek to), then seek back to frame 2 again. A guard that compares
+    the target against the relative counter sees 2 == 2 and wrongly
+    treats this as a no-op, leaving the reader positioned past frame 2
+    instead of seeking back to it.
+    """
     expected = ffprobe_pts(synthetic_video, 5)
     cap = FFmpegNVDECCapture(str(synthetic_video), use_gpu=False)
     with cap as c:
-        c.set(cv2.CAP_PROP_POS_FRAMES, 3)
+        c.set(cv2.CAP_PROP_POS_FRAMES, 2)
         ok, _frame = c.read()
         assert ok
-        first_pts = c.get_last_pts()
-        assert first_pts == pytest.approx(expected[3], abs=1e-3)
+        assert c.get_last_pts() == pytest.approx(expected[2], abs=1e-3)
+        ok, _frame = c.read()
+        assert ok
+        assert c.get_last_pts() == pytest.approx(expected[3], abs=1e-3)
         assert c.get(cv2.CAP_PROP_POS_FRAMES) == 4
 
-        # Seek back to the same absolute frame and read again.
-        c.set(cv2.CAP_PROP_POS_FRAMES, 3)
+        # Seek back to frame 2. The relative "since last seek" counter is
+        # also 2 at this point, which is what makes the stale guard fail.
+        c.set(cv2.CAP_PROP_POS_FRAMES, 2)
         ok, _frame = c.read()
         assert ok
-        second_pts = c.get_last_pts()
 
-        assert second_pts == pytest.approx(first_pts, abs=1e-6)
-        assert second_pts == pytest.approx(expected[3], abs=1e-3)
+        assert c.get_last_pts() == pytest.approx(expected[2], abs=1e-3)
