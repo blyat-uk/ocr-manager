@@ -12,6 +12,15 @@ def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True, capture_output=True)
 
 
+def _ffprobe_duration(video_path: Path) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "json", str(video_path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(json.loads(result.stdout)["format"]["duration"])
+
+
 @pytest.fixture(scope="session")
 def synthetic_video(tmp_path_factory) -> Path:
     """10 frames, 320x240, 25 fps, yuv420p H.264 in MP4."""
@@ -118,8 +127,20 @@ def reference_media() -> dict:
             "video": video,
             "crop": entry["crop"],
             "brightness": entry["brightness"],
+            "duration": _ffprobe_duration(video),
         }
 
     if not resolved:
         pytest.skip("no reference projects resolved from manifest")
     return resolved
+
+
+@pytest.fixture(scope="session")
+def detector_truth() -> dict:
+    """Ground truth crop/brightness values extracted from each reference
+    project's own .ocr.json (see tests/fixtures/detector_truth.json and
+    task-2-brief.md Step 1). Skips when the fixture file is absent."""
+    truth_path = FIXTURES / "detector_truth.json"
+    if not truth_path.exists():
+        pytest.skip(f"{truth_path} not present")
+    return json.loads(truth_path.read_text())

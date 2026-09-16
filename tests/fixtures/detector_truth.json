@@ -1,0 +1,111 @@
+{
+  "slay": {
+    "dir": "Slay the Gods S2",
+    "files": {
+      "ZS2_-_11_[1080p]TXHBR.mp4": {
+        "crop": [
+          288,
+          786,
+          1344,
+          53
+        ],
+        "brightness": 209
+      },
+      "ZS2_-_12_[1080p]TXHBR.mp4": {
+        "crop": [
+          288,
+          784,
+          1344,
+          55
+        ],
+        "brightness": 209
+      },
+      "ZS2_-_13_[1080p]TXHBR.mp4": {
+        "crop": [
+          288,
+          784,
+          1344,
+          54
+        ],
+        "brightness": 209
+      },
+      "ZS2_-_14_[1080p]TXHBR.mp4": {
+        "crop": [
+          288,
+          780,
+          1344,
+          61
+        ],
+        "brightness": 209
+      },
+      "ZS2_-_15_[1080p]TXHBR.mp4": {
+        "crop": [
+          288,
+          784,
+          1344,
+          54
+        ],
+        "brightness": 209
+      }
+    }
+  },
+  "xwz": {
+    "dir": "XWZ",
+    "files": {
+      "XWZ_-_168_[4K]10BHQ.mp4": {
+        "crop": [
+          576,
+          1892,
+          2688,
+          108
+        ],
+        "brightness": 230
+      },
+      "XWZ_-_169_[4K]10BHQ.mp4": {
+        "crop": [
+          576,
+          1892,
+          2688,
+          108
+        ],
+        "brightness": 230
+      },
+      "XWZ_-_170_[4K]10BHQ.mp4": {
+        "crop": [
+          576,
+          1892,
+          2688,
+          108
+        ],
+        "brightness": 230
+      },
+      "XWZ_-_171_[4K]10BHQ.mp4": {
+        "crop": [
+          576,
+          1892,
+          2688,
+          108
+        ],
+        "brightness": 230
+      },
+      "XWZ_-_172_[4K]10BHQ.mp4": {
+        "crop": [
+          576,
+          1892,
+          2688,
+          108
+        ],
+        "brightness": 230
+      },
+      "XWZ_-_173_[4K]YK10BHBRHQ.mp4": {
+        "crop": [
+          746,
+          1886,
+          2347,
+          127
+        ],
+        "brightness": 230
+      }
+    }
+  }
+}
