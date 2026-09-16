@@ -87,6 +87,30 @@ RANGES = [
 ]
 
 
+def _matrix(cases, fast):
+    """Parametrize over `cases` (single values, or pytest.param tuples whose
+    ids are joined), keeping the cases whose id is in `fast` in the fast suite
+    and marking the rest of the matrix slow. `fast` holds at least one case
+    per property a test exists for; `-m slow` runs the remainder."""
+    params = []
+    for case in cases:
+        parts = case if isinstance(case, tuple) else (case,)
+        values, ids = [], []
+        for part in parts:
+            if hasattr(part, "values"):
+                values.extend(part.values)
+                ids.append(part.id)
+            else:
+                values.append(part)
+                ids.append(str(part))
+        case_id = "-".join(ids)
+        marks = () if case_id in fast else (pytest.mark.slow,)
+        params.append(pytest.param(*values, id=case_id, marks=marks))
+    unknown = set(fast) - {p.id for p in params}
+    assert not unknown, f"fast cases that are not in the matrix: {unknown}"
+    return params
+
+
 def _encode(path, pix_fmt, codec, rate, extra, size="320x240", video_start=None):
     gop = (["-x265-params", "keyint=10:min-keyint=10:log-level=error"]
            if codec == "libx265" else ["-g", "10"])
@@ -283,9 +307,17 @@ def _assert_phase15_matches_phase1(scanner, recorder, text_frames, phase1_frames
     )
 
 
-@pytest.mark.parametrize("time_start,time_end", RANGES)
-@pytest.mark.parametrize("sampling", SAMPLING)
-@pytest.mark.parametrize("clip_id", list(CLIPS))
+@pytest.mark.parametrize("clip_id,sampling,time_start,time_end", _matrix(
+    [(c, sampling, r) for c in CLIPS for sampling in SAMPLING for r in RANGES],
+    fast={
+        # Container start: index origin, and half-frame ties after phase 1's seek.
+        "offset-h264-every-frame-whole-clip", "offset-h264-every-0.5s-whole-clip",
+        "offset-h264-every-frame-from-2.3s",
+        # HEVC in MP4: seeks landing after the target.
+        "zero-start-h265-10bit-every-frame-whole-clip",
+        # Video 0.525 frame after a zero container start, with a seek.
+        "video-start-0.021s-mkv-every-frame-from-1s",
+    }))
 def test_phase15_reads_the_frames_phase1_sampled(clips, monkeypatch, clip_id, sampling, time_start, time_end):
     scanner = _scanner(_clip(clips, clip_id), sampling)
     recorder = _Recorder()
@@ -314,8 +346,9 @@ def test_phase15_reads_the_frames_phase1_sampled_on_the_offset_fixture(offset_vi
     _assert_phase15_matches_phase1(scanner, recorder, text_frames, phase1_frames, augmented)
 
 
-@pytest.mark.parametrize("sampling", SAMPLING)
-@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
+@pytest.mark.parametrize("clip_id,sampling", _matrix(
+    [(c, sampling) for c in ["zero-start-h264", "offset-h264"] for sampling in SAMPLING],
+    fast={"offset-h264-every-frame"}))
 def test_ffmpeg_fallback_phase15_reads_the_frames_phase1_sampled(clips, monkeypatch, clip_id, sampling):
     """The subprocess backend positions by frame ordinal and estimates PTS
     as ordinal / fps + start time -- a different frame-index meaning from
@@ -389,14 +422,15 @@ def _assert_seek_lands(cap, frames, order):
     assert not wrong, f"seek_to_pts landed on the wrong frame (index, wanted PTS, got PTS): {wrong[:10]}"
 
 
-@pytest.mark.parametrize("clip_id", list(CLIPS))
+@pytest.mark.parametrize("clip_id", _matrix(
+    list(CLIPS), fast={"offset-h264", "zero-start-h265-10bit", "video-start-0.021s-mkv"}))
 def test_seek_to_pts_lands_on_exactly_that_frame(clips, clip_id):
     frames = _every_frame(PyAVCapture, _clip(clips, clip_id))
     with PyAVCapture(str(_clip(clips, clip_id))) as cap:
         _assert_seek_lands(cap, frames, _visit_order(len(frames)))
 
 
-@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
+@pytest.mark.parametrize("clip_id", _matrix(["zero-start-h264", "offset-h264"], fast={"offset-h264"}))
 def test_ffmpeg_fallback_seek_to_pts_lands_on_exactly_that_frame(clips, clip_id):
     if not pyav_adapter.FFMPEG_AVAILABLE:
         pytest.skip("ffmpeg CLI not available")
@@ -519,8 +553,10 @@ def _assert_same_crops(got, expected):
         assert g.shape == e.shape and np.array_equal(g, e), f"OCR crop {i} differs"
 
 
-@pytest.mark.parametrize("sampling", SAMPLING)
-@pytest.mark.parametrize("clip_id", list(CLIPS))
+@pytest.mark.parametrize("clip_id,sampling", _matrix(
+    [(c, sampling) for c in CLIPS for sampling in SAMPLING],
+    # A container start, and a frame phase 1 detects on a downscaled copy of.
+    fast={"offset-h264-every-frame", "zero-start-h264-960p-every-0.5s"}))
 def test_retained_crops_are_what_phase15_would_have_fetched(clips, monkeypatch, clip_id, sampling):
     from videocr.label_scanner import _RetainedCrops
 
@@ -640,6 +676,7 @@ ON_SCREEN_TOLERANCE = 1e-6
 # Zero start; video 0.021 s after a zero container start (0.525 frame, as on
 # Youxia Zhanji); 1.5 s container start (half-frame ties at 25 fps); HEVC in
 # MP4, whose seeks can land after the target; 23.976 fps; MKV.
+PHASE34_FAST = {"video-start-0.021s-mkv", "offset-h264", "zero-start-h265-10bit"}
 PHASE34_CLIPS = [
     "zero-start-h264",
     "video-start-0.021s-mkv",
@@ -873,7 +910,7 @@ def _phase34_scanner(path):
     return scanner
 
 
-@pytest.mark.parametrize("clip_id", PHASE34_CLIPS)
+@pytest.mark.parametrize("clip_id", _matrix(PHASE34_CLIPS, PHASE34_FAST))
 def test_phase3_reads_the_frame_on_screen_at_each_sample_time(clips, monkeypatch, clip_id):
     path = _clip(clips, clip_id)
     reference = _decode_reference(path)
@@ -887,7 +924,7 @@ def test_phase3_reads_the_frame_on_screen_at_each_sample_time(clips, monkeypatch
     result.assert_none()
 
 
-@pytest.mark.parametrize("clip_id", PHASE34_CLIPS)
+@pytest.mark.parametrize("clip_id", _matrix(PHASE34_CLIPS, PHASE34_FAST))
 def test_phase4_reads_the_frame_on_screen_at_each_sample_time(clips, monkeypatch, clip_id):
     path = _clip(clips, clip_id)
     reference = _decode_reference(path)
@@ -971,7 +1008,7 @@ def _fallback_phase34_run(scanner, reference, recorder, monkeypatch, capture_cls
     return phase3, phase4
 
 
-@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
+@pytest.mark.parametrize("clip_id", _matrix(["zero-start-h264", "offset-h264"], fast={"offset-h264"}))
 def test_ffmpeg_fallback_phases_3_and_4_read_the_frame_on_screen(clips, monkeypatch, clip_id):
     """The subprocess backend positions by frame ordinal and reports PTS as
     ordinal / fps + container start; the frame on screen is judged by those
@@ -1031,7 +1068,7 @@ def _assert_display_time_seeks(cap, reference, fps, times, read_on=True):
                        f"(time, frame on screen PTS, PTS read): {wrong[:10]}")
 
 
-@pytest.mark.parametrize("clip_id", PHASE34_CLIPS)
+@pytest.mark.parametrize("clip_id", _matrix(PHASE34_CLIPS, PHASE34_FAST))
 def test_seek_to_display_time_reads_the_frame_on_screen(clips, clip_id):
     path = _clip(clips, clip_id)
     reference = _decode_reference(path)
@@ -1141,7 +1178,7 @@ def test_seeks_past_the_end_report_no_frame_without_retrying(clips, caplog, seek
     assert not caplog.records
 
 
-@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
+@pytest.mark.parametrize("clip_id", _matrix(["zero-start-h264", "offset-h264"], fast={"offset-h264"}))
 def test_ffmpeg_fallback_seek_to_display_time_reads_the_frame_on_screen(clips, clip_id):
     if not pyav_adapter.FFMPEG_AVAILABLE:
         pytest.skip("ffmpeg CLI not available")
