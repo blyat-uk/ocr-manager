@@ -377,6 +377,10 @@ class PyAVCapture:
         self._crop_native = None         # (x, y, w, h) in native decode coords
         self._crop_scaled_size = None    # (w, h) the scale stage should target
         self._crop_graph_active = False  # True once the graph actually cropped
+        # Filled in by _detect_tonemap() during __enter__, before _plan_crop()
+        # needs to know whether a filter graph will exist at all.
+        self._needs_tonemap = False
+        self._tonemap_trc = None
 
     def __enter__(self):
         if not PYAV_AVAILABLE:
@@ -425,14 +429,34 @@ class PyAVCapture:
         self._pos = 0
         self._frame_generator = self.container.decode(video=0)
 
-        # Translate the requested output-space crop into a native-space,
-        # aligned, padded decode box (no-op if no crop was requested).
-        self._plan_crop()
+        # Whether the stream needs HDR->SDR tone mapping. Resolved before the
+        # crop is planned because _plan_crop's admissibility rule depends on
+        # whether a filter graph is going to exist for some other reason.
+        self._needs_tonemap, self._tonemap_trc = self._detect_tonemap()
 
-        # Set up combined filter graph (tone mapping + scaling)
-        self._setup_filter_graph()
+        try:
+            # Translate the requested output-space crop into a native-space,
+            # aligned, padded decode box (no-op if no crop was requested).
+            self._plan_crop()
+
+            # Set up combined filter graph (tone mapping + scaling)
+            self._setup_filter_graph()
+        except Exception:
+            # __exit__ does not run when __enter__ raises, so release the
+            # container here rather than leaking an open demuxer.
+            self.container.close()
+            self.container = None
+            raise
 
         return self
+
+    def _detect_tonemap(self):
+        """(needs_tonemap, transfer_characteristic) for this stream."""
+        try:
+            trc = self.stream.codec_context.color_trc
+        except Exception:
+            return False, None
+        return trc in (_TRC_SMPTE2084, _TRC_ARIB_STD_B67), trc
 
     def _plan_crop(self):
         """Translate the requested output-space crop into a native-space,
@@ -453,6 +477,29 @@ class PyAVCapture:
         it is sliced off after conversion via `self._crop_slice`.
         """
         if self._crop_request is None:
+            return
+
+        # The crop stage is only admissible when a filter graph is going to
+        # exist anyway (tone map and/or downscale). Without one, read()'s
+        # reference path converts with `frame.to_ndarray(format='bgr24')`,
+        # whereas any graph converts through a `format=bgr24` filter *node*.
+        # Those are not the same function: swscale's filter node dithers,
+        # the reformatter behind to_ndarray does not, so for any source
+        # deeper than 8 bits the two disagree. Measured on 320x240
+        # testsrc2, frame 0, to_ndarray vs format-filter:
+        #
+        #   yuv420p    (h264/h265)  max abs diff 0
+        #   yuv420p10le h264         max abs diff 148
+        #   yuv420p10le h265         max abs diff 148
+        #
+        # So merely *asking* for a crop would silently change every pixel of
+        # a 10-bit source. Refuse instead, leaving `_crop_slice` None so
+        # video.py slices the full frame in Python off the identical
+        # reference path. Where a graph exists for another reason the
+        # conversion path is the same with and without the crop node, and
+        # the crop stays exact (verified by the crop-invariant matrix,
+        # which covers 10-bit downscale geometries).
+        if not self._needs_tonemap and self._scale_factor >= 1.0:
             return
 
         x, y, w, h = (int(v) for v in self._crop_request)
@@ -503,15 +550,11 @@ class PyAVCapture:
 
     def _setup_filter_graph(self):
         """Build a unified PyAV filter graph for HDR tone mapping and/or downscaling."""
-        needs_tonemap = False
-        trc = None
-        try:
-            trc = self.stream.codec_context.color_trc
-            needs_tonemap = trc in (_TRC_SMPTE2084, _TRC_ARIB_STD_B67)
-        except Exception:
-            pass
-
+        needs_tonemap, trc = self._needs_tonemap, self._tonemap_trc
         needs_scale = self._scale_factor < 1.0
+        # _plan_crop only plans a crop when one of the two above is true, so
+        # the crop node never brings a graph (and with it a different bgr24
+        # conversion path) into existence on its own.
         needs_crop = self._crop_slice is not None
 
         if not needs_tonemap and not needs_scale and not needs_crop:
