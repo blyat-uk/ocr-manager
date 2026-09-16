@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Main application entry point."""
+import multiprocessing
 import subprocess
 import sys
 import shutil
@@ -1813,4 +1814,10 @@ def main():
 
 
 if __name__ == '__main__':
+    # Required for a frozen (PyInstaller) build: without it, the
+    # forkserver/resource-tracker launch commands core.detect.ranges'
+    # process pool uses on the first fingerprinting job aren't recognised,
+    # and the frozen executable re-launches the whole GUI instead (twice),
+    # blocking forever. No-op in a normal (non-frozen) run.
+    multiprocessing.freeze_support()
     main()

@@ -7,14 +7,15 @@ Measures three suites against the reference media in `/mnt/FAST/work`
            split into model-load / decode / OCR-inference / label-scan time.
   crop   - `core/subtitle_detector.py`'s SubtitleDetectionWorker, one file
            per reference project.
-  ranges - `core/audio_analysis.py` + `core/audio_finder/`, cold (no cache)
-           and warm (cache present), one project run per project.
+  ranges - `core.detect.ranges.pipeline.analyse()` (what
+           `core/audio_analysis.py`'s AudioAnalysisWorker calls), cold (no
+           cache) and warm (cache present), one project run per project.
 
 Every suite skips cleanly when its media is absent, exactly like
 `tools/fidelity_check.py`, and none of them ever write into
 `/mnt/FAST/work/*` -- OCR/crop runs only read video files, and the ranges
-suite always points `db_path` at a temp directory instead of the project's
-own `.audio_fingerprints.db`.
+suite always points `cache_dir` at a temp directory instead of the
+project's own `.ocr-cache/`.
 
 Usage:
     .venv/bin/python tools/bench.py --suite all --label NAME --repeat 2 \\
@@ -518,42 +519,6 @@ def run_crop_suite(repeat: int) -> dict:
 # Ranges suite
 # --------------------------------------------------------------------------
 
-def _install_ranges_instrumentation():
-    import core.audio_analysis as vc_audio
-    from core.audio_finder.audio import pipeline as vc_pipeline
-
-    stats = {"identity_s": 0.0, "decode_s": 0.0, "fingerprint_s": 0.0}
-
-    orig_sha256 = vc_audio.compute_sha256
-    orig_extract = vc_pipeline.extract_audio
-    orig_spectrogram = vc_pipeline.compute_spectrogram
-    orig_peaks = vc_pipeline.find_peaks
-    orig_hashes = vc_pipeline.generate_fingerprints
-
-    def timed(bucket, fn):
-        def wrapped(*a, **kw):
-            t0 = time.perf_counter()
-            result = fn(*a, **kw)
-            stats[bucket] += time.perf_counter() - t0
-            return result
-        return wrapped
-
-    vc_audio.compute_sha256 = timed("identity_s", orig_sha256)
-    vc_pipeline.extract_audio = timed("decode_s", orig_extract)
-    vc_pipeline.compute_spectrogram = timed("fingerprint_s", orig_spectrogram)
-    vc_pipeline.find_peaks = timed("fingerprint_s", orig_peaks)
-    vc_pipeline.generate_fingerprints = timed("fingerprint_s", orig_hashes)
-
-    def restore():
-        vc_audio.compute_sha256 = orig_sha256
-        vc_pipeline.extract_audio = orig_extract
-        vc_pipeline.compute_spectrogram = orig_spectrogram
-        vc_pipeline.find_peaks = orig_peaks
-        vc_pipeline.generate_fingerprints = orig_hashes
-
-    return stats, restore
-
-
 def _project_video_files(project_dir: Path) -> list[str]:
     return sorted(
         p.name for p in project_dir.iterdir()
@@ -561,37 +526,47 @@ def _project_video_files(project_dir: Path) -> list[str]:
     )
 
 
-def _run_ranges_pass(project_dir: Path, filenames: list[str], db_path: Path) -> dict:
-    """One ingest+analyze+compute pass against `db_path` (never inside
-    `project_dir` -- the whole point of calling _ingest/_analyze/
-    _compute_time_ranges directly instead of the worker's _run(), which
-    hardcodes db_path = project_dir/.audio_fingerprints.db)."""
-    from core.audio_analysis import AudioAnalysisWorker, DEFAULT_MIN_SEGMENT_SEC
-    from core.audio_finder.config import AnalysisConfig, MatchConfig
+def _run_ranges_pass(project_dir: Path, filenames: list[str], cache_dir: Path) -> dict:
+    """One analyse() pass against `cache_dir` (never inside `project_dir` --
+    the whole point of taking a cache_dir parameter here instead of always
+    calling core.detect.ranges.pipeline.default_cache_dir(project_dir),
+    which would write `.ocr-cache/` into the project).
 
-    stats, restore = _install_ranges_instrumentation()
-    try:
-        worker = AudioAnalysisWorker(str(project_dir), filenames)
-        cfg = AnalysisConfig(match=MatchConfig(min_length_sec=DEFAULT_MIN_SEGMENT_SEC), db_path=str(db_path))
+    Bucket note: fingerprinting now runs inside a process pool (see
+    core.detect.ranges.pipeline.ingest), so the parent can no longer isolate
+    identity/decode/fingerprint sub-costs the way the original in-process
+    implementation could -- identity_s and decode_s are always 0.0 here.
+    fingerprint_s is the whole "Fingerprinting" phase's wall time (identity
+    check + cache lookup + decode + fingerprint, whichever a file needs),
+    and match_s is "Analyzing" + "Computing time ranges" together, timed via
+    analyse()'s own phase-change progress events -- the same events the real
+    AudioAnalysisWorker forwards as phase_changed.
+    """
+    from core.audio_analysis import DEFAULT_MIN_SEGMENT_SEC
+    from core.detect.ranges.config import MatchConfig, RangesConfig
+    from core.detect.ranges.pipeline import DEFAULT_WORKERS, FileEntry, analyse
 
-        t0 = time.perf_counter()
-        tag_id, profile_id = worker._ingest(cfg, "bench")
-        ingest_s = time.perf_counter() - t0
+    entries = [FileEntry(name=name, path=str(project_dir / name)) for name in filenames]
+    cfg = RangesConfig(match=MatchConfig(min_length_sec=DEFAULT_MIN_SEGMENT_SEC))
 
-        t0 = time.perf_counter()
-        worker._analyze(cfg, tag_id, profile_id)
-        match_s = time.perf_counter() - t0
+    marks = {}
 
-        results = worker._compute_time_ranges(cfg, tag_id, profile_id)
-    finally:
-        restore()
+    def on_progress(event):
+        if event.kind == "phase" and event.message not in marks:
+            marks[event.message] = time.perf_counter()
 
-    total_s = ingest_s + match_s
+    t_start = time.perf_counter()
+    results = analyse(entries, cfg, on_progress, cache_dir=str(cache_dir), workers=DEFAULT_WORKERS)
+    t_end = time.perf_counter()
+
+    fingerprint_s = marks.get("Analyzing", t_end) - marks.get("Fingerprinting", t_start)
+    match_s = t_end - marks.get("Analyzing", t_end)
+
     return {
-        "seconds": total_s,
-        "identity_s": stats["identity_s"],
-        "decode_s": stats["decode_s"],
-        "fingerprint_s": stats["fingerprint_s"],
+        "seconds": t_end - t_start,
+        "identity_s": 0.0,
+        "decode_s": 0.0,
+        "fingerprint_s": fingerprint_s,
         "match_s": match_s,
         "keep_ranges": results,
     }
@@ -606,9 +581,9 @@ def _run_ranges_project(key: str, entry: dict) -> tuple[dict | None, dict | None
         return None, None
 
     with tempfile.TemporaryDirectory(prefix="ranges-bench-") as td:
-        db_path = Path(td) / "bench_fingerprints.db"
-        cold = _run_ranges_pass(project_dir, filenames, db_path)
-        warm = _run_ranges_pass(project_dir, filenames, db_path)
+        cache_dir = Path(td) / "cache"
+        cold = _run_ranges_pass(project_dir, filenames, cache_dir)
+        warm = _run_ranges_pass(project_dir, filenames, cache_dir)
 
     if cold["keep_ranges"] != warm["keep_ranges"]:
         print(f"WARNING ranges/{key}: cold and warm keep_ranges differ -- "

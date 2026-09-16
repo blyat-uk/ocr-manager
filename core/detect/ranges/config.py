@@ -1,6 +1,13 @@
+"""Parameters for the time-range pipeline.
+
+Every default is copied verbatim from the original
+``core/audio_finder/config.py``; changing any of them changes detection
+output. ``RangesConfig.fingerprint_params()`` lists exactly the fields that
+change a file's fingerprints, and is what the fingerprint cache is keyed on.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -14,10 +21,6 @@ class DSPConfig:
     @property
     def frames_per_sec(self) -> float:
         return self.sample_rate / self.hop_length
-
-    @property
-    def freq_bin_hz(self) -> float:
-        return self.sample_rate / self.n_fft
 
     @property
     def num_bins(self) -> int:
@@ -53,25 +56,23 @@ class MatchConfig:
     stop_word_file_ratio: float = 0.9
 
 
-@dataclass
-class AnalysisConfig:
-    dsp: DSPConfig = None
-    peak: PeakConfig = None
-    hash: HashConfig = None
-    match: MatchConfig = None
-    db_path: str = ""
+@dataclass(frozen=True)
+class RangesConfig:
+    dsp: DSPConfig = field(default_factory=DSPConfig)
+    peak: PeakConfig = field(default_factory=PeakConfig)
+    hash: HashConfig = field(default_factory=HashConfig)
+    match: MatchConfig = field(default_factory=MatchConfig)
+    # Bridge short silence gaps that sit at the same position in most files
+    # (the "merge repeating silences" setting in the UI).
+    merge_repeating_silences: bool = False
 
-    def __post_init__(self):
-        if self.dsp is None:
-            self.dsp = DSPConfig()
-        if self.peak is None:
-            self.peak = PeakConfig()
-        if self.hash is None:
-            self.hash = HashConfig()
-        if self.match is None:
-            self.match = MatchConfig()
+    def fingerprint_params(self) -> dict:
+        """Every parameter that affects a file's fingerprint array.
 
-    def fingerprint_params_dict(self) -> dict:
+        A superset of the original ``fingerprint_params_dict()``: it also
+        carries the hash bit widths, which the original left out of its
+        profile key even though they change the packed hashes.
+        """
         return {
             "sample_rate": self.dsp.sample_rate,
             "n_fft": self.dsp.n_fft,
@@ -85,4 +86,7 @@ class AnalysisConfig:
             "fanout": self.hash.fanout,
             "dt_min": self.hash.dt_min,
             "dt_max": self.hash.dt_max,
+            "f1_bits": self.hash.f1_bits,
+            "f2_bits": self.hash.f2_bits,
+            "dt_bits": self.hash.dt_bits,
         }
