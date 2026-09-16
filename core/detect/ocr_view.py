@@ -187,16 +187,26 @@ def sample_times(duration: float, time_ranges, n: int, phase: float = 0.5) -> li
     return times
 
 
-def video_duration(video_path: str) -> float:
-    """Duration as the OCR pass counts it: frame count / fps from Capture.
-    Raises FETCH_ERRORS when the file cannot be opened."""
+def video_timing(video_path: str) -> tuple[float, float]:
+    """(duration, fps) as the OCR pass counts them: frame count / fps from
+    Capture. Raises FETCH_ERRORS when the file cannot be opened."""
     with Capture(video_path) as cap:
         frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-    return frames / fps if fps else 0.0
+    return (frames / fps if fps else 0.0), fps
+
+
+def video_duration(video_path: str) -> float:
+    """Duration as the OCR pass counts it (see video_timing)."""
+    return video_timing(video_path)[0]
 
 
 def grab_ocr_strips(video_path: str, crop_box, times: list[float]) -> list[np.ndarray]:
+    """Strips only; see grab_ocr_strips_at."""
+    return [strip for _, strip in grab_ocr_strips_at(video_path, crop_box, times)]
+
+
+def grab_ocr_strips_at(video_path: str, crop_box, times: list[float]) -> list[tuple[float, np.ndarray]]:
     """Crop strips at `times`, pixel-identical to what the OCR pass hands its
     brightness filter for the same frames: opened through the same `Capture`
     with the same decode_target_height and in-graph crop request as
@@ -212,10 +222,10 @@ def grab_ocr_strips(video_path: str, crop_box, times: list[float]) -> list[np.nd
     Guard (h264 MKV). See task-4-report.md.
 
     `times` are in the OCR pass's own position domain (a time maps to frame
-    index round(t * fps), as `time_start` does). Results keep the order of
-    `times`. A frame that cannot be read, seeked to or opened (FETCH_ERRORS)
-    is dropped and logged, never raised; a file that cannot be opened at all
-    returns [].
+    index round(t * fps), as `time_start` does). Returns (requested time,
+    strip) pairs in the order of `times`. A frame that cannot be read, seeked
+    to or opened (FETCH_ERRORS) is dropped and logged, never raised; a file
+    that cannot be opened at all returns [].
     """
     if not times:
         return []
@@ -279,4 +289,4 @@ def grab_ocr_strips(video_path: str, crop_box, times: list[float]) -> list[np.nd
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr-view-grab") as pool:
         list(pool.map(work, [order[k::workers] for k in range(workers)]))
-    return [strip for strip in results if strip is not None]
+    return [(times[i], strip) for i, strip in enumerate(results) if strip is not None]

@@ -501,16 +501,32 @@ class _ExplodingOCR:
 
 def _fake_source(monkeypatch, strips=None, rounds=None):
     """Stand in for the frame source: every call returns `strips` (cycled),
-    or the next entry of `rounds`. Records (n, phase) per call."""
+    or the next entry of `rounds`, as (time, strip) pairs with distinct times.
+    Neighbour frames default to none (see _fake_neighbours). Records (n, phase)
+    per call."""
     calls = []
 
     def fake_sample(video_path, crop_box, time_ranges, n, phase=0.5):
         calls.append((n, phase))
         source = rounds[len(calls) - 1] if rounds else strips
-        return [source[i % len(source)] for i in range(n)]
+        return [(100.0 * len(calls) + i, source[i % len(source)]) for i in range(n)]
 
     monkeypatch.setattr(B, "_sample_strips", fake_sample)
+    _fake_neighbours(monkeypatch, lambda t: [])
     return calls
+
+
+def _fake_neighbours(monkeypatch, provider):
+    """Neighbour frames of the strip sampled at time t: provider(t) -> strips.
+    Returns the list of centre-time batches requested."""
+    requested = []
+
+    def fake(video_path, crop_box, time_ranges, centres):
+        requested.append(list(centres))
+        return {t: [(t + 0.4 * (k + 1), strip) for k, strip in enumerate(provider(t))] for t in centres}
+
+    monkeypatch.setattr(B, "_neighbour_strips", fake)
+    return requested
 
 
 def _interleave(a, b):
@@ -525,8 +541,10 @@ def test_detect_measures_the_gate_floor_on_empty_strips(monkeypatch):
     empty = [_ramp_strip(top=200) for _ in range(12)]
     _fake_source(monkeypatch, _interleave(text, empty))
 
+    neighbour_requests = _fake_neighbours(monkeypatch, lambda t: [])
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _GlyphReadingOCR())
 
+    assert neighbour_requests == [], "no dim strips: no neighbour frames fetched"
     # The floor comes from the EMPTY strips (ramp tops out at 200). Measured
     # on the text strips it would be 251, above the glyph cores themselves,
     # and the pick could not clear it.
@@ -788,6 +806,146 @@ def test_a_dim_strip_that_would_not_trip_the_gate_at_its_own_level_is_not_re_rea
 
     assert result.flagged is None
     assert ocr.calls == 1
+
+
+class _MarkedOCR(_GlyphReadingOCR):
+    """Reads the line whenever glyph cores survive; a 255 marker at row -3
+    changes what it reads: column 0 -> a near variant of the line, column 1 ->
+    a different line altogether."""
+
+    def predict(self, images):
+        self.calls += 1
+        out = []
+        for img in images:
+            line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
+            if np.count_nonzero(line.min(axis=2)) < self.CORE_PX // 2:
+                out.append(_ocr_item("", 0.0))
+            elif img[-3, 1, 0] == 255:
+                out.append(_ocr_item("完全不同的一句台词", 0.99))
+            elif img[-3, 0, 0] == 255:
+                out.append(_ocr_item("你好世界啊", 0.99))
+            else:
+                out.append(_ocr_item("你好世界", 0.99))
+        return out
+
+
+def _marked(strip, column):
+    strip = strip.copy()
+    strip[-3, column] = 255
+    return strip
+
+
+def _fade_scene(monkeypatch, neighbour_provider):
+    """11 bright strips and 5 dim ones (glyph level 200, read at their own
+    threshold 192 but not at the pick 227); neighbours from the provider."""
+    dim = _glyph_strip(core=(200,) * 3)
+    text = [_glyph_strip() for _ in range(11)] + [dim.copy() for _ in range(5)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+    return _fake_neighbours(monkeypatch, neighbour_provider)
+
+
+@pytest.mark.parametrize("neighbour", [
+    "same line",        # full brightness a moment later: the fade's own line
+    "near variant",     # read slightly differently, still the same line
+])
+def test_a_dim_strip_whose_neighbours_read_its_line_at_the_pick_was_a_fade(monkeypatch, neighbour):
+    bright = _glyph_strip() if neighbour == "same line" else _marked(_glyph_strip(), 0)
+    requested = _fade_scene(monkeypatch, lambda t: [bright] * 4)
+    ocr = _MarkedOCR()
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
+
+    assert result.value == 227
+    assert result.flagged is None
+    assert result.auto_applicable
+    assert len(requested) == 1 and len(requested[0]) == 5, "one fetch for the five dim strips"
+    assert ocr.calls == 2, "own-level re-reads and neighbours share one OCR batch"
+
+
+@pytest.mark.parametrize("neighbour", [
+    "dim like the strip",   # a dimmer style: at the pick nothing survives
+    "no text",
+    "no frames",            # neighbours could not be read
+])
+def test_a_dim_strip_whose_neighbours_never_read_it_at_the_pick_is_dim_text(monkeypatch, neighbour):
+    provider = {
+        "dim like the strip": lambda t: [_glyph_strip(core=(200,) * 3)] * 4,
+        "no text": lambda t: [_ramp_strip(top=150)] * 4,
+        "no frames": lambda t: [],
+    }[neighbour]
+    _fade_scene(monkeypatch, provider)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _MarkedOCR())
+
+    assert result.value == 227
+    assert result.flagged == "dim-text?"
+    assert not result.auto_applicable
+
+
+def test_neighbours_reading_a_different_line_do_not_make_a_dim_strip_a_fade(monkeypatch):
+    _fade_scene(monkeypatch, lambda t: [_marked(_glyph_strip(), 1)] * 4)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _MarkedOCR())
+
+    assert result.flagged == "dim-text?"
+
+
+def test_neighbours_that_would_not_trip_the_gate_at_the_pick_are_not_read(monkeypatch):
+    # The OCR pass never OCRs these frames at the pick, so they cannot show
+    # the line surviving there, whatever OCR would read.
+    quiet = _glyph_strip()
+    quiet[:, CENTRE_X0:CENTRE_X0 + H] = 0
+    _fade_scene(monkeypatch, lambda t: [quiet] * 4)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _MarkedOCR())
+
+    assert result.flagged == "dim-text?"
+
+
+def test_a_strip_that_reads_at_the_pick_itself_is_not_checked_for_dim_text(monkeypatch):
+    # Strip 15 reads only at the window's lowest threshold (220), which is
+    # also the pick: nothing is lost there, whatever it reads at its own level.
+    texts = [f"第{i}行字幕文本" for i in range(16)]
+    strips = [_probe_strip(i, 16) for i in range(15)] + [_probe_strip(15, 16, core=230)]
+    steady = {t: ("ok", 0.99) for t in (220, 225, 230, 235)}
+    scripts = [steady] * 15 + [{220: ("ok", 0.99), 222: ("ok", 0.99)}]   # 222: its own level
+    _fake_source(monkeypatch, strips + [_ramp_strip(top=200)] * 8)
+    requested = _fake_neighbours(monkeypatch, lambda t: [])
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ScriptedOCR(scripts, texts))
+
+    assert result.value == 220 and result.plateau == (220, 235)
+    assert result.flagged == "narrow-plateau?"
+    assert requested == []
+
+
+def test_a_strip_used_as_evidence_is_not_checked_for_dim_text_even_at_a_bridged_dip(monkeypatch):
+    # Strip 0 misses one threshold -- exactly the pick, 235 -- inside a band
+    # it otherwise reads; the plateau bridges that dip. The strip is evidence
+    # already, so the dim-text check must leave it alone.
+    texts = [f"第{i}行字幕文本" for i in range(16)]
+    steady = {t: ("ok", 0.99) for t in range(220, 256, 5)}
+    holed = {t: v for t, v in steady.items() if t != 235}
+    _fake_source(monkeypatch, [_probe_strip(i, 16) for i in range(16)] + [_ramp_strip(top=200)] * 8)
+    requested = _fake_neighbours(monkeypatch, lambda t: [])
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ScriptedOCR([holed] + [steady] * 15, texts))
+
+    assert result.plateau == (220, 255) and result.value == 235
+    assert result.flagged is None
+    assert requested == []
+
+
+@pytest.mark.parametrize("t, duration, spans, expected", [
+    (50.0, 100.0, None, [49.2, 49.6, 50.4, 50.8]),
+    (0.3, 100.0, None, [0.0, 0.7, 1.1]),                  # start of file: -0.5 and -0.1 both clamp to frame 0
+    (99.7, 100.0, None, [98.9, 99.3, 99.96]),             # end of file: clamped to the last frame (100 - 1/25)
+    (60.2, 600.0, [(60.0, 120.0), (300.0, 330.0)], [60.0, 60.6, 61.0]),   # keep range start
+    (60.0, 600.0, [(60.0, 120.0)], [60.4, 60.8]),        # clamps onto the strip's own frame are dropped
+    (329.9, 600.0, [(60.0, 120.0), (300.0, 330.0)], [329.1, 329.5, 330.0]),  # the span holding t, not another
+])
+def test_neighbour_times_stay_inside_the_file_and_the_keep_range(t, duration, spans, expected):
+    assert np.allclose(B._neighbour_times(t, duration, 25.0, spans), expected)
 
 
 def test_text_strips_that_read_nothing_even_at_their_own_level_are_not_dim_text(monkeypatch):

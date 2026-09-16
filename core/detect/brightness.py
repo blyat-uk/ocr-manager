@@ -39,8 +39,12 @@ plateau top; see PICK_BELOW_TOP.
 
 Text strips that verification could not use because they read nowhere in
 its window (or only at its lowest threshold) are re-read once at their own
-seed threshold; any that read there are a dimmer style the window never saw,
-flagged "dim-text?".
+seed threshold. One that reads there is either a frame caught mid-fade --
+lost at any threshold, including a hand-tuned one -- or a dimmer style the
+pick would lose for good. Its neighbour frames (+/- 0.4 and 0.8 s), masked at
+the pick, tell them apart: if any reads the same line, the line survives at
+the pick and the strip was a fade; otherwise the result is flagged
+"dim-text?".
 
 Cheap path (`folder_plateau` given): 6 frames, analytic seed only. A seed
 inside the folder plateau is accepted and picked PICK_BELOW_TOP below itself
@@ -153,7 +157,10 @@ FLAG_THIN_EVIDENCE = "thin-evidence?"       # fewer than THIN_EVIDENCE_STRIPS st
 FLAG_COLOURED_TEXT = "coloured-text?"       # implausibly low seed; not verified
 FLAG_NO_PLATEAU = "no-plateau?"             # OCR verification found no valid run; value is the seed
 FLAG_NARROW_PLATEAU = "narrow-plateau?"     # plateau narrower than PICK_BELOW_TOP: no safe margin
-FLAG_DIM_TEXT = "dim-text?"                 # text strips unreadable in the window read at their own level
+FLAG_DIM_TEXT = "dim-text?"                 # a line readable at its own level never reads at the pick
+
+# Neighbour frames checked around a dim strip, in seconds.
+NEIGHBOUR_OFFSETS_SEC = (-0.8, -0.4, 0.4, 0.8)
 FLAG_ESCALATE = "escalate"                  # cheap path: seed outside the folder plateau (or no text)
 FLAG_CANCELLED = "cancelled"                # cancel_check fired: result incomplete
 
@@ -234,13 +241,52 @@ def _ranges_select_nothing(video_path: str, time_ranges) -> bool:
     return duration > 0 and not ocr_view.keep_spans(duration, time_ranges)
 
 
-def _sample_strips(video_path: str, crop_box, time_ranges, n: int, phase: float = 0.5) -> list[np.ndarray]:
+def _sample_strips(video_path: str, crop_box, time_ranges, n: int,
+                   phase: float = 0.5) -> list[tuple[float, np.ndarray]]:
+    """(time, strip) pairs for one sampling round."""
     try:
         duration = ocr_view.video_duration(video_path)
     except ocr_view.FETCH_ERRORS as exc:
         logger.warning("%s: cannot open (%s: %s)", video_path, type(exc).__name__, exc)
         return []
-    return ocr_view.grab_ocr_strips(video_path, crop_box, ocr_view.sample_times(duration, time_ranges, n, phase))
+    return ocr_view.grab_ocr_strips_at(video_path, crop_box, ocr_view.sample_times(duration, time_ranges, n, phase))
+
+
+def _neighbour_times(t: float, duration: float, fps: float, spans) -> list[float]:
+    """Times NEIGHBOUR_OFFSETS_SEC around `t`, clamped to the file (its last
+    frame) and, when keep-range `spans` are given, to the span holding `t`.
+    Times that land on t's own frame or repeat another neighbour's frame
+    after clamping are dropped."""
+    lo = 0.0
+    hi = max(0.0, duration - 1.0 / fps) if fps else duration
+    if spans:
+        s, e = min(spans, key=lambda span: 0.0 if span[0] <= t <= span[1] else min(abs(t - span[0]), abs(t - span[1])))
+        lo, hi = max(lo, s), min(hi, e)
+    frame = (lambda x: round(x * fps)) if fps else (lambda x: x)
+    seen = {frame(t)}
+    out = []
+    for offset in NEIGHBOUR_OFFSETS_SEC:
+        nt = min(max(t + offset, lo), hi)
+        if frame(nt) not in seen:
+            seen.add(frame(nt))
+            out.append(nt)
+    return out
+
+
+def _neighbour_strips(video_path: str, crop_box, time_ranges,
+                      centres: list[float]) -> dict[float, list[tuple[float, np.ndarray]]]:
+    """(time, strip) neighbours (see _neighbour_times) for each centre time,
+    fetched in one grab through the OCR pass's own capture chain. A frame that
+    cannot be read is simply missing."""
+    try:
+        duration, fps = ocr_view.video_timing(video_path)
+    except ocr_view.FETCH_ERRORS as exc:
+        logger.warning("%s: cannot open for neighbour frames (%s: %s)", video_path, type(exc).__name__, exc)
+        return {t: [] for t in centres}
+    spans = ocr_view.keep_spans(duration, time_ranges) if time_ranges else None
+    wanted = {t: _neighbour_times(t, duration, fps, spans) for t in centres}
+    fetched = dict(ocr_view.grab_ocr_strips_at(video_path, crop_box, sorted({nt for ts in wanted.values() for nt in ts})))
+    return {t: [(nt, fetched[nt]) for nt in ts if nt in fetched] for t, ts in wanted.items()}
 
 
 def _detect_text_polys(det_engine, strips: list[np.ndarray]) -> list[list[np.ndarray]]:
@@ -554,18 +600,27 @@ def verify_with_ocr(strips: list[np.ndarray], seed: int, ocr_engine
     return v.value, v.plateau, v.curve
 
 
-def _dim_text_rereads(strips: list[np.ndarray], polys_per_strip, verification: _Verification,
-                      ocr_engine) -> list[tuple[int, int, str]]:
-    """Re-read, at its own threshold, every verified strip that was no
-    evidence because it read nowhere in the window or only at the window's
-    lowest threshold -- a subtitle style dimmer than the median, which the
-    seed's window never reaches. Its own threshold is the seed formula applied
-    to that strip alone. Masked strips that do not trip the gate are not
-    OCR'd, as in verification; the rest go in one batch. Returns (strip index,
-    threshold, text read) for each strip re-read."""
-    batch, meta = [], []
+def _dim_text_check(video_path: str, crop_box, time_ranges, strips: list[np.ndarray], times: list[float],
+                    polys_per_strip, verification: _Verification, ocr_engine) -> list[dict]:
+    """Find lines the pick would lose that verification never saw.
+
+    Candidates are verified strips that were no evidence because they read
+    nowhere in the window or only at its lowest threshold, and that do not
+    read at the pick itself. Each is masked at its own threshold (the seed
+    formula applied to that strip alone); its neighbour frames are masked at
+    the PICK. Everything that trips the gate goes to OCR in one batch.
+
+    Returns one record per candidate whose own-threshold mask tripped the gate:
+    {index, time, threshold, text (read at its own threshold), neighbours:
+    [(time, text read at the pick)], survives (a neighbour's reading near-
+    matches `text`)}. A record with text and not `survives` is a dim line.
+    """
+    pick_j = verification.grid.index(verification.value) if verification.value in verification.grid else None
+    pending = []
     for k, index in enumerate(verification.chosen):
         if verification.modals[k] is not None or verification.readable[k] not in ([], [0]):
+            continue
+        if pick_j is not None and verification.readings[k] and verification.readings[k][pick_j][0]:
             continue
         level = _glyph_level(strips[index], polys_per_strip[index])
         if level is None:
@@ -573,11 +628,32 @@ def _dim_text_rereads(strips: list[np.ndarray], polys_per_strip, verification: _
         t = _seed_from_level(level)
         masked = ocr_view.mask(strips[index], t)
         if ocr_view.gate_fires(masked):
-            batch.append(masked)
-            meta.append((index, t))
-    if not batch:
+            pending.append((index, t, masked))
+    if not pending:
         return []
-    return [(index, t, _reading(pred)[0]) for (index, t), pred in zip(meta, _ocr_predict(ocr_engine, batch))]
+
+    neighbours = _neighbour_strips(video_path, crop_box, time_ranges, [times[index] for index, _, _ in pending])
+    batch, slots = [], []
+    records = []
+    for r, (index, t, masked) in enumerate(pending):
+        records.append(dict(index=index, time=times[index], threshold=t, text="", neighbours=[], survives=False))
+        batch.append(masked)
+        slots.append((r, None))
+        for neighbour_time, strip in neighbours.get(times[index], []):
+            neighbour_masked = ocr_view.mask(strip, verification.value)
+            if ocr_view.gate_fires(neighbour_masked):
+                batch.append(neighbour_masked)
+                slots.append((r, neighbour_time))
+    for (r, neighbour_time), pred in zip(slots, _ocr_predict(ocr_engine, batch)):
+        text = _reading(pred)[0]
+        if neighbour_time is None:
+            records[r]["text"] = text
+        else:
+            records[r]["neighbours"].append((neighbour_time, text))
+    for record in records:
+        record["survives"] = bool(record["text"]) and any(
+            text and _near_reading(text, record["text"]) for _, text in record["neighbours"])
+    return records
 
 
 # --------------------------------------------------------------------------
@@ -617,17 +693,19 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
         return BrightnessResult(DEFAULT_BRIGHTNESS, None, fallback, floor, FLAG_CANCELLED, [])
 
     cheap = folder_plateau is not None
-    strips, polys = [], []
+    strips, times, polys = [], [], []
     for phase in SAMPLE_ROUND_PHASES[:1] if cheap else SAMPLE_ROUND_PHASES:
         if _is_cancelled(cancel_check):
             return cancelled()
-        batch = _sample_strips(video_path, crop_box, time_ranges,
+        pairs = _sample_strips(video_path, crop_box, time_ranges,
                                CHEAP_SAMPLE_FRAMES if cheap else FULL_SAMPLE_FRAMES, phase)
-        strips += batch
-        polys += _detect_text_polys(det_engine, batch)
+        strips += [strip for _, strip in pairs]
+        times += [t for t, _ in pairs]
+        polys += _detect_text_polys(det_engine, [strip for _, strip in pairs])
         if sum(1 for p in polys if p) >= VERIFY_STRIPS:
             break
     text_strips = [s for s, p in zip(strips, polys) if p]
+    text_times = [t for t, p in zip(times, polys) if p]
     text_polys = [p for p in polys if p]
     empty_strips = [s for s, p in zip(strips, polys) if not p]
     try:
@@ -667,7 +745,9 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
         flagged = _compose_flag(flagged, FLAG_NO_PLATEAU)
     elif plateau[1] - plateau[0] < PICK_BELOW_TOP:
         flagged = _compose_flag(flagged, FLAG_NARROW_PLATEAU)
-    if any(text for _, _, text in _dim_text_rereads(text_strips, text_polys, verification, ocr_engine)):
+    dim = _dim_text_check(video_path, crop_box, time_ranges, text_strips, text_times, text_polys,
+                          verification, ocr_engine)
+    if any(record["text"] and not record["survives"] for record in dim):
         flagged = _compose_flag(flagged, FLAG_DIM_TEXT)
     if floor is not None and value < floor + GATE_FLOOR_MARGIN:
         flagged = _compose_flag(flagged, FLAG_NO_CLEAN_THRESHOLD)
