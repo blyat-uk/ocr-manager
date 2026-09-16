@@ -36,10 +36,12 @@ import logging
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from dataclasses import fields as _dataclass_fields
 from statistics import median
 
 import numpy as np
 
+from core.config import Config as _Config
 from core.detect import vad
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,21 @@ MAX_CROP_HEIGHT_FRAC = 0.25
 # Detection score threshold - real text typically scores ~0.97.
 DT_SCORE_THRESHOLD = 0.9
 
+def _label_max_duration_default() -> float:
+    """Read core.config.Config's own label_max_duration default rather than
+    hardcoding a twin of it: the label pipeline already encodes "how long a
+    single subtitle can plausibly stay on screen" as this value, and if
+    that assumption ever changes, this module's watermark-vs-repeated-line
+    boundary (below) should track it automatically instead of silently
+    diverging. core/config.py has no Qt imports, so this import doesn't
+    violate core/detect/'s Qt-free convention.
+    """
+    for f in _dataclass_fields(_Config):
+        if f.name == "label_max_duration":
+            return float(f.default)
+    return 5.0  # matches Config's own fallback, in case the field is ever renamed
+
+
 # Watermark rejection: a box present in every sampled frame, to within this
 # fraction of frame height, is *suspected* static content (a logo/watermark)
 # rather than a subtitle, but only once there are enough samples for "every
@@ -67,14 +84,21 @@ DT_SCORE_THRESHOLD = 0.9
 # original value this reproduces).
 WATERMARK_TOLERANCE_FRAC = 4.0 / 1080.0
 WATERMARK_MIN_SAMPLES = 3
-# A same-extent match across samples spanning less than this many seconds
-# is NOT enough evidence of static content: vad.probe_times() only
-# guarantees 0.75s minimum separation between picks, so several
-# chronological picks can land inside one displayed subtitle line's own
-# duration, all showing the same text. Require the contributing samples to
-# span more than one plausible subtitle's display duration before calling
-# it a watermark rather than "the same line, sampled repeatedly".
-WATERMARK_MIN_SPAN_SEC = 2.0
+# Extent identity alone cannot distinguish a real watermark from the same
+# subtitle line sampled several times within its own display: vad.probe_times()
+# only guarantees 0.75s minimum separation between picks, so N picks can
+# span as little as (N-1)*0.75s, which is well inside a single subtitle's
+# lifetime. The span requirement therefore has to exceed the longest a
+# single subtitle could plausibly last, not an arbitrary round number --
+# WATERMARK_MIN_SPAN_SEC is set above _label_max_duration_default() (the
+# label pipeline's own ceiling, 5.0s by default) with an explicit margin,
+# so a span that clears it is provably longer than any one subtitle could
+# have lasted. Below that span the two cases are genuinely indistinguishable
+# by extent alone -- see _watermark_status()'s "uncertain" outcome, which
+# does NOT reject (a wrong box is visible/correctable in a review UI; a
+# missing box with no explanation is not).
+WATERMARK_SPAN_MARGIN_SEC = 1.0
+WATERMARK_MIN_SPAN_SEC = _label_max_duration_default() + WATERMARK_SPAN_MARGIN_SEC
 
 # Frame grab defaults.
 TARGET_HEIGHT = 480
@@ -98,7 +122,9 @@ FLAG_SPEECH_PROBES_EXHAUSTED = "speech-probes-exhausted"  # audio has speech, bu
 FLAG_TOP_POSITIONED = "top-positioned?"
 FLAG_CEILING_EXCEEDED = "ceiling-exceeded"
 FLAG_LOW_AGREEMENT = "low-agreement"
-FLAG_STATIC_CONTENT = "static-content"              # watermark/logo rejection
+FLAG_STATIC_CONTENT = "static-content"              # watermark/logo rejection (confirmed)
+FLAG_WATERMARK_UNCERTAIN = "static-content?"        # same extent every sample, but not enough
+                                                     # temporal spread to confirm -- box is kept
 
 
 @dataclass
@@ -282,25 +308,37 @@ def _per_frame_extents(polys_per_frame, frame_h: float, cutoff_frac: float,
     return extents
 
 
-def _is_watermark(accepted: list[tuple[float, float, float, float]], total_frames: int,
-                   frame_h: float, contributing_times: list[float] | None = None) -> bool:
-    """True if the same extent (within WATERMARK_TOLERANCE_FRAC of frame
-    height) appears in every one of `total_frames` sampled frames --
-    *and*, when timestamps are available, those samples span more than
-    WATERMARK_MIN_SPAN_SEC. Static content is present continuously;
-    several chronological probes landing inside one subtitle's own
-    display duration would also look identical without being static.
+def _watermark_status(accepted: list[tuple[float, float, float, float]], total_frames: int,
+                       frame_h: float, contributing_times: list[float] | None = None,
+                       ) -> str | None:
+    """Tri-state watermark judgement for a set of per-frame extents:
+
+    - None: not watermark-shaped at all (too few samples, or the extents
+      actually differ across frames). Ordinary detection.
+    - "confirmed": the same extent (within WATERMARK_TOLERANCE_FRAC of
+      frame height) appears in every one of `total_frames` sampled frames,
+      AND the contributing samples span more than WATERMARK_MIN_SPAN_SEC --
+      long enough that no single subtitle could plausibly have still been
+      the same displayed line across the whole span. Reject.
+    - "uncertain": the extent matches, but either no timing information was
+      supplied, or the samples that do have timing span too little to rule
+      out "the same line, sampled repeatedly". Do NOT reject: return the
+      box as usual and let the caller attach an explanatory flag instead.
+      A wrong box is visible and correctable in a review UI; a missing box
+      with no explanation is neither.
 
     `contributing_times` is optional: aggregate_box()'s public, pure API
-    doesn't require callers to supply sample timestamps (the 7 unit tests
-    in tests/test_detect_crop.py call it without any), so when it's None
-    this falls back to the extent-identity check alone -- the behaviour
-    those tests pin. detect_crop() (the actual orchestration this rule
-    exists to protect) always supplies real probe timestamps, so the
-    temporal-spread requirement is live on the path that matters.
+    doesn't require callers to supply sample timestamps (the 7 brief-locked
+    unit tests in tests/test_detect_crop.py call it without any). Absent
+    any timing information at all, this preserves the original
+    extent-identity-only behaviour those tests pin (always "confirmed" when
+    the extents match) rather than inventing a judgement from nothing.
+    detect_crop() (the actual orchestration this rule protects) always
+    supplies real probe timestamps, so the temporal-spread requirement is
+    live on the path that matters.
     """
     if len(accepted) != total_frames or total_frames < WATERMARK_MIN_SAMPLES:
-        return False
+        return None
     tolerance = frame_h * WATERMARK_TOLERANCE_FRAC
     first = accepted[0]
     same_extent = all(
@@ -308,41 +346,48 @@ def _is_watermark(accepted: list[tuple[float, float, float, float]], total_frame
         for e in accepted[1:]
     )
     if not same_extent:
-        return False
-    if contributing_times is not None and len(contributing_times) >= 2:
-        span = max(contributing_times) - min(contributing_times)
-        if span < WATERMARK_MIN_SPAN_SEC:
-            return False
-    return True
+        return None
+    if contributing_times is None:
+        return "confirmed"
+    if len(contributing_times) < 2:
+        return "uncertain"
+    span = max(contributing_times) - min(contributing_times)
+    return "confirmed" if span >= WATERMARK_MIN_SPAN_SEC else "uncertain"
 
 
 def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
                    sample_times: list[float] | None = None,
-                   ) -> tuple[tuple[float, float, float, float] | None, int, bool]:
-    """Returns (raw union extent or None, count of contributing frames,
-    whether the result looks like a watermark).
+                   ) -> tuple[tuple[float, float, float, float] | None, int, str | None]:
+    """Returns (raw union extent, count of contributing frames, watermark
+    status). The union is None only when there are no in-band polys at all,
+    OR the watermark status is "confirmed" (see _watermark_status()) -- an
+    "uncertain" status still returns the real union, since insufficient
+    evidence must not silently discard a detection.
 
     `sample_times`, if given, must align 1:1 with `polys_per_frame`; only
     the timestamps of frames that actually contributed an in-band poly are
-    used (see _is_watermark).
+    used (see _watermark_status()).
     """
     extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
     accepted = [e for e in extents if e is not None]
     if not accepted:
-        return None, 0, False
+        return None, 0, None
 
     contributing_times = None
     if sample_times is not None and len(sample_times) == len(extents):
         contributing_times = [t for e, t in zip(extents, sample_times) if e is not None]
 
-    if _is_watermark(accepted, len(extents), frame_h, contributing_times):
-        return None, len(accepted), True
+    status = _watermark_status(accepted, len(extents), frame_h, contributing_times)
 
     min_x = min(e[0] for e in accepted)
     min_y = min(e[1] for e in accepted)
     max_x = max(e[2] for e in accepted)
     max_y = max(e[3] for e in accepted)
-    return (min_x, min_y, max_x, max_y), len(accepted), False
+    union = (min_x, min_y, max_x, max_y)
+
+    if status == "confirmed":
+        return None, len(accepted), status
+    return union, len(accepted), status
 
 
 def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float = 0.55,
@@ -351,7 +396,12 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     """Union of accepted text-detection polygons across sampled frames, into
     one padded, clamped crop box -- or None if there's nothing to build a
     box from (no in-band polys, the box exceeds the height ceiling, or the
-    result looks like a static watermark rather than a subtitle).
+    result is a *confirmed* static watermark -- see _watermark_status()).
+    An extent that merely *looks* identical across samples but lacks
+    enough temporal spread to confirm that ("uncertain") still returns a
+    real box; callers that want to surface the distinction should call
+    _union_extent() directly for the watermark status, as detect_crop()
+    does.
 
     `polys_per_frame`: one entry per sampled frame, each a list of polygons
     (each polygon an array-like of (x, y) points) in `frame_size` pixel
@@ -368,7 +418,7 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     temporal spread among the contributing samples instead of only extent
     identity. Optional and keyword-friendly precisely so the plain
     positional calls in tests/test_detect_crop.py's pure tests keep working
-    unchanged; see _is_watermark()'s docstring.
+    unchanged; see _watermark_status()'s docstring.
     """
     frame_w, frame_h = frame_size
     s = settings or {}
@@ -377,7 +427,7 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     min_height_frac = float(s.get("crop_min_height_fraction", CROP_MIN_HEIGHT_FRACTION))
     cutoff_frac = float(s.get("bottom_half_cutoff", band_frac))
 
-    union, _agreed, is_watermark = _union_extent(polys_per_frame, frame_h, cutoff_frac, sample_times)
+    union, _agreed, _watermark_status_ = _union_extent(polys_per_frame, frame_h, cutoff_frac, sample_times)
     if union is None:
         return None
 
@@ -445,6 +495,37 @@ def _compose_flag(existing: str | None, new: str) -> str:
     return f"{existing}+{new}"
 
 
+def _spread_order(times: list[float]) -> list[float]:
+    """Reorder timestamps by greedy farthest-point sampling: the earliest
+    entries visited are maximally spread apart, rather than adjacent in
+    the original (chronological) list. Doesn't add, drop, or rank
+    candidates -- vad.probe_times() already picked all of them -- only
+    changes visitation order.
+
+    Why this matters: detect_crop() stops probing as soon as it has enough
+    hits, so whichever candidates get visited first determine which
+    samples the watermark check (see WATERMARK_MIN_SPAN_SEC) has to work
+    with. Walking candidates in strict chronological order means a local
+    cluster of nearby hits can satisfy the stop condition before any
+    temporally-spread candidate is ever tried -- the watermark check would
+    then be structurally unable to ever confirm a real watermark, not just
+    correctly abstain on an ambiguous one. Visiting spread-out candidates
+    first makes rule 1 (WATERMARK_MIN_SPAN_SEC) actually fire in practice.
+    """
+    if len(times) <= 2:
+        return list(times)
+    remaining = list(times)
+    ordered = [remaining.pop(0), remaining.pop(-1)]
+    while remaining:
+        best_idx, best_dist = 0, -1.0
+        for i, t in enumerate(remaining):
+            dist = min(abs(t - o) for o in ordered)
+            if dist > best_dist:
+                best_idx, best_dist = i, dist
+        ordered.append(remaining.pop(best_idx))
+    return ordered
+
+
 def _map_poly_to_full_frame(poly, geometry: tuple) -> np.ndarray:
     """Map a polygon from a grabbed (cropped+scaled) frame's coordinate
     space back to full original-frame pixel coordinates."""
@@ -475,6 +556,11 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     detect_crop can stop probing on hits that end up contributing nothing,
     landing on box=None with neither fallback triggered.
 
+    `times` is walked in _spread_order(), not the order it's given in, so
+    that if/when enough hits accumulate to stop, they're already spread
+    across real time rather than clustered -- see _spread_order()'s
+    docstring for why the watermark check needs this.
+
     Returns (polys_per_frame, sample_pts_used, raw_hit_count, frame_times).
     Polygons are already mapped to full-frame pixel coordinates.
     `frame_times` has one entry per entry of `polys_per_frame`, the probe
@@ -487,6 +573,8 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     _, frame_h = frame_size
     cutoff_frac = float((settings or {}).get("bottom_half_cutoff", band_frac))
     raw_hits = 0
+
+    times = _spread_order(times)
 
     i = 0
     while i < len(times):
@@ -565,8 +653,11 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     - The bottom band yields nothing at all, even after the uniform
       fallback: retry once on full frames (band_frac=1.0, no position
       cutoff). flagged gains "top-positioned?".
-    A result can also be flagged "static-content" (watermark rejected;
-    see _is_watermark()), "ceiling-exceeded" (in-band hits exist but the
+    A result can also be flagged "static-content" (watermark CONFIRMED --
+    same extent every sample, spanning more than WATERMARK_MIN_SPAN_SEC;
+    box is None), "static-content?" (same extent every sample, but not
+    enough temporal spread to confirm; box is still returned -- see
+    _watermark_status()), "ceiling-exceeded" (in-band hits exist but the
     resulting box is too tall), or "low-agreement" (a box was built, but
     from fewer than LOW_AGREEMENT_HITS contributing frames).
     """
@@ -619,7 +710,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     cutoff_frac = 0.0 if used_full_frame_retry else float(
         (settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)
     )
-    envelope_extent, agreed, is_watermark = _union_extent(
+    envelope_extent, agreed, watermark_status = _union_extent(
         polys_per_frame, orig_h, cutoff_frac, frame_times,
     )
     envelope = None
@@ -637,8 +728,19 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     box = aggregate_box(polys_per_frame, frame_size, box_band_frac, box_settings, frame_times)
 
     if box is None and agreed > 0:
-        flagged = _compose_flag(flagged, FLAG_STATIC_CONTENT if is_watermark else FLAG_CEILING_EXCEEDED)
-    elif box is not None and 0 < agreed < LOW_AGREEMENT_HITS:
+        # watermark_status can only be "confirmed" here (never "uncertain",
+        # which by construction always returns a real union/box) or None
+        # (ceiling exceeded with no watermark involvement at all).
+        flagged = _compose_flag(
+            flagged, FLAG_STATIC_CONTENT if watermark_status == "confirmed" else FLAG_CEILING_EXCEEDED,
+        )
+    if box is not None and watermark_status == "uncertain":
+        # Same extent every sample, but not enough temporal spread among
+        # the contributing probes to tell a real watermark apart from the
+        # same subtitle line sampled repeatedly -- kept the box rather
+        # than guess, per the review ruling; flag it so a human can.
+        flagged = _compose_flag(flagged, FLAG_WATERMARK_UNCERTAIN)
+    if box is not None and 0 < agreed < LOW_AGREEMENT_HITS:
         flagged = _compose_flag(flagged, FLAG_LOW_AGREEMENT)
 
     return CropResult(

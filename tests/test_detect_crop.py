@@ -65,21 +65,52 @@ def test_padding_is_applied_before_the_floor():
     assert box == (288, 977, 1344, 56)
 
 
-def test_watermark_rejection_requires_temporal_spread():
-    # Identical extents that all land within one plausible subtitle's own
-    # display duration could be the SAME line, sampled repeatedly -- not
-    # proof of static content. Only real temporal spread across the
-    # contributing samples should trigger watermark rejection.
+def test_watermark_five_vad_minimum_spaced_picks_is_not_confirmed_static():
+    # vad.probe_times() guarantees only 0.75s minimum separation between
+    # picks (_PEAK_MIN_SEPARATION_SEC), so 5 chronological picks can span
+    # as little as (5-1)*0.75 = 3.0s -- well under WATERMARK_MIN_SPAN_SEC
+    # (label_max_duration + margin, 6.0s by default). This is precisely
+    # the boundary a prior version of this rule got wrong: it must NOT be
+    # confirmed as static content, and the box must still be returned.
     same = _poly(1600, 1000, 1850, 1040)
     polys_per_frame = [[same]] * 5
+    times = [10.0, 10.75, 11.5, 12.25, 13.0]
+    assert times[-1] - times[0] < crop.WATERMARK_MIN_SPAN_SEC
 
-    clustered_times = [10.0, 10.3, 10.6, 10.9, 11.2]  # spans 1.2s
-    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=clustered_times)
-    assert box is not None, "clustered-in-time identical detections should not be a watermark"
+    _union, _agreed, status = crop._union_extent(polys_per_frame, FRAME[1], 0.55, times)
+    assert status == "uncertain"
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=times)
+    assert box is not None
 
-    spread_times = [10.0, 12.0, 14.0, 16.0, 18.0]  # spans 8s
-    box2 = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=spread_times)
-    assert box2 is None, "identical detections spread widely in time look like static content"
+
+def test_watermark_three_minimum_spaced_picks_is_not_silently_accepted():
+    # 3 identical-extent picks at minimum VAD spacing span only 1.5s --
+    # too little evidence to confirm a watermark, but also too little to
+    # silently wave through as an ordinary clean detection: it must carry
+    # the "could not judge" status/flag rather than either extreme.
+    same = _poly(1600, 1000, 1850, 1040)
+    polys_per_frame = [[same]] * 3
+    times = [10.0, 10.75, 11.5]
+
+    _union, _agreed, status = crop._union_extent(polys_per_frame, FRAME[1], 0.55, times)
+    assert status == "uncertain"
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=times)
+    assert box is not None
+
+
+def test_watermark_wide_span_is_still_confirmed_and_rejected():
+    # A genuine watermark sampled across a span no single subtitle could
+    # plausibly last must still be rejected -- the fix for the false
+    # positive/negative boundaries must not have gutted the rule entirely.
+    same = _poly(1600, 1000, 1850, 1040)
+    polys_per_frame = [[same]] * 5
+    times = [10.0, 30.0, 50.0, 70.0, 90.0]  # span 80s
+    assert times[-1] - times[0] >= crop.WATERMARK_MIN_SPAN_SEC
+
+    _union, _agreed, status = crop._union_extent(polys_per_frame, FRAME[1], 0.55, times)
+    assert status == "confirmed"
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=times)
+    assert box is None
 
 
 @pytest.mark.needs_media
