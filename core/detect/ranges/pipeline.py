@@ -26,6 +26,7 @@ import os
 import tempfile
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 
 import numpy as np
@@ -183,7 +184,20 @@ def save_cached(cache_dir: str, key: str, hashes: np.ndarray, duration: float) -
 def _pool_context():
     # forkserver: never fork() the (possibly multi-threaded, Qt) caller.
     ctx = multiprocessing.get_context("forkserver")
-    ctx.set_forkserver_preload(["core.detect.ranges.fingerprint"])
+    # "__main__" is preloaded alongside the fingerprint module so the
+    # forkserver process (spawned once, reused for every task) pays the
+    # cost of importing the app's entry module a single time instead of on
+    # every worker fork. This is safe: the forkserver bootstrap reimports
+    # "__main__" via multiprocessing.spawn's path-based fixup, which runs
+    # the module under run_name="__mp_main__" -- every entry point this
+    # preload can see (main.py, `python -m pytest`, the `pytest` console
+    # script, tools/bench.py) guards its side effects behind
+    # `if __name__ == "__main__":`, so that guard is False and nothing is
+    # re-executed. Verified directly: a forkserver pool with "__main__" in
+    # the preload list, started both under pytest and as a standalone
+    # script, completes without hanging or re-running the script's own
+    # `if __name__ == "__main__":` block (see task-6-report.md).
+    ctx.set_forkserver_preload(["core.detect.ranges.fingerprint", "__main__"])
     return ctx
 
 
@@ -228,18 +242,39 @@ def ingest(
             _check_cancel(cancel)
             finish(i, fingerprint.fingerprint_file(files[i].path, cfg), from_cache=False)
     elif misses:
-        pool = ProcessPoolExecutor(max_workers=min(workers, len(misses)), mp_context=_pool_context())
+        pool = None
         try:
+            pool = ProcessPoolExecutor(max_workers=min(workers, len(misses)), mp_context=_pool_context())
             pending = {pool.submit(fingerprint.fingerprint_file, files[i].path, cfg): i for i in misses}
             while pending:
                 _check_cancel(cancel)
                 completed, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
                 for future in completed:
                     finish(pending.pop(future), future.result(), from_cache=False)
+        except (ValueError, OSError, BrokenProcessPool) as exc:
+            # The process pool itself could not start (e.g. ValueError from
+            # get_context("forkserver") on a platform without it, an OSError
+            # spawning the forkserver process, or a BrokenProcessPool
+            # detected at start-up). Fall back to fingerprinting whatever is
+            # still missing serially, in-process, with the exact same
+            # function -- identical fingerprints, just no parallelism.
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+                pool = None
+            logger.warning(
+                "Process pool unavailable (%s: %s); falling back to serial fingerprinting.",
+                type(exc).__name__, exc,
+            )
+            for i in misses:
+                if hashes[i] is None:
+                    _check_cancel(cancel)
+                    finish(i, fingerprint.fingerprint_file(files[i].path, cfg), from_cache=False)
         except BaseException:
-            pool.shutdown(wait=False, cancel_futures=True)
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
             raise
-        pool.shutdown(wait=True)
+        else:
+            pool.shutdown(wait=True)
 
     return hashes, durations  # type: ignore[return-value]
 

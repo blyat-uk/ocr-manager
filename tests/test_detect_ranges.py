@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import wave
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pytest
@@ -1249,6 +1251,37 @@ def test_cancel_raises_and_fewer_than_two_files_is_empty(synthetic_episodes, tmp
         pl.analyse(_entries(synthetic_episodes), _SYNTH_CFG, cache_dir=None, workers=1,
                    cancel=lambda: True)
     assert pl.analyse(_entries(synthetic_episodes[:1]), _SYNTH_CFG, cache_dir=None, workers=1) == {}
+
+
+@pytest.mark.parametrize("exc", [
+    ValueError("cannot find context for 'forkserver'"),
+    OSError("could not start forkserver"),
+    BrokenProcessPool("pool broke at start-up"),
+])
+def test_pool_start_failure_falls_back_to_serial_fingerprinting_with_identical_output(
+    synthetic_episodes, tmp_path, monkeypatch, caplog, exc,
+):
+    """Task-6 ruling 2: if the process pool cannot start -- ValueError (e.g.
+    get_context("forkserver") failing on a platform without it), OSError, or
+    a BrokenProcessPool at start-up -- ingest() must fall back to
+    fingerprinting the misses serially, in-process, using the exact same
+    fingerprint.fingerprint_file() function, and log exactly one warning.
+    The fallback's output must be identical to a normal pooled run.
+    """
+    pooled = pl.analyse(_entries(synthetic_episodes), _SYNTH_CFG, cache_dir=None, workers=2)
+    assert pooled  # the synthetic corpus really has repeats -- a non-trivial result
+
+    def broken_pool_context():
+        raise exc
+
+    monkeypatch.setattr(pl, "_pool_context", broken_pool_context)
+
+    with caplog.at_level(logging.WARNING):
+        serial = pl.analyse(_entries(synthetic_episodes), _SYNTH_CFG, cache_dir=None, workers=2)
+
+    assert list(serial.items()) == list(pooled.items())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {[r.message for r in warnings]}"
 
 
 def test_fingerprint_params_cover_every_field_that_changes_fingerprints():
