@@ -1124,7 +1124,8 @@ def test_seek_to_display_time_retries_from_further_back_when_a_seek_lands_late(c
 def test_seeks_report_no_frame_when_the_retries_run_out(clips, monkeypatch, caplog, seek_name):
     """When every allowed seek lands after the target, neither seek may hand
     out the later frame as if it were the one asked for: both return False,
-    log a warning, and the next read() fails."""
+    log a warning, and the next read() fails. That is not the end of the
+    stream (seek_past_end stays False), even straight after a seek that was."""
     path = _clip(clips, "zero-start-h264")
     reference = _decode_reference(path)
     monkeypatch.setattr(PyAVCapture, "_SEEK_MAX_RETRIES", 1)
@@ -1132,15 +1133,17 @@ def test_seeks_report_no_frame_when_the_retries_run_out(clips, monkeypatch, capl
     target = reference[60][0]
     with PyAVCapture(str(path)) as cap:
         seek = getattr(cap, seek_name)
+        assert seek(reference[-1][0] + 1.0) is False and cap.seek_past_end is True
         cap.container = _LateSeekingContainer(cap.container, cap.stream, late_seconds=1.5)
         assert seek(target) is False
+        assert cap.seek_past_end is False
         assert cap.read() == (False, None)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
         # Phase 1.5's fetch treats it as an unreadable frame.
         assert LabelScanner._read_frame_at_pts(cap, target) is None
         # And the capture is still usable.
         cap.container = cap.container._container
-        assert seek(target) is True
+        assert seek(target) is True and cap.seek_past_end is False
         ok, frame = cap.read()
         assert ok and cap.get_last_pts() == target and np.array_equal(frame, reference[60][1])
 
@@ -1173,8 +1176,10 @@ def test_seeks_past_the_end_report_no_frame_without_retrying(clips, caplog, seek
         counting = _LateSeekingContainer(cap.container, cap.stream, late_seconds=0.0)
         cap.container = counting
         assert getattr(cap, seek_name)(reference[-1][0] + 1.0) is False
+        assert cap.seek_past_end is True
         assert len(counting.seeks) == 1
         assert cap.read() == (False, None)
+        assert getattr(cap, seek_name)(reference[10][0]) is True and cap.seek_past_end is False
     assert not caplog.records
 
 
@@ -1213,11 +1218,15 @@ with pyav_adapter.Capture(path) as cap:
     out = []
     for t in times:
         found = cap.seek_to_display_time(t)
+        past_end = cap.seek_past_end
         ok, frame = cap.read()
         pts = cap.get_last_pts() if ok else None
         index = next((i for i, (p, f) in enumerate(frames) if p == pts and np.array_equal(f, frame)), None) if ok else None
-        out.append([t, found, ok, index])
-print(json.dumps({"pts": [p for p, _ in frames], "reads": out}))
+        out.append([t, found, past_end, ok, index])
+    assert out[-1][2], "the probe must end past the last frame"
+    cap.seek_to_pts(frames[3][0])
+    after_pts_seek = cap.seek_past_end
+print(json.dumps({"pts": [p for p, _ in frames], "reads": out, "after_pts_seek": after_pts_seek}))
 """
 
 
@@ -1237,14 +1246,15 @@ def test_opencv_fallback_seek_to_display_time_reads_the_frame_on_screen(clips):
     reference = [(p, None) for p in result["pts"]]
     assert len(reference) == FRAMES
     wrong = []
-    for t, found, read_ok, index in result["reads"]:
+    for t, found, past_end, read_ok, index in result["reads"]:
         i = _on_screen(reference, t, fps)
         if i is None:
-            if found or read_ok:
-                wrong.append((t, "past the end", found, read_ok))
-        elif not (found and read_ok and index == i):
-            wrong.append((t, reference[i][0], found, read_ok, index))
-    assert not wrong, f"(time, frame on screen PTS, seek result, read ok, frame index read): {wrong}"
+            if found or not past_end or read_ok:
+                wrong.append((t, "past the end", found, past_end, read_ok))
+        elif not (found and not past_end and read_ok and index == i):
+            wrong.append((t, reference[i][0], found, past_end, read_ok, index))
+    assert not wrong, f"(time, frame on screen PTS, seek result, seek_past_end, read ok, frame index read): {wrong}"
+    assert result["after_pts_seek"] is False, "seek_to_pts() left seek_past_end set"
     assert any(_on_screen(reference, t, fps) is None for t, *_ in result["reads"])
 
 
@@ -1397,9 +1407,12 @@ def test_ffmpeg_fallback_set_restarts_the_pipe_a_seek_past_the_end_stopped(clips
         assert cap.seek_to_display_time(reference[40][0])
         assert cap.read()[0]
         position = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-        assert position == 41
+        assert position == 41 and cap.seek_past_end is False
         assert not cap.seek_to_display_time(reference[-1][0] + 1.0)
+        assert cap.seek_past_end is True
         assert cap.read() == (False, None)
+        assert cap.seek_to_pts(reference[5][0]) and cap.seek_past_end is False
+        assert not cap.seek_to_display_time(reference[-1][0] + 1.0) and cap.seek_past_end is True
 
         n = position if target == "the position before the seek" else 0
         assert cap.set(cv2.CAP_PROP_POS_FRAMES, n)
@@ -1425,3 +1438,101 @@ def test_ffmpeg_fallback_frames_are_writable_so_label_masks_apply(clips):
         assert not frame[y:y + h, x:x + w].any()
         ok, following = cap.read()
         assert ok and following[y:y + h, x:x + w].any(), "masking one frame changed the next"
+
+
+class _NothingDecodingContainer(_LateSeekingContainer):
+    """Seeks normally, but decodes nothing after them -- what a seek that
+    fails to find its keyframe looks like to the capture."""
+
+    def decode(self, *args, **kwargs):
+        return iter(())
+
+
+class _ExhaustingSeeks:
+    """Makes chosen seek_to_display_time() calls run out of retries for real:
+    for those calls no retry is allowed and the container decodes nothing
+    after the seek, so the seek takes its retries-exhausted path (and logs)
+    mid-stream, wherever the time is."""
+
+    def __init__(self, monkeypatch, fail):
+        self.fail = fail  # t -> whether this call should exhaust
+        self.calls = []   # (t, result)
+        real = PyAVCapture.seek_to_display_time
+        exhausting = self
+
+        def seek(cap, t):
+            if not exhausting.fail(t):
+                result = real(cap, t)
+            else:
+                container = cap.container
+                cap.container = _NothingDecodingContainer(container, cap.stream, late_seconds=0.0)
+                cap._SEEK_MAX_RETRIES = 0
+                try:
+                    result = real(cap, t)
+                finally:
+                    cap.container = container
+                    del cap._SEEK_MAX_RETRIES
+            exhausting.calls.append((t, result))
+            return result
+
+        monkeypatch.setattr(PyAVCapture, "seek_to_display_time", seek)
+
+
+def _scan_for_end_with(scanner, path, discovery):
+    """(label end, detections) from a forward scan whose label is on screen
+    throughout."""
+    detections = []
+
+    class _Counting(_WholeRegionDetector):
+        def predict(self, frame):
+            detections.append(1)
+            return super().predict(frame)
+
+    box = _region_box(scanner)
+    with PyAVCapture(str(path)) as cap:
+        end = scanner._scan_for_end(cap, _Counting(), box, discovery, ref_box=box)
+    return end, len(detections)
+
+
+@pytest.mark.parametrize("failures", [1, 2], ids=["one-failed-seek", "two-consecutive-failed-seeks"])
+def test_phase4_forward_scan_skips_a_seek_that_runs_out_of_retries(clips, monkeypatch, caplog, failures):
+    """A seek that runs out of retries mid-label is not the end of the stream:
+    the forward scan skips that time (without counting it as an absence, so
+    two in a row do not end the label either) and the label ends where it
+    would have without the failures."""
+    path = _clip(clips, "zero-start-h264")
+    scanner = _phase34_scanner(path)
+    discovery = 0.5
+    clean_end, clean_detections = _scan_for_end_with(scanner, path, discovery)
+    assert clean_end > discovery + 10 * scanner.TIMING_SCAN_INTERVAL
+
+    failing = [discovery + (3 + i) * scanner.TIMING_SCAN_INTERVAL for i in range(failures)]
+    caplog.set_level(logging.WARNING, logger="videocr.pyav_adapter")
+    seeks = _ExhaustingSeeks(monkeypatch, lambda t: any(abs(t - f) < 1e-9 for f in failing))
+    end, detections = _scan_for_end_with(scanner, path, discovery)
+
+    assert [result for t, result in seeks.calls if any(abs(t - f) < 1e-9 for f in failing)] == [False] * failures
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == failures, "the injected seeks did not run out of retries"
+    assert end == clean_end, f"the label ended at {end} after {failures} failed seek(s), not at {clean_end}"
+    assert detections == clean_detections - failures
+
+
+def test_phase4_forward_scan_ends_at_its_time_bound_when_every_seek_runs_out_of_retries(clips, monkeypatch, caplog):
+    """Seeks that keep failing never end the label early, and the scan still
+    stops: at its time bound, having tried each time once."""
+    path = _clip(clips, "zero-start-h264")
+    scanner = _phase34_scanner(path)
+    discovery, step = 0.5, scanner.TIMING_SCAN_INTERVAL
+    times, t = [], discovery + step
+    while t <= discovery + scanner.TIMING_SCAN_MAX_DURATION:
+        times.append(t)
+        t += step
+    caplog.set_level(logging.WARNING, logger="videocr.pyav_adapter")
+    seeks = _ExhaustingSeeks(monkeypatch, lambda t: True)
+
+    end, detections = _scan_for_end_with(scanner, path, discovery)
+
+    assert all(result is False for _, result in seeks.calls)
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == len(seeks.calls)
+    assert [t for t, _ in seeks.calls] == times, "the scan did not try each time up to its bound exactly once"
+    assert end == discovery and detections == 0

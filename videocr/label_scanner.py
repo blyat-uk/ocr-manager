@@ -1745,8 +1745,9 @@ class LabelScanner:
         first time past the last frame: the end of the stream is where the
         display-time seek finds no frame, not where int(pts * fps) reaches the
         frame count, which on a file whose first frame is after time 0 comes
-        up to that offset early. (A seek whose every retry lands late also
-        finds no frame; that is logged, and ends the scan the same way.)
+        up to that offset early. A seek whose every retry lands late (logged)
+        is not the end: that time is skipped, like an unreadable frame,
+        without counting as an absence.
         """
         step = self.TIMING_SCAN_INTERVAL
         consecutive_absent = 0
@@ -1759,7 +1760,10 @@ class LabelScanner:
 
         while pts <= max_pts:
             if not cap.seek_to_display_time(pts):
-                break  # past the last frame, and so is every later time
+                if cap.seek_past_end:
+                    break  # past the last frame, and so is every later time
+                pts += step
+                continue
             ret, frame = cap.read()
             if not ret or frame is None:
                 pts += step

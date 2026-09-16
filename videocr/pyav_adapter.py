@@ -183,6 +183,8 @@ class FFmpegNVDECCapture:
         self._last_pts = None  # Estimated PTS in seconds
         self._hdr_transfer = None  # Color transfer from ffprobe
         self._container_start_time = 0.0
+        # See PyAVCapture.seek_past_end.
+        self.seek_past_end = False
 
     def _probe_video(self):
         """Get video metadata using ffprobe."""
@@ -353,6 +355,7 @@ class FFmpegNVDECCapture:
         -ss is relative to the start time), so this inverts that. Unlike
         set(), it also repositions to ordinal 0.
         """
+        self.seek_past_end = False
         # The 1e-6 absorbs float noise when `pts` is exactly a frame's PTS.
         self._reposition(max(0, math.ceil((pts - self._container_start_time) * self._fps - 1e-6)))
         return True
@@ -371,8 +374,9 @@ class FFmpegNVDECCapture:
             bool: False when that ordinal is at or past the frame count
                   (ffprobe's nb_frames, or failing that the duration
                   estimate the pipeline bounds its scans with); read()/grab()
-                  then fail until the next seek. ffmpeg itself would still
-                  deliver a frame for a -ss past the end.
+                  then fail until the next seek, and seek_past_end is True.
+                  ffmpeg itself would still deliver a frame for a -ss past
+                  the end.
         """
         limit = t + DISPLAY_TIME_TOLERANCE
         start = self._container_start_time
@@ -382,7 +386,8 @@ class FFmpegNVDECCapture:
             ordinal -= 1
         while (ordinal + 1) / self._fps + start <= limit:
             ordinal += 1
-        if ordinal >= self._frame_count:
+        self.seek_past_end = ordinal >= self._frame_count
+        if self.seek_past_end:
             self._stop_ffmpeg()
             return False
         self._reposition(ordinal)
@@ -485,6 +490,12 @@ class PyAVCapture:
         self._output_height = None
         # PTS tracking - canonical timestamp source
         self._last_pts = None  # Last frame's PTS in seconds
+        # Why the last seek_to_pts()/seek_to_display_time() found no frame:
+        # True when its time is past the last frame (or there is nothing to
+        # decode), so every later time is too. False after a seek that found
+        # a frame, and after one whose retries all landed late -- a later
+        # time may still have a frame.
+        self.seek_past_end = False
         # Combined filter graph for tone mapping and/or scaling (None = fast path)
         self._filter_graph = None
         # Crop-in-filter-graph state
@@ -999,9 +1010,10 @@ class PyAVCapture:
         told, since what it decodes first is the first frame). When all
         _SEEK_MAX_RETRIES retries still land late, it logs a warning naming
         `description` and reports no frame. After False, read()/grab() fail
-        until the next seek.
+        until the next seek, and seek_past_end tells the two apart.
         """
         self._read_started = True
+        self.seek_past_end = False
         time_base = self.stream.time_base
         stream_start = self.stream.start_time if self.stream.start_time is not None else 0
         backoff = max(1, int(round(self._SEEK_BACKOFF_SECONDS / time_base)))
@@ -1035,6 +1047,7 @@ class PyAVCapture:
     def _no_frame(self, retries_exhausted_by=None):
         """A seek's False: leave nothing for read()/grab() to return until
         the next seek, rather than whatever frame the seek stopped at."""
+        self.seek_past_end = retries_exhausted_by is None
         if retries_exhausted_by is not None:
             logger.warning(
                 "%s on %s: every seek, including %d retries from further back, "
@@ -1179,6 +1192,7 @@ else:
             self._scale_factor = 1.0
             self._output_width = None
             self._output_height = None
+            self.seek_past_end = False  # See PyAVCapture.seek_past_end.
         def __enter__(self):
             self.cap = cv2.VideoCapture(self.path)
             if not self.cap.isOpened():
@@ -1228,6 +1242,7 @@ else:
             so the frame reported as `pts` is ordinal ceil(pts * fps) - 1."""
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             ordinal = max(0, math.ceil(pts * fps - 1e-6) - 1) if fps else 0
+            self.seek_past_end = False
             return self.cap.set(cv2.CAP_PROP_POS_FRAMES, ordinal)
         def seek_to_display_time(self, t):
             """Interface parity with PyAVCapture.seek_to_display_time. read()
@@ -1235,7 +1250,8 @@ else:
             is the last ordinal whose reported PTS is at most
             `t` + DISPLAY_TIME_TOLERANCE, or ordinal 0 when `t` precedes it.
             Returns False when that ordinal is at or past the frame count
-            OpenCV reports, leaving the capture at the end so read() fails."""
+            OpenCV reports (seek_past_end is then True), leaving the capture
+            at the end so read() fails."""
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             ordinal = 0
             if fps:
@@ -1247,7 +1263,8 @@ else:
                 while (ordinal + 2) / fps <= limit:
                     ordinal += 1
             frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if frame_count > 0 and ordinal >= frame_count:
+            self.seek_past_end = frame_count > 0 and ordinal >= frame_count
+            if self.seek_past_end:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
                 return False
             return self.cap.set(cv2.CAP_PROP_POS_FRAMES, ordinal)
