@@ -792,6 +792,24 @@ class LabelScanner:
             return None
         return frame
 
+    @staticmethod
+    def _read_frame_on_screen(cap, t):
+        """Read the frame on screen at time `t`: the last frame whose PTS is
+        at most `t`, or the first frame if `t` precedes it (see
+        seek_to_display_time). None if `t` is past the last frame or the
+        frame cannot be read.
+
+        Phases 3 and 4 record what they find in this frame under `t`.
+        set(CAP_PROP_POS_FRAMES, int(t * fps)) could read a frame one or more
+        frames away from it (tests/test_label_frame_identity.py).
+        """
+        if not cap.seek_to_display_time(t):
+            return None
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return None
+        return frame
+
     def _batch_ocr_text_frames(self, text_frames, ocr, progress=None, retained=None):
         """Run OCR on every Phase 1 detection box to annotate with text.
 
@@ -1349,15 +1367,13 @@ class LabelScanner:
                 group_ocr_results = [[] for _ in cluster]
 
                 for si, sample_pts in enumerate(sample_pts_list):
-                    frame_idx = int(sample_pts * self.fps)
-                    if frame_idx >= self.num_frames:
+                    if int(sample_pts * self.fps) >= self.num_frames:
                         if progress is not None:
                             progress.update(1)
                         continue
 
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
+                    frame = self._read_frame_on_screen(cap, sample_pts)
+                    if frame is None:
                         if progress is not None:
                             progress.update(1)
                         continue
@@ -1558,10 +1574,8 @@ class LabelScanner:
         the encompassing box centroid. Falls back to encompassing_box if
         detection fails.
         """
-        frame_idx = int(ref_pts * self.fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret or frame is None:
+        frame = self._read_frame_on_screen(cap, ref_pts)
+        if frame is None:
             return encompassing_box
 
         self._apply_label_masks(frame)
@@ -1693,13 +1707,11 @@ class LabelScanner:
             min_pts = max(min_pts, lower_bound)
 
         while pts >= min_pts:
-            frame_idx = int(pts * self.fps)
-            if frame_idx < 0:
+            if int(pts * self.fps) < 0:
                 break
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret or frame is None:
+            frame = self._read_frame_on_screen(cap, pts)
+            if frame is None:
                 pts -= step
                 continue
 
@@ -1729,13 +1741,11 @@ class LabelScanner:
             max_pts = min(max_pts, upper_bound)
 
         while pts <= max_pts:
-            frame_idx = int(pts * self.fps)
-            if frame_idx >= self.num_frames:
+            if int(pts * self.fps) >= self.num_frames:
                 break
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret or frame is None:
+            frame = self._read_frame_on_screen(cap, pts)
+            if frame is None:
                 pts += step
                 continue
 

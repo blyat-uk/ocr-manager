@@ -1,10 +1,14 @@
 """Video capture adapters with optional GPU acceleration."""
 import cv2
+import itertools
+import logging
 import math
 import numpy as np
 import subprocess
 import json
 import shutil
+
+logger = logging.getLogger(__name__)
 
 # Try PyAV first (FFmpeg bindings with hardware acceleration support)
 try:
@@ -36,6 +40,11 @@ DECODE_TARGET_HEIGHT = 1080
 # qualifying alignment within this cap, the crop stage is refused rather
 # than risk a phase mismatch between crop and scale (see _crop_axis_plan).
 _CROP_ALIGN_CAP = 64
+
+# seek_to_display_time(t) counts a frame as shown at `t` when its PTS is at
+# most `t` plus this, so a time that is a frame's PTS give or take float
+# rounding (a PTS plus a sum of 0.5 s or 0.2 s steps) names that frame.
+DISPLAY_TIME_TOLERANCE = 1e-6
 
 
 def _crop_axis_plan(out_dim: int, native_dim: int):
@@ -365,6 +374,55 @@ class FFmpegNVDECCapture:
         self._pos = 0
         return True
 
+    def seek_to_display_time(self, t):
+        """Position the pipe so the next read()/grab() returns the frame on
+        screen at time `t` (interface parity with
+        PyAVCapture.seek_to_display_time): the last frame whose PTS, as
+        get_last_pts() reports it, is at most `t` + DISPLAY_TIME_TOLERANCE,
+        or the first frame when `t` precedes it.
+
+        This backend reports PTS as ordinal / fps + container start time, so
+        this finds the last such ordinal with that same expression.
+
+        Returns:
+            bool: False when that ordinal is at or past the frame count
+                  (ffprobe's nb_frames, or failing that the duration
+                  estimate the pipeline bounds its scans with); read()/grab()
+                  then fail until the next seek. ffmpeg itself would still
+                  deliver a frame for a -ss past the end.
+        """
+        limit = t + DISPLAY_TIME_TOLERANCE
+        start = self._container_start_time
+        ordinal = max(0, math.floor((limit - start) * self._fps))
+        # Settle float rounding against read()'s own PTS expression.
+        while ordinal > 0 and ordinal / self._fps + start > limit:
+            ordinal -= 1
+        while (ordinal + 1) / self._fps + start <= limit:
+            ordinal += 1
+        if ordinal >= self._frame_count:
+            self._stop_ffmpeg()
+            return False
+        self._reposition(ordinal)
+        return True
+
+    def _reposition(self, ordinal):
+        """Make `ordinal` the next frame the pipe delivers, restarting ffmpeg
+        unless it is already next."""
+        if self.proc is not None and ordinal == self._seek_pos + self._pos:
+            return
+        self._stop_ffmpeg()
+        self._start_ffmpeg(ordinal / self._fps if ordinal > 0 else None)
+        self._seek_pos = ordinal
+        self._pos = 0
+
+    def _stop_ffmpeg(self):
+        """End the pipe; read()/grab() fail until the next seek starts one."""
+        if self.proc:
+            self.proc.stdout.close()
+            self.proc.terminate()
+            self.proc.wait()
+            self.proc = None
+
     def read(self):
         """Read next frame from FFmpeg pipe.
 
@@ -377,6 +435,8 @@ class FFmpegNVDECCapture:
                 self._last_pts = self._pos / self._fps if self._fps else None
             return ret, frame
 
+        if self.proc is None:
+            return False, None  # a seek past the last frame stopped the pipe
         try:
             raw = self.proc.stdout.read(self._frame_size)
             if len(raw) != self._frame_size:
@@ -898,6 +958,90 @@ class PyAVCapture:
 
         return False
 
+    def seek_to_display_time(self, t):
+        """Position the capture so the next read()/grab() returns the frame
+        on screen at time `t`: the last frame whose PTS -- as get_last_pts()
+        reports it -- is at most `t` + DISPLAY_TIME_TOLERANCE, or the first
+        frame when `t` precedes it. Reading on continues with the frames
+        after it.
+
+        This is what a scan that records a decision under a time must read.
+        seek_to_pts() instead returns the first frame at or after a time,
+        which for a time between two frames is the one not yet shown. And
+        set(CAP_PROP_POS_FRAMES, int(t * fps)) matches neither: it truncates
+        (int(150.2 * 25) == 3754), maps positions back through
+        round(PTS * fps) (one frame early throughout a file whose first frame
+        is 0.525 frame in), never retries a seek that lands late, and does
+        not move at all for position 0. This always seeks.
+
+        It decodes up to the first frame past `t`, and keeps that one for the
+        read after next. If the first frame decoded is already past `t` or
+        the seek yields no frame, it retries from further back exactly as
+        seek_to_pts() does.
+
+        Returns:
+            bool: True if a frame is on screen at `t`. False when `t` is
+                  past the last frame (its PTS plus one frame at the nominal
+                  rate), and when all _SEEK_MAX_RETRIES retries still land
+                  after `t` (a warning is logged). After False, read()/grab()
+                  fail until the next seek.
+        """
+        self._read_started = True
+        time_base = self.stream.time_base
+        limit = t + DISPLAY_TIME_TOLERANCE
+        target_ts = math.floor(limit / time_base)
+        stream_start = self.stream.start_time if self.stream.start_time is not None else 0
+        backoff = max(1, int(round(self._SEEK_BACKOFF_SECONDS / time_base)))
+        seek_ts = max(target_ts, stream_start)
+        for attempt in range(self._SEEK_MAX_RETRIES + 1):
+            self.container.seek(seek_ts, stream=self.stream)
+            self._frame_generator = self.container.decode(video=0)
+            self._pending_frame = None
+            from_stream_start = seek_ts <= stream_start
+
+            on_screen = after = None
+            for frame in self._frame_generator:
+                if frame.pts is None:
+                    continue
+                if float(frame.pts * time_base) > limit:
+                    after = frame
+                    break
+                on_screen = frame
+            if on_screen is None and after is not None and from_stream_start:
+                on_screen, after = after, None  # `t` precedes the first frame
+            if on_screen is not None:
+                if after is None and limit >= float(on_screen.pts * time_base) + 1.0 / self._fps:
+                    return self._no_frame()  # past the last frame
+                self._park(on_screen, after)
+                return True
+            if from_stream_start:
+                return self._no_frame()  # nothing to decode
+            if attempt == self._SEEK_MAX_RETRIES:
+                return self._no_frame(f"seek_to_display_time({t!r})")
+            seek_ts = max(target_ts - backoff, stream_start)
+            backoff *= 2
+
+    def _park(self, frame, following=None):
+        """Make a frame a seek decoded the next one read()/grab() returns,
+        followed by `following` (also already decoded) if given, then the
+        rest of the stream."""
+        self._pending_frame = frame
+        if following is not None:
+            self._frame_generator = itertools.chain((following,), self._frame_generator)
+        self._pos = int(round(float(frame.pts * self.stream.time_base) * self._fps))
+
+    def _no_frame(self, retries_exhausted_by=None):
+        """A seek's False: leave nothing for read()/grab() to return until
+        the next seek, rather than whatever frame the seek stopped at."""
+        if retries_exhausted_by is not None:
+            logger.warning(
+                "%s on %s: every seek, including %d retries from further back, "
+                "landed after the target; reporting no frame rather than a later one",
+                retries_exhausted_by, self.path, self._SEEK_MAX_RETRIES)
+        self._pending_frame = None
+        self._frame_generator = iter(())
+        return False
+
     def read(self):
         """Read next frame (compatible with cv2.VideoCapture.read).
 
@@ -1082,6 +1226,23 @@ else:
             so the frame reported as `pts` is ordinal ceil(pts * fps) - 1."""
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             ordinal = max(0, math.ceil(pts * fps - 1e-6) - 1) if fps else 0
+            return self.cap.set(cv2.CAP_PROP_POS_FRAMES, ordinal)
+        def seek_to_display_time(self, t):
+            """Interface parity with PyAVCapture.seek_to_display_time. read()
+            reports PTS as (ordinal + 1) / fps, so the frame on screen at `t`
+            is the last ordinal whose reported PTS is at most
+            `t` + DISPLAY_TIME_TOLERANCE, or ordinal 0 when `t` precedes it.
+            A `t` past the last frame shows up as read() failing."""
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            ordinal = 0
+            if fps:
+                limit = t + DISPLAY_TIME_TOLERANCE
+                ordinal = max(0, math.floor(limit * fps) - 1)
+                # Settle float rounding against read()'s own PTS expression.
+                while ordinal > 0 and (ordinal + 1) / fps > limit:
+                    ordinal -= 1
+                while (ordinal + 2) / fps <= limit:
+                    ordinal += 1
             return self.cap.set(cv2.CAP_PROP_POS_FRAMES, ordinal)
         def get_last_pts(self) -> float:
             return self._last_pts

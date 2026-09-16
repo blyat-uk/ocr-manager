@@ -1,4 +1,8 @@
-"""Label phase 1.5 must OCR exactly the frames phase 1 detected text in.
+"""Label phases must analyse exactly the frame each decision is recorded under.
+
+Phase 1.5 must OCR exactly the frames phase 1 detected text in, and phases 3
+and 4 must analyse the frame on screen at each time they record a reading or
+a boundary under (see the section on phases 3 and 4 below).
 
 Phase 1 samples a frame, runs detection on it and records
 (frame_idx, pts, boxes). Phase 1.5 then fetches that frame again at native
@@ -22,7 +26,12 @@ just before each keyframe, are actually sampled. Zero-start H.264 is the
 control that the old frame-index re-fetch also passed; zero-start 10-bit
 HEVC in MP4 is not -- see its entry in CLIPS.
 """
+import bisect
+import json
+import logging
 import subprocess
+import sys
+from pathlib import Path
 
 import av
 import cv2
@@ -49,8 +58,21 @@ CLIPS = {
     # Taller than LabelScanner.SCAN_HEIGHT above the dialogue cutoff, so
     # phase 1 detects on a downscaled copy rather than on the frame itself.
     "zero-start-h264-960p": ("mp4", "yuv420p", "libx264", "25", []),
+    # Like Youxia Zhanji (4K HEVC MKV): the video stream starts 0.021 s --
+    # 0.525 of a frame at 25 fps -- after an audio stream at 0, so the
+    # container starts at 0 but every frame's PTS * fps is k + 0.525.
+    "video-start-0.021s-mkv": ("mkv", "yuv420p", "libx264", "25", []),
+    "video-start-0.021s-h265-10bit-mkv": ("mkv", "yuv420p10le", "libx265", "25", []),
 }
 SIZES = {"zero-start-h264-960p": "1280x960"}
+# Clips whose video stream is remuxed to start this long after the audio.
+VIDEO_START = {"video-start-0.021s-mkv": 0.021, "video-start-0.021s-h265-10bit-mkv": 0.021}
+
+
+def _have_encoder(name):
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    return any(line.split()[1:2] == [name] for line in out.splitlines())
+
 
 # Phase 1's own sampling (every 0.5 s), and every frame.
 SAMPLING = [pytest.param(None, id="every-0.5s"), pytest.param("every-frame", id="every-frame")]
@@ -64,22 +86,53 @@ RANGES = [
 ]
 
 
-def _encode(path, pix_fmt, codec, rate, extra, size="320x240"):
+def _encode(path, pix_fmt, codec, rate, extra, size="320x240", video_start=None):
     gop = (["-x265-params", "keyint=10:min-keyint=10:log-level=error"]
            if codec == "libx265" else ["-g", "10"])
+    if video_start is None:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", f"testsrc2=size={size}:rate={rate}",
+             "-frames:v", str(FRAMES), "-pix_fmt", pix_fmt, "-c:v", codec,
+             *gop, *extra, str(path)],
+            check=True, capture_output=True,
+        )
+        return
+    # Encode video and audio both starting at 0 (with a millisecond encoder
+    # time base, so the offset is not rounded to a frame), then remux with
+    # the video input delayed.
+    plain = path.with_name(f"{path.stem}-plain{path.suffix}")
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
          "-f", "lavfi", "-i", f"testsrc2=size={size}:rate={rate}",
-         "-frames:v", str(FRAMES), "-pix_fmt", pix_fmt, "-c:v", codec,
-         *gop, *extra, str(path)],
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+         "-map", "0:v", "-map", "1:a", "-frames:v", str(FRAMES), "-t", str(FRAMES / 25 + 0.2),
+         "-pix_fmt", pix_fmt, "-c:v", codec, *gop, "-enc_time_base:v", "1:1000",
+         "-c:a", "aac", *extra, str(plain)],
         check=True, capture_output=True,
     )
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-itsoffset", str(video_start), "-i", str(plain), "-i", str(plain),
+         "-map", "0:v", "-map", "1:a", "-c", "copy", str(path)],
+        check=True, capture_output=True,
+    )
+    plain.unlink()
 
 
 def _start_time(path):
     container = av.open(str(path))
     try:
         return (container.start_time or 0) / 1_000_000
+    finally:
+        container.close()
+
+
+def _video_start_time(path):
+    container = av.open(str(path))
+    try:
+        stream = container.streams.video[0]
+        return float(stream.start_time * stream.time_base)
     finally:
         container.close()
 
@@ -105,16 +158,27 @@ def _assert_adjacent_frames_differ(path):
 
 @pytest.fixture(scope="module")
 def clips(tmp_path_factory):
+    """Clip id -> path. A clip whose encoder is missing is left out, and the
+    tests that use it skip (see _clip)."""
     root = tmp_path_factory.mktemp("label_frame_identity")
     out = {}
     for cid, (ext, pix_fmt, codec, rate, extra) in CLIPS.items():
+        if not _have_encoder(codec):
+            continue
         path = root / f"{cid}.{ext}"
-        _encode(path, pix_fmt, codec, rate, extra, SIZES.get(cid, "320x240"))
+        _encode(path, pix_fmt, codec, rate, extra, SIZES.get(cid, "320x240"), VIDEO_START.get(cid))
         expected_start = 1.5 if extra else 0.0
         assert _start_time(path) == pytest.approx(expected_start, abs=1e-3), cid
+        assert _video_start_time(path) == pytest.approx(VIDEO_START.get(cid, expected_start), abs=1e-6), cid
         assert _assert_adjacent_frames_differ(path) == FRAMES, cid
         out[cid] = path
     return out
+
+
+def _clip(clips, clip_id):
+    if clip_id not in clips:
+        pytest.skip(f"{CLIPS[clip_id][2]} encoder not available for {clip_id}")
+    return clips[clip_id]
 
 
 def _scanner(path, sampling):
@@ -222,7 +286,7 @@ def _assert_phase15_matches_phase1(scanner, recorder, text_frames, phase1_frames
 @pytest.mark.parametrize("sampling", SAMPLING)
 @pytest.mark.parametrize("clip_id", list(CLIPS))
 def test_phase15_reads_the_frames_phase1_sampled(clips, monkeypatch, clip_id, sampling, time_start, time_end):
-    scanner = _scanner(clips[clip_id], sampling)
+    scanner = _scanner(_clip(clips, clip_id), sampling)
     recorder = _Recorder()
     recorder.install(monkeypatch, PyAVCapture)
 
@@ -258,7 +322,7 @@ def test_ffmpeg_fallback_phase15_reads_the_frames_phase1_sampled(clips, monkeypa
     if not pyav_adapter.FFMPEG_AVAILABLE:
         pytest.skip("ffmpeg CLI not available")
     monkeypatch.setattr("videocr.label_scanner.Capture", CpuFFmpegCapture)
-    scanner = _scanner(clips[clip_id], sampling)
+    scanner = _scanner(_clip(clips, clip_id), sampling)
     recorder = _Recorder()
     recorder.install(monkeypatch, FFmpegNVDECCapture)
 
@@ -277,7 +341,7 @@ def test_phase15_never_ocrs_a_frame_other_than_the_one_asked_for(clips, monkeypa
     def seek_one_frame_late(cap, pts):
         return real_seek(cap, pts + 1.0 / cap.get(cv2.CAP_PROP_FPS))
 
-    scanner = _scanner(clips["zero-start-h264"], None)
+    scanner = _scanner(_clip(clips, "zero-start-h264"), None)
     text_frames = scanner._phase1_find_text_frames(_WholeRegionDetector(), None, None)
     assert len(text_frames) >= 3
 
@@ -326,8 +390,8 @@ def _assert_seek_lands(cap, frames, order):
 
 @pytest.mark.parametrize("clip_id", list(CLIPS))
 def test_seek_to_pts_lands_on_exactly_that_frame(clips, clip_id):
-    frames = _every_frame(PyAVCapture, clips[clip_id])
-    with PyAVCapture(str(clips[clip_id])) as cap:
+    frames = _every_frame(PyAVCapture, _clip(clips, clip_id))
+    with PyAVCapture(str(_clip(clips, clip_id))) as cap:
         _assert_seek_lands(cap, frames, _visit_order(len(frames)))
 
 
@@ -335,8 +399,8 @@ def test_seek_to_pts_lands_on_exactly_that_frame(clips, clip_id):
 def test_ffmpeg_fallback_seek_to_pts_lands_on_exactly_that_frame(clips, clip_id):
     if not pyav_adapter.FFMPEG_AVAILABLE:
         pytest.skip("ffmpeg CLI not available")
-    frames = _every_frame(CpuFFmpegCapture, clips[clip_id])
-    with CpuFFmpegCapture(str(clips[clip_id])) as cap:
+    frames = _every_frame(CpuFFmpegCapture, _clip(clips, clip_id))
+    with CpuFFmpegCapture(str(_clip(clips, clip_id))) as cap:
         # Every seek restarts ffmpeg, so visit a subset, including frame 0
         # and consecutive frames (which must not restart it).
         _assert_seek_lands(cap, frames, _visit_order(len(frames), stride=7) + [40, 41, 42, 0])
@@ -344,9 +408,9 @@ def test_ffmpeg_fallback_seek_to_pts_lands_on_exactly_that_frame(clips, clip_id)
 
 @pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264", "offset-h265-10bit"])
 def test_seek_to_pts_between_and_outside_frames(clips, clip_id):
-    frames = _every_frame(PyAVCapture, clips[clip_id])
+    frames = _every_frame(PyAVCapture, _clip(clips, clip_id))
     pts = [p for p, _ in frames]
-    with PyAVCapture(str(clips[clip_id])) as cap:
+    with PyAVCapture(str(_clip(clips, clip_id))) as cap:
         # Between two frames: the later one.
         assert cap.seek_to_pts((pts[30] + pts[31]) / 2)
         ok, frame = cap.read()
@@ -386,8 +450,8 @@ class _LateSeekingContainer:
 
 @pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
 def test_seek_to_pts_retries_from_further_back_when_a_seek_lands_late(clips, clip_id):
-    frames = _every_frame(PyAVCapture, clips[clip_id])
-    with PyAVCapture(str(clips[clip_id])) as cap:
+    frames = _every_frame(PyAVCapture, _clip(clips, clip_id))
+    with PyAVCapture(str(_clip(clips, clip_id))) as cap:
         late = _LateSeekingContainer(cap.container, cap.stream, late_seconds=1.5)
         cap.container = late
         # Frames far enough in that the first seek lands after them.
@@ -459,7 +523,7 @@ def _assert_same_crops(got, expected):
 def test_retained_crops_are_what_phase15_would_have_fetched(clips, monkeypatch, clip_id, sampling):
     from videocr.label_scanner import _RetainedCrops
 
-    scanner = _masked_scanner(clips[clip_id], sampling)
+    scanner = _masked_scanner(_clip(clips, clip_id), sampling)
     recorder = _Recorder()
     recorder.install(monkeypatch, PyAVCapture)
     retained = _RetainedCrops(budget_bytes=1 << 30)
@@ -494,7 +558,7 @@ def test_retained_crops_are_what_phase15_would_have_fetched(clips, monkeypatch, 
 def test_crops_over_the_budget_are_fetched_by_pts(clips, monkeypatch, clip_id):
     from videocr.label_scanner import _RetainedCrops
 
-    scanner = _masked_scanner(clips[clip_id], "every-frame")
+    scanner = _masked_scanner(_clip(clips, clip_id), "every-frame")
     recorder = _Recorder()
     recorder.install(monkeypatch, PyAVCapture)
 
@@ -539,7 +603,7 @@ def test_retained_crops_are_only_used_for_the_boxes_they_were_cut_for(clips):
 
 
 def test_scan_serves_phase15_from_phase1_without_opening_the_video_again(clips, monkeypatch):
-    scanner = _masked_scanner(clips["offset-h264"], None)
+    scanner = _masked_scanner(_clip(clips, "offset-h264"), None)
     opens = _Counting(monkeypatch, "__enter__")
     seeks = _Counting(monkeypatch, "seek_to_pts")
     monkeypatch.setattr(LabelScanner, "_phase2_group_by_position", lambda self, text_frames, progress=None: [])
@@ -552,3 +616,562 @@ def test_scan_serves_phase15_from_phase1_without_opening_the_video_again(clips, 
     assert len(recorder.ocr_calls) >= 3
     assert opens.calls == 1, "phase 1.5 opened the video although phase 1 kept every crop"
     assert seeks.calls == 0
+
+
+# --- phases 3 and 4: the frame on screen at each decision's time -------------
+#
+# Phase 3 OCRs a cluster every 0.5 s from its first PTS and records each
+# reading under that sample time; phase 4 runs detection 0.2 s apart around
+# each segment and records the label's start and end under those times. Each
+# must therefore analyse the frame on screen at the time: the last frame
+# whose PTS is at most t (within ON_SCREEN_TOLERANCE), the first frame when t
+# precedes it, and no frame once t is past the last frame's duration.
+#
+# The reference is a plain sequential decode of the clip, independent of any
+# capture seek. Phase 3 is driven with groups as phase 2 hands them over
+# (first/last PTS are frame PTS) and phase 4 with segments as phase 3 hands
+# them over (start/end are phase 3 sample times), through the real sampling
+# loops, with engines that record the frame the capture last read and the
+# exact input they were given.
+
+ON_SCREEN_TOLERANCE = 1e-6
+
+# Zero start; video 0.021 s after a zero container start (0.525 frame, as on
+# Youxia Zhanji); 1.5 s container start (half-frame ties at 25 fps); HEVC in
+# MP4, whose seeks can land after the target; 23.976 fps; MKV.
+PHASE34_CLIPS = [
+    "zero-start-h264",
+    "video-start-0.021s-mkv",
+    "video-start-0.021s-h265-10bit-mkv",
+    "offset-h264",
+    "zero-start-h265-10bit",
+    "offset-h265-10bit",
+    "offset-h264-23.976fps",
+    "offset-h264-mkv",
+]
+
+
+def _decode_reference(path):
+    """[(PTS, BGR frame)] for every frame, from one sequential PyAV decode."""
+    container = av.open(str(path))
+    try:
+        stream = container.streams.video[0]
+        frames = [(float(frame.pts * stream.time_base), frame.to_ndarray(format="bgr24"))
+                  for frame in container.decode(stream)]
+    finally:
+        container.close()
+    pts = [p for p, _ in frames]
+    assert all(a < b for a, b in zip(pts, pts[1:])), f"{path}: PTS not strictly increasing"
+    return frames
+
+
+def _on_screen(reference, t, fps):
+    """Index of the frame on screen at `t` in `reference`, or None past the end."""
+    pts = [p for p, _ in reference]
+    i = bisect.bisect_right(pts, t + ON_SCREEN_TOLERANCE) - 1
+    if i < 0:
+        return 0
+    if i == len(pts) - 1 and t + ON_SCREEN_TOLERANCE >= pts[i] + 1.0 / fps:
+        return None
+    return i
+
+
+def _region_box(scanner):
+    """The whole region above the dialogue cutoff, as a 4x2 box."""
+    w, h = scanner.width, scanner.dialogue_cutoff_y
+    return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+
+
+class _Mismatches:
+    """Samples whose analysed frame is not the one on screen at their time."""
+
+    def __init__(self, what):
+        self.what = what
+        self.checked = 0
+        self.early = 0
+        self.late = 0
+        self.lines = []
+
+    def check(self, t, reference, fps, got_pts, got_frame, got_input, expected_input):
+        self.checked += 1
+        want_pts, want_frame = reference[_on_screen(reference, t, fps)]
+        same_frame = got_frame is not None and got_frame.shape == want_frame.shape and np.array_equal(got_frame, want_frame)
+        same_input = got_input.shape == expected_input.shape and np.array_equal(got_input, expected_input)
+        if got_pts == want_pts and same_frame and same_input:
+            return
+        if got_pts is not None and got_pts < want_pts:
+            self.early += 1
+        elif got_pts is not None and got_pts > want_pts:
+            self.late += 1
+        self.lines.append(f"t={t:.6f}: on screen PTS {want_pts:.6f}, analysed PTS "
+                          f"{got_pts if got_pts is None else format(got_pts, '.6f')} "
+                          f"(pixels identical: {same_frame}, engine input identical: {same_input})")
+
+    def missing(self, message):
+        self.lines.append(message)
+
+    def assert_none(self):
+        assert not self.lines, (
+            f"{self.what}: {len(self.lines)} of {self.checked} samples did not analyse the frame on "
+            f"screen at their time ({self.early} early, {self.late} late):\n  " + "\n  ".join(self.lines[:40])
+        )
+
+
+class _Phase3OCR:
+    """Reads one confident line covering the whole crop, named after the call
+    ("call0", "call1", ...), so each reading phase 3 records under a time can
+    be traced to the frame the capture had read and the crop OCR was given."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.calls = []  # (pts, frame, crop)
+
+    def predict(self, crop):
+        pts, frame = self.recorder.last
+        self.calls.append((pts, frame, crop.copy()))
+        h, w = crop.shape[:2]
+        poly = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+        return [{"rec_texts": [f"call{len(self.calls) - 1}"], "rec_scores": [1.0], "rec_polys": [poly]}]
+
+
+class _Phase4Detector:
+    """Finds the whole detection input as one box on every call, so every
+    phase 4 scan runs to its time bound, and records the frame the capture had
+    read and the input it was given."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.calls = []  # (pts, frame, input)
+
+    def predict(self, image):
+        pts, frame = self.recorder.last
+        self.calls.append((pts, frame, image.copy()))
+        h, w = image.shape[:2]
+        return [{"dt_polys": [[[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]]}]
+
+
+def _phase3_group_runs(scanner, reference):
+    """Lists of groups for separate phase 3 calls. Groups in one call are
+    disjoint in time, so each is its own cluster. One call has a group per
+    frame (sampled once, at that frame's PTS); the others have groups spanning
+    25 frames (sampled at +0, +0.5 and +1.0 s), starting at every frame."""
+    pts = [p for p, _ in reference]
+    box = _region_box(scanner)
+    runs = [[{"first_pts": p, "last_pts": p, "encompassing_box": box} for p in pts]]
+    span = min(25, len(pts) - 1)
+    for first in range(span + 1):
+        groups = [{"first_pts": pts[i], "last_pts": pts[i + span], "encompassing_box": box}
+                  for i in range(first, len(pts) - span, span + 1)]
+        if groups:
+            runs.append(groups)
+    return runs
+
+
+def _phase3_sample_times(scanner, group):
+    """The times phase 3 records a group's readings under."""
+    times, t = [], group["first_pts"]
+    while t <= group["last_pts"]:
+        times.append(t)
+        t += scanner.SAMPLE_INTERVAL_SECONDS
+    return times
+
+
+def _phase4_segments(scanner, reference):
+    """Segments starting at every other frame's PTS, alternately 0.5 s later,
+    each 0.5 s long; plus starts of 0.62 s and 0.61 s, whose backward scans
+    reach 0.02 s and 0.01 s (inside the first frame's duration)."""
+    pts = [p for p, _ in reference]
+    box = _region_box(scanner)
+    starts = [pts[i] + 0.5 if n % 2 else pts[i] for n, i in enumerate(range(0, len(pts), 2))]
+    starts += [0.62, 0.61]
+    return [{"box": box, "text": "label", "confidence": 1.0, "start_pts": s, "end_pts": s + 0.5}
+            for s in starts]
+
+
+def _phase4_sample_times(scanner, segment):
+    """The times phase 4 runs detection at for one segment, in order: the
+    reference box at the midpoint, then the backward and forward scans."""
+    fps, num_frames, step = scanner.fps, scanner.num_frames, scanner.TIMING_SCAN_INTERVAL
+    start, end = segment["start_pts"], segment["end_pts"]
+    times = [(start + end) / 2]
+    t, low = start - step, max(0, start - scanner.TIMING_SCAN_MAX_DURATION)
+    while t >= low and int(t * fps) >= 0:
+        times.append(t)
+        t -= step
+    t, high = end + step, min(num_frames / fps, end + scanner.TIMING_SCAN_MAX_DURATION)
+    while t <= high and int(t * fps) < num_frames:
+        times.append(t)
+        t += step
+    return times
+
+
+def _check_phase3(scanner, reference, recorder, monkeypatch):
+    fps = scanner.fps
+    readings = []
+    real_best = LabelScanner._best_single_reading
+
+    def recording_best(self, ocr_results, fallback_box):
+        readings.append([(t, text) for t, text, _, _ in ocr_results])
+        return real_best(self, ocr_results, fallback_box)
+
+    monkeypatch.setattr(LabelScanner, "_best_single_reading", recording_best)
+    result = _Mismatches("phase 3")
+    for groups in _phase3_group_runs(scanner, reference):
+        ocr = _Phase3OCR(recorder)
+        readings.clear()
+        scanner._phase3_ocr_and_segment(groups, ocr)
+        assert len(readings) == len(groups)
+        for group, got in zip(groups, readings):
+            box = group["encompassing_box"]
+            for t, text in got:
+                pts, frame, crop = ocr.calls[int(text[len("call"):])]
+                i = _on_screen(reference, t, fps)
+                if i is None:
+                    result.missing(f"t={t:.6f} is past the last frame but was OCR'd (PTS {pts})")
+                    continue
+                want = reference[i][1].copy()
+                scanner._apply_label_masks(want)
+                expected, _ = scanner._crop_cluster_region(want, box, padding=50)
+                expected, _ = scanner._resize_max_dimension(expected, scanner.RECOGNIZE_HEIGHT)
+                result.check(t, reference, fps, pts, frame, crop, expected)
+            want_times = [t for t in _phase3_sample_times(scanner, group)
+                          if int(t * fps) < scanner.num_frames and _on_screen(reference, t, fps) is not None]
+            if [t for t, _ in got] != want_times:
+                result.missing(f"group {group['first_pts']:.6f}-{group['last_pts']:.6f}: readings at "
+                               f"{[t for t, _ in got]}, expected one at each of {want_times}")
+    return result
+
+
+def _check_phase4(scanner, reference, recorder):
+    fps = scanner.fps
+    result = _Mismatches("phase 4")
+    times_checked = []
+    for segment in _phase4_segments(scanner, reference):
+        detector = _Phase4Detector(recorder)
+        scanner._phase4_find_timing([segment], detector)
+        want_times = [t for t in _phase4_sample_times(scanner, segment)
+                      if _on_screen(reference, t, fps) is not None]
+        if len(detector.calls) != len(want_times):
+            result.missing(f"segment {segment['start_pts']:.6f}-{segment['end_pts']:.6f}: "
+                           f"{len(detector.calls)} detections for {len(want_times)} sample times")
+        for t, (pts, frame, image) in zip(want_times, detector.calls):
+            want = reference[_on_screen(reference, t, fps)][1].copy()
+            scanner._apply_label_masks(want)
+            roi, _, _ = scanner._crop_roi_for_detection(want[: scanner.dialogue_cutoff_y, :], segment["box"])
+            if roi.shape[0] > scanner.SCAN_HEIGHT:
+                roi, _ = scanner._downscale(roi, scanner.SCAN_HEIGHT)
+            result.check(t, reference, fps, pts, frame, image, roi)
+            times_checked.append(t)
+    return result, times_checked
+
+
+def _phase34_scanner(path):
+    scanner = _scanner(path, None)
+    scanner.label_mask_crops = MASKS
+    return scanner
+
+
+@pytest.mark.parametrize("clip_id", PHASE34_CLIPS)
+def test_phase3_reads_the_frame_on_screen_at_each_sample_time(clips, monkeypatch, clip_id):
+    path = _clip(clips, clip_id)
+    reference = _decode_reference(path)
+    scanner = _phase34_scanner(path)
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+
+    result = _check_phase3(scanner, reference, recorder, monkeypatch)
+
+    assert result.checked >= 2 * len(reference), "too few phase 3 samples to mean anything"
+    result.assert_none()
+
+
+@pytest.mark.parametrize("clip_id", PHASE34_CLIPS)
+def test_phase4_reads_the_frame_on_screen_at_each_sample_time(clips, monkeypatch, clip_id):
+    path = _clip(clips, clip_id)
+    reference = _decode_reference(path)
+    scanner = _phase34_scanner(path)
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+
+    result, times = _check_phase4(scanner, reference, recorder)
+
+    assert result.checked >= 5 * len(reference), "too few phase 4 samples to mean anything"
+    # A backward scan reached the first frame's duration from time 0, where a
+    # frame-index seek to position 0 would not move the capture at all.
+    assert any(0 <= t < 1.0 / scanner.fps for t in times)
+    result.assert_none()
+
+
+def test_phases_3_and_4_read_the_frame_on_screen_on_the_offset_fixture(offset_video, monkeypatch):
+    """The shared 1.5 s-offset fixture (10 frames).
+
+    Phase 3 analyses none of it: its end-of-stream check compares
+    int(t * fps) with the frame count, and every frame here is at position
+    37 or later of 10. That check is unchanged (it decides whether to sample,
+    not which frame a sample reads), so only phase 4 -- whose backward scans
+    run from inside the clip to before its first frame -- is checked here.
+    """
+    reference = _decode_reference(offset_video)
+    scanner = _phase34_scanner(offset_video)
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+
+    phase3 = _check_phase3(scanner, reference, recorder, monkeypatch)
+    phase4, times = _check_phase4(scanner, reference, recorder)
+
+    assert phase3.checked == 0
+    assert phase4.checked >= 5 * len(reference)
+    assert any(t < reference[0][0] for t in times), "no phase 4 sample before the first frame"
+    assert any(reference[0][0] <= t for t in times), "no phase 4 sample inside the clip"
+    phase3.assert_none()
+    phase4.assert_none()
+
+
+def _fallback_phase34_run(scanner, reference, recorder, monkeypatch, capture_cls):
+    """A reduced phase 3 and phase 4 run for a fallback backend, which restarts
+    a decoder for most seeks: groups spanning 14 frames from every 14th frame
+    (sampled at +0 and +0.5 s), and three segments."""
+    fps = scanner.fps
+    box = _region_box(scanner)
+    pts = [p for p, _ in reference]
+    readings = []
+    real_best = LabelScanner._best_single_reading
+
+    def recording_best(self, ocr_results, fallback_box):
+        readings.append([(t, text) for t, text, _, _ in ocr_results])
+        return real_best(self, ocr_results, fallback_box)
+
+    monkeypatch.setattr(LabelScanner, "_best_single_reading", recording_best)
+    monkeypatch.setattr("videocr.label_scanner.Capture", capture_cls)
+    phase3 = _Mismatches("phase 3")
+    groups = [{"first_pts": pts[i], "last_pts": pts[i + 13], "encompassing_box": box}
+              for i in range(0, len(pts) - 13, 14)]
+    ocr = _Phase3OCR(recorder)
+    scanner._phase3_ocr_and_segment(groups, ocr)
+    for group, got in zip(groups, readings):
+        for t, text in got:
+            got_pts, frame, crop = ocr.calls[int(text[len("call"):])]
+            want = reference[_on_screen(reference, t, fps)][1].copy()
+            scanner._apply_label_masks(want)
+            expected, _ = scanner._crop_cluster_region(want, box, padding=50)
+            phase3.check(t, reference, fps, got_pts, frame, crop, expected)
+
+    phase4 = _Mismatches("phase 4")
+    for start in (0.62, pts[40], pts[61] + 0.5):
+        segment = {"box": box, "text": "label", "confidence": 1.0, "start_pts": start, "end_pts": start + 0.5}
+        detector = _Phase4Detector(recorder)
+        scanner._phase4_find_timing([segment], detector)
+        want_times = [t for t in _phase4_sample_times(scanner, segment) if _on_screen(reference, t, fps) is not None]
+        if len(detector.calls) != len(want_times):
+            phase4.missing(f"segment at {start}: {len(detector.calls)} detections for {len(want_times)} times")
+        for t, (got_pts, frame, image) in zip(want_times, detector.calls):
+            want = reference[_on_screen(reference, t, fps)][1].copy()
+            scanner._apply_label_masks(want)
+            roi, _, _ = scanner._crop_roi_for_detection(want[: scanner.dialogue_cutoff_y, :], box)
+            phase4.check(t, reference, fps, got_pts, frame, image, roi)
+    return phase3, phase4
+
+
+@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
+def test_ffmpeg_fallback_phases_3_and_4_read_the_frame_on_screen(clips, monkeypatch, clip_id):
+    """The subprocess backend positions by frame ordinal and reports PTS as
+    ordinal / fps + container start; the frame on screen is judged by those
+    PTS and that backend's own frames."""
+    if not pyav_adapter.FFMPEG_AVAILABLE:
+        pytest.skip("ffmpeg CLI not available")
+    path = _clip(clips, clip_id)
+    reference = _every_frame(CpuFFmpegCapture, path)
+    # No label masks: this backend's frames are read-only views of the pipe.
+    scanner = _scanner(path, None)
+    recorder = _Recorder()
+    recorder.install(monkeypatch, FFmpegNVDECCapture)
+
+    phase3, phase4 = _fallback_phase34_run(scanner, reference, recorder, monkeypatch, CpuFFmpegCapture)
+
+    assert phase3.checked >= 8 and phase4.checked >= 30
+    phase3.assert_none()
+    phase4.assert_none()
+
+
+# --- seek_to_display_time(): the capture-level contract phases 3 and 4 use ----
+
+def _display_time_probes(reference, fps):
+    """Times on every frame's PTS, just inside and just outside the tolerance
+    below it, a third of a frame after it, before the first frame, inside the
+    last frame's duration and past it."""
+    pts = [p for p, _ in reference]
+    probes = []
+    for p in pts:
+        probes += [p, p - ON_SCREEN_TOLERANCE / 2, p - 2 * ON_SCREEN_TOLERANCE, p + 1.0 / (3 * fps)]
+    probes += [0.0, -1.0, pts[0] - 1e-3, pts[-1] + 0.5 / fps, pts[-1] + 1.0 / fps, pts[-1] + 10.0]
+    return probes
+
+
+def _assert_display_time_seeks(cap, reference, fps, times, read_on=True):
+    wrong = []
+    for t in times:
+        i = _on_screen(reference, t, fps)
+        ok = cap.seek_to_display_time(t)
+        if i is None:
+            if ok or cap.read() != (False, None):
+                wrong.append((t, "past the end", "a frame"))
+            continue
+        read_ok, frame = cap.read()
+        got = cap.get_last_pts() if read_ok else None
+        if not (ok and read_ok and got == reference[i][0] and np.array_equal(frame, reference[i][1])):
+            wrong.append((t, reference[i][0], got))
+            continue
+        if read_on and i + 1 < len(reference):
+            # Reading on continues with the next frame.
+            read_ok, frame = cap.read()
+            got = cap.get_last_pts() if read_ok else None
+            if not (read_ok and got == reference[i + 1][0] and np.array_equal(frame, reference[i + 1][1])):
+                wrong.append((t, "then", reference[i + 1][0], got))
+    assert not wrong, (f"{len(wrong)} of {len(times)} display-time seeks read the wrong frame "
+                       f"(time, frame on screen PTS, PTS read): {wrong[:10]}")
+
+
+@pytest.mark.parametrize("clip_id", PHASE34_CLIPS)
+def test_seek_to_display_time_reads_the_frame_on_screen(clips, clip_id):
+    path = _clip(clips, clip_id)
+    reference = _decode_reference(path)
+    with PyAVCapture(str(path)) as cap:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        probes = _display_time_probes(reference, fps)
+        # Forwards, backwards and jumping, so every seek direction is covered.
+        _assert_display_time_seeks(cap, reference, fps, probes)
+        _assert_display_time_seeks(cap, reference, fps, probes[::-3], read_on=False)
+        _assert_display_time_seeks(cap, reference, fps, [p for pair in zip(probes[::5], probes[::-5]) for p in pair],
+                                   read_on=False)
+
+
+def test_seek_to_display_time_on_the_offset_fixture(offset_video):
+    reference = _decode_reference(offset_video)
+    with PyAVCapture(str(offset_video)) as cap:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        probes = _display_time_probes(reference, fps)
+        _assert_display_time_seeks(cap, reference, fps, probes + probes[::-1])
+
+
+@pytest.mark.parametrize("clip_id", ["zero-start-h264", "video-start-0.021s-mkv", "offset-h264"])
+def test_seek_to_display_time_repositions_to_the_first_frame(clips, clip_id):
+    """set(CAP_PROP_POS_FRAMES, 0) does not move the capture; a display time
+    inside or before the first frame's duration must."""
+    path = _clip(clips, clip_id)
+    reference = _decode_reference(path)
+    with PyAVCapture(str(path)) as cap:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        for t in (0.0, reference[0][0] + 0.5 / fps, reference[0][0] - 1.0):
+            assert cap.seek_to_display_time(reference[60][0])
+            for _ in range(5):
+                assert cap.read()[0]
+            assert cap.seek_to_display_time(t)
+            ok, frame = cap.read()
+            assert ok and cap.get_last_pts() == reference[0][0] and np.array_equal(frame, reference[0][1]), t
+
+
+@pytest.mark.parametrize("clip_id", ["zero-start-h264", "video-start-0.021s-mkv", "offset-h264"])
+def test_seek_to_display_time_retries_from_further_back_when_a_seek_lands_late(clips, clip_id):
+    path = _clip(clips, clip_id)
+    reference = _decode_reference(path)
+    with PyAVCapture(str(path)) as cap:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        late = _LateSeekingContainer(cap.container, cap.stream, late_seconds=1.5)
+        cap.container = late
+        times = [reference[60][0], reference[75][0] + 0.5 / fps, reference[99][0], reference[62][0] - 1e-7]
+        _assert_display_time_seeks(cap, reference, fps, times)
+        assert len(late.seeks) > len(times), "the late seeks never needed a retry, so this proves nothing"
+
+
+@pytest.mark.parametrize("seek_name", ["seek_to_display_time"])
+def test_seeks_report_no_frame_when_the_retries_run_out(clips, monkeypatch, caplog, seek_name):
+    """When every allowed seek lands after the target, the seek may not hand
+    out the later frame as if it were the one asked for: it returns False,
+    logs a warning, and the next read() fails."""
+    path = _clip(clips, "zero-start-h264")
+    reference = _decode_reference(path)
+    monkeypatch.setattr(PyAVCapture, "_SEEK_MAX_RETRIES", 1)
+    caplog.set_level(logging.WARNING, logger="videocr.pyav_adapter")
+    target = reference[60][0]
+    with PyAVCapture(str(path)) as cap:
+        seek = getattr(cap, seek_name)
+        cap.container = _LateSeekingContainer(cap.container, cap.stream, late_seconds=1.5)
+        assert seek(target) is False
+        assert cap.read() == (False, None)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        # Phase 1.5's fetch treats it as an unreadable frame.
+        assert LabelScanner._read_frame_at_pts(cap, target) is None
+        # And the capture is still usable.
+        cap.container = cap.container._container
+        assert seek(target) is True
+        ok, frame = cap.read()
+        assert ok and cap.get_last_pts() == target and np.array_equal(frame, reference[60][1])
+
+
+@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
+def test_ffmpeg_fallback_seek_to_display_time_reads_the_frame_on_screen(clips, clip_id):
+    if not pyav_adapter.FFMPEG_AVAILABLE:
+        pytest.skip("ffmpeg CLI not available")
+    path = _clip(clips, clip_id)
+    reference = _every_frame(CpuFFmpegCapture, path)
+    with CpuFFmpegCapture(str(path)) as cap:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        probes = _display_time_probes(reference, fps)
+        # Every seek restarts ffmpeg, so visit a subset: every seventh probe
+        # both ways, the ones around time 0 and the end, and a run of
+        # consecutive frames (which must not restart it).
+        subset = probes[::7] + probes[::-7] + probes[-6:] + probes[:12] + [0.0]
+        _assert_display_time_seeks(cap, reference, fps, subset, read_on=False)
+
+
+_OPENCV_PROBE = r"""
+import json, shutil, sys
+sys.modules["av"] = None
+_which = shutil.which
+shutil.which = lambda name, *a, **k: None if name in ("ffmpeg", "ffprobe") else _which(name, *a, **k)
+import numpy as np
+from videocr import pyav_adapter
+assert pyav_adapter.Capture.__name__ == "OpenCVCapture", pyav_adapter.Capture
+path, times = sys.argv[1], json.loads(sys.argv[2])
+with pyav_adapter.Capture(path) as cap:
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append((cap.get_last_pts(), frame.copy()))
+    out = []
+    for t in times:
+        cap.seek_to_display_time(t)
+        ok, frame = cap.read()
+        pts = cap.get_last_pts() if ok else None
+        index = next((i for i, (p, f) in enumerate(frames) if p == pts and np.array_equal(f, frame)), None) if ok else None
+        out.append([t, pts, index])
+print(json.dumps({"pts": [p for p, _ in frames], "reads": out}))
+"""
+
+
+def test_opencv_fallback_seek_to_display_time_reads_the_frame_on_screen(clips):
+    """OpenCVCapture only exists when neither PyAV nor the ffmpeg CLI does, so
+    it is exercised in a subprocess that hides both. It reports PTS as
+    (ordinal + 1) / fps; the frame on screen is judged by those."""
+    path = _clip(clips, "zero-start-h264")
+    fps = 25.0
+    times = [k / fps for k in range(0, 101, 3)] + [k / fps - 2e-6 for k in range(1, 101, 5)]
+    times += [k / fps + 0.5 / fps for k in range(0, 100, 4)] + [0.0, -1.0, 0.5 / fps, 4.02, 5.0]
+    probe = subprocess.run([sys.executable, "-c", _OPENCV_PROBE, str(path), json.dumps(times)],
+                           capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1])
+    assert probe.returncode == 0, probe.stderr[-2000:]
+    result = json.loads(probe.stdout.strip().splitlines()[-1])
+    reference = [(p, None) for p in result["pts"]]
+    assert len(reference) == FRAMES
+    wrong = []
+    for t, pts, index in result["reads"]:
+        i = _on_screen(reference, t, fps)
+        if i is None:
+            if pts is not None:
+                wrong.append((t, None, pts))
+        elif index != i:
+            wrong.append((t, reference[i][0], pts))
+    assert not wrong, f"(time, frame on screen PTS, PTS read): {wrong}"
+
