@@ -97,10 +97,11 @@ class SubtitleDetectionWorker(QObject):
         consensus: list[tuple[float, float]] = []
 
         try:
-            from videocr.utils import create_detection_engine, suppress_output
+            from videocr import engine_registry
+            from videocr.utils import suppress_output
 
             with suppress_output():
-                det_engine = create_detection_engine(None, True)
+                det_engine = engine_registry.get_detection_engine(None, True)
         except Exception as e:
             logger.exception("Failed to create subtitle detection engine")
             self.error.emit(str(e))

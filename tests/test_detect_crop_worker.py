@@ -458,3 +458,35 @@ def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
     assert calls[3] == [(900 / 1080, 50 / 1080), (905 / 1080, 55 / 1080)], (
         f"consensus for d.mp4 must reflect only the unflagged a.mp4/c.mp4 results: {calls[3]}"
     )
+
+
+def test_detection_engine_is_shared_across_worker_runs(monkeypatch):
+    """Opening a folder twice must not rebuild the detection model: the worker
+    takes its engine from videocr.engine_registry, which builds once per
+    process (5-10 s per build on real PaddleOCR)."""
+    builds = []
+
+    def counting_builder(det_model_dir, use_gpu):
+        engine = object()
+        builds.append(engine)
+        return engine
+
+    monkeypatch.setattr("videocr.utils.create_detection_engine", counting_builder)
+
+    seen_engines = []
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        seen_engines.append(det_engine)
+        return _crop_result(box=(10, 900, 1000, 80), hit_pts=[42.5])
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    for _ in range(2):
+        outcome = _run_worker(SubtitleDetectionWorker(_make_video_files(["a.mp4"])))
+        assert not outcome["timed_out"]
+        assert not outcome["errors"]
+
+    assert len(builds) == 1
+    assert len(seen_engines) == 2
+    assert seen_engines[0] is seen_engines[1] is builds[0]
