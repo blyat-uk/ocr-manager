@@ -110,9 +110,21 @@ def test_crop_invariant_holds_across_decode_ratios(
         cropped = _read_all(cap, 5)
 
     if not graph_active:
-        # Refused: nothing to assert about pixel content here -- video.py's
-        # Python-side slice (guarded on `_crop_slice`) is responsible for
-        # the actual crop in this case.
+        # Refused: video.py's `not getattr(v, '_crop_slice', None)` guard
+        # (videocr/video.py) depends on `_crop_slice` being exactly None
+        # here -- assert that directly. Then prove end-to-end that the
+        # frame PyAVCapture handed back, sliced in Python the way video.py
+        # would, reproduces the reference exactly (reusing the clip and
+        # frames already generated above; no extra decode needed).
+        assert cap._crop_slice is None
+        x, y, w, h = crop
+        for i, (f, c) in enumerate(zip(full, cropped)):
+            expected = f[y:y + h, x:x + w]
+            got = c[y:y + h, x:x + w]
+            assert np.array_equal(got, expected), (
+                f"{width}x{height}->{decode_target_height} frame {i}: "
+                "Python-slice fallback on the refused path diverged from the reference"
+            )
         return
 
     x, y, w, h = crop

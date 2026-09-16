@@ -563,11 +563,19 @@ class PyAVCapture:
             if needs_crop:
                 self._crop_graph_active = True
         except Exception:
-            # Graceful fallback: proceed without filtering. read() will slice
-            # the full frame with the original output-space rectangle instead.
+            # Graceful fallback: proceed without filtering. Also clear the
+            # crop plan -- self._crop_slice is in downscaled *output*-space
+            # coordinates, but without the filter graph read() would hand
+            # back a *native*-resolution frame, so slicing it with those
+            # coordinates would extract the wrong region rather than an
+            # approximate one. Clearing it here keeps "refused" uniform
+            # (`_crop_slice is None`) with the planner's own refusal path,
+            # and video.py's `not getattr(v, '_crop_slice', None)` guard
+            # then does the crop in Python against the full native frame.
             self._filter_graph = None
             self._scale_factor = 1.0
             self._crop_graph_active = False
+            self._crop_slice = None
 
     def __exit__(self, exc_type, exc_value, traceback):
         if not PYAV_AVAILABLE:
@@ -663,15 +671,13 @@ class PyAVCapture:
             else:
                 img = frame.to_ndarray(format='bgr24')
 
+            # `_crop_slice` is only ever set once the graph has actually
+            # cropped (see _plan_crop / _setup_filter_graph's exception
+            # handler, which clears it back to None on any refusal), so
+            # there is no "planned but inactive" case to special-case here.
             if self._crop_slice is not None:
                 y0, y1, x0, x1 = self._crop_slice
-                if self._crop_graph_active:
-                    img = img[y0:y1, x0:x1]
-                else:
-                    # Graph unavailable: slice the full frame with the original
-                    # output-space rectangle instead.
-                    rx, ry, rw, rh = self._crop_request
-                    img = img[ry:ry + rh, rx:rx + rw]
+                img = img[y0:y1, x0:x1]
                 img = np.ascontiguousarray(img)
 
             return True, img
