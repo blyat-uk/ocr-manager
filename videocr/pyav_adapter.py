@@ -1,5 +1,6 @@
 """Video capture adapters with optional GPU acceleration."""
 import cv2
+import math
 import numpy as np
 import subprocess
 import json
@@ -28,6 +29,61 @@ _ZSCALE_AVAILABLE = None  # Lazy-cached
 # regardless of source resolution.  get(CAP_PROP_FRAME_*) still returns native
 # dimensions; only read() produces scaled frames.
 DECODE_TARGET_HEIGHT = 1080
+
+# Largest output-space alignment step we'll accept when planning an
+# in-graph crop. If neither axis's exact native/output ratio yields a
+# qualifying alignment within this cap, the crop stage is refused rather
+# than risk a phase mismatch between crop and scale (see _crop_axis_plan).
+_CROP_ALIGN_CAP = 64
+
+
+def _crop_axis_plan(out_dim: int, native_dim: int):
+    """Plan one axis of an in-graph crop so native-space coordinates are
+    both exact integers and even (required for 4:2:0 chroma safety).
+
+    `out_dim` and `native_dim` are generally related by a rounded scale
+    factor (e.g. `_output_width` is `int(width * sf)` rounded up to even),
+    not a clean ratio, so we derive the *exact* rational mapping from their
+    gcd instead of trusting a single float scale factor for both axes.
+
+    Reducing native_dim/out_dim by g = gcd(out_dim, native_dim) gives
+    out_dim = g * out_step and native_dim = g * native_step with
+    out_step and native_step coprime. An output-space coordinate maps to
+    an exact integer native coordinate iff it is a multiple of out_step
+    (since gcd(out_step, native_step) == 1). If native_step is odd, the
+    resulting native coordinate needs a further factor of 2 to guarantee
+    it lands on an even (chroma-safe) native pixel; if native_step is
+    already even any multiple of out_step is automatically even.
+
+    Returns (align, native_step, out_step), where any output coordinate
+    that is a multiple of `align` maps via
+    `native = (coord // out_step) * native_step`
+    to an exact, even native coordinate -- or None if no such alignment
+    exists within `_CROP_ALIGN_CAP`.
+    """
+    g = math.gcd(out_dim, native_dim)
+    out_step = out_dim // g
+    native_step = native_dim // g
+
+    # Empirical finding (not just theory): libswscale's scale filter is
+    # only reliably bit-identical across two differently-sized invocations
+    # of the *same* ratio when the ratio's reduced denominator (out_step)
+    # is a power of two. Ratios such as 4:3 or 10:9 (out_step 3 or 9) were
+    # measured to differ from the full-frame reference by up to 1 LSB on a
+    # scattering of pixels, and raising the padding from 8 to 64 changed
+    # nothing -- so this is not an edge/tap-support shortfall, it is
+    # accumulated floating-point drift in the filter's phase computation
+    # that depends on the *absolute* native offset a crop starts at, which
+    # a locally-restarted sub-buffer scale cannot reproduce unless 1/out_step
+    # is exactly representable in binary floating point (true only for
+    # powers of two). Refuse the crop stage rather than risk it.
+    if out_step & (out_step - 1) != 0:
+        return None
+
+    align = out_step if native_step % 2 == 0 else 2 * out_step
+    if align > _CROP_ALIGN_CAP:
+        return None
+    return align, native_step, out_step
 
 
 def _has_zscale() -> bool:
@@ -382,32 +438,64 @@ class PyAVCapture:
         """Translate the requested output-space crop into a native-space,
         aligned, padded decode box plus the exact slice to take afterwards.
 
-        Alignment: chroma subsampling needs even coordinates, and on the
-        downscale path the native-resolution box must map to whole output
-        pixels, so we align to `2 / scale_factor`. A padding margin absorbs
-        swscale's filter taps at the crop edges; it is sliced off after
-        conversion via `self._crop_slice`.
+        The invariant this must satisfy: EITHER the crop stage is planned
+        such that the graph's crop+scale is `np.array_equal` to slicing the
+        full-frame reference, OR the crop stage is refused entirely (this
+        method returns without setting `self._crop_slice`), leaving
+        `video.py` to slice the full frame in Python. "Planned but only
+        approximately correct" must never happen.
+
+        The two axes are planned independently via `_crop_axis_plan`
+        because `_output_height` is exactly the decode target but
+        `_output_width` is `int(width * sf)` rounded up to even, so the
+        two axes' native/output ratios are not generally identical. A
+        padding margin absorbs swscale's filter taps at the crop edges;
+        it is sliced off after conversion via `self._crop_slice`.
         """
         if self._crop_request is None:
             return
 
         x, y, w, h = (int(v) for v in self._crop_request)
         out_w, out_h = self._output_width, self._output_height
-        x = max(0, min(x, out_w)); y = max(0, min(y, out_h))
+        x = max(0, min(x, out_w - 1)); y = max(0, min(y, out_h - 1))
         w = max(1, min(w, out_w - x)); h = max(1, min(h, out_h - y))
 
-        inv = 1.0 / self._scale_factor if self._scale_factor < 1.0 else 1.0
-        align = max(2, int(round(2 * inv)))
+        plan_x = _crop_axis_plan(out_w, self._width)
+        plan_y = _crop_axis_plan(out_h, self._height)
+        if plan_x is None or plan_y is None:
+            # Some axis either has no alignment within the cap, or its
+            # ratio's reduced denominator isn't a power of two (see
+            # _crop_axis_plan) -- refuse the crop stage rather than risk a
+            # phase/precision mismatch against the reference.
+            # `self._crop_slice` stays None.
+            return
+        align_x, native_step_x, out_step_x = plan_x
+        align_y, native_step_y, out_step_y = plan_y
 
-        # Padded box in OUTPUT space, aligned down/up to `align`.
-        px0 = max(0, ((x - self._CROP_PAD) // align) * align)
-        py0 = max(0, ((y - self._CROP_PAD) // align) * align)
-        px1 = min(out_w, -(-(x + w + self._CROP_PAD) // align) * align)
-        py1 = min(out_h, -(-(y + h + self._CROP_PAD) // align) * align)
+        def to_native_x(coord):
+            return (coord // out_step_x) * native_step_x
 
-        # Same box in NATIVE space, where the crop filter runs.
-        n_x0 = int(round(px0 * inv)); n_y0 = int(round(py0 * inv))
-        n_w = int(round((px1 - px0) * inv)); n_h = int(round((py1 - py0) * inv))
+        def to_native_y(coord):
+            return (coord // out_step_y) * native_step_y
+
+        # Padded box in OUTPUT space, aligned down/up per-axis.
+        px0 = max(0, ((x - self._CROP_PAD) // align_x) * align_x)
+        py0 = max(0, ((y - self._CROP_PAD) // align_y) * align_y)
+        px1 = min(out_w, -(-(x + w + self._CROP_PAD) // align_x) * align_x)
+        py1 = min(out_h, -(-(y + h + self._CROP_PAD) // align_y) * align_y)
+
+        # Same box in NATIVE space, where the crop filter runs. Clamp
+        # against the actual decoded frame: `_output_width`/`_output_height`
+        # can round up past the exact native/scale ratio (e.g. to force an
+        # even output width), so defensively cap the native box too.
+        n_x0 = to_native_x(px0)
+        n_y0 = to_native_y(py0)
+        n_x1 = min(to_native_x(px1), self._width)
+        n_y1 = min(to_native_y(py1), self._height)
+        n_w = n_x1 - n_x0
+        n_h = n_y1 - n_y0
+        if n_w <= 0 or n_h <= 0:
+            return
 
         self._crop_native = (n_x0, n_y0, n_w, n_h)
         self._crop_scaled_size = (px1 - px0, py1 - py0)
