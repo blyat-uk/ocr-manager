@@ -1443,3 +1443,21 @@ def test_fingerprint_params_cover_every_field_that_changes_fingerprints():
     assert pl.cache_key("identity", RangesConfig(match=MatchConfig(min_count=3))) == base
     assert pl.cache_key("other", RangesConfig()) != base
     assert hashlib.sha256(base.encode()).hexdigest()  # a plain string key
+
+
+@pytest.mark.parametrize("cpus, expected", [(2, 2), (None, 1), (32, 8)])
+def test_default_workers_never_exceed_the_cpus_available(cpus, expected):
+    """Evaluated at import, so checked in a fresh interpreter whose
+    os.cpu_count() reports `cpus`."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    snippet = (
+        "import os; os.cpu_count = lambda: %r\n"
+        "from core.detect.ranges import pipeline\n"
+        "print(pipeline.DEFAULT_WORKERS)" % (cpus,)
+    )
+    out = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True, check=True,
+                         cwd=Path(__file__).resolve().parent.parent)
+    assert int(out.stdout.strip()) == expected

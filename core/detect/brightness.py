@@ -123,7 +123,11 @@ SEED_MARGIN = 8
 SEED_MIN, SEED_MAX = 100, 245
 POLY_ERODE_KERNEL = 3             # 1px erosion keeps polygon-edge background out
 MIN_GLYPH_REGION_PIXELS = 50      # fewer eroded-polygon pixels than this: no Otsu
-IMPLAUSIBLE_SEED = 150            # below this the min-channel model is broken (coloured text)
+# Below this the min-channel model is broken (coloured text). Spike value,
+# uncalibrated: the task brief's "< 150", also the floor of the spike's search
+# range; not swept, only validated as part of the whole pipeline on the
+# reference corpus (task-4-report.md).
+IMPLAUSIBLE_SEED = 150
 
 # --- Gate floor
 GATE_QUIET_PERCENT = 95
@@ -135,6 +139,10 @@ VERIFY_HALF_WINDOW = 25
 VERIFY_STEP = 5
 # A threshold is valid when its agreement is within this of the best
 # threshold's agreement AND the mean confidence clears MIN_MEAN_CONFIDENCE.
+# Both are spike values, uncalibrated: the defaults of the brightness spike's
+# verifier (tol=0.02, minconf=0.97), carried over unchanged; neither was swept.
+# They are validated only as part of the whole pipeline -- 13 reference
+# projects, real OCR pass A/B (task-4-report.md) -- not individually.
 AGREEMENT_TOLERANCE = 0.02
 MIN_MEAN_CONFIDENCE = 0.97
 # A strip is evidence only when its modal reading is supported by this many

@@ -31,7 +31,7 @@ a result without review.
 
 | detector | how to cancel | what comes back |
 |---|---|---|
-| crop.detect_crop | cancel_check callable, polled between probe batches and rounds | a CropResult, not an exception: flagged gains "cancelled", and `box` is whatever the evidence so far gives -- possibly clipped, possibly None. auto_applicable is False. |
+| crop.detect_crop | cancel_check callable, polled during audio extraction (every 0.1 s), between probe batches and between rounds | a CropResult, not an exception: flagged gains "cancelled", and `box` is whatever the evidence so far gives -- possibly clipped, possibly None. auto_applicable is False. |
 | brightness.detect_brightness | cancel_check callable, polled before each sampling round, before OCR verification, and before each OCR batch / neighbour grab of the dim-text check | a BrightnessResult with flagged == "cancelled", value DEFAULT_BRIGHTNESS (nothing measured), plateau None, curve []. auto_applicable is False. |
 | ranges.pipeline.analyse | cancel callable, polled between files and between phases | raises ranges.pipeline.AnalysisCancelled (no partial result). core/audio_analysis.py turns it into finished({}). |
 

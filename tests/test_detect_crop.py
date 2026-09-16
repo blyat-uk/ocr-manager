@@ -638,7 +638,7 @@ def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [1.0, 2.0, 3.0],
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [1.0, 2.0, 3.0],
     )
 
     last_chunk_times: list[float] = []
@@ -684,7 +684,7 @@ def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, c
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): vad_times,
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: vad_times,
     )
 
     last_chunk_times: list[float] = []
@@ -728,7 +728,7 @@ def _detect_crop_with_mocked_rounds(monkeypatch, round_outcomes, vad_times=None,
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): (
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: (
             vad_times if vad_times is not None else [1.0, 2.0, 3.0]
         ),
     )
@@ -946,7 +946,7 @@ def test_safety_net_fallback_flag_fires_for_a_truly_unanticipated_no_box_path(mo
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [1.0, 2.0, 3.0],
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [1.0, 2.0, 3.0],
     )
 
     def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
@@ -1202,7 +1202,7 @@ def _detect_crop_at_resolution(monkeypatch, dims, predict=None):
 
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (*dims, None))
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(requested))
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: list(requested))
     monkeypatch.setattr(crop, "_PersistentFrameFetcher", _RecordingFetcher, raising=False)
 
     def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
@@ -1278,7 +1278,7 @@ def test_persistent_fetcher_open_failure_falls_back_to_one_shot_grabs(monkeypatc
 
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (3840, 2160, None))
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [float(t) for t in range(10, 40)])
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [float(t) for t in range(10, 40)])
     monkeypatch.setattr(crop, "_PersistentFrameFetcher", FailingFetcher, raising=False)
     last_chunk: list[float] = []
 
@@ -1619,7 +1619,7 @@ def test_detect_crop_analyses_tone_mapped_frames_on_hdr_sources(monkeypatch, enc
     monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: path == "persistent", raising=False)
     monkeypatch.setattr(crop, "TARGET_HEIGHT", 120)
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [0.3, 1.37, 2.2])
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [0.3, 1.37, 2.2])
     engine = _FrameRecordingEngine()
 
     result = crop.detect_crop(str(video), 3.0, engine)
@@ -1667,7 +1667,7 @@ def test_recorded_sample_and_hit_pts_refetch_exactly_the_analysed_frames(monkeyp
     video = _clip(encoded_clips, clip)
     monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: path == "persistent", raising=False)
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(_ROUND_TRIP_TIMES))
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: list(_ROUND_TRIP_TIMES))
     engine = _FrameRecordingEngine()
 
     result = crop.detect_crop(str(video), 3.0, engine)
@@ -1692,7 +1692,7 @@ def test_persistent_path_falls_back_to_one_shot_grabs_when_a_whole_batch_fails(m
     video = _clip(encoded_clips, "h264-bframes")
     monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: True, raising=False)
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(_ROUND_TRIP_TIMES))
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: list(_ROUND_TRIP_TIMES))
     attempts = {"n": 0}
 
     def undecodable(self, t, geometry):
@@ -1927,3 +1927,28 @@ def test_detect_crop_on_a_video_only_file_probes_uniformly_and_flags_no_speech(v
 def test_detect_crop_still_raises_when_the_audio_stream_cannot_be_decoded(undecodable_audio_clip):
     with pytest.raises(subprocess.CalledProcessError):
         crop.detect_crop(str(undecodable_audio_clip), 4.0, _BrightBoxDetector())
+
+
+def test_cancelling_while_audio_is_extracted_returns_a_cancelled_result_promptly(
+        synthetic_audio_video, tmp_path, monkeypatch):
+    """M6: detect_crop's cancel_check reaches audio extraction, so Cancel does
+    not wait for ffmpeg; the result is cancelled with nothing probed (not
+    no-speech, which would claim the file is silent)."""
+    import os
+    import shutil
+    import time
+
+    real = shutil.which("ffmpeg")
+    fake = tmp_path / "bin" / "ffmpeg"
+    fake.parent.mkdir()
+    fake.write_text(f'#!/bin/sh\ncase " $* " in *" -vn "*) exec sleep 8;; esac\nexec "{real}" "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+
+    started = time.monotonic()
+    result = crop.detect_crop(str(synthetic_audio_video), 10.0, _BrightBoxDetector(),
+                              cancel_check=lambda: time.monotonic() - started > 0.3)
+
+    assert time.monotonic() - started < 3.0
+    assert result.flagged == crop.FLAG_CANCELLED
+    assert result.box is None and result.probes_used == 0 and not result.auto_applicable

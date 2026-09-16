@@ -1535,7 +1535,9 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     (videocr.engine_registry) for the whole call: an engine must never serve
     two threads at once, and OCR workers run as threads in the same process.
 
-    `cancel_check`, if given, is a zero-argument callable polled between
+    `cancel_check`, if given, is a zero-argument callable polled while the
+    audio window is extracted (see vad.extract_audio_window(); cancelled
+    there, the result is just "cancelled", with nothing probed), between
     probe batches (see _run_round()) AND between the fallback rounds
     below, so a caller driving several files from a background thread
     (core/subtitle_detector.py) can make Cancel take effect within roughly
@@ -1594,7 +1596,14 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     sample_pts: list[float] = []
     flagged: str | None = None
 
-    times = vad.probe_times(video_path, duration_sec, window_frac=(0.40, 0.60))
+    try:
+        times = vad.probe_times(video_path, duration_sec, window_frac=(0.40, 0.60),
+                                cancel_check=cancel_check)
+    except vad.AudioExtractionCancelled:
+        # Cancelled before a single probe: say so, and nothing else --
+        # falling through would compose no-speech onto a file that was
+        # never listened to.
+        return CropResult(box=None, flagged=FLAG_CANCELLED, frame_size=frame_size)
     speech_probing_available = bool(times)
     if not speech_probing_available:
         times = _uniform_probe_times(duration_sec)
