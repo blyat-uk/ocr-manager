@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -731,7 +733,7 @@ def _detect_crop_with_mocked_rounds(monkeypatch, round_outcomes, vad_times=None,
     calls = {"n": 0}
 
     def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
-                        settings, known_dims=None, cancel_check=None):
+                        settings, known_dims=None, cancel_check=None, fetcher=None):
         idx = calls["n"]
         calls["n"] += 1
         assert idx < len(round_outcomes), f"_run_round called more times than scripted ({idx + 1})"
@@ -946,7 +948,7 @@ def test_safety_net_fallback_flag_fires_for_a_truly_unanticipated_no_box_path(mo
     )
 
     def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
-                        settings, known_dims=None, cancel_check=None):
+                        settings, known_dims=None, cancel_check=None, fetcher=None):
         # raw_hits > 0 so neither fallback round ever runs -- only
         # _union_extent_detailed()/aggregate_box() decide box/flag from
         # here, and those are the ones forced to "find nothing" below.
@@ -974,6 +976,468 @@ def test_safety_net_fallback_flag_fires_for_a_truly_unanticipated_no_box_path(mo
         "dummy-unflagged-path.mp4" in rec.message and rec.levelname == "WARNING"
         for rec in caplog.records
     ), "a warning naming the file must be logged when the fallback fires"
+
+
+# --------------------------------------------------------------------------
+# Task 2b: tolerant convergence
+# --------------------------------------------------------------------------
+
+def _drive_run_round_by_rank(monkeypatch, n_candidates, polys_for_rank, consensus=None):
+    """Runs the real _run_round() over `n_candidates` timestamps, with the
+    frame-grab layer faked out and the engine answering by each probe's
+    VISITATION rank (its index in _spread_order()), so a test can script
+    exactly what each successive batch of PROBE_BATCH_SIZE probes sees."""
+    times_all = [float(t) for t in range(n_candidates)]
+    rank = {t: i for i, t in enumerate(crop._spread_order(times_all))}
+    last_chunk_times: list[float] = []
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        last_chunk_times[:] = times
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        return pairs, (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+
+    class FakeEngine:
+        def predict(self, frames):
+            results = []
+            for t in last_chunk_times:
+                polys = polys_for_rank(rank[t])
+                results.append({"dt_scores": [1.0] * len(polys), "dt_polys": polys})
+            return results
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+    return crop._run_round(
+        "dummy.mp4", times_all, FakeEngine(), band_frac=0.55, consensus=consensus,
+        frame_size=FRAME, settings=None,
+    )
+
+
+def _dialogue_line(rank, top=980.0, bottom=1030.0):
+    """One subtitle line whose WIDTH differs on every probe, the way
+    successive dialogue lines do -- each later probe is a little wider than
+    any before it, so the raw union's horizontal extent grows every batch."""
+    half = 150 + 6 * rank
+    return [_poly(960 - half, top, 960 + half, bottom)]
+
+
+def _vertical_tolerance_px():
+    return crop.CONVERGENCE_VERTICAL_TOLERANCE_FRAC * FRAME[1]
+
+
+# The largest batch-to-batch vertical growth of the raw union measured on the
+# reference corpus without a new line appearing -- pure edge jitter (XWZ 169,
+# 12.4px of a 2160px frame -- see task-2b-report.md).
+LARGEST_MEASURED_BATCH_JITTER_FRAC = 12.4 / 2160.0
+
+
+def test_dialogue_width_variance_and_edge_jitter_converge_before_the_probe_cap(monkeypatch):
+    """Task 2b: exact-equality convergence never fired on real dialogue (slay
+    hit the 30-probe cap on every run) because each new line's width nudges
+    the union's horizontal edges. The crop's width is a fixed centred fraction
+    of the frame, so horizontal growth cannot change the box; and the
+    vertical edges jitter by a few px between frames of the same line. Both
+    must count as stable: here the width grows on every probe, and batches 2
+    and 3 each move the top and bottom edges by the largest jitter measured
+    on the corpus, so the run must stop after exactly
+    CONVERGENCE_STABLE_ROUNDS stable batches, well under the cap."""
+    jitter = LARGEST_MEASURED_BATCH_JITTER_FRAC * FRAME[1]
+
+    def polys_for_rank(rank):
+        batch = min(rank // crop.PROBE_BATCH_SIZE, 2)
+        return _dialogue_line(rank, top=980.0 - jitter * batch, bottom=1030.0 + jitter * batch)
+
+    _polys, sample_pts, _hits, _times = _drive_run_round_by_rank(monkeypatch, 60, polys_for_rank)
+
+    expected = crop.PROBE_BATCH_SIZE * (crop.CONVERGENCE_STABLE_ROUNDS + 1)
+    assert len(sample_pts) == expected < crop.MAX_PROBES_PER_ROUND, (
+        f"ordinary width variance and edge jitter must converge after {expected} probes, "
+        f"got {len(sample_pts)}"
+    )
+
+
+# The smallest single-line height measured on the reference corpus (XWZ 168
+# and 169, 87px of a 2160px frame -- see task-2b-report.md). A second subtitle line
+# grows the union by at least this much, so no tolerance may swallow it.
+SMALLEST_MEASURED_LINE_HEIGHT_FRAC = 87.0 / 2160.0
+
+
+@pytest.mark.parametrize("edge,growth", [
+    ("top", "just-over-tolerance"),
+    ("bottom", "just-over-tolerance"),
+    ("top", "second-line"),
+])
+def test_growth_beyond_the_convergence_tolerance_is_never_treated_as_stable(monkeypatch, edge, growth):
+    """Task 2b gate: a union that grows by more than the tolerance across
+    batches must not count as stable. Batches 1-2 hold steady (1 stable
+    round); batch 3 grows one vertical edge by either 1px more than the
+    tolerance or by one second subtitle line (the smallest line height
+    measured on the corpus). That batch must reset stability, so probing
+    cannot stop before batch 5 -- a tolerance loose enough to absorb it would
+    stop after batch 3, exactly the "width-variance-sized tolerance swallows
+    a second line" failure this guards."""
+    tol = _vertical_tolerance_px()
+    amount = tol + 1.0 if growth == "just-over-tolerance" else SMALLEST_MEASURED_LINE_HEIGHT_FRAC * FRAME[1]
+
+    def polys_for_rank(rank):
+        if rank == 12:  # batch 3
+            if edge == "top":
+                return _dialogue_line(rank, top=980.0 - amount)
+            return _dialogue_line(rank, bottom=1030.0 + amount)
+        return _dialogue_line(rank)
+
+    polys_per_frame, sample_pts, _hits, frame_times = _drive_run_round_by_rank(monkeypatch, 60, polys_for_rank)
+
+    assert len(sample_pts) >= crop.PROBE_BATCH_SIZE * 5, (
+        f"growth of {amount:.1f}px (tolerance {tol:.1f}px) on the {edge} edge was treated as "
+        f"stable: probing stopped after {len(sample_pts)} probes"
+    )
+    union, *_ = crop._union_extent(polys_per_frame, FRAME[1], 0.55, frame_times)
+    if edge == "top":
+        assert union[1] == pytest.approx(980.0 - amount, abs=0.01)
+    else:
+        assert union[3] == pytest.approx(1030.0 + amount, abs=0.01)
+
+
+def test_convergence_tolerance_is_cumulative_so_creeping_growth_cannot_mask_a_late_second_line(monkeypatch):
+    """Task 2b gate, the per-batch loophole: if stability compared each batch
+    only against the batch before it, a union creeping upward by 0.6x the
+    tolerance per batch would look stable twice in a row and stop after 3
+    batches -- never reaching the two-line frame in batch 4. Growth is
+    measured against the union at the START of the stable streak, so 1.2x
+    the tolerance of cumulative creep resets it and the second line is
+    captured."""
+    tol = _vertical_tolerance_px()
+    two_line = [_poly(400, 920, 1500, 970), _poly(400, 980, 1500, 1030)]
+
+    def polys_for_rank(rank):
+        if rank == 7:    # batch 2
+            return _dialogue_line(rank, top=980.0 - 0.6 * tol)
+        if rank == 12:   # batch 3
+            return _dialogue_line(rank, top=980.0 - 1.2 * tol)
+        if rank == 17:   # batch 4
+            return two_line
+        return _dialogue_line(rank)
+
+    polys_per_frame, sample_pts, _hits, frame_times = _drive_run_round_by_rank(monkeypatch, 60, polys_for_rank)
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=frame_times)
+
+    assert len(sample_pts) > crop.PROBE_BATCH_SIZE * 3, (
+        f"creeping growth (1.2x tolerance over two batches) was treated as stable: stopped after "
+        f"{len(sample_pts)} probes"
+    )
+    assert box is not None and box[1] <= 920, f"the late second line was clipped: {box}"
+
+
+# --------------------------------------------------------------------------
+# Task 2b: probe fetching -- recorded timestamps and the persistent path
+# --------------------------------------------------------------------------
+
+def test_sample_and_hit_pts_record_the_time_of_the_frame_actually_fetched(monkeypatch):
+    """Task 2b requirement 4: the frames a probe returns must be the frames
+    at the timestamps the result reports. The fetch layer reports, per frame,
+    the time of the frame it actually decoded (for a persistent container,
+    the first frame at or after the requested time -- up to one frame
+    later). sample_pts and hit_pts must record THAT time, never the requested
+    one, or the UI slider / filmstrip would point at a frame that was never
+    analysed."""
+    shift = 0.028
+    requested = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0]
+    fetched = {round(t + shift, 6) for t in requested}
+    last_pairs: list = []
+
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(crop.vad, "probe_times",
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(requested))
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        pairs = [(round(t + shift, 6), np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        last_pairs[:] = pairs
+        return pairs, (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+
+    class FakeEngine:
+        def predict(self, frames):
+            return [{"dt_scores": [1.0], "dt_polys": _dialogue_line(int(t))} for t, _ in last_pairs]
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+    result = crop.detect_crop("dummy.mp4", 60.0, FakeEngine())
+
+    assert result.box is not None
+    assert result.sample_pts, "probes were fetched"
+    assert set(result.sample_pts) <= fetched, (
+        f"sample_pts recorded requested times instead of fetched ones: {result.sample_pts}"
+    )
+    assert result.hit_pts and set(result.hit_pts) <= fetched, (
+        f"hit_pts recorded requested times instead of fetched ones: {result.hit_pts}"
+    )
+
+
+class _RecordingFetcher:
+    """Stands in for crop._PersistentFrameFetcher: reports each frame 20ms
+    after the requested time (as a persistent decoder landing on the next
+    frame would), identity geometry at the source's own resolution."""
+    instances: list = []
+
+    def __init__(self, video_path, known_dims):
+        self.video_path = video_path
+        self.known_dims = known_dims
+        self.closed = False
+        self.fetched: list[float] = []
+        self.last_pairs: list = []
+        _RecordingFetcher.instances.append(self)
+
+    def fetch(self, times, band_frac, target_height):
+        w, h = self.known_dims
+        pairs = [(round(t + 0.02, 6), np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        self.fetched.extend(t for t, _ in pairs)
+        self.last_pairs = pairs
+        return pairs, (w, h, w, h, 0, 0, w, h)
+
+    def close(self):
+        self.closed = True
+
+
+def _detect_crop_at_resolution(monkeypatch, dims, predict=None):
+    """detect_crop() with vad/ffprobe faked, a spy on the one-shot grab
+    layer and _RecordingFetcher standing in for the persistent one. Returns
+    (result, one_shot_calls)."""
+    _RecordingFetcher.instances = []
+    w, h = dims
+    requested = [float(t) for t in range(10, 40)]
+    one_shot_calls = {"n": 0}
+    last_pairs: list = []
+
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: dims)
+    monkeypatch.setattr(crop.vad, "probe_times",
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(requested))
+    monkeypatch.setattr(crop, "_PersistentFrameFetcher", _RecordingFetcher, raising=False)
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        one_shot_calls["n"] += 1
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        last_pairs[:] = pairs
+        return pairs, (w, h, w, h, 0, 0, w, h)
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+
+    class FakeEngine:
+        def predict(self, frames):
+            if predict is not None:
+                predict()
+            pairs = _RecordingFetcher.instances[-1].last_pairs if _RecordingFetcher.instances else last_pairs
+            line_top, line_bottom = h * 0.92, h * 0.96
+            return [
+                {"dt_scores": [1.0], "dt_polys": [_poly(w * 0.4 - int(t), line_top, w * 0.6 + int(t), line_bottom)]}
+                for t, _ in pairs
+            ]
+
+    result = crop.detect_crop("dummy-4k.mp4", 60.0, FakeEngine())
+    return result, one_shot_calls["n"]
+
+
+@pytest.mark.parametrize("dims,persistent", [
+    ((1920, 888), False),    # slay: one-shot grabs measured faster
+    ((1920, 1080), False),   # the crossover boundary itself stays on one-shot grabs
+    ((3840, 2160), True),    # xwz: persistent containers measured faster
+])
+def test_fetch_strategy_follows_the_measured_resolution_crossover(monkeypatch, dims, persistent):
+    """Task 2b requirement 2: persistent containers only where they measurably
+    win. Above the crossover every probe goes through the persistent fetcher
+    (never a one-shot ffmpeg grab), its reported times are what the result
+    records, and it is closed once detection finishes; at or below it,
+    nothing is opened and one-shot grabs are used exactly as before."""
+    result, one_shot_calls = _detect_crop_at_resolution(monkeypatch, dims)
+
+    assert result.box is not None
+    if persistent:
+        assert len(_RecordingFetcher.instances) == 1, "one persistent fetcher per detect_crop() call"
+        fetcher = _RecordingFetcher.instances[0]
+        assert one_shot_calls == 0, f"{dims}: {one_shot_calls} batches went through one-shot grabs"
+        assert result.sample_pts == fetcher.fetched
+        assert set(result.hit_pts) <= set(fetcher.fetched)
+        assert fetcher.closed, "the persistent containers must be released when detection ends"
+    else:
+        assert _RecordingFetcher.instances == [], f"{dims}: persistent containers opened below the crossover"
+        assert one_shot_calls > 0
+
+
+def test_persistent_fetcher_is_closed_even_when_detection_raises(monkeypatch):
+    """Containers hold several decoded 4K reference frames each; an exception
+    from the detection engine (which detect_crop() lets propagate to the
+    adapter) must not leak them."""
+    def boom():
+        raise RuntimeError("engine failed")
+
+    with pytest.raises(RuntimeError, match="engine failed"):
+        _detect_crop_at_resolution(monkeypatch, (3840, 2160), predict=boom)
+
+    assert len(_RecordingFetcher.instances) == 1
+    assert _RecordingFetcher.instances[0].closed
+
+
+def test_persistent_fetcher_open_failure_falls_back_to_one_shot_grabs(monkeypatch, caplog):
+    """If the persistent containers cannot be opened (PyAV cannot read what
+    the ffmpeg CLI can), detection must still run on one-shot grabs, and say
+    so in the log rather than fail the file."""
+    class FailingFetcher:
+        def __init__(self, video_path, known_dims):
+            raise OSError("cannot open container")
+
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (3840, 2160))
+    monkeypatch.setattr(crop.vad, "probe_times",
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [float(t) for t in range(10, 40)])
+    monkeypatch.setattr(crop, "_PersistentFrameFetcher", FailingFetcher, raising=False)
+    last_chunk: list[float] = []
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        last_chunk[:] = times
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        return pairs, (3840, 2160, 3840, 2160, 0, 0, 3840, 2160)
+
+    class FakeEngine:
+        def predict(self, frames):
+            return [{"dt_scores": [1.0], "dt_polys": [_poly(1500 - int(t), 1990, 2300 + int(t), 2080)]}
+                    for t in last_chunk]
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+    with caplog.at_level("WARNING"):
+        result = crop.detect_crop("dummy-unopenable.mp4", 60.0, FakeEngine())
+
+    assert result.box is not None
+    assert any("dummy-unopenable.mp4" in rec.message and rec.levelname == "WARNING" for rec in caplog.records)
+
+
+# Real PyAV decoding against real one-shot ffmpeg grabs, on small synthetic
+# clips: 25fps, 3s, a GOP of 50 frames, so an accurate seek has to decode
+# forward from a keyframe (and skip or not skip non-reference frames) to reach
+# every requested time below.
+_CLIP_ENCODERS = {
+    "h264-bframes": ["-c:v", "libx264", "-g", "50", "-bf", "3"],
+    "hevc-bpyramid": ["-c:v", "libx265", "-x265-params", "keyint=50:bframes=4:b-pyramid=1:log-level=error"],
+    "hevc-temporal-layers": ["-c:v", "libx265", "-x265-params",
+                             "keyint=50:bframes=4:b-pyramid=1:temporal-layers=3:log-level=error"],
+    # AV1 is here because non-reference skipping is NOT exact for it: libdav1d
+    # never outputs a skipped frame, so an accurate seek would silently land
+    # on a later frame.
+    "av1": ["-c:v", "libsvtav1", "-g", "50"],
+}
+
+
+@pytest.fixture(scope="module")
+def encoded_clips(tmp_path_factory):
+    out_dir = tmp_path_factory.mktemp("fetch-clips")
+    clips = {}
+    for name, codec_args in _CLIP_ENCODERS.items():
+        out = out_dir / f"{name}.mp4"
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=3",
+             "-pix_fmt", "yuv420p", *codec_args, str(out)],
+            capture_output=True,
+        )
+        clips[name] = out if proc.returncode == 0 else None
+    return clips
+
+
+def _one_shot(video, t, geometry):
+    _w, _h, cw, ch, cx, cy, ow, oh = geometry
+    return crop._grab_one(str(video), t, cw, ch, cx, cy, ow, oh)
+
+
+@pytest.mark.parametrize("codec", sorted(_CLIP_ENCODERS))
+def test_persistent_fetcher_returns_the_frame_at_the_timestamp_it_reports(encoded_clips, codec):
+    """Task 2b requirement 4, on real decoding: every frame the persistent
+    fetcher returns is pixel-identical to the one-shot accurate grab at the
+    requested time (so switching fetch strategy cannot change what is
+    analysed), and the time it reports is that frame's own timestamp -- the
+    first frame at or after the request -- which resolves back to the same
+    frame. All requested times sit between frames, so reporting the
+    requested time instead is detectable."""
+    video = encoded_clips[codec]
+    if video is None:
+        pytest.skip(f"ffmpeg cannot encode {codec} here")
+    requested = [0.21, 1.37, 0.5, 2.03, 0.05, 2.9]
+    dims = crop._probe_dimensions(str(video))
+
+    fetcher = crop._PersistentFrameFetcher(str(video), dims)
+    try:
+        pairs, geometry = fetcher.fetch(requested, 0.55, crop.TARGET_HEIGHT)
+    finally:
+        fetcher.close()
+
+    assert len(pairs) == len(requested)
+    for req, (got, frame) in zip(requested, pairs):
+        assert req < got < req + 0.04, f"{codec}: requested {req}, reported {got}"
+        assert np.array_equal(frame, _one_shot(video, req, geometry)), (
+            f"{codec}: frame for t={req} differs from the one-shot accurate grab"
+        )
+        assert np.array_equal(frame, _one_shot(video, got, geometry)), (
+            f"{codec}: reported time {got} does not resolve to the analysed frame"
+        )
+        assert not np.array_equal(frame, _one_shot(video, got - 0.04, geometry)), (
+            f"{codec}: clip frames are not distinguishable, test proves nothing"
+        )
+
+
+def test_persistent_fetcher_honours_the_container_start_offset(offset_video):
+    """Probe times, like `ffmpeg -ss`, are relative to the container's start;
+    the offset_video fixture's timestamps all begin at 1.5s. A persistent
+    decoder seeking in raw stream time would land on the wrong frame."""
+    requested = [0.05, 0.21, 0.33]
+    dims = crop._probe_dimensions(str(offset_video))
+    fetcher = crop._PersistentFrameFetcher(str(offset_video), dims)
+    try:
+        pairs, geometry = fetcher.fetch(requested, 0.55, crop.TARGET_HEIGHT)
+    finally:
+        fetcher.close()
+
+    assert [round(t, 3) for t, _ in pairs] == [0.08, 0.24, 0.36]
+    for req, (_got, frame) in zip(requested, pairs):
+        assert np.array_equal(frame, _one_shot(offset_video, req, geometry))
+
+
+def test_persistent_fetcher_drops_and_reports_a_failed_grab_keeping_request_order(encoded_clips, caplog):
+    """grab_frames()'s contract carries over: a failed grab (here, past the
+    end of the clip) is dropped and logged, not raised, and the frames that
+    did succeed stay in request order."""
+    video = encoded_clips["h264-bframes"]
+    if video is None:
+        pytest.skip("ffmpeg cannot encode h264 here")
+    dims = crop._probe_dimensions(str(video))
+    fetcher = crop._PersistentFrameFetcher(str(video), dims)
+    try:
+        with caplog.at_level("WARNING"):
+            pairs, _geometry = fetcher.fetch([1.01, 99.0, 0.5], 0.55, crop.TARGET_HEIGHT)
+    finally:
+        fetcher.close()
+
+    assert [round(t, 3) for t, _ in pairs] == [1.04, 0.52]
+    assert any("99.000" in rec.message and rec.levelname == "WARNING" for rec in caplog.records)
+
+
+def test_grab_frames_uses_persistent_containers_above_the_crossover_with_identical_frames(
+        monkeypatch, encoded_clips):
+    """grab_frames() (public) gains the persistent path without changing its
+    contract: frames in request order, identical to one-shot grabs. The clip
+    is small, so the crossover policy is forced on to exercise the path."""
+    video = encoded_clips["hevc-bpyramid"]
+    if video is None:
+        pytest.skip("ffmpeg cannot encode hevc here")
+    times = [2.03, 0.21, 1.37]
+    expected = crop.grab_frames(str(video), times)
+
+    one_shot_calls = {"n": 0}
+    real_grab_one = crop._grab_one
+
+    def counting_grab_one(*args, **kwargs):
+        one_shot_calls["n"] += 1
+        return real_grab_one(*args, **kwargs)
+
+    monkeypatch.setattr(crop, "_grab_one", counting_grab_one)
+    monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: True, raising=False)
+    frames = crop.grab_frames(str(video), times)
+
+    assert one_shot_calls["n"] == 0, "above the crossover grab_frames() must not spawn one-shot grabs"
+    assert len(frames) == len(expected) == len(times)
+    assert all(np.array_equal(a, b) for a, b in zip(frames, expected))
 
 
 @pytest.mark.needs_media

@@ -27,9 +27,16 @@ tests in `tests/test_detect_crop.py`:
    padding was 0, and the raw (unpadded) box measurably sat a few pixels
    short of what users accepted (see task-2-brief.md's background section).
 
+Probe frames are fetched two ways, chosen per source by resolution (see
+_prefers_persistent_fetch()): one-shot `ffmpeg -ss` processes, or a pool of
+persistent PyAV containers (_PersistentFrameFetcher) that seek accurately and
+decode forward. Both return the SAME frame for the same requested time, pixel
+for pixel; only the cost differs. Neither snaps probes to keyframes -- see
+_PersistentFrameFetcher's docstring for the measurement that ruled that out.
+
 No Qt imports here (core/detect/ is Qt-free by project convention) -- this
-module only touches numpy, subprocess (ffmpeg/ffprobe) and the detection
-engine object it's handed.
+module only touches numpy, PyAV, subprocess (ffmpeg/ffprobe) and the
+detection engine object it's handed.
 """
 from __future__ import annotations
 
@@ -42,6 +49,7 @@ from dataclasses import dataclass, field
 from dataclasses import fields as _dataclass_fields
 from statistics import median
 
+import av
 import numpy as np
 
 from core.config import Config as _Config
@@ -111,11 +119,12 @@ GRAB_POOL_SIZE = 10  # max concurrent ffmpeg subprocesses inside grab_frames()
 PROBE_BATCH_SIZE = 5          # probes fetched per batch before re-checking the stop condition
 CONSENSUS_MIN_ENTRIES = 3     # consensus list must have at least this many entries to shortcut
 # Convergence stop (replaces a fixed hit-count stop -- see _run_round()):
-# stop once the raw union hasn't grown for this many consecutive batches.
+# stop once the raw union hasn't grown (beyond CONVERGENCE_VERTICAL_TOLERANCE_FRAC,
+# below) for this many consecutive batches.
 # 2 ("a couple") means the *earliest* a stop can happen is after 3 batches
 # (15 probes at PROBE_BATCH_SIZE=5): batch 1 always resets the counter (it
-# has no prior union to match), batch 2 must repeat batch 1's union
-# (1 stable round), batch 3 must repeat that again (2 stable rounds ->
+# has no prior union to match), batch 2 must match batch 1's union
+# (1 stable round), batch 3 must still match it (2 stable rounds ->
 # stop). Requiring 1 repeat alone would let a single lucky coincidence
 # stop early; requiring 2 means the union has now demonstrably stopped
 # growing across two independent additional looks, not just one.
@@ -125,8 +134,36 @@ CONVERGENCE_STABLE_ROUNDS = 2
 # RAW union's shape already agrees with it -- legitimate evidence this
 # file's band matches the series, but never a substitute for stability
 # itself: a stop still requires the raw union to have been observed
-# unchanged across a batch boundary, not merely "enough hits seen".
+# stable (within tolerance) across a batch boundary, not merely "enough
+# hits seen".
 CONSENSUS_STABLE_ROUNDS = 1
+# Convergence tolerance (Task 2b). "Stable" compares only the raw union's
+# VERTICAL edges, and allows them to have moved by up to this fraction of
+# frame height since the start of the current stable streak -- see
+# _union_is_stable().
+#
+# Horizontal edges are not compared at all: the returned box's width is a
+# fixed, centred CROP_WIDTH_FRACTION of the frame (aggregate_box() never reads
+# the union's x-extent), so a wider dialogue line cannot change the box, and
+# comparing it is what kept exact-equality convergence from ever firing on
+# real dialogue (slay hit MAX_PROBES_PER_ROUND on every run; batch-to-batch
+# horizontal growth measured up to 185px there).
+#
+# The vertical value is derived from union variation measured on the two
+# reference files (every speech-guided probe, see task-2b-report.md):
+# - Jitter, the growth that must count as stable: batch-to-batch vertical
+#   growth of the raw union without a new line measured at most 0.57% of
+#   frame height (XWZ 169 12.4px/2160, XWZ 168 7.4px/2160, slay 3px/888),
+#   and the full spread of any single edge across ALL frames of the subtitle
+#   cluster -- a bound on how far jitter alone can ever move that edge -- at
+#   most 1.14% (slay's bottom edge, 10.2px/888; XWZ at most 0.92%).
+# - Real growth, which must never count as stable: a second subtitle line
+#   grows the union by at least one line height, and the smallest single-line
+#   height measured was 4.03% (xwz, 87px/2160).
+# 1.5% clears the largest jitter bound with ~30% headroom while staying below
+# 0.4x the smallest line height, so a second line always exceeds it by more
+# than 2.5x.
+CONVERGENCE_VERTICAL_TOLERANCE_FRAC = 0.015
 # Hard ceiling on probes fetched in one _run_round() call, so content
 # whose union never stabilizes (or that never converges within the
 # candidate list) still has bounded latency. Set to roughly the old
@@ -173,6 +210,20 @@ BASELINE_CLUSTER_MIN_DOMINANT_SIZE = 3
 # the kept union with little to no gap; real noise measured on the
 # reference corpus sat ~2.4 line heights away, comfortably outside this.
 ADJACENT_SINGLETON_MAX_GAP_LINE_HEIGHTS = 1.0
+# Probe fetching (Task 2b). Sources with MORE than this many pixels fetch
+# probes through persistent PyAV containers; at or below it, through one-shot
+# ffmpeg processes. Measured crossover, see _prefers_persistent_fetch().
+PERSISTENT_FETCH_MIN_PIXELS = 1920 * 1080
+PERSISTENT_POOL_SIZE = PROBE_BATCH_SIZE   # one container per probe of a batch
+# Decoders whose non-reference-frame skipping (AVDISCARD_NONREF) is exact for
+# an accurate seek: the skipped frames are never referenced AND the decoder
+# still outputs every frame it does decode. Measured pixel-identical to
+# one-shot grabs for h264 and hevc (including temporally scalable hevc);
+# libdav1d (AV1) is the counter-example -- with skipping on it returned a
+# later frame for 14 of 17 requested times -- so anything not listed here
+# decodes every frame. See test_persistent_fetcher_returns_the_frame_at_the_
+# timestamp_it_reports.
+NONREF_SKIP_EXACT_CODECS = frozenset({"h264", "hevc"})
 UNIFORM_START_FRAC = 0.40
 UNIFORM_END_FRAC = 0.60
 UNIFORM_STEP_SEC = 0.5
@@ -211,6 +262,12 @@ FLAG_UNKNOWN_REJECTION = "unknown-rejection"        # structural safety net (see
 @dataclass
 class CropResult:
     box: tuple[int, int, int, int] | None
+    # Every frame actually fetched and analysed, in probing order, each
+    # recorded under the time the fetch layer reported for THAT frame --
+    # which for a persistent-container fetch is the decoded frame's own
+    # timestamp (the first frame at or after the requested time), never the
+    # requested time itself. A grab that failed returned no frame and is not
+    # listed. probes_used == len(sample_pts).
     sample_pts: list[float] = field(default_factory=list)
     envelope: tuple[int, int, int, int] | None = None
     agreed: int = 0
@@ -273,6 +330,18 @@ def _crop_geometry(orig_w: int, orig_h: int, band_frac: float,
     return crop_w, crop_h, 0, crop_y, out_w, out_h
 
 
+def _seek_seconds(t: float) -> float:
+    """The container-relative time an accurate seek to `t` actually targets.
+
+    Millisecond precision, because that is what the one-shot path hands
+    `ffmpeg -ss`. The persistent path (see _PersistentDecoder.grab()) targets
+    exactly the same value, so for any requested time both paths decode the
+    same frame -- the first one at or after this time -- and a probe's frame
+    cannot depend on which fetch strategy happened to run.
+    """
+    return float(f"{max(0.0, t):.3f}")
+
+
 def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
                crop_y: int, out_w: int, out_h: int) -> np.ndarray | None:
     """Grab a single frame at time `t`, already cropped+scaled. None on failure.
@@ -286,7 +355,7 @@ def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{max(0.0, t):.3f}", "-i", video_path,
+        "-ss", f"{_seek_seconds(t):.3f}", "-i", video_path,
         "-frames:v", "1",
         "-vf", f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={out_w}:{out_h}",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
@@ -345,17 +414,253 @@ def _grab_frames_with_times(video_path: str, times: list[float], band_frac: floa
     return pairs, (orig_w, orig_h) + geometry
 
 
+# Tolerance when comparing a decoded frame's timestamp against the seek
+# target: absorbs float rounding in pts * time_base, far below one frame.
+_PTS_EPSILON_SEC = 1e-6
+
+
+class _PersistentDecoder:
+    """One open PyAV container plus the crop/scale/bgr24 filter graphs built
+    for it. Used by exactly one worker thread at a time (see
+    _PersistentFrameFetcher.fetch()); PyAV releases the GIL while demuxing
+    and decoding, so several of these decode genuinely in parallel.
+    """
+
+    def __init__(self, video_path: str):
+        self._container = av.open(video_path)
+        try:
+            if not self._container.streams.video:
+                raise ValueError(f"no video stream found in {video_path}")
+            self._stream = self._container.streams.video[0]
+            self._time_base = self._stream.time_base
+            start = self._container.start_time
+            # Probe times, like `ffmpeg -ss`, are relative to the container's
+            # start; stream timestamps are not.
+            self._start_sec = start / av.time_base if start is not None else 0.0
+            self._skip_nonref = self._stream.codec_context.name in NONREF_SKIP_EXACT_CODECS
+            self._graphs: dict[tuple, av.filter.Graph] = {}
+        except BaseException:
+            self._container.close()
+            raise
+
+    def _graph_for(self, geometry: tuple) -> av.filter.Graph:
+        graph = self._graphs.get(geometry)
+        if graph is None:
+            _orig_w, _orig_h, crop_w, crop_h, crop_x, crop_y, out_w, out_h = geometry
+            graph = av.filter.Graph()
+            chain = [
+                graph.add_buffer(template=self._stream),
+                graph.add("crop", f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"),
+                graph.add("scale", f"{out_w}:{out_h}"),
+                graph.add("format", "bgr24"),
+                graph.add("buffersink"),
+            ]
+            for upstream, downstream in zip(chain, chain[1:]):
+                upstream.link_to(downstream)
+            graph.configure()
+            self._graphs[geometry] = graph
+        return graph
+
+    def grab(self, t: float, geometry: tuple) -> tuple[float, np.ndarray]:
+        """Accurate seek: the first frame at or after _seek_seconds(t) --
+        the same frame `ffmpeg -ss` returns -- cropped and scaled the same
+        way _grab_one() does. Returns (that frame's own container-relative
+        timestamp, image). Raises on any failure; the caller drops and logs.
+        """
+        target = _seek_seconds(t) + self._start_sec
+        time_base = self._time_base
+        codec_context = self._stream.codec_context
+        self._container.seek(int(target / time_base), stream=self._stream, backward=True)
+        frame = None
+        skipping = self._skip_nonref
+        try:
+            if skipping:
+                # Frames no other frame references can be skipped on the way
+                # to the target -- but only BEFORE it: skipping stops at the
+                # first packet whose pts reaches the target, and every packet
+                # holding a frame at or after the target reaches it too, so
+                # the target and everything after it are always decoded.
+                codec_context.skip_frame = "NONREF"
+            for packet in self._container.demux(self._stream):
+                if skipping and (packet.pts is None or packet.pts * time_base >= target - _PTS_EPSILON_SEC):
+                    codec_context.skip_frame = "DEFAULT"
+                    skipping = False
+                for decoded in codec_context.decode(packet):
+                    if decoded.pts is not None and decoded.pts * time_base >= target - _PTS_EPSILON_SEC:
+                        frame = decoded
+                        break
+                if frame is not None:
+                    break
+        finally:
+            if self._skip_nonref:
+                codec_context.skip_frame = "DEFAULT"
+        if frame is None:
+            raise EOFError(f"no frame at or after {t:.3f}s")
+
+        graph = self._graph_for(geometry)
+        graph.push(frame)
+        image = graph.pull().to_ndarray()
+        _orig_w, _orig_h, _cw, _ch, _cx, _cy, out_w, out_h = geometry
+        if image.shape != (out_h, out_w, 3):
+            raise ValueError(f"filtered frame has shape {image.shape}, expected {(out_h, out_w, 3)}")
+        return round(float(frame.pts * time_base) - self._start_sec, 6), image
+
+    def close(self) -> None:
+        self._graphs.clear()
+        self._container.close()
+
+
+class _PersistentFrameFetcher:
+    """Probe fetching through a pool of persistent PyAV containers, one per
+    probe in a batch, each seeking accurately and decoding forward.
+
+    Why accurate seeks, and not the keyframe snapping the Task 2b brief asked
+    for: a keyframe-only fetch is ~15x cheaper per probe at 4K, but the
+    reference encodes place keyframes at scene cuts, where burned-in
+    subtitles are absent or mid-fade. Measured with the detection engine on
+    every speech-guided probe, a subtitle was detected at the requested
+    times for 50.5% (XWZ 168) / 47.5% (XWZ 169) / 74% (slay) of probes, but
+    in only 3% / 3% / 22% of frames sitting exactly on a keyframe; snapping
+    each probe to the nearest keyframe inside the speech segment containing
+    it cut those hit rates to 40% / 29% / 50%, and an end-to-end run
+    halved the contributing hits. Snapping to keyframes removes the very
+    evidence the audio guidance selects for. See task-2b-report.md.
+
+    What the pool buys instead is the per-probe process and container
+    start-up that one-shot grabs pay, plus parallel decoding across
+    containers; decode-forward skips non-reference frames where that is
+    exact (NONREF_SKIP_EXACT_CODECS). Frames are pixel-identical to
+    _grab_one() at the same requested time.
+
+    Contract, same as grab_frames(): frames come back in request order,
+    failures are dropped and logged, never raised. Each returned pair is
+    (the decoded frame's own container-relative timestamp, image) -- that
+    timestamp, not the requested one, is what callers must record.
+    """
+
+    def __init__(self, video_path: str, known_dims: tuple[int, int],
+                 pool_size: int = PERSISTENT_POOL_SIZE):
+        self._video_path = video_path
+        self._dims = known_dims
+        self._decoders: list[_PersistentDecoder] = []
+        self._executor: ThreadPoolExecutor | None = None
+        try:
+            for _ in range(max(1, pool_size)):
+                self._decoders.append(_PersistentDecoder(video_path))
+        except BaseException:
+            self.close()
+            raise
+        self._executor = ThreadPoolExecutor(max_workers=len(self._decoders),
+                                            thread_name_prefix="crop-probe-fetch")
+
+    def fetch(self, times: list[float], band_frac: float,
+              target_height: int) -> tuple[list[tuple[float, np.ndarray]], tuple]:
+        """(pairs, geometry) exactly as _grab_frames_with_times() returns
+        them, except each pair carries the fetched frame's own timestamp."""
+        orig_w, orig_h = self._dims
+        geometry = (orig_w, orig_h) + _crop_geometry(orig_w, orig_h, band_frac, target_height)
+        if not times:
+            return [], geometry
+
+        results: list[tuple[float, np.ndarray] | None] = [None] * len(times)
+        n_decoders = len(self._decoders)
+
+        def work(k: int) -> None:
+            # Decoder k owns every k-th request: no decoder is ever touched
+            # by two threads at once.
+            decoder = self._decoders[k]
+            for i in range(k, len(times), n_decoders):
+                results[i] = self._grab(decoder, times[i], geometry)
+
+        list(self._executor.map(work, range(min(n_decoders, len(times)))))
+        return [r for r in results if r is not None], geometry
+
+    def _grab(self, decoder: _PersistentDecoder, t: float,
+              geometry: tuple) -> tuple[float, np.ndarray] | None:
+        try:
+            return decoder.grab(t, geometry)
+        except (av.error.FFmpegError, OSError, ValueError, EOFError) as exc:
+            logger.warning(
+                "grab_frames: failed to grab t=%.3f from %s (%s: %s)",
+                t, self._video_path, type(exc).__name__, exc,
+            )
+            return None
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        decoders, self._decoders = self._decoders, []
+        for decoder in decoders:
+            decoder.close()
+
+
+def _prefers_persistent_fetch(frame_size: tuple[int, int]) -> bool:
+    """Fetch-strategy policy: persistent containers only where they
+    measurably beat one-shot grabs.
+
+    Measured with this module's real detect_crop() on the reference files,
+    fetch time for the same 15 probes (and the same box) with the policy
+    forced each way, medians of 4 interleaved runs on a shared, loaded
+    machine: XWZ 168 (3840x2160, 10-bit HEVC) one-shot 3.33s vs persistent
+    1.09s; XWZ 169 3.47s vs 1.03s; slay (1920x888, HEVC) one-shot 0.91s vs
+    persistent 1.20s. A resolution sweep re-encoded from one XWZ scene
+    (720p..2160p, same keyframe positions and bits per pixel) had
+    persistent winning at every size, so the crossover is content-dependent
+    -- slay's longer GOPs and costlier-per-pixel decode favour one-shot
+    processes, whose ffmpeg decoders frame-thread each long decode run --
+    and the only real 1080p-class source measured favours one-shot grabs.
+    So the line sits just above 1080p: nothing at or below 1920x1080
+    changes.
+    """
+    width, height = frame_size
+    return width * height > PERSISTENT_FETCH_MIN_PIXELS
+
+
+def _open_frame_fetcher(video_path: str,
+                        known_dims: tuple[int, int]) -> _PersistentFrameFetcher | None:
+    """The persistent fetcher for this source if the policy wants one, else
+    None (one-shot grabs). If the containers cannot be opened, logs a warning
+    and returns None: one-shot grabs still work wherever the ffmpeg CLI can
+    read the file."""
+    if not _prefers_persistent_fetch(known_dims):
+        return None
+    try:
+        return _PersistentFrameFetcher(video_path, known_dims)
+    except (av.error.FFmpegError, OSError, ValueError) as exc:
+        logger.warning(
+            "%s: could not open persistent decoders (%s: %s); falling back to one-shot ffmpeg grabs",
+            video_path, type(exc).__name__, exc,
+        )
+        return None
+
+
 def grab_frames(video_path: str, times: list[float], band_frac: float = 0.55,
                  target_height: int = TARGET_HEIGHT) -> list[np.ndarray]:
-    """Parallel one-shot ffmpeg grabs, cropped to the bottom `band_frac` of
-    the frame and scaled to `target_height`, in the same order as `times`.
+    """Frames at `times`, cropped to the bottom `band_frac` of the frame and
+    scaled to `target_height`, in the same order as `times`.
 
-    Failed grabs (ffmpeg error, timeout, short read) are dropped rather
-    than raising -- a handful of unreadable probe timestamps shouldn't
-    fail the whole detection pass -- and logged via the `core.detect.crop`
-    logger.
+    Fetched by parallel one-shot ffmpeg grabs, or -- above the resolution
+    crossover, see _prefers_persistent_fetch() -- by a pool of persistent
+    containers; the frames are identical either way.
+
+    Failed grabs (decode error, timeout, short read, past the end) are
+    dropped rather than raising -- a handful of unreadable probe timestamps
+    shouldn't fail the whole detection pass -- and logged via the
+    `core.detect.crop` logger.
     """
-    pairs, _ = _grab_frames_with_times(video_path, times, band_frac, target_height)
+    if not times:
+        return []
+    known_dims = _probe_dimensions(video_path)
+    fetcher = _open_frame_fetcher(video_path, known_dims)
+    if fetcher is None:
+        pairs, _ = _grab_frames_with_times(video_path, times, band_frac, target_height,
+                                           known_dims=known_dims)
+    else:
+        try:
+            pairs, _ = fetcher.fetch(times, band_frac, target_height)
+        finally:
+            fetcher.close()
     return [frame for _, frame in pairs]
 
 
@@ -466,6 +771,24 @@ def _bounding_union(extents: list[tuple[float, float, float, float] | None],
     max_x = max(e[2] for e in accepted)
     max_y = max(e[3] for e in accepted)
     return (min_x, min_y, max_x, max_y)
+
+
+def _union_is_stable(current: tuple[float, float, float, float],
+                     anchor: tuple[float, float, float, float], frame_h: float) -> bool:
+    """Has the raw union stayed put since `anchor` -- the raw union at the
+    start of the current stable streak?
+
+    Only the vertical edges are compared, each within
+    CONVERGENCE_VERTICAL_TOLERANCE_FRAC of frame height (see that constant
+    for the measured derivation). Horizontal edges are ignored because the
+    box's width never depends on them. Growth is measured against the
+    streak's START, not the previous batch, so it is cumulative: several
+    batches each growing a little less than the tolerance cannot add up to
+    more than it and still count as stable.
+    """
+    tolerance = frame_h * CONVERGENCE_VERTICAL_TOLERANCE_FRAC
+    return (abs(current[1] - anchor[1]) <= tolerance
+            and abs(current[3] - anchor[3]) <= tolerance)
 
 
 def _cluster_by_baseline(indexed_baselines: list[tuple[int, float]], tolerance: float,
@@ -823,9 +1146,12 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
                 frame_size: tuple[int, int], settings: dict | None,
                 known_dims: tuple[int, int] | None = None,
                 cancel_check: Callable[[], bool] | None = None,
+                fetcher: _PersistentFrameFetcher | None = None,
                 ) -> tuple[list, list[float], int, list[float]]:
     """Fetch+detect `times` in PROBE_BATCH_SIZE-sized batches, stopping
-    once the raw in-band union has stopped growing for
+    once the raw in-band union has stopped growing -- its vertical edges
+    within CONVERGENCE_VERTICAL_TOLERANCE_FRAC of where they stood when the
+    stable streak began, see _union_is_stable() -- for
     CONVERGENCE_STABLE_ROUNDS consecutive batches (or just
     CONSENSUS_STABLE_ROUNDS, when an in-tolerance consensus is available --
     see the "Consensus RELAXES..." comment at the stop check below), or
@@ -891,10 +1217,19 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     looking, so a late-arriving batch is never silently skipped just for
     arriving late.
 
+    `fetcher`: the persistent-container fetcher detect_crop() opened for
+    this source (see _prefers_persistent_fetch()), or None for one-shot
+    grabs. Either way each fetched frame comes back with the time the fetch
+    layer reports for THAT frame, and that is the time recorded -- in
+    sample_pts and frame_times alike -- never the requested one. The probe
+    budget (MAX_PROBES_PER_ROUND) counts requested probes, so grabs that
+    fail still spend it.
+
     Returns (polys_per_frame, sample_pts_used, raw_hit_count, frame_times).
     Polygons are already mapped to full-frame pixel coordinates.
-    `frame_times` has one entry per entry of `polys_per_frame`, the probe
-    timestamp that produced it (for the watermark temporal-spread check).
+    `sample_pts_used` lists every frame actually fetched, in probing order.
+    `frame_times` has one entry per entry of `polys_per_frame`, the fetched
+    frame's timestamp (for the watermark temporal-spread check).
     """
     polys_per_frame: list[list] = []
     frame_times: list[float] = []
@@ -903,25 +1238,33 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     _, frame_h = frame_size
     cutoff_frac = float((settings or {}).get("bottom_half_cutoff", band_frac))
     raw_hits = 0
-    prior_union: tuple[float, float, float, float] | None = None
+    stability_anchor: tuple[float, float, float, float] | None = None
     stable_rounds = 0
+    attempted = 0
 
     times = _spread_order(times)
 
     i = 0
     while i < len(times):
-        if len(sample_pts) >= MAX_PROBES_PER_ROUND:
+        if attempted >= MAX_PROBES_PER_ROUND:
             break
         if cancel_check is not None and cancel_check():
             break
 
         chunk = times[i:i + PROBE_BATCH_SIZE]
         i += len(chunk)
+        attempted += len(chunk)
 
-        pairs, geometry = _grab_frames_with_times(
-            video_path, chunk, band_frac, TARGET_HEIGHT, known_dims=known_dims,
-        )
-        sample_pts.extend(chunk)
+        if fetcher is None:
+            pairs, geometry = _grab_frames_with_times(
+                video_path, chunk, band_frac, TARGET_HEIGHT, known_dims=known_dims,
+            )
+        else:
+            pairs, geometry = fetcher.fetch(chunk, band_frac, TARGET_HEIGHT)
+        # The time of each frame actually fetched, not the requested time:
+        # a UI seeking to a recorded timestamp must land on the frame that
+        # was analysed (Task 2b requirement 4).
+        sample_pts.extend(t for t, _frame in pairs)
         if not pairs:
             continue
         orig_w, orig_h, crop_w, crop_h, crop_x, crop_y, out_w, out_h = geometry
@@ -951,16 +1294,22 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
         extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
         raw_hits = sum(e is not None for e in extents)
 
-        # Convergence stop: has the raw union grown since the last batch?
-        # A None union (no in-band hits yet at all) is never "stable" --
-        # there's nothing to converge on, so keep probing until either a
-        # real union appears or the probe budget/candidate list runs out.
+        # Convergence stop: has the raw union grown -- beyond the tolerance,
+        # measured from the start of the current stable streak -- since the
+        # streak began? Any growth beyond it restarts the streak from the
+        # grown union (see _union_is_stable()). A None union (no in-band
+        # hits yet at all) is never "stable" -- there's nothing to converge
+        # on, so keep probing until either a real union appears or the
+        # probe budget/candidate list runs out.
         current_union = _bounding_union(extents)
-        if current_union is not None and current_union == prior_union:
+        if current_union is None:
+            stability_anchor = None
+            stable_rounds = 0
+        elif stability_anchor is not None and _union_is_stable(current_union, stability_anchor, frame_h):
             stable_rounds += 1
         else:
+            stability_anchor = current_union
             stable_rounds = 0
-        prior_union = current_union
 
         # Consensus RELAXES the convergence requirement -- it never
         # replaces it. A trustworthy cross-file consensus (>=3 already-
@@ -1008,12 +1357,15 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     one batch of one file, not only between whole files.
 
     Orchestration: vad.probe_times() picks candidate timestamps ranked by
-    likelihood of carrying dialogue -> grab_frames() fetches them in
-    batches, already cropped to the bottom band and downscaled ->
+    likelihood of carrying dialogue -> they are fetched in batches (one-shot
+    grabs, or persistent containers above the resolution crossover -- see
+    _prefers_persistent_fetch()), already cropped to the bottom band and
+    downscaled ->
     det_engine.predict() scores each frame's text polygons -> polys
     scoring >= 0.9 that also fall in-band are kept and mapped back to
     full-frame coordinates -> _run_round() stops once the raw (unfiltered)
-    union has held steady for CONVERGENCE_STABLE_ROUNDS (2) consecutive
+    union's vertical extent has held steady, within
+    CONVERGENCE_VERTICAL_TOLERANCE_FRAC, for CONVERGENCE_STABLE_ROUNDS (2) consecutive
     probe batches, or for just CONSENSUS_STABLE_ROUNDS (1) when
     `consensus` (a list of (y_frac, h_frac) from already-resolved files)
     has at least CONSENSUS_MIN_ENTRIES (3) entries and the raw union's own
@@ -1063,57 +1415,65 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         times = _uniform_probe_times(duration_sec)
         flagged = _compose_flag(flagged, FLAG_NO_SPEECH)
 
-    polys_per_frame, used, raw_hits, frame_times = _run_round(
-        video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
-        consensus=consensus, frame_size=frame_size, settings=settings, known_dims=known_dims,
-        cancel_check=cancel_check,
-    )
-    sample_pts.extend(used)
-    # Checked (and reused, not re-polled) once per round, right after that
-    # round returns: cancel_check() cutting a round short is a real,
-    # distinct reason a round found little or nothing -- composed
-    # explicitly here (FLAG_CANCELLED) rather than left to be inferred
-    # from an absent flag downstream, which is exactly how round 1's
-    # cancellation went unflagged before this (see task-3 review round 3):
-    # the round-2/round-3 entry gates below skip on `not cancelled`, so a
-    # file cancelled during round 1 with zero hits never triggered
-    # FLAG_SPEECH_PROBES_EXHAUSTED or FLAG_TOP_POSITIONED either, and
-    # nothing else was there to explain the resulting box=None.
-    cancelled = _is_cancelled(cancel_check)
-    if cancelled:
-        flagged = _compose_flag(flagged, FLAG_CANCELLED)
-
-    if raw_hits == 0 and speech_probing_available and not cancelled:
-        uniform_times = _uniform_probe_times(duration_sec)
+    # Opened once per file and shared by every round below; closed however
+    # detection ends (including an exception from the engine), since each
+    # container holds several decoded reference frames.
+    fetcher = _open_frame_fetcher(video_path, known_dims)
+    used_full_frame_retry = False
+    try:
         polys_per_frame, used, raw_hits, frame_times = _run_round(
-            video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
-            consensus=consensus, frame_size=frame_size, settings=settings,
-            known_dims=known_dims, cancel_check=cancel_check,
+            video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
+            consensus=consensus, frame_size=frame_size, settings=settings, known_dims=known_dims,
+            cancel_check=cancel_check, fetcher=fetcher,
         )
         sample_pts.extend(used)
-        flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
+        # Checked (and reused, not re-polled) once per round, right after that
+        # round returns: cancel_check() cutting a round short is a real,
+        # distinct reason a round found little or nothing -- composed
+        # explicitly here (FLAG_CANCELLED) rather than left to be inferred
+        # from an absent flag downstream, which is exactly how round 1's
+        # cancellation went unflagged before this (see task-3 review round 3):
+        # the round-2/round-3 entry gates below skip on `not cancelled`, so a
+        # file cancelled during round 1 with zero hits never triggered
+        # FLAG_SPEECH_PROBES_EXHAUSTED or FLAG_TOP_POSITIONED either, and
+        # nothing else was there to explain the resulting box=None.
         cancelled = _is_cancelled(cancel_check)
         if cancelled:
             flagged = _compose_flag(flagged, FLAG_CANCELLED)
 
-    used_full_frame_retry = False
-    if raw_hits == 0 and not cancelled:
-        retry_times = _uniform_probe_times(duration_sec) if not sample_pts else sample_pts
-        # Reuse the already-attempted timestamps for the full-frame retry
-        # rather than probing new ones -- we already know these timestamps
-        # exist in the video; band_frac=1.0 just widens what we look at.
-        retry_times = sorted(set(retry_times))
-        polys_per_frame, used, raw_hits, frame_times = _run_round(
-            video_path, retry_times, det_engine, band_frac=1.0,
-            consensus=consensus, frame_size=frame_size,
-            settings={**(settings or {}), "bottom_half_cutoff": 0.0},
-            known_dims=known_dims, cancel_check=cancel_check,
-        )
-        sample_pts.extend(used)
-        flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
-        used_full_frame_retry = True
-        if _is_cancelled(cancel_check):
-            flagged = _compose_flag(flagged, FLAG_CANCELLED)
+        if raw_hits == 0 and speech_probing_available and not cancelled:
+            uniform_times = _uniform_probe_times(duration_sec)
+            polys_per_frame, used, raw_hits, frame_times = _run_round(
+                video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
+                consensus=consensus, frame_size=frame_size, settings=settings,
+                known_dims=known_dims, cancel_check=cancel_check, fetcher=fetcher,
+            )
+            sample_pts.extend(used)
+            flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
+            cancelled = _is_cancelled(cancel_check)
+            if cancelled:
+                flagged = _compose_flag(flagged, FLAG_CANCELLED)
+
+        if raw_hits == 0 and not cancelled:
+            retry_times = _uniform_probe_times(duration_sec) if not sample_pts else sample_pts
+            # Reuse the already-attempted timestamps for the full-frame retry
+            # rather than probing new ones -- we already know these timestamps
+            # exist in the video; band_frac=1.0 just widens what we look at.
+            retry_times = sorted(set(retry_times))
+            polys_per_frame, used, raw_hits, frame_times = _run_round(
+                video_path, retry_times, det_engine, band_frac=1.0,
+                consensus=consensus, frame_size=frame_size,
+                settings={**(settings or {}), "bottom_half_cutoff": 0.0},
+                known_dims=known_dims, cancel_check=cancel_check, fetcher=fetcher,
+            )
+            sample_pts.extend(used)
+            flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
+            used_full_frame_retry = True
+            if _is_cancelled(cancel_check):
+                flagged = _compose_flag(flagged, FLAG_CANCELLED)
+    finally:
+        if fetcher is not None:
+            fetcher.close()
 
     cutoff_frac = 0.0 if used_full_frame_retry else float(
         (settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)
