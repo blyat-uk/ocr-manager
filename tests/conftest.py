@@ -73,6 +73,24 @@ def synthetic_subtitle_video(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def synthetic_audio_video(tmp_path_factory) -> Path:
+    """10 s, 320x240, with 1 kHz tone bursts at 1-3 s, 5-6 s and 8-9 s."""
+    out = tmp_path_factory.mktemp("media") / "audio.mp4"
+    bursts = "+".join([
+        "between(t,1,3)", "between(t,5,6)", "between(t,8,9)",
+    ])
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=10",
+        "-f", "lavfi", "-i", f"sine=frequency=1000:duration=10",
+        "-filter_complex", f"[1:a]volume='if({bursts},1,0)':eval=frame[a]",
+        "-map", "0:v", "-map", "[a]",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-c:a", "aac", str(out),
+    ])
+    return out
+
+
+@pytest.fixture(scope="session")
 def reference_media() -> dict:
     """Reference projects, or skip the test when they are not present."""
     manifest = json.loads((FIXTURES / "media_manifest.json").read_text())
