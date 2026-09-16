@@ -638,6 +638,13 @@ class LabelScanner:
     def _phase1_find_text_frames(self, det_engine, time_start, time_end, progress=None, cancel_event=None):
         """Sparse sampling at 720p to identify frames containing text outside dialogue region.
 
+        Every frame in the range is decoded, but only every
+        `sample_interval`-th one is converted to BGR (`read()`); the rest are
+        skipped with `grab()`. The sampled frames, their indices and their
+        PTS are identical to reading every frame and keeping every Nth
+        (pinned by tests/test_label_sampling.py). Decoding stays at native
+        resolution.
+
         Returns list of (frame_idx, pts, boxes) where boxes are in original (cropped frame) coords.
         """
         sample_interval = max(1, int(self.fps * self.SAMPLE_INTERVAL_SECONDS))
@@ -662,17 +669,20 @@ class LabelScanner:
                 if cancel_event is not None and cancel_event.is_set():
                     return text_frames
 
+                # Only process at sample intervals. Frames in between are
+                # decoded but never converted to BGR, which at 4K is most of
+                # the cost of reading them.
+                if (frame_idx - start_idx) % sample_interval != 0:
+                    cap.grab()
+                    frame_idx += 1
+                    continue
+
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     frame_idx += 1
                     continue
 
                 pts = cap.get_last_pts() if hasattr(cap, "get_last_pts") else frame_idx / self.fps
-
-                # Only process at sample intervals
-                if (frame_idx - start_idx) % sample_interval != 0:
-                    frame_idx += 1
-                    continue
 
                 # No brightness filter at detection stage
                 self._apply_label_masks(frame)

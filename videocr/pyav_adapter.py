@@ -367,6 +367,17 @@ class FFmpegNVDECCapture:
         except Exception:
             return False, None
 
+    def grab(self):
+        """Advance past the next frame (compatible with cv2.VideoCapture.grab).
+
+        Interface parity with PyAVCapture.grab. The pipe delivers every
+        frame already converted, so there is nothing to skip here: this is
+        read() with the frame discarded, keeping position and PTS exactly
+        as read() leaves them.
+        """
+        ok, _ = self.read()
+        return ok
+
     def get_last_pts(self) -> float:
         """Get estimated PTS of the last read frame in seconds."""
         return self._last_pts
@@ -812,18 +823,7 @@ class PyAVCapture:
             return ret, frame
 
         try:
-            # Check if we have a pending frame from seek
-            if hasattr(self, '_pending_frame') and self._pending_frame is not None:
-                frame = self._pending_frame
-                self._pending_frame = None
-            else:
-                frame = next(self._frame_generator)
-
-            # Store canonical PTS timestamp in seconds (ground truth for timing)
-            self._last_pts = float(frame.pts * self.stream.time_base)
-
-            # Calculate frame position from PTS (for compatibility)
-            self._pos = int(round(self._last_pts * self._fps))
+            frame = self._next_decoded()
 
             # Apply filter graph (tone mapping + scaling) if set up
             if self._filter_graph is not None:
@@ -848,6 +848,57 @@ class PyAVCapture:
             return False, None
         except Exception:
             return False, None
+
+    def grab(self):
+        """Advance past the next frame without converting it
+        (compatible with cv2.VideoCapture.grab).
+
+        The frame is still decoded -- later frames may reference it -- and
+        position/PTS advance exactly as in read(), but the frame is neither
+        pushed through the filter graph nor converted to BGR. For a 10-bit
+        4K source that conversion is most of what read() costs the calling
+        thread, so a sequential scan that only looks at every Nth frame
+        should grab() the others. The frames it does read() are
+        byte-identical to reading every frame: neither the BGR conversion
+        nor any graph this class builds (tone map, downscale, crop) carries
+        state from one frame to the next, which tests/test_label_sampling.py
+        checks for each graph configuration.
+
+        Returns:
+            bool: True if a frame was consumed, False at end of stream.
+        """
+        self._read_started = True
+        if not PYAV_AVAILABLE:
+            return self.cap.grab()
+
+        try:
+            self._next_decoded()
+            return True
+        except StopIteration:
+            return False
+        except Exception:
+            return False
+
+    def _next_decoded(self):
+        """Consume the next decoded frame -- the one a seek parked, if any --
+        and advance position/PTS to it. Shared by read() and grab() so the
+        two can never disagree about which frame comes next.
+
+        Raises StopIteration at end of stream.
+        """
+        # Check if we have a pending frame from seek
+        if getattr(self, '_pending_frame', None) is not None:
+            frame = self._pending_frame
+            self._pending_frame = None
+        else:
+            frame = next(self._frame_generator)
+
+        # Store canonical PTS timestamp in seconds (ground truth for timing)
+        self._last_pts = float(frame.pts * self.stream.time_base)
+
+        # Calculate frame position from PTS (for compatibility)
+        self._pos = int(round(self._last_pts * self._fps))
+        return frame
 
     def get_last_pts(self) -> float:
         """Get the PTS (presentation timestamp) of the last read frame in seconds.
@@ -929,6 +980,11 @@ else:
                                        (self._output_width, self._output_height),
                                        interpolation=cv2.INTER_AREA)
             return ret, frame
+        def grab(self):
+            """Interface parity with PyAVCapture.grab: advance one frame
+            without retrieving or resizing it. read() derives PTS from the
+            stream position, so the next read() is unaffected."""
+            return self.cap.grab()
         def get_last_pts(self) -> float:
             return self._last_pts
         def get_stream_start_time(self) -> float:
