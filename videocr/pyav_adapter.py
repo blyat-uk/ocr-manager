@@ -22,7 +22,8 @@ FFMPEG_AVAILABLE = shutil.which('ffmpeg') is not None and shutil.which('ffprobe'
 _TRC_SMPTE2084 = 16   # PQ (HDR10)
 _TRC_ARIB_STD_B67 = 18  # HLG
 
-_ZSCALE_AVAILABLE = None  # Lazy-cached
+_ZSCALE_AVAILABLE = None  # Lazy-cached (system ffmpeg CLI)
+_PYAV_ZSCALE_AVAILABLE = None  # Lazy-cached (PyAV's own filter registry)
 
 # Downscale 4K+ to 1080p at decode level for performance.
 # Frames arrive pre-scaled so the OCR pipeline processes the same pixel count
@@ -87,7 +88,12 @@ def _crop_axis_plan(out_dim: int, native_dim: int):
 
 
 def _has_zscale() -> bool:
-    """Check if system FFmpeg has zscale filter (requires zimg)."""
+    """Check if the *system* FFmpeg CLI has the zscale filter (requires zimg).
+
+    Only meaningful for FFmpegNVDECCapture, which shells out to that binary.
+    PyAV graphs run against the FFmpeg bundled in the `av` wheel, whose
+    filter inventory is unrelated -- use `_pyav_has_zscale()` for those.
+    """
     global _ZSCALE_AVAILABLE
     if _ZSCALE_AVAILABLE is None:
         try:
@@ -99,6 +105,27 @@ def _has_zscale() -> bool:
         except Exception:
             _ZSCALE_AVAILABLE = False
     return _ZSCALE_AVAILABLE
+
+
+def _pyav_has_zscale() -> bool:
+    """Check if PyAV's own bundled FFmpeg exposes the zscale filter.
+
+    The binary wheels for av>=18 are not built against zimg, so `zscale` is
+    absent from PyAV's registry even on machines whose system ffmpeg has it.
+    Probing the CLI instead (see `_has_zscale`) makes every HDR source build
+    a graph that cannot configure.
+    """
+    global _PYAV_ZSCALE_AVAILABLE
+    if _PYAV_ZSCALE_AVAILABLE is None:
+        if not PYAV_AVAILABLE:
+            _PYAV_ZSCALE_AVAILABLE = False
+        else:
+            try:
+                import av.filter
+                _PYAV_ZSCALE_AVAILABLE = 'zscale' in av.filter.filters_available
+            except Exception:
+                _PYAV_ZSCALE_AVAILABLE = False
+    return _PYAV_ZSCALE_AVAILABLE
 
 
 def _build_ffmpeg_tonemap_vf(transfer: str) -> str:
@@ -336,10 +363,6 @@ class FFmpegNVDECCapture:
         """Get estimated PTS of the last read frame in seconds."""
         return self._last_pts
 
-    def get_scale_factor(self):
-        """Get the downscaling factor (1.0 = no scaling, <1.0 = downscaled)."""
-        return self._scale_factor
-
     def get_stream_start_time(self) -> float:
         """Container-level start_time in seconds (0 for most MKV, non-zero for some MP4)."""
         return getattr(self, "_container_start_time", 0.0)
@@ -548,6 +571,36 @@ class PyAVCapture:
         self._crop_scaled_size = (px1 - px0, py1 - py0)
         self._crop_slice = (y - py0, y - py0 + h, x - px0, x - px0 + w)
 
+    @staticmethod
+    def _add_tonemap_chain(graph, last, trc):
+        """Append the best HDR->SDR tone-map chain PyAV can actually build.
+
+        Returns the new tail filter. The zscale variant is preferred because
+        it linearises and returns to BT.709 properly, but PyAV's bundled
+        FFmpeg usually lacks zimg; the zscale-free variant is then the same
+        chain `_build_ffmpeg_tonemap_vf` hands the subprocess backend in the
+        equivalent situation. Building the chain against PyAV's own registry
+        rather than the system ffmpeg CLI is the whole point: probing the CLI
+        made every PQ/HLG source raise inside graph.configure().
+        """
+        if _pyav_has_zscale():
+            zscale_linear_args = 't=linear:npl=100' if trc == _TRC_SMPTE2084 else 't=linear'
+            linearize = graph.add('zscale', zscale_linear_args)
+            fmt_in = graph.add('format', 'gbrpf32le')
+            tonemap = graph.add('tonemap', 'hable')
+            bt709 = graph.add('zscale', 't=bt709')
+            last.link_to(linearize)
+            linearize.link_to(fmt_in)
+            fmt_in.link_to(tonemap)
+            tonemap.link_to(bt709)
+            return bt709
+
+        fmt_in = graph.add('format', 'gbrpf32le')
+        tonemap = graph.add('tonemap', 'hable')
+        last.link_to(fmt_in)
+        fmt_in.link_to(tonemap)
+        return tonemap
+
     def _setup_filter_graph(self):
         """Build a unified PyAV filter graph for HDR tone mapping and/or downscaling."""
         needs_tonemap, trc = self._needs_tonemap, self._tonemap_trc
@@ -567,16 +620,7 @@ class PyAVCapture:
             last = buf
 
             if needs_tonemap:
-                zscale_linear_args = 't=linear:npl=100' if trc == _TRC_SMPTE2084 else 't=linear'
-                linearize = graph.add('zscale', zscale_linear_args)
-                fmt_in = graph.add('format', 'gbrpf32le')
-                tonemap = graph.add('tonemap', 'hable')
-                bt709 = graph.add('zscale', 't=bt709')
-                last.link_to(linearize)
-                linearize.link_to(fmt_in)
-                fmt_in.link_to(tonemap)
-                tonemap.link_to(bt709)
-                last = bt709
+                last = self._add_tonemap_chain(graph, last, trc)
 
             if needs_crop:
                 n_x0, n_y0, n_w, n_h = self._crop_native
@@ -605,20 +649,26 @@ class PyAVCapture:
             self._filter_graph = graph
             if needs_crop:
                 self._crop_graph_active = True
-        except Exception:
-            # Graceful fallback: proceed without filtering. Also clear the
-            # crop plan -- self._crop_slice is in downscaled *output*-space
-            # coordinates, but without the filter graph read() would hand
-            # back a *native*-resolution frame, so slicing it with those
-            # coordinates would extract the wrong region rather than an
-            # approximate one. Clearing it here keeps "refused" uniform
-            # (`_crop_slice is None`) with the planner's own refusal path,
-            # and video.py's `not getattr(v, '_crop_slice', None)` guard
-            # then does the crop in Python against the full native frame.
+        except Exception as exc:
+            # Fatal, deliberately. The graph is the only thing that honours
+            # `decode_target_height` and the only thing that tone maps, while
+            # callers (videocr/video.py) have already rescaled their crop
+            # coordinates into output space. Continuing without it would hand
+            # them native-resolution, still-HDR frames that they would then
+            # slice with stale output-space coordinates -- the wrong region of
+            # the wrong picture, silently. Reset the crop state so a caller
+            # that catches this cannot find a half-built plan.
             self._filter_graph = None
-            self._scale_factor = 1.0
             self._crop_graph_active = False
             self._crop_slice = None
+            raise RuntimeError(
+                f"Could not build the PyAV filter graph for {self.path} "
+                f"(tone map={needs_tonemap}, downscale={needs_scale}, "
+                f"crop={needs_crop}). Decoding without it would silently "
+                f"return {self._width}x{self._height} frames where "
+                f"{self._output_width}x{self._output_height} was requested. "
+                f"Refusing rather than degrading. Cause: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def __exit__(self, exc_type, exc_value, traceback):
         if not PYAV_AVAILABLE:
@@ -644,12 +694,6 @@ class PyAVCapture:
         elif prop == cv2.CAP_PROP_POS_FRAMES:
             return self._pos
         return 0
-
-    def get_scale_factor(self):
-        """Get the downscaling factor (1.0 = no scaling, <1.0 = downscaled)."""
-        if not PYAV_AVAILABLE:
-            return 1.0
-        return self._scale_factor
 
     def set(self, prop, value):
         """Set video property (compatible with cv2.VideoCapture.set)."""
@@ -715,9 +759,10 @@ class PyAVCapture:
                 img = frame.to_ndarray(format='bgr24')
 
             # `_crop_slice` is only ever set once the graph has actually
-            # cropped (see _plan_crop / _setup_filter_graph's exception
-            # handler, which clears it back to None on any refusal), so
-            # there is no "planned but inactive" case to special-case here.
+            # cropped: _plan_crop refuses unless a graph is needed anyway,
+            # and a graph that fails to build aborts __enter__ outright
+            # rather than leaving a plan behind. So there is no "planned but
+            # inactive" case to special-case here.
             if self._crop_slice is not None:
                 y0, y1, x0, x1 = self._crop_slice
                 img = img[y0:y1, x0:x1]
@@ -806,8 +851,6 @@ else:
             return ret, frame
         def get_last_pts(self) -> float:
             return self._last_pts
-        def get_scale_factor(self):
-            return self._scale_factor
         def get_stream_start_time(self) -> float:
             return 0.0  # OpenCV doesn't expose start_time
     Capture = OpenCVCapture
