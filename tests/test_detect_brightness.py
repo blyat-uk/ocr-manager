@@ -468,10 +468,12 @@ class _GlyphReadingOCR:
     def __init__(self, conf=0.99):
         self.calls = 0
         self.images = 0
+        self.batch_sizes = []
         self.conf = conf
 
     def predict(self, images):
         self.calls += 1
+        self.batch_sizes.append(len(images))
         out = []
         for img in images:
             self.images += 1
@@ -648,7 +650,10 @@ def test_top_up_stops_once_there_are_enough_text_strips(monkeypatch):
     ocr = _GlyphReadingOCR()
     B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
     assert [n for n, _ in calls] == [24, 24]
-    assert ocr.images == 16 * 7
+    # Verification OCRs 16 of the 20 text strips at the 7 thresholds that trip
+    # the gate; the dim-text check reads the other 4 there too, plus once each
+    # at their own level, in one more batch.
+    assert ocr.batch_sizes == [16 * 7, 4 * 7 + 4]
 
 
 def test_thin_evidence_after_every_round_is_flagged(monkeypatch):
@@ -1257,6 +1262,90 @@ def test_cancellation_is_polled_through_the_dim_text_check(monkeypatch, cancel_a
     assert result.flagged == ("cancelled" if cancel_at_poll else None)
     assert ocr.calls == ocr_calls
     assert sum(len(grab) for grab in grabs) == frames_fetched
+
+
+def _nineteen_text_strips(monkeypatch, dim=None):
+    """19 text strips (glyph core 250) and 5 empty ones; `dim` maps text-strip
+    indices to a dimmer glyph core. Verification's spread pick OCRs 16 of the
+    19 and skips indices 3, 9 and 15."""
+    strips = [_level_strip((dim or {}).get(i, 250)) for i in range(19)]
+    _fake_source(monkeypatch, strips + [_ramp_strip(top=200)] * 8)
+    assert sorted(set(range(19)) - set(B._spread_pick(list(range(19)), 16))) == [3, 9, 15]
+    return _fake_neighbours(monkeypatch, lambda t: [])
+
+
+@pytest.mark.parametrize("dim_at", [9, 10])   # 9: never verified; 10: verified
+def test_a_short_dim_line_is_flagged_whether_or_not_verification_picked_its_strip(monkeypatch, dim_at):
+    # Reviewer's scope scenario: 罢了 at 217, 罢 at 222, nothing from 227 up.
+    requested = _nineteen_text_strips(monkeypatch, {dim_at: 223})
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(),
+                                 _DimReadsOCR(lambda t: "罢了" if t == 217 else "罢"))
+
+    assert result.plateau == (217, 247) and result.value == 227
+    assert result.flagged == "dim-text?"
+    assert not result.auto_applicable
+    assert requested == [[100.0 + dim_at]]
+
+
+def test_clean_unverified_text_strips_raise_no_flag(monkeypatch):
+    requested = _nineteen_text_strips(monkeypatch)
+    ocr = _DimReadsOCR(lambda t: "")
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
+
+    assert result.plateau == (217, 247) and result.value == 227
+    assert result.flagged is None and result.auto_applicable
+    assert requested == []
+    assert ocr.calls == 2, "verification, then the three unverified strips in one batch"
+
+
+@pytest.mark.parametrize("dim_at, plateau, value, flagged", [
+    # never verified: its readings only feed the dim-text check
+    (9, (217, 247), 227, "dim-text?"),
+    # verified: the same strip is evidence (罢了 twice) and closes the plateau
+    (10, (217, 222), 217, "narrow-plateau?"),
+])
+def test_readings_of_unverified_strips_never_move_the_value_or_plateau(monkeypatch, dim_at, plateau, value, flagged):
+    _nineteen_text_strips(monkeypatch, {dim_at: 223})
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _DimReadsOCR(lambda t: "罢了"))
+
+    assert result.plateau == plateau and result.value == value
+    assert result.flagged == flagged
+
+
+def test_an_unverified_strip_unreadable_in_the_window_is_read_at_its_own_level(monkeypatch):
+    # Strips 9 (never verified) and 10 (verified) have glyph core 200: nothing
+    # survives anywhere in 217..252. Both read at their own level, 192 -- the
+    # unverified one speculatively, in the same batch as its grid readings.
+    requested = _nineteen_text_strips(monkeypatch, {9: 200, 10: 200})
+    ocr = _DimReadsOCR(lambda t: "旁白文字" if t == 192 else "")
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
+
+    assert result.plateau == (217, 247) and result.value == 227
+    assert result.flagged == "dim-text?"
+    assert requested == [[109.0, 110.0]]
+    assert ocr.calls == 2, "verification, then one batch: unverified grid readings and own-level reads"
+
+
+@pytest.mark.parametrize("n_dim, fetched, flagged", [
+    (8, True, None),            # at the limit: neighbours fetched, each shows the line -- fades
+    (9, False, "dim-text?"),    # over it: no fetch, straight to review
+])
+def test_too_many_candidates_go_to_review_without_fetching_neighbours(monkeypatch, n_dim, fetched, flagged):
+    # 24 text strips, n_dim of them dim (core 200, re-read at 192); every
+    # neighbour frame shows the line at full brightness.
+    strips = [_glyph_strip() for _ in range(24 - n_dim)] + [_glyph_strip(core=(200,) * 3) for _ in range(n_dim)]
+    _fake_source(monkeypatch, strips)
+    requested = _fake_neighbours(monkeypatch, lambda t: [_glyph_strip()] * 4)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _MarkedOCR())
+
+    assert result.plateau == (217, 247) and result.value == 227
+    assert result.flagged == flagged
+    assert requested == ([[100.0 + i for i in range(24 - n_dim, 24)]] if fetched else [])
 
 
 def test_text_strips_that_read_nothing_even_at_their_own_level_are_not_dim_text(monkeypatch):

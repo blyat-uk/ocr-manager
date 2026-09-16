@@ -38,16 +38,19 @@ short subtitle lines on 4 of 13 reference projects, every loss 0-10 below the
 plateau top; see PICK_BELOW_TOP.
 
 Dim-text check: the most complete reading of a line must be readable at the
-pick, on its own frame or a nearby one. For every verified text strip --
-evidence or not -- its line is its reading at the lowest threshold where it
-reads anything (or, when it reads nowhere in the window, its reading at its
-own seed threshold). When the strip's reading at the pick is not that same
-line (_same_line), it was caught mid-fade -- lost at any threshold,
+pick, on its own frame or a nearby one. For every text strip -- verified or
+not, evidence or not -- its line is its reading at the lowest threshold where
+it reads anything (or, when it reads nowhere in the window, its reading at its
+own seed threshold); strips verification did not OCR are read across its
+window for this check alone. When the strip's reading at the pick is not that
+same line (_same_line), it was caught mid-fade -- lost at any threshold,
 including a hand-tuned one -- or it is a line the pick loses for good: a
 dimmer style, a short line, or a fragment of it that won the modal. Its
 neighbour frames (+/- 0.4 and 0.8 s), masked at the pick, tell them apart:
 if any reads the same line, the line survives; otherwise the result is
-flagged "dim-text?". The check only adds a flag; it never moves the value.
+flagged "dim-text?". With more than MAX_NEIGHBOUR_CANDIDATES candidates no
+neighbour is fetched and the result is flagged outright. The check only adds
+a flag; it never moves the value or the plateau.
 
 Cheap path (`folder_plateau` given): 6 frames, analytic seed only. A seed
 inside the folder plateau is accepted and picked PICK_BELOW_TOP below itself
@@ -173,6 +176,12 @@ NEIGHBOUR_OFFSETS_SEC = (-0.8, -0.4, 0.4, 0.8)
 # load 12-21) took 3.0-3.2 s in grabs of 8, 2.9-3.0 s in one grab and
 # 3.4-3.5 s in grabs of 4.
 NEIGHBOUR_FETCH_CHUNK = 8
+# More candidates than this and no neighbour frame is fetched: every candidate
+# counts as lost and the result is flagged "dim-text?" for review. Each
+# candidate costs up to 4 neighbour frames, ~0.75 s at 4K; clutter that
+# survives only low thresholds (a burned-in HUD) can make every strip a
+# candidate, and 8 already covers twice the most any reference file needed (4).
+MAX_NEIGHBOUR_CANDIDATES = 8
 
 
 @dataclass
@@ -649,69 +658,101 @@ def verify_with_ocr(strips: list[np.ndarray], seed: int, ocr_engine
 def _dim_text_check(video_path: str, crop_box, time_ranges, strips: list[np.ndarray], times: list[float],
                     polys_per_strip, verification: _Verification, ocr_engine,
                     cancel_check: Callable[[], bool] | None = None) -> list[dict]:
-    """Check that every verified strip's most complete line is read at the pick.
+    """Check that every text strip's most complete line is read at the pick.
 
-    For each strip verification OCR'd (evidence or not):
+    For EVERY text strip -- verified or not, evidence or not:
+    - its readings across the verification grid are verification's own for
+      the strips it OCR'd. A strip it skipped (beyond VERIFY_STRIPS) is masked
+      at every grid threshold and OCR'd where the mask trips the gate, exactly
+      as verification would have -- for this check only: these readings never
+      reach the value, the plateau or any strip's modal.
     - its line is its reading at the lowest grid threshold that reads
       anything. A strip that reads nowhere in the window is masked at its own
       threshold (the seed formula applied to that strip alone) and, when that
-      trips the gate, re-read there -- all such strips in ONE OCR batch. A
-      strip still without a reading carries no text and is dropped.
-    - its reading at the pick is verification's own (gated) reading there.
+      trips the gate, read there instead; a skipped strip gets that own-level
+      mask speculatively, since its grid readings are not known yet. The
+      skipped strips' grid masks and every own-level mask go to OCR in ONE
+      batch. A strip still without a reading carries no text and is dropped.
+    - its reading at the pick is its (gated) grid reading there.
     - when that is _same_line as its line, the line survives on its own frame.
-    - otherwise the strip is a candidate: its neighbour frames are fetched,
-      masked at the PICK and, where they trip the gate, OCR'd -- all
-      candidates' neighbours in ONE batch. The line survives when any
-      neighbour reads the same line.
+    - otherwise the strip is a candidate. Up to MAX_NEIGHBOUR_CANDIDATES
+      candidates have their neighbour frames fetched, masked at the PICK and,
+      where they trip the gate, OCR'd -- all in ONE batch; a candidate's line
+      survives when any neighbour reads the same line. Over that many, no
+      neighbour is fetched and every candidate counts as lost ("capped").
 
     cancel_check is polled before each OCR batch and each neighbour grab;
     raises _Cancelled when it fires.
 
-    Returns one record per strip with a line: {index, time, threshold (where
-    the line was read), text (the line), at_pick, candidate, neighbours:
-    [(time, text read at the pick)], survives}. A record that does not
-    survive is a line the pick loses.
+    Returns one record per strip with a line: {index, time, verified,
+    threshold (where the line was read), text (the line), at_pick, candidate,
+    capped, neighbours: [(time, text read at the pick)], survives}. A record
+    that does not survive is a line the pick loses (or, capped, one that was
+    not checked further).
     """
     grid, pick = verification.grid, verification.value
     # The pick is always a grid threshold (the seed, or a plateau edge or
     # 20 below its top); were it not, nothing would count as read there.
     pick_j = grid.index(pick) if pick in grid else None
-    records, rereads = [], []
-    for k, index in enumerate(verification.chosen):
-        per_t = verification.readings[k]
-        record = dict(index=index, time=times[index], threshold=None, text="", at_pick="",
-                      candidate=False, neighbours=[], survives=True)
-        if pick_j is not None and per_t:
-            record["at_pick"] = per_t[pick_j][0]
+    verified = {index: k for k, index in enumerate(verification.chosen)}
+    empty = ("", 0.0)
+    work, batch, slots = [], [], []
+    for index, strip in enumerate(strips):
+        k = verified.get(index)
+        item = dict(index=index, readings=list(verification.readings[k]) if k is not None else [empty] * len(grid),
+                    own=None, own_text="")
+        work.append(item)
+        if k is None:
+            for j, t in enumerate(grid):
+                masked = ocr_view.mask(strip, t)
+                if ocr_view.gate_fires(masked):
+                    batch.append(masked)
+                    slots.append((item, j))
+        if k is None or not any(text for text, _ in item["readings"]):
+            level = _glyph_level(strip, polys_per_strip[index])
+            if level is not None:
+                own = _seed_from_level(level)
+                masked = ocr_view.mask(strip, own)
+                if ocr_view.gate_fires(masked):
+                    item["own"] = own
+                    batch.append(masked)
+                    slots.append((item, None))
+    if batch:
+        if _is_cancelled(cancel_check):
+            raise _Cancelled
+        for (item, j), pred in zip(slots, _ocr_predict(ocr_engine, batch)):
+            if j is None:
+                item["own_text"] = _reading(pred)[0]
+            else:
+                item["readings"][j] = _reading(pred)
+
+    records = []
+    for item in work:
+        per_t, index = item["readings"], item["index"]
+        record = dict(index=index, time=times[index], verified=index in verified, threshold=None, text="",
+                      at_pick=per_t[pick_j][0] if pick_j is not None and per_t else "",
+                      candidate=False, capped=False, neighbours=[], survives=True)
         lowest = next((j for j, (text, _) in enumerate(per_t) if text), None)
         if lowest is not None:
             record.update(threshold=grid[lowest], text=per_t[lowest][0])
+        elif item["own"] is not None and item["own_text"]:
+            record.update(threshold=item["own"], text=item["own_text"])
+        if record["text"]:
             records.append(record)
-            continue
-        level = _glyph_level(strips[index], polys_per_strip[index])
-        if level is None:
-            continue
-        own = _seed_from_level(level)
-        masked = ocr_view.mask(strips[index], own)
-        if ocr_view.gate_fires(masked):
-            record["threshold"] = own
-            records.append(record)
-            rereads.append((record, masked))
-    if rereads:
-        if _is_cancelled(cancel_check):
-            raise _Cancelled
-        for (record, _), pred in zip(rereads, _ocr_predict(ocr_engine, [masked for _, masked in rereads])):
-            record["text"] = _reading(pred)[0]
-    records = [record for record in records if record["text"]]
 
     candidates = [record for record in records if not _same_line(record["at_pick"], record["text"])]
+    for record in candidates:
+        record["candidate"] = True
     if not candidates:
+        return records
+    if len(candidates) > MAX_NEIGHBOUR_CANDIDATES:
+        for record in candidates:
+            record.update(capped=True, survives=False)
         return records
     neighbours = _neighbour_strips(video_path, crop_box, time_ranges, [record["time"] for record in candidates],
                                    cancel_check=cancel_check)
     batch, slots = [], []
     for record in candidates:
-        record["candidate"] = True
         for neighbour_time, strip in neighbours.get(record["time"], []):
             masked = ocr_view.mask(strip, pick)
             if ocr_view.gate_fires(masked):
