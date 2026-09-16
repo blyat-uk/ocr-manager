@@ -1,0 +1,47 @@
+[Script Info]
+Title: Video Subtitles
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 888
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:09:35.40,0:09:36.16,Default,,0,0,0,,其实
+Dialogue: 0,0:09:36.80,0:09:39.24,Default,,0,0,0,,我在案发之前就去过酒馆调查
+Dialogue: 0,0:09:40.24,0:09:40.92,Default,,0,0,0,,当时
+Dialogue: 0,0:09:41.32,0:09:43.60,Default,,0,0,0,,我正在追查十切鬼童的动向
+Dialogue: 0,0:09:44.16,0:09:45.04,Default,,0,0,0,,但沒想到
+Dialogue: 0,0:09:45.40,0:09:47.36,Default,,0,0,0,,见过的那个服务员会遇害
+Dialogue: 0,0:09:49.32,0:09:51.12,Default,,0,0,0,,当我再次到达现场的时候
+Dialogue: 0,0:09:51.44,0:09:52.28,Default,,0,0,0,,跟你一样
+Dialogue: 0,0:09:52.76,0:09:54.52,Default,,0,0,0,,也发现了出血的异常
+Dialogue: 0,0:09:57.12,0:09:57.88,Default,,0,0,0,,但还没来得及
+Dialogue: 0,0:09:57.88,0:09:59.24,Default,,0,0,0,,进一步收集信息
+Dialogue: 0,0:09:59.32,0:10:00.00,Default,,0,0,0,,你们就到了
+
+[Script Info]
+Title: Video Subtitles
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 888
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:14:00.00,0:14:00.24,Default,,0,0,0,,发现不明原因大量死亡的十切鬼童
+Dialogue: 0,0:14:02.16,0:14:02.60,Default,,0,0,0,,队长
+Dialogue: 0,0:14:03.00,0:14:04.68,Default,,0,0,0,,从刚才就一直联系不上七夜
+Dialogue: 0,0:14:12.20,0:14:12.56,Default,,0,0,0,,七夜
+Dialogue: 0,0:14:12.76,0:14:13.12,Default,,0,0,0,,躲开
+Dialogue: 0,0:14:20.88,0:14:22.24,Default,,0,0,0,,献祭十切鬼童
+Dialogue: 0,0:14:23.08,0:14:24.96,Default,,0,0,0,,召唤出这个川境巅峰的大家伙
+Dialogue: 0,0:14:28.52,0:14:30.00,Default,,0,0,0,,目的就是在仪式开始前拦住我们
