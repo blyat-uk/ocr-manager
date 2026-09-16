@@ -339,6 +339,32 @@ class FFmpegNVDECCapture:
             return True
         return False
 
+    def seek_to_pts(self, pts):
+        """Position the pipe so the next read()/grab() returns the first
+        frame whose PTS -- as get_last_pts() reports it -- is at or after
+        `pts` (interface parity with PyAVCapture.seek_to_pts).
+
+        This backend reports PTS as ordinal / fps + container start time,
+        where the ordinal counts frames from the start of the file (ffmpeg's
+        -ss is relative to the start time), so this inverts that. Unlike
+        set(), it also repositions to ordinal 0.
+        """
+        if not FFMPEG_AVAILABLE:
+            return self.cap.set(cv2.CAP_PROP_POS_MSEC, pts * 1000.0)
+
+        # The 1e-6 absorbs float noise when `pts` is exactly a frame's PTS.
+        ordinal = max(0, math.ceil((pts - self._container_start_time) * self._fps - 1e-6))
+        if ordinal == self._seek_pos + self._pos:
+            return True
+        if self.proc:
+            self.proc.stdout.close()
+            self.proc.terminate()
+            self.proc.wait()
+        self._start_ffmpeg(ordinal / self._fps if ordinal > 0 else None)
+        self._seek_pos = ordinal
+        self._pos = 0
+        return True
+
     def read(self):
         """Read next frame from FFmpeg pipe.
 
@@ -807,6 +833,71 @@ class PyAVCapture:
             return True
         return False
 
+    # How far before the requested PTS seek_to_pts() retries when a seek
+    # lands after it, doubling per retry.
+    _SEEK_BACKOFF_SECONDS = 1.0
+    _SEEK_MAX_RETRIES = 8
+
+    def seek_to_pts(self, pts):
+        """Position the capture so the next read()/grab() returns the first
+        frame whose PTS -- as get_last_pts() reports it -- is at or after
+        `pts`. Passing a PTS that get_last_pts() returned earlier lands on
+        exactly that frame.
+
+        set(CAP_PROP_POS_FRAMES, n) cannot promise that. It targets
+        round(PTS * fps), so on a file whose first frame is not at PTS 0 (an
+        MP4 edit list, a container start time) an index counted from the
+        first frame read names a different frame, and two frames whose
+        PTS * fps straddle a .5 map to the same position. This compares
+        float(frame.pts * time_base) -- the value get_last_pts() returns --
+        directly, and skips the frames before the target without
+        converting them, exactly as set() does.
+
+        If a seek lands *after* the target (a demuxer indexing keyframes by
+        DTS can) or yields no frame at all, it retries from further back,
+        until the first decoded frame is at or before the target or the
+        seek reaches the start of the stream.
+
+        Returns:
+            bool: True if a frame at or after `pts` exists, False at end
+                  of stream.
+        """
+        self._read_started = True
+        if not PYAV_AVAILABLE:
+            return self.cap.set(cv2.CAP_PROP_POS_MSEC, pts * 1000.0)
+
+        time_base = self.stream.time_base
+        target_ts = int(round(pts / time_base))
+        stream_start = self.stream.start_time if self.stream.start_time is not None else 0
+        backoff = max(1, int(round(self._SEEK_BACKOFF_SECONDS / time_base)))
+        seek_ts = max(target_ts, stream_start)
+        for attempt in range(self._SEEK_MAX_RETRIES + 1):
+            self.container.seek(seek_ts, stream=self.stream)
+            self._frame_generator = self.container.decode(video=0)
+            self._pending_frame = None
+            # Nothing precedes what a seek to the start of the stream
+            # decodes, and the retries are bounded.
+            may_retry = seek_ts > stream_start and attempt < self._SEEK_MAX_RETRIES
+
+            decoded_any = False
+            for frame in self._frame_generator:
+                if frame.pts is None:
+                    continue
+                frame_pts = float(frame.pts * time_base)
+                if not decoded_any and frame_pts > pts and may_retry:
+                    break  # landed after the target
+                decoded_any = True
+                if frame_pts >= pts:
+                    self._pending_frame = frame
+                    self._pos = int(round(frame_pts * self._fps))
+                    return True
+            if decoded_any or not may_retry:
+                return False  # end of stream before reaching the target
+            seek_ts = max(target_ts - backoff, stream_start)
+            backoff *= 2
+
+        return False
+
     def read(self):
         """Read next frame (compatible with cv2.VideoCapture.read).
 
@@ -985,6 +1076,13 @@ else:
             without retrieving or resizing it. read() derives PTS from the
             stream position, so the next read() is unaffected."""
             return self.cap.grab()
+        def seek_to_pts(self, pts):
+            """Interface parity with PyAVCapture.seek_to_pts. read() reports
+            PTS as the post-read position / fps, i.e. (ordinal + 1) / fps,
+            so the frame reported as `pts` is ordinal ceil(pts * fps) - 1."""
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            ordinal = max(0, math.ceil(pts * fps - 1e-6) - 1) if fps else 0
+            return self.cap.set(cv2.CAP_PROP_POS_FRAMES, ordinal)
         def get_last_pts(self) -> float:
             return self._last_pts
         def get_stream_start_time(self) -> float:

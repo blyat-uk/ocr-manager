@@ -714,11 +714,30 @@ class LabelScanner:
     # Phase 1.5: Batch OCR to annotate boxes with text
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _read_frame_at_pts(cap, pts):
+        """Read the frame whose PTS get_last_pts() reported as `pts`.
+
+        Returns the native-resolution BGR frame, or None if it cannot be
+        read or the capture lands on a frame with a different PTS: a
+        different frame is never substituted for the one asked for.
+        """
+        cap.seek_to_pts(pts)
+        ret, frame = cap.read()
+        if not ret or frame is None or cap.get_last_pts() != pts:
+            return None
+        return frame
+
     def _batch_ocr_text_frames(self, text_frames, ocr):
         """Run OCR on every Phase 1 detection box to annotate with text.
 
         Replaces each bare np.array box with {"box": np.array, "text": str|None}
         so Phase 2 can use text similarity in addition to spatial proximity.
+
+        Each frame is fetched by the PTS phase 1 recorded, not by its
+        frame_idx: phase 1 counts frame_idx from where its own read started,
+        which is not the position set(CAP_PROP_POS_FRAMES) seeks to once the
+        file has a container start time (tests/test_label_frame_identity.py).
 
         Returns augmented text_frames: [(frame_idx, pts, [{"box": ..., "text": ...}, ...]), ...]
         """
@@ -726,9 +745,8 @@ class LabelScanner:
 
         with Capture(self.video_path) as cap:
             for frame_idx, pts, boxes in text_frames:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if not ret or frame is None:
+                frame = self._read_frame_at_pts(cap, pts)
+                if frame is None:
                     # Keep boxes without text if frame unreadable
                     augmented.append((frame_idx, pts, [{"box": box, "text": None} for box in boxes]))
                     continue
