@@ -1,6 +1,7 @@
 import subprocess
 
 import av
+import cv2
 import numpy as np
 import pytest
 
@@ -142,7 +143,7 @@ def test_convergence_captures_a_two_line_subtitle_regardless_of_probe_order(monk
 
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         # Identity geometry: crop==out, no offset, so _map_poly_to_full_frame
         # passes the canned polys through unchanged for simple assertions.
         last_chunk_times[:] = times
@@ -271,7 +272,7 @@ def test_discarding_does_not_shorten_probing_relative_to_unfiltered_union(monkey
     def run(with_outlier):
         last_chunk_times: list[float] = []
 
-        def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
             last_chunk_times[:] = times
             pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
             geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -360,7 +361,7 @@ def test_consensus_relaxes_convergence_but_never_stops_on_hit_count(monkeypatch)
 
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -412,7 +413,7 @@ def test_consensus_stop_reads_the_unfiltered_union_not_a_clustered_box(monkeypat
 
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -485,7 +486,7 @@ def test_consensus_never_relaxes_toward_a_union_shorter_than_the_series(monkeypa
 
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -590,7 +591,7 @@ def test_run_round_cancel_check_stops_within_a_couple_of_batches(monkeypatch):
     2 batches worth of probes (10) should be fetched."""
     times_all = [float(t) for t in range(200)]
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
         return pairs, geometry
@@ -634,15 +635,15 @@ def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
     hit_time = 25.5
     assert hit_time in uniform_times and hit_time != uniform_times[0]
 
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [1.0, 2.0, 3.0],
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [1.0, 2.0, 3.0],
     )
 
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -677,18 +678,18 @@ def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
 def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, cancel_check=None):
     """Shared plumbing for the end-to-end box=None/flag tests below: drives
     the real detect_crop() orchestration with vad.probe_times(),
-    _probe_dimensions() and _grab_frames_with_times() faked out, and
+    _probe_source() and _grab_frames_with_times() faked out, and
     `predict_fn(t) -> (scores, polys)` controlling what the engine "sees"
     at each probed timestamp."""
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): vad_times,
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: vad_times,
     )
 
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -724,17 +725,17 @@ def _detect_crop_with_mocked_rounds(monkeypatch, round_outcomes, vad_times=None,
     number_of_run_round_calls) -- the latter lets a test assert a later
     round was never reached at all.
     """
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): (
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: (
             vad_times if vad_times is not None else [1.0, 2.0, 3.0]
         ),
     )
     calls = {"n": 0}
 
     def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
-                        settings, known_dims=None, cancel_check=None, fetcher=None):
+                        settings, known_dims=None, cancel_check=None, fetcher=None, transfer=None):
         idx = calls["n"]
         calls["n"] += 1
         assert idx < len(round_outcomes), f"_run_round called more times than scripted ({idx + 1})"
@@ -942,14 +943,14 @@ def test_safety_net_fallback_flag_fires_for_a_truly_unanticipated_no_box_path(mo
     structural post-condition just before CropResult is built must catch
     this and compose FLAG_UNKNOWN_REJECTION, and log a warning naming the
     file."""
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
-        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [1.0, 2.0, 3.0],
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [1.0, 2.0, 3.0],
     )
 
     def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
-                        settings, known_dims=None, cancel_check=None, fetcher=None):
+                        settings, known_dims=None, cancel_check=None, fetcher=None, transfer=None):
         # raw_hits > 0 so neither fallback round ever runs -- only
         # _union_extent_detailed()/aggregate_box() decide box/flag from
         # here, and those are the ones forced to "find nothing" below.
@@ -992,7 +993,7 @@ def _drive_run_round_by_rank(monkeypatch, n_candidates, polys_for_rank, consensu
     rank = {t: i for i, t in enumerate(crop._spread_order(times_all))}
     last_chunk_times: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         return pairs, (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -1140,7 +1141,7 @@ def test_failed_grabs_are_not_recorded_but_still_spend_the_probe_budget(monkeypa
     times_all = [float(t) for t in range(200)]
     requested: list[float] = []
 
-    def half_failing_grab(video_path, times, band_frac, target_height, known_dims=None):
+    def half_failing_grab(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         requested.extend(times)
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times if int(t) % 2 == 0]
         return pairs, (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
@@ -1199,12 +1200,12 @@ def _detect_crop_at_resolution(monkeypatch, dims, predict=None):
     one_shot_calls = {"n": 0}
     last_pairs: list = []
 
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: dims)
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (*dims, None))
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(requested))
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: list(requested))
     monkeypatch.setattr(crop, "_PersistentFrameFetcher", _RecordingFetcher, raising=False)
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         one_shot_calls["n"] += 1
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         last_pairs[:] = pairs
@@ -1275,13 +1276,13 @@ def test_persistent_fetcher_open_failure_falls_back_to_one_shot_grabs(monkeypatc
         def __init__(self, video_path, known_dims, pool_size=None):
             raise OSError("cannot open container")
 
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (3840, 2160))
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (3840, 2160, None))
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [float(t) for t in range(10, 40)])
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [float(t) for t in range(10, 40)])
     monkeypatch.setattr(crop, "_PersistentFrameFetcher", FailingFetcher, raising=False)
     last_chunk: list[float] = []
 
-    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None, transfer=None):
         last_chunk[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         return pairs, (3840, 2160, 3840, 2160, 0, 0, 3840, 2160)
@@ -1315,11 +1316,16 @@ def test_grab_frames_opens_no_more_persistent_containers_than_requested_times(mo
         def close(self):
             pass
 
-    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (3840, 2160))
+    monkeypatch.setattr(crop, "_probe_source", lambda video_path: (3840, 2160, None))
     monkeypatch.setattr(crop, "_PersistentFrameFetcher", CountingFetcher, raising=False)
 
     assert len(crop.grab_frames("dummy-4k.mp4", [12.0])) == 1
     assert opened == [1], f"containers opened for a single requested time: {opened}"
+
+
+def _hdr_tags(transfer):
+    return ["-vf", f"setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc",
+            "-color_trc", transfer, "-color_primaries", "bt2020", "-colorspace", "bt2020nc"]
 
 
 # Real PyAV decoding against real one-shot ffmpeg grabs, on small synthetic
@@ -1352,6 +1358,14 @@ _CLIPS = {
     "av1": dict(size="320x240", rate="25", pix_fmt="yuv420p",
                 encoders=[["-c:v", "libsvtav1", "-g", "50"],
                           ["-c:v", "libaom-av1", "-cpu-used", "8", "-g", "50"]]),
+    # HDR: the OCR pass tone-maps PQ and HLG sources (videocr.pyav_adapter),
+    # so probe frames must be tone-mapped the same way on both fetch paths.
+    "hevc10-pq": dict(size="640x360", rate="25", pix_fmt="yuv420p10le",
+                      encoders=[["-c:v", "libx265", "-x265-params", "keyint=50:bframes=4:log-level=error",
+                                 *_hdr_tags("smpte2084")]]),
+    "hevc10-hlg": dict(size="640x360", rate="25", pix_fmt="yuv420p10le",
+                       encoders=[["-c:v", "libx265", "-x265-params", "keyint=50:bframes=4:log-level=error",
+                                  *_hdr_tags("arib-std-b67")]]),
 }
 
 # Requested probe times, deliberately out of order (so a reused decoder seeks
@@ -1396,7 +1410,8 @@ def _clip(encoded_clips, name):
 
 def _one_shot(video, t, geometry):
     _w, _h, cw, ch, cx, cy, ow, oh = geometry
-    return crop._grab_one(str(video), t, cw, ch, cx, cy, ow, oh)
+    return crop._grab_one(str(video), t, cw, ch, cx, cy, ow, oh,
+                          transfer=crop._probe_source(str(video))[2])
 
 
 @pytest.mark.parametrize("pool_size", [crop.PERSISTENT_POOL_SIZE, 1])
@@ -1500,12 +1515,14 @@ def test_non_reference_skipping_stays_off_where_it_returns_a_different_frame(mon
     pytest.skip("no AV1 clip able to expose non-reference skipping could be encoded here: " + "; ".join(outcomes))
 
 
-def test_persistent_fetcher_matches_one_shot_on_10bit_hevc_with_an_odd_crop_and_a_real_downscale(encoded_clips):
+@pytest.mark.parametrize("clip", ["hevc10-ntsc-film", "hevc10-pq", "hevc10-hlg"])
+def test_persistent_fetcher_matches_one_shot_on_10bit_hevc_with_an_odd_crop_and_a_real_downscale(encoded_clips, clip):
     """The identity above only exercises a no-resampling geometry. PyAV
     bundles its own FFmpeg while one-shot grabs use the system ffmpeg, so
     guard the conversions that can drift between them: 10-bit to bgr24, an
-    odd crop height, and a real downscale."""
-    video = _clip(encoded_clips, "hevc10-ntsc-film")
+    odd crop height, and a real downscale -- and, on PQ and HLG sources, the
+    tone map."""
+    video = _clip(encoded_clips, clip)
     dims = crop._probe_dimensions(str(video))
     fetcher = crop._PersistentFrameFetcher(str(video), dims)
     try:
@@ -1519,6 +1536,106 @@ def test_persistent_fetcher_matches_one_shot_on_10bit_hevc_with_an_odd_crop_and_
         assert np.array_equal(frame, _one_shot(video, req, geometry)), (
             f"t={req}: persistent frame differs from the one-shot grab"
         )
+
+
+def _stream_transfer(video):
+    with av.open(str(video)) as container:
+        return int(container.streams.video[0].codec_context.color_trc)
+
+
+def _ocr_pass_band(video, t, geometry):
+    """The frame the OCR pass's own capture (videocr.pyav_adapter, which
+    tone-maps PQ and HLG) decodes at `t` -- the first frame at or after it,
+    the same frame a probe at `t` fetches -- cut to the probe's band and, if
+    the geometry downscales, resized to the probe's size with cv2 (so only
+    close to a probe, not identical, in that case)."""
+    from videocr.pyav_adapter import PyAVCapture
+
+    _w, _h, cw, ch, cx, cy, ow, oh = geometry
+    with PyAVCapture(str(video)) as cap:
+        assert cap._needs_tonemap, "the OCR pass does not tone-map this clip; the test would prove nothing"
+        assert cap.seek_to_pts(crop._seek_seconds(t))
+        ok, frame = cap.read()
+    assert ok
+    band = frame[cy:cy + ch, cx:cx + cw]
+    if (ow, oh) == (cw, ch):
+        return band
+    return cv2.resize(band, (ow, oh), interpolation=cv2.INTER_AREA)
+
+
+def _untone_mapped_band(video, t, geometry):
+    """The same probe decoded WITHOUT a tone map, as crop detection used to."""
+    _w, _h, cw, ch, cx, cy, ow, oh = geometry
+    return crop._grab_one(str(video), t, cw, ch, cx, cy, ow, oh)
+
+
+def _mean_abs_diff(a, b):
+    return float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean())
+
+
+HDR_TRANSFERS = {"hevc10-pq": 16, "hevc10-hlg": 18}  # AVCOL_TRC_SMPTE2084, AVCOL_TRC_ARIB_STD_B67
+
+
+@pytest.mark.parametrize("path", ["one-shot", "persistent"])
+@pytest.mark.parametrize("clip", sorted(HDR_TRANSFERS))
+def test_hdr_probe_frames_are_tone_mapped_like_the_ocr_pass(encoded_clips, clip, path):
+    """I2: spec section 11 -- detection sampling uses the OCR pass's tone-map
+    chain. Measured on synthetic PQ/HLG clips with burned-in subtitles, the
+    un-tone-mapped probes differed by 74-114 levels on >99% of pixels and
+    moved the detected box by up to 7 px (see the fetch layer's comment).
+    At a geometry with no resampling, a probe must be exactly the OCR pass's
+    tone-mapped pixels."""
+    video = _clip(encoded_clips, clip)
+    assert _stream_transfer(video) == HDR_TRANSFERS[clip], "clip is not tagged HDR; the test would prove nothing"
+    dims = crop._probe_dimensions(str(video))
+    times = [0.3, 1.37, 2.2]
+    if path == "one-shot":
+        pairs, geometry = crop._grab_frames_with_times(str(video), times, 0.55, crop.TARGET_HEIGHT)
+    else:
+        fetcher = crop._PersistentFrameFetcher(str(video), dims)
+        try:
+            pairs, geometry = fetcher.fetch(times, 0.55, crop.TARGET_HEIGHT)
+        finally:
+            fetcher.close()
+    _w, _h, cw, ch, _cx, _cy, ow, oh = geometry
+    assert (ow, oh) == (cw, ch), "expected a geometry with no resampling"
+    assert [t for t, _ in pairs] == times
+    for t, frame in pairs:
+        reference = _ocr_pass_band(video, t, geometry)
+        assert _mean_abs_diff(_untone_mapped_band(video, t, geometry), reference) > 20, (
+            "tone mapping barely changes this clip; the test would prove nothing")
+        assert np.array_equal(frame, reference), (
+            f"{clip} {path} t={t}: probe is not the OCR pass's tone-mapped frame "
+            f"(mean |diff| {_mean_abs_diff(frame, reference):.1f} levels)")
+
+
+@pytest.mark.parametrize("path", ["one-shot", "persistent"])
+@pytest.mark.parametrize("clip", sorted(HDR_TRANSFERS))
+def test_detect_crop_analyses_tone_mapped_frames_on_hdr_sources(monkeypatch, encoded_clips, clip, path):
+    """End to end: detect_crop() has to hand the engine tone-mapped probes on
+    either fetch path, including after a real downscale (a band taller than
+    the probe height)."""
+    video = _clip(encoded_clips, clip)
+    monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: path == "persistent", raising=False)
+    monkeypatch.setattr(crop, "TARGET_HEIGHT", 120)
+    monkeypatch.setattr(crop.vad, "probe_times",
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: [0.3, 1.37, 2.2])
+    engine = _FrameRecordingEngine()
+
+    result = crop.detect_crop(str(video), 3.0, engine)
+
+    assert sorted(result.sample_pts) == [0.3, 1.37, 2.2]
+    assert len(engine.analysed) == len(result.sample_pts)
+    orig_w, orig_h = crop._probe_dimensions(str(video))
+    geometry = (orig_w, orig_h) + crop._crop_geometry(orig_w, orig_h, crop.BOTTOM_HALF_CUTOFF, 120)
+    assert geometry[-1] == 120 and geometry[3] > 120, "expected a real downscale"
+    for t, analysed in zip(result.sample_pts, engine.analysed):
+        reference = _ocr_pass_band(video, t, geometry)
+        untone_mapped = _untone_mapped_band(video, t, geometry)
+        assert _mean_abs_diff(untone_mapped, reference) > 20
+        assert _mean_abs_diff(analysed, reference) < 3.0, (
+            f"{clip} {path} t={t}: analysed frame is {_mean_abs_diff(analysed, reference):.1f} levels "
+            f"from the OCR pass's tone-mapped frame (untone-mapped: {_mean_abs_diff(untone_mapped, reference):.1f})")
 
 
 class _FrameRecordingEngine:
@@ -1550,7 +1667,7 @@ def test_recorded_sample_and_hit_pts_refetch_exactly_the_analysed_frames(monkeyp
     video = _clip(encoded_clips, clip)
     monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: path == "persistent", raising=False)
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(_ROUND_TRIP_TIMES))
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: list(_ROUND_TRIP_TIMES))
     engine = _FrameRecordingEngine()
 
     result = crop.detect_crop(str(video), 3.0, engine)
@@ -1575,7 +1692,7 @@ def test_persistent_path_falls_back_to_one_shot_grabs_when_a_whole_batch_fails(m
     video = _clip(encoded_clips, "h264-bframes")
     monkeypatch.setattr(crop, "_prefers_persistent_fetch", lambda frame_size: True, raising=False)
     monkeypatch.setattr(crop.vad, "probe_times",
-                        lambda video_path, duration_sec, window_frac=(0.4, 0.6): list(_ROUND_TRIP_TIMES))
+                        lambda video_path, duration_sec, window_frac=(0.4, 0.6), cancel_check=None: list(_ROUND_TRIP_TIMES))
     attempts = {"n": 0}
 
     def undecodable(self, t, geometry):
@@ -1704,3 +1821,134 @@ def test_crop_does_not_drift_from_previously_accepted_values(reference_media, de
         )
         if nh > oh:
             print(f"{key}: box grew {oh}px -> {nh}px (expected where two-line subtitles occur)")
+
+
+# --- Which results may be applied without review ---------------------------
+
+
+def _module_flags():
+    return {value for name, value in vars(crop).items() if name.startswith("FLAG_")}
+
+
+def test_every_crop_flag_is_classified_as_informational_or_blocking():
+    """A flag added later must be classified on purpose, not default into
+    either set by omission."""
+    assert crop.INFORMATIONAL_FLAGS | crop.BLOCKING_FLAGS == _module_flags()
+    assert not crop.INFORMATIONAL_FLAGS & crop.BLOCKING_FLAGS
+    assert crop.INFORMATIONAL_FLAGS == {crop.FLAG_NO_SPEECH, crop.FLAG_SPEECH_PROBES_EXHAUSTED}
+
+
+BOX = (288, 900, 1344, 90)
+
+
+@pytest.mark.parametrize("flagged", [None, crop.FLAG_NO_SPEECH, crop.FLAG_SPEECH_PROBES_EXHAUSTED])
+def test_a_box_with_only_informational_flags_is_auto_applicable(flagged):
+    assert crop.CropResult(box=BOX, flagged=flagged).auto_applicable
+
+
+@pytest.mark.parametrize("flag", sorted({crop.FLAG_TOP_POSITIONED, crop.FLAG_LOW_AGREEMENT,
+                                          crop.FLAG_WATERMARK_UNCERTAIN, crop.FLAG_MULTIPLE_POSITIONS,
+                                          crop.FLAG_OUTLIER_DISCARDED, crop.FLAG_CANCELLED}))
+def test_a_box_with_any_blocking_flag_is_not_auto_applicable(flag):
+    assert not crop.CropResult(box=BOX, flagged=flag).auto_applicable
+    # Composed after an informational flag (the order detect_crop() composes in).
+    assert not crop.CropResult(box=BOX, flagged=f"{crop.FLAG_NO_SPEECH}+{flag}").auto_applicable
+    assert not crop.CropResult(box=BOX, flagged=f"{flag}+{crop.FLAG_SPEECH_PROBES_EXHAUSTED}").auto_applicable
+
+
+@pytest.mark.parametrize("flagged", [None, crop.FLAG_NO_SPEECH, crop.FLAG_STATIC_CONTENT,
+                                     crop.FLAG_CEILING_EXCEEDED, crop.FLAG_UNKNOWN_REJECTION])
+def test_no_box_is_never_auto_applicable(flagged):
+    assert not crop.CropResult(box=None, flagged=flagged).auto_applicable
+
+
+def test_an_unrecognised_flag_blocks():
+    assert not crop.CropResult(box=BOX, flagged="something-new?").auto_applicable
+    assert not crop.CropResult(box=BOX, flagged=f"{crop.FLAG_NO_SPEECH}+something-new?").auto_applicable
+
+
+def test_a_cancelled_detection_with_a_partial_box_is_not_auto_applicable(monkeypatch):
+    """Cancellation keeps whatever box the evidence so far gives -- possibly
+    clipped -- so the result must say it cannot be applied."""
+    calls = {"n": 0}
+
+    def cancel_after_first_batch():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    result = _detect_crop_with_fakes(
+        monkeypatch, [float(t) for t in range(20, 40)],
+        lambda t: ([1.0], [_poly(400 + int(t), 980, 1500, 1030)]),
+        cancel_check=cancel_after_first_batch,
+    )
+    assert result.box is not None and crop.FLAG_CANCELLED in result.flagged
+    assert not result.auto_applicable
+
+
+# --- Files without an audio stream ------------------------------------------
+
+
+class _BrightBoxDetector:
+    """Detection engine stand-in: one polygon around the bright pixels of
+    each frame it is given, scored 1.0; nothing on a dark frame."""
+
+    def __init__(self):
+        self.frames_seen = 0
+
+    def predict(self, frames):
+        results = []
+        for frame in frames:
+            self.frames_seen += 1
+            ys, xs = np.nonzero(frame.max(axis=2) > 128)
+            if len(xs) == 0:
+                results.append({"dt_scores": [], "dt_polys": []})
+            else:
+                results.append({"dt_scores": [1.0],
+                                "dt_polys": [_poly(xs.min(), ys.min(), xs.max(), ys.max())]})
+        return results
+
+
+def test_detect_crop_on_a_video_only_file_probes_uniformly_and_flags_no_speech(video_only_clip):
+    """A file with no audio stream at all gets what spec 7.1 promises files
+    with no speech: uniform probing over the 40-60% window, a box, and the
+    no-speech flag -- not an ffmpeg error that skips the file."""
+    engine = _BrightBoxDetector()
+    result = crop.detect_crop(str(video_only_clip), 20.0, engine)
+
+    assert result.flagged == crop.FLAG_NO_SPEECH
+    assert result.box is not None
+    _, y, _, h = result.box
+    assert y <= 300 and y + h >= 330, f"box {result.box} must contain the bar (y 300-330)"
+    uniform = set(crop._uniform_probe_times(20.0))
+    assert result.sample_pts and set(result.sample_pts) <= uniform
+    assert result.hit_pts and all(int(t) % 2 == 0 for t in result.hit_pts)
+
+
+def test_detect_crop_still_raises_when_the_audio_stream_cannot_be_decoded(undecodable_audio_clip):
+    with pytest.raises(subprocess.CalledProcessError):
+        crop.detect_crop(str(undecodable_audio_clip), 4.0, _BrightBoxDetector())
+
+
+def test_cancelling_while_audio_is_extracted_returns_a_cancelled_result_promptly(
+        synthetic_audio_video, tmp_path, monkeypatch):
+    """M6: detect_crop's cancel_check reaches audio extraction, so Cancel does
+    not wait for ffmpeg; the result is cancelled with nothing probed (not
+    no-speech, which would claim the file is silent)."""
+    import os
+    import shutil
+    import time
+
+    real = shutil.which("ffmpeg")
+    fake = tmp_path / "bin" / "ffmpeg"
+    fake.parent.mkdir()
+    fake.write_text(f'#!/bin/sh\ncase " $* " in *" -vn "*) exec sleep 8;; esac\nexec "{real}" "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+
+    started = time.monotonic()
+    result = crop.detect_crop(str(synthetic_audio_video), 10.0, _BrightBoxDetector(),
+                              cancel_check=lambda: time.monotonic() - started > 0.3)
+
+    assert time.monotonic() - started < 3.0
+    assert result.flagged == crop.FLAG_CANCELLED
+    assert result.box is None and result.probes_used == 0 and not result.auto_applicable

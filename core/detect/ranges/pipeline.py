@@ -41,7 +41,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_SEGMENT_SEC = 30.0
 # Minimum gap duration (seconds) to be considered a "keep" range.
 MIN_GAP_SEC = 5.0
-DEFAULT_WORKERS = 8
+# Fingerprinting processes: 8 at most, never more than the machine has CPUs.
+DEFAULT_WORKERS = min(8, os.cpu_count() or 1)
 CACHE_DIRNAME = ".ocr-cache"
 
 _MIN_FILES_FOR_STOP_WORDS = 10

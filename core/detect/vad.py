@@ -37,6 +37,8 @@ measurement and its most recent (rank-based probe_times()) numbers.
 from __future__ import annotations
 
 import subprocess
+import time
+from collections.abc import Callable
 
 import numpy as np
 
@@ -65,19 +67,72 @@ _MIN_SEGMENT_SEC = 0.25
 _PEAK_MIN_SEPARATION_SEC = 0.75
 _PEAK_TARGET_SPACING_SEC = 2.5
 _SILENCE_AMPLITUDE_EPS = 1e-6
+# extract_audio_window(): a bound for a hung decoder, not a performance
+# target. The longest window on the reference corpus -- 40-60% of an 84.5-min
+# movie, 1014 s of audio -- extracted in 0.47 s (20.7-min 4K episode: 0.14 s),
+# so 120 s is ~250x the worst measured case.
+AUDIO_EXTRACT_TIMEOUT_SEC = 120.0
+# How often a running extraction checks cancel_check.
+_CANCEL_POLL_SEC = 0.1
+
+
+class AudioExtractionCancelled(Exception):
+    """cancel_check fired while extract_audio_window() was running; ffmpeg was
+    stopped and nothing was returned."""
+
+
+def has_audio_stream(video_path: str) -> bool:
+    """Whether the file has at least one audio stream (decodable or not).
+
+    Raises CalledProcessError when ffprobe cannot read the file at all, so a
+    missing or corrupt file is never mistaken for a silent one. ffmpeg's own
+    exit status cannot make this distinction: extracting audio fails with
+    the same status (234) for a file with no audio stream and for one whose
+    audio stream cannot be decoded.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index", "-of", "csv=p=0", video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+    return bool(result.stdout.strip())
 
 
 def extract_audio_window(video_path: str, start_sec: float, duration_sec: float,
-                         sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Decode a window of the first audio stream as mono float32 in [-1, 1]."""
+                         sample_rate: int = SAMPLE_RATE,
+                         cancel_check: Callable[[], bool] | None = None) -> np.ndarray:
+    """Decode a window of the first audio stream as mono float32 in [-1, 1].
+
+    Raises CalledProcessError when ffmpeg fails, TimeoutExpired after
+    AUDIO_EXTRACT_TIMEOUT_SEC, and AudioExtractionCancelled once
+    `cancel_check` (polled every _CANCEL_POLL_SEC) returns truthy; ffmpeg is
+    killed in the last two cases.
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", f"{max(0.0, start_sec):.3f}", "-t", f"{max(0.0, duration_sec):.3f}",
         "-i", video_path, "-vn", "-ac", "1", "-ar", str(sample_rate),
         "-f", "s16le", "pipe:1",
     ]
-    result = subprocess.run(cmd, capture_output=True, check=True)
-    samples = np.frombuffer(result.stdout, dtype=np.int16)
+    timeout = AUDIO_EXTRACT_TIMEOUT_SEC
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        while True:
+            try:
+                # Retrying communicate() after its timeout loses no output.
+                stdout, stderr = proc.communicate(timeout=_CANCEL_POLL_SEC)
+                break
+            except subprocess.TimeoutExpired:
+                cancelled = cancel_check is not None and cancel_check()
+                if cancelled or time.monotonic() >= deadline:
+                    proc.kill()
+                    proc.communicate()
+                    if cancelled:
+                        raise AudioExtractionCancelled(video_path) from None
+                    raise subprocess.TimeoutExpired(cmd, timeout) from None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr)
+    samples = np.frombuffer(stdout, dtype=np.int16)
     return (samples.astype(np.float32) / 32768.0)
 
 
@@ -236,7 +291,8 @@ def _probe_candidates(samples: np.ndarray, sample_rate: int,
 
 
 def probe_times(video_path: str, duration_sec: float,
-                window_frac: tuple[float, float] = (0.40, 0.60)) -> list[float]:
+                window_frac: tuple[float, float] = (0.40, 0.60),
+                cancel_check: Callable[[], bool] | None = None) -> list[float]:
     """Absolute timestamps worth sampling, ranked by in-band energy.
 
     Deliberately NOT a speech/not-speech decision and deliberately does not
@@ -249,7 +305,11 @@ def probe_times(video_path: str, duration_sec: float,
     returns at least one candidate -- worst case "least bad candidate",
     never an empty result that silently loses the speedup this module
     exists to provide. Returns [] only when the window is true digital
-    silence (or degenerate: non-positive duration/window).
+    silence, when the file has no audio stream at all, or when the window
+    is degenerate (non-positive duration/window). An audio stream that
+    exists but cannot be extracted still raises (CalledProcessError), as
+    does a file ffprobe cannot read. `cancel_check` reaches the audio
+    extraction: see extract_audio_window() for it, and for its timeout.
 
     Chronological, never highest-energy-first: long high-energy spans are
     frequently music and action, not dialogue, so the consumer should see
@@ -261,6 +321,8 @@ def probe_times(video_path: str, duration_sec: float,
     length = max(0.0, duration_sec * (window_frac[1] - window_frac[0]))
     if length <= 0:
         return []
+    if not has_audio_stream(video_path):
+        return []
 
-    samples = extract_audio_window(video_path, start, length)
+    samples = extract_audio_window(video_path, start, length, cancel_check=cancel_check)
     return _probe_candidates(samples, SAMPLE_RATE, start, length)

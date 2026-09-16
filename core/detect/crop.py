@@ -54,6 +54,10 @@ import numpy as np
 
 from core.config import Config as _Config
 from core.detect import vad
+from core.detect.flags import compose_flag as _compose_flag
+from core.detect.flags import is_cancelled as _is_cancelled
+from core.detect.flags import only_informational
+from videocr.pyav_adapter import _TRC_ARIB_STD_B67, _TRC_SMPTE2084, PyAVCapture, _pyav_has_zscale
 
 logger = logging.getLogger(__name__)
 
@@ -270,8 +274,29 @@ FLAG_UNKNOWN_REJECTION = "unknown-rejection"        # structural safety net (see
                                                      # does, a specific flag is missing above it.
 
 
+# Which flags leave a box safe to apply without review -- see
+# CropResult.auto_applicable for the classification of every flag.
+INFORMATIONAL_FLAGS = frozenset({FLAG_NO_SPEECH, FLAG_SPEECH_PROBES_EXHAUSTED})
+BLOCKING_FLAGS = frozenset({
+    FLAG_TOP_POSITIONED, FLAG_CEILING_EXCEEDED, FLAG_LOW_AGREEMENT, FLAG_STATIC_CONTENT,
+    FLAG_WATERMARK_UNCERTAIN, FLAG_MULTIPLE_POSITIONS, FLAG_OUTLIER_DISCARDED, FLAG_CANCELLED,
+    FLAG_UNKNOWN_REJECTION,
+})
+
+
 @dataclass
 class CropResult:
+    """One file's crop detection.
+
+    Apply `box` without review only when `auto_applicable`. `flagged` is
+    None or FLAG_* reasons joined by "+". Cancellation (FLAG_CANCELLED) does
+    not raise: the result keeps whatever box the evidence gathered so far
+    gives, which may be clipped. The times in `sample_pts` / `hit_pts`
+    re-fetch their frames through THIS module's fetch layer (grab_frames),
+    whose pixels are not the OCR pass's, and on some sources not even its
+    frames -- see grab_frames() and core/detect/__init__.py.
+    """
+
     box: tuple[int, int, int, int] | None
     # One entry per frame actually fetched and analysed, in probing order:
     # the probe's requested time, which is a time that re-fetches exactly the
@@ -303,22 +328,106 @@ class CropResult:
     # without a second, redundant dimension probe of their own.
     frame_size: tuple[int, int] | None = None
 
+    @property
+    def auto_applicable(self) -> bool:
+        """True only when there is a box and every flag on it is
+        informational: the flag says how the probes were chosen, not that
+        the box is in doubt. An unrecognised flag blocks.
+
+        | flag                    | box     | class         | why |
+        |-------------------------|---------|---------------|-----|
+        | no-speech               | kept    | informational | No audio stream or digital silence, so probes are uniform 0.5 s steps over 40-60% -- the old detector's own probing, whose boxes were applied unreviewed. The box passes every rule below. |
+        | speech-probes-exhausted | kept    | informational | Speech-guided probes found no text, so the same uniform probing ran; same reasoning. |
+        | top-positioned?         | kept    | blocking      | From the full-frame retry, with no bottom-band cutoff: signs, titles or scene text anywhere in frame qualify. The old bottom-half detector could never return such a box. |
+        | low-agreement           | kept    | blocking      | Under LOW_AGREEMENT_HITS contributing frames: the union needs several frames to catch a second line, so the box may clip one. |
+        | static-content?         | kept    | blocking      | Same extent in every sample over too short a span to rule out a logo or watermark. |
+        | multiple-positions?     | kept    | blocking      | A second baseline cluster (a repositioned subtitle, or a lone adjacent line) was folded into the union: the box may be inflated or span two positions. |
+        | outlier-discarded?      | kept    | blocking      | A hit at a baseline nothing else shared was left out. Noise or a once-seen subtitle elsewhere -- the code cannot tell, and if it was a subtitle the box misses it. |
+        | cancelled               | partial | blocking      | Probing was cut short; the box is from partial evidence and may be clipped. |
+        | static-content          | None    | blocking      | Confirmed watermark; no box. |
+        | ceiling-exceeded        | None    | blocking      | Union taller than MAX_CROP_HEIGHT_FRAC; no box. |
+        | unknown-rejection       | None    | blocking      | Safety net: no box and no specific flag. |
+        """
+        return self.box is not None and only_informational(self.flagged, INFORMATIONAL_FLAGS)
+
 
 # --------------------------------------------------------------------------
 # ffprobe / ffmpeg plumbing
 # --------------------------------------------------------------------------
 
-def _probe_dimensions(video_path: str) -> tuple[int, int]:
-    """Return (width, height) of the first video stream via ffprobe."""
+def _probe_source(video_path: str) -> tuple[int, int, str | None]:
+    """(width, height, color_transfer) of the first video stream via ffprobe.
+    color_transfer is ffprobe's name for it ("smpte2084", "bt709", ...) or
+    None when the stream does not signal one."""
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height", "-of", "json", video_path,
+        "-show_entries", "stream=width,height,color_transfer", "-of", "json", video_path,
     ]
     result = subprocess.run(cmd, capture_output=True, check=True, text=True)
     streams = json.loads(result.stdout).get("streams", [])
     if not streams:
         raise ValueError(f"no video stream found in {video_path}")
-    return int(streams[0]["width"]), int(streams[0]["height"])
+    stream = streams[0]
+    return int(stream["width"]), int(stream["height"]), stream.get("color_transfer")
+
+
+def _probe_dimensions(video_path: str) -> tuple[int, int]:
+    """Return (width, height) of the first video stream via ffprobe."""
+    width, height, _transfer = _probe_source(video_path)
+    return width, height
+
+
+# Probe frames are tone-mapped exactly when, and exactly as, the OCR pass
+# tone-maps: PQ and HLG sources, through PyAVCapture._add_tonemap_chain()
+# (videocr/pyav_adapter.py), ahead of the crop. Spec section 11: detection
+# sampling uses the OCR pass's chain.
+#
+# Measured before this (I2; synthetic 30 s clips, burned-in white subtitles
+# over colour, light-gradient and dark scenes, converted SDR -> PQ at 100, 203
+# and 1000 nits, PQ tag-only, HLG; real TextDetection; final-fix-report.md):
+# - pixels: un-tone-mapped probes were 74-114 levels off the tone-mapped ones
+#   on over 99% of pixels (now 0.01-0.03 levels off a graph that scales
+#   before bgr24, 0.02-0.07 off PyAVCapture + cv2 resize);
+# - detect_crop() boxes moved 1-7 px on all 6 HDR clips. On the 203-nit PQ
+#   clip the box bottom sat 3 px short at 1080p and 7 px short at 2160p (the
+#   padding there is 3.2 / 6.5 px), from 9 and 8 contributing frames instead
+#   of 12. For scale: resampling differences of ~1.5 levels alone move a
+#   box 1-3 px on the SDR control, so the 1080p shifts are near the
+#   detector's own jitter; the 2160p shift and the pixel gap are not.
+# - cost: detect_crop() on the PQ clips went 0.82 -> 1.21 s (1080p) and
+#   0.73 -> 0.94 s (2160p), medians of 3 at load 6-11; SDR sources unchanged.
+_TONE_MAPPED_TRANSFERS = {"smpte2084": _TRC_SMPTE2084, "arib-std-b67": _TRC_ARIB_STD_B67}
+
+
+def _tone_map_filters(transfer: str | None) -> list[str]:
+    """ffmpeg CLI filters for the OCR pass's tone map of a `transfer` source,
+    in order; [] when the OCR pass does not tone-map it. Mirrors
+    PyAVCapture._add_tonemap_chain() filter for filter -- including its
+    choice of chain by what PyAV's bundled FFmpeg supports, not by what the
+    system ffmpeg does -- so one-shot grabs and the persistent path (which
+    calls that method itself) produce the same pixels."""
+    if transfer not in _TONE_MAPPED_TRANSFERS:
+        return []
+    if _pyav_has_zscale():
+        linear = "zscale=t=linear:npl=100" if transfer == "smpte2084" else "zscale=t=linear"
+        return [linear, "format=gbrpf32le", "tonemap=hable", "zscale=t=bt709"]
+    return ["format=gbrpf32le", "tonemap=hable"]
+
+
+def _probe_filters(crop_w: int, crop_h: int, crop_x: int, crop_y: int, out_w: int, out_h: int,
+                   transfer: str | None) -> str:
+    """The -vf chain of a one-shot grab. SDR: crop, scale (bgr24 at the
+    output). Tone-mapped: tone map, crop, bgr24, scale -- the OCR pass's
+    order (tone map ahead of the crop, scaling on bgr24)."""
+    tone_map = _tone_map_filters(transfer)
+    if not tone_map:
+        return f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={out_w}:{out_h}"
+    return ",".join(tone_map + [f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}", "format=bgr24",
+                                f"scale={out_w}:{out_h}"])
+
+
+# Default for `transfer` arguments below: probe the source for it.
+_PROBE = object()
 
 
 def _crop_geometry(orig_w: int, orig_h: int, band_frac: float,
@@ -361,8 +470,10 @@ def _seek_seconds(t: float) -> float:
 
 
 def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
-               crop_y: int, out_w: int, out_h: int) -> np.ndarray | None:
-    """Grab a single frame at time `t`, already cropped+scaled. None on failure.
+               crop_y: int, out_w: int, out_h: int, transfer: str | None = None) -> np.ndarray | None:
+    """Grab a single frame at time `t`, already cropped+scaled (and
+    tone-mapped when `transfer` is PQ or HLG, see _tone_map_filters()). None
+    on failure.
 
     Every failure mode of the ffmpeg invocation itself (missing binary,
     permission error, timeout, ...) is caught here and turned into a
@@ -375,7 +486,7 @@ def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", f"{_seek_seconds(t):.3f}", "-i", video_path,
         "-frames:v", "1",
-        "-vf", f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={out_w}:{out_h}",
+        "-vf", _probe_filters(crop_w, crop_h, crop_x, crop_y, out_w, out_h, transfer),
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]
     try:
@@ -398,6 +509,7 @@ def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
 
 def _grab_frames_with_times(video_path: str, times: list[float], band_frac: float,
                              target_height: int, known_dims: tuple[int, int] | None = None,
+                             transfer=_PROBE,
                              ) -> tuple[list[tuple[float, np.ndarray]], tuple]:
     """Implementation behind grab_frames(): parallel one-shot ffmpeg grabs,
     bounded to GRAB_POOL_SIZE concurrent processes, returning (requested
@@ -410,18 +522,27 @@ def _grab_frames_with_times(video_path: str, times: list[float], band_frac: floa
     the ffprobe re-spawn this function would otherwise do on every batch.
     grab_frames() itself never passes this, so it stays independently
     callable/testable exactly as documented.
+
+    `transfer`: the source's color_transfer as _probe_source() reports it
+    (None: not signalled), which decides the tone map; probed when not given.
     """
     if not times:
         return [], (0, 0, 0, 0, 0, 0, 0, 0)
 
-    orig_w, orig_h = known_dims if known_dims is not None else _probe_dimensions(video_path)
+    if known_dims is None or transfer is _PROBE:
+        probed_w, probed_h, probed_transfer = _probe_source(video_path)
+        if known_dims is None:
+            known_dims = (probed_w, probed_h)
+        if transfer is _PROBE:
+            transfer = probed_transfer
+    orig_w, orig_h = known_dims
     geometry = _crop_geometry(orig_w, orig_h, band_frac, target_height)
     crop_w, crop_h, crop_x, crop_y, out_w, out_h = geometry
 
     results: list[np.ndarray | None] = [None] * len(times)
     with ThreadPoolExecutor(max_workers=min(GRAB_POOL_SIZE, len(times))) as pool:
         futures = {
-            pool.submit(_grab_one, video_path, t, crop_w, crop_h, crop_x, crop_y, out_w, out_h): i
+            pool.submit(_grab_one, video_path, t, crop_w, crop_h, crop_x, crop_y, out_w, out_h, transfer): i
             for i, t in enumerate(times)
         }
         for future in futures:
@@ -462,17 +583,29 @@ class _PersistentDecoder:
             raise
 
     def _graph_for(self, geometry: tuple) -> av.filter.Graph:
+        """crop -> scale -> bgr24, the same filters as a one-shot grab
+        (_probe_filters()). A PQ or HLG stream -- decided from the stream's
+        own transfer characteristic, as PyAVCapture._detect_tonemap() does
+        for the OCR pass -- gets the OCR pass's tone map first, through
+        PyAVCapture._add_tonemap_chain() itself, then crop -> bgr24 -> scale.
+        See _TONE_MAPPED_TRANSFERS for the measurement behind it."""
         graph = self._graphs.get(geometry)
         if graph is None:
             _orig_w, _orig_h, crop_w, crop_h, crop_x, crop_y, out_w, out_h = geometry
             graph = av.filter.Graph()
-            chain = [
-                graph.add_buffer(template=self._stream),
-                graph.add("crop", f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"),
-                graph.add("scale", f"{out_w}:{out_h}"),
-                graph.add("format", "bgr24"),
-                graph.add("buffersink"),
-            ]
+            buffer = graph.add_buffer(template=self._stream)
+            trc = int(self._stream.codec_context.color_trc)
+            if trc in _TONE_MAPPED_TRANSFERS.values():
+                head = [PyAVCapture._add_tonemap_chain(graph, buffer, trc)]
+                tail = [graph.add("crop", f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"),
+                        graph.add("format", "bgr24"),
+                        graph.add("scale", f"{out_w}:{out_h}")]
+            else:
+                head = [buffer]
+                tail = [graph.add("crop", f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"),
+                        graph.add("scale", f"{out_w}:{out_h}"),
+                        graph.add("format", "bgr24")]
+            chain = head + tail + [graph.add("buffersink")]
             for upstream, downstream in zip(chain, chain[1:]):
                 upstream.link_to(downstream)
             graph.configure()
@@ -686,6 +819,17 @@ def grab_frames(video_path: str, times: list[float], band_frac: float = 0.55,
     crossover, see _prefers_persistent_fetch() -- by a pool of persistent
     containers; the frames are identical either way.
 
+    These are NOT the pixels the OCR pass sees, and on some sources not even
+    its frames: a full-width band through crop -> scale -> bgr24 (or the
+    system ffmpeg CLI), where the OCR pass decodes through
+    videocr.pyav_adapter.Capture with its own decode downscale, crop and
+    brightness mask. Measured: identical on Slay the Gods (1080p 8-bit), but
+    87-90% of pixels off by up to 13 levels on XWZ (4K 10-bit) and a
+    different frame on Jinwu Guard (h264 MKV) -- see task-4-report.md. Use
+    core.detect.ocr_view for anything that must match OCR (brightness
+    tuning or previews), and see core/detect/__init__.py for which times
+    re-fetch through which function.
+
     Failed grabs (decode error, timeout, short read, past the end) are
     dropped rather than raising -- a handful of unreadable probe timestamps
     shouldn't fail the whole detection pass -- and logged via the
@@ -693,14 +837,15 @@ def grab_frames(video_path: str, times: list[float], band_frac: float = 0.55,
     """
     if not times:
         return []
-    known_dims = _probe_dimensions(video_path)
+    orig_w, orig_h, transfer = _probe_source(video_path)
+    known_dims = (orig_w, orig_h)
     # No more containers than frames asked for: each persistent 4K decoder
     # holds several decoded reference frames.
     fetcher = _open_frame_fetcher(video_path, known_dims,
                                   pool_size=min(PERSISTENT_POOL_SIZE, len(times)))
     if fetcher is None:
         pairs, _ = _grab_frames_with_times(video_path, times, band_frac, target_height,
-                                           known_dims=known_dims)
+                                           known_dims=known_dims, transfer=transfer)
     else:
         try:
             pairs, _ = fetcher.fetch(times, band_frac, target_height)
@@ -1126,19 +1271,6 @@ def _consistent_with_consensus(y_frac: float, h_frac: float,
     return True
 
 
-def _compose_flag(existing: str | None, new: str) -> str:
-    """Combine flag reasons instead of one silently clobbering another --
-    e.g. "speech probes found nothing" AND "had to widen past the bottom
-    band" can both be true of the same result, and both are useful to a
-    reviewer deciding whether to trust the box."""
-    if not existing:
-        return new
-    parts = existing.split("+")
-    if new in parts:
-        return existing
-    return f"{existing}+{new}"
-
-
 def _spread_order(times: list[float]) -> list[float]:
     """Reorder timestamps by greedy farthest-point sampling: the earliest
     entries visited are maximally spread apart, rather than adjacent in
@@ -1192,6 +1324,7 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
                 known_dims: tuple[int, int] | None = None,
                 cancel_check: Callable[[], bool] | None = None,
                 fetcher: _PersistentFrameFetcher | None = None,
+                transfer=_PROBE,
                 ) -> tuple[list, list[float], int, list[float]]:
     """Fetch+detect `times` in PROBE_BATCH_SIZE-sized batches, stopping
     once the raw in-band union has stopped growing -- its vertical edges
@@ -1262,6 +1395,9 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     looking, so a late-arriving batch is never silently skipped just for
     arriving late.
 
+    `transfer`: the source's color_transfer (see _probe_source()), which
+    decides whether one-shot grabs tone-map; probed when not given.
+
     `fetcher`: the persistent-container fetcher detect_crop() opened for
     this source (see _prefers_persistent_fetch()), or None for one-shot
     grabs. Either way each fetched frame is recorded -- in sample_pts and
@@ -1305,6 +1441,7 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
         if fetcher is None:
             pairs, geometry = _grab_frames_with_times(
                 video_path, chunk, band_frac, TARGET_HEIGHT, known_dims=known_dims,
+                transfer=transfer,
             )
         else:
             pairs, geometry = fetcher.fetch(chunk, band_frac, TARGET_HEIGHT)
@@ -1388,17 +1525,19 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     return polys_per_frame, sample_pts, raw_hits, frame_times
 
 
-def _is_cancelled(cancel_check: Callable[[], bool] | None) -> bool:
-    return cancel_check is not None and cancel_check()
-
-
 def detect_crop(video_path: str, duration_sec: float, det_engine,
                  consensus: list[tuple[float, float]] | None = None,
                  settings: dict | None = None,
                  cancel_check: Callable[[], bool] | None = None) -> CropResult:
     """Detect the subtitle crop box for `video_path`.
 
-    `cancel_check`, if given, is a zero-argument callable polled between
+    `det_engine` must be an engine the caller holds a lease on
+    (videocr.engine_registry) for the whole call: an engine must never serve
+    two threads at once, and OCR workers run as threads in the same process.
+
+    `cancel_check`, if given, is a zero-argument callable polled while the
+    audio window is extracted (see vad.extract_audio_window(); cancelled
+    there, the result is just "cancelled", with nothing probed), between
     probe batches (see _run_round()) AND between the fallback rounds
     below, so a caller driving several files from a background thread
     (core/subtitle_detector.py) can make Cancel take effect within roughly
@@ -1450,14 +1589,21 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     tall), or "low-agreement" (a box was built, but from fewer than
     LOW_AGREEMENT_HITS contributing frames).
     """
-    known_dims = _probe_dimensions(video_path)
-    orig_w, orig_h = known_dims
+    orig_w, orig_h, transfer = _probe_source(video_path)
+    known_dims = (orig_w, orig_h)
     frame_size = (orig_w, orig_h)
 
     sample_pts: list[float] = []
     flagged: str | None = None
 
-    times = vad.probe_times(video_path, duration_sec, window_frac=(0.40, 0.60))
+    try:
+        times = vad.probe_times(video_path, duration_sec, window_frac=(0.40, 0.60),
+                                cancel_check=cancel_check)
+    except vad.AudioExtractionCancelled:
+        # Cancelled before a single probe: say so, and nothing else --
+        # falling through would compose no-speech onto a file that was
+        # never listened to.
+        return CropResult(box=None, flagged=FLAG_CANCELLED, frame_size=frame_size)
     speech_probing_available = bool(times)
     if not speech_probing_available:
         times = _uniform_probe_times(duration_sec)
@@ -1472,7 +1618,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
             consensus=consensus, frame_size=frame_size, settings=settings, known_dims=known_dims,
-            cancel_check=cancel_check, fetcher=fetcher,
+            cancel_check=cancel_check, fetcher=fetcher, transfer=transfer,
         )
         sample_pts.extend(used)
         # Checked (and reused, not re-polled) once per round, right after that
@@ -1495,6 +1641,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                 video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
                 consensus=consensus, frame_size=frame_size, settings=settings,
                 known_dims=known_dims, cancel_check=cancel_check, fetcher=fetcher,
+                transfer=transfer,
             )
             sample_pts.extend(used)
             flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
@@ -1513,6 +1660,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                 consensus=consensus, frame_size=frame_size,
                 settings={**(settings or {}), "bottom_half_cutoff": 0.0},
                 known_dims=known_dims, cancel_check=cancel_check, fetcher=fetcher,
+                transfer=transfer,
             )
             sample_pts.extend(used)
             flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)

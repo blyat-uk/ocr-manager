@@ -132,8 +132,8 @@ def _run(monkeypatch, slot_budget=PRODUCTION_SLOT_BUDGET,
                         lambda *a, **k: ocr)
     # Every call here uses the same (lang, det, rec, gpu) key, but each
     # needs its OWN fresh TaggingOCR to track just that run's frames -- the
-    # process-wide engine registry would otherwise hand back a stale engine
-    # from an earlier call in this same test session instead of the one
+    # process-wide engine pool would otherwise lease out the idle engine an
+    # earlier call in this same test returned to it, instead of the one
     # just monkeypatched in above. conftest.py's autouse reset only runs
     # between TESTS, not between the several _run() calls one test makes
     # (test_admitted_candidates_are_identical_across_batch_sizes calls this

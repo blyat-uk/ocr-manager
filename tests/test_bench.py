@@ -29,3 +29,50 @@ def test_compare_handles_a_metric_missing_from_before():
     after = {"crop": {"slay": Measurement(seconds=1.0).as_dict()}}
     table = compare(before, after)  # brightness detection has no "before" at all
     assert "new" in table.lower()
+
+
+# --- What the suites count (M4) -----------------------------------------------
+
+
+def test_ocr_instrumentation_counts_frames_decoded_by_grab_as_well_as_read(synthetic_video):
+    """Label phase 1 decodes most frames with grab() and converts only the
+    sampled ones with read(); "frames decoded" must count both."""
+    from tools.bench import _install_ocr_instrumentation
+    from videocr import pyav_adapter
+
+    stats, restore = _install_ocr_instrumentation()
+    try:
+        with pyav_adapter.Capture(str(synthetic_video)) as cap:
+            assert cap.read()[0]
+            assert cap.grab()
+            assert cap.grab()
+            assert cap.read()[0]
+    finally:
+        restore()
+    assert stats["frames_decoded"] == 4
+
+
+def test_crop_suite_reports_the_probes_detection_used(monkeypatch, synthetic_video, tmp_path):
+    """The crop detector fetches probes through its own fetch layer, never
+    Capture.read(), so counting reads always reported 0: the count must be
+    the detector's own CropResult.probes_used."""
+    from core import subtitle_detector
+    from core.detect.crop import CropResult
+    from tools import bench
+
+    monkeypatch.setattr("videocr.utils.create_detection_engine", lambda det_model_dir, use_gpu: object())
+    monkeypatch.setattr(
+        subtitle_detector, "detect_crop",
+        lambda video_path, duration_sec, det_engine, consensus=None, settings=None, cancel_check=None:
+            CropResult(box=(10, 200, 300, 30), sample_pts=[0.1] * 13, hit_pts=[0.1], agreed=5,
+                       probes_used=13, flagged="low-agreement", frame_size=(320, 240)))
+
+    entry = {"video": synthetic_video, "dir": tmp_path}
+    result = bench._run_crop_case("synthetic", entry)
+
+    assert result is not None
+    assert result["extra"]["probes"] == 13
+    assert result["extra"]["detected"] == {"x": 10, "y": 200, "width": 300, "height": 30}
+    # A box withheld from the UI for review is still a measured detection.
+    assert result["extra"]["flagged"] == "low-agreement"
+    assert result["extra"]["auto_applicable"] is False

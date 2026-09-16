@@ -76,6 +76,9 @@ from rapidfuzz.distance import Levenshtein
 
 from core.config import Config as _Config
 from core.detect import ocr_view
+from core.detect.flags import compose_flag as _compose_flag
+from core.detect.flags import is_cancelled as _is_cancelled
+from core.detect.flags import only_informational
 from videocr import utils as _videocr_utils
 from videocr.models import PredictedFrames
 
@@ -120,7 +123,11 @@ SEED_MARGIN = 8
 SEED_MIN, SEED_MAX = 100, 245
 POLY_ERODE_KERNEL = 3             # 1px erosion keeps polygon-edge background out
 MIN_GLYPH_REGION_PIXELS = 50      # fewer eroded-polygon pixels than this: no Otsu
-IMPLAUSIBLE_SEED = 150            # below this the min-channel model is broken (coloured text)
+# Below this the min-channel model is broken (coloured text). Spike value,
+# uncalibrated: the task brief's "< 150", also the floor of the spike's search
+# range; not swept, only validated as part of the whole pipeline on the
+# reference corpus (task-4-report.md).
+IMPLAUSIBLE_SEED = 150
 
 # --- Gate floor
 GATE_QUIET_PERCENT = 95
@@ -132,6 +139,10 @@ VERIFY_HALF_WINDOW = 25
 VERIFY_STEP = 5
 # A threshold is valid when its agreement is within this of the best
 # threshold's agreement AND the mean confidence clears MIN_MEAN_CONFIDENCE.
+# Both are spike values, uncalibrated: the defaults of the brightness spike's
+# verifier (tol=0.02, minconf=0.97), carried over unchanged; neither was swept.
+# They are validated only as part of the whole pipeline -- 13 reference
+# projects, real OCR pass A/B (task-4-report.md) -- not individually.
 AGREEMENT_TOLERANCE = 0.02
 MIN_MEAN_CONFIDENCE = 0.97
 # A strip is evidence only when its modal reading is supported by this many
@@ -154,7 +165,7 @@ MIN_READING_REPEATS = 2
 PICK_BELOW_TOP = 20
 
 # --- BrightnessResult.flagged reasons, composed with "+" (like core.detect.crop).
-# Only FLAG_NO_CLEAN_THRESHOLD on its own leaves a result auto-applicable.
+# Only FLAG_NO_CLEAN_THRESHOLD (INFORMATIONAL_FLAGS) leaves a result auto-applicable.
 FLAG_NO_CLEAN_THRESHOLD = "no-clean-threshold"  # informational: empty frames trip the gate at the pick
 FLAG_NEEDS_CROP = "needs-crop"              # no crop box: nothing measured
 FLAG_RANGES_EMPTY = "ranges-empty?"         # keep ranges select nothing in the file: nothing measured
@@ -166,6 +177,7 @@ FLAG_NARROW_PLATEAU = "narrow-plateau?"     # plateau narrower than PICK_BELOW_T
 FLAG_DIM_TEXT = "dim-text?"                 # a strip's most complete line is not read at the pick, nor nearby
 FLAG_ESCALATE = "escalate"                  # cheap path: seed outside the folder plateau (or no text)
 FLAG_CANCELLED = "cancelled"                # cancel_check fired: result incomplete
+INFORMATIONAL_FLAGS = frozenset({FLAG_NO_CLEAN_THRESHOLD})
 
 # --- Dim-text check
 # Neighbour frames checked around a strip whose line the pick loses, in seconds.
@@ -180,7 +192,8 @@ NEIGHBOUR_FETCH_CHUNK = 8
 # counts as lost and the result is flagged "dim-text?" for review. Each
 # candidate costs up to 4 neighbour frames, ~0.75 s at 4K; clutter that
 # survives only low thresholds (a burned-in HUD) can make every strip a
-# candidate, and 8 already covers twice the most any reference file needed (4).
+# candidate. The most any reference file needed is 5 (XWZ 170 and 172), so 8
+# leaves 3 candidates of headroom, not double.
 MAX_NEIGHBOUR_CANDIDATES = 8
 
 
@@ -222,18 +235,7 @@ class BrightnessResult:
         value was not measured, not verified, or not safe: needs-crop,
         ranges-empty?, no-text, thin-evidence?, coloured-text?, no-plateau?,
         narrow-plateau?, dim-text?, escalate, cancelled."""
-        return self.flagged is None or self.flagged == FLAG_NO_CLEAN_THRESHOLD
-
-
-def _compose_flag(existing: str | None, new: str) -> str:
-    if not existing:
-        return new
-    parts = existing.split("+")
-    return existing if new in parts else f"{existing}+{new}"
-
-
-def _is_cancelled(cancel_check: Callable[[], bool] | None) -> bool:
-    return cancel_check is not None and bool(cancel_check())
+        return only_informational(self.flagged, INFORMATIONAL_FLAGS)
 
 
 class _Cancelled(Exception):
@@ -780,8 +782,9 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
     `crop_box` is the file's (x, y, w, h) in native pixels, as the OCR pass
     takes it. `time_ranges` are the file's keep ranges as (start, end) pairs
     ("MM:SS" strings, seconds, or None for open ends) or {"start", "end"}
-    mappings, or None. Engines are passed in (detection-only and full OCR) so
-    a process-wide engine cache can supply them.
+    mappings, or None. Engines are passed in (detection-only and full OCR);
+    the caller must hold a lease on both (videocr.engine_registry) for the
+    whole call, since an engine must never serve two threads at once.
 
     With `folder_plateau` this is the cheap path: 6 frames, analytic seed
     only. A seed inside the plateau gives the value seed - PICK_BELOW_TOP,

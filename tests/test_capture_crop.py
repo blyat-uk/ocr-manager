@@ -348,7 +348,7 @@ def test_run_ocr_turns_on_the_graph_crop_for_a_downscaled_source(tmp_path, monke
         def predict(self, batch):
             return [[] for _ in batch]
 
-    monkeypatch.setattr(engine_registry, "get_ocr_engine",
+    monkeypatch.setattr(engine_registry, "_build_ocr_engine",
                         lambda *a, **k: _DummyEngine())
 
     v = Video(str(src), None, None)

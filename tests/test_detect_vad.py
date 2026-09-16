@@ -1,3 +1,8 @@
+import os
+import shutil
+import subprocess
+import time
+
 import numpy as np
 import pytest
 
@@ -196,3 +201,78 @@ def test_probe_candidates_never_empty_for_nonsilent_audio(samples, label):
 
 def test_probe_candidates_empty_only_for_true_digital_silence():
     assert vad._probe_candidates(_silence(3.0), SR, start=0.0, length=3.0) == []
+
+
+# --- Files without usable audio ---------------------------------------------
+
+
+def test_probe_times_is_empty_for_a_file_with_no_audio_stream(video_only_clip):
+    """No audio stream means nothing to rank, exactly like digital silence:
+    [] sends crop detection to uniform probing with the no-speech flag,
+    instead of an ffmpeg error that skips the file."""
+    assert vad.probe_times(str(video_only_clip), duration_sec=20.0) == []
+
+
+def test_has_audio_stream_tells_video_only_files_from_files_with_audio(
+        video_only_clip, synthetic_audio_video, undecodable_audio_clip):
+    assert vad.has_audio_stream(str(video_only_clip)) is False
+    assert vad.has_audio_stream(str(synthetic_audio_video)) is True
+    assert vad.has_audio_stream(str(undecodable_audio_clip)) is True
+
+
+def test_an_audio_stream_that_cannot_be_decoded_still_raises(undecodable_audio_clip):
+    """Only a MISSING audio stream is a normal outcome. An audio stream that
+    is there but cannot be extracted is a real failure and must surface."""
+    with pytest.raises(subprocess.CalledProcessError):
+        vad.probe_times(str(undecodable_audio_clip), duration_sec=4.0)
+
+
+def test_probing_a_file_that_cannot_be_opened_raises(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError):
+        vad.probe_times(str(tmp_path / "missing.mp4"), duration_sec=20.0)
+
+
+# --- Audio extraction is bounded and cancellable (M6) -----------------------
+
+
+@pytest.fixture
+def hanging_audio_ffmpeg(tmp_path, monkeypatch):
+    """Puts an `ffmpeg` first on PATH that hangs (sleeps 8 s) when asked to
+    extract audio (-vn) and runs the real ffmpeg otherwise."""
+    real = shutil.which("ffmpeg")
+    fake = tmp_path / "bin" / "ffmpeg"
+    fake.parent.mkdir()
+    fake.write_text(f'#!/bin/sh\ncase " $* " in *" -vn "*) exec sleep 8;; esac\nexec "{real}" "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+    return fake
+
+
+def test_extract_audio_window_gives_up_at_its_timeout(synthetic_audio_video, hanging_audio_ffmpeg, monkeypatch):
+    monkeypatch.setattr(vad, "AUDIO_EXTRACT_TIMEOUT_SEC", 0.5, raising=False)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        vad.extract_audio_window(str(synthetic_audio_video), 0.0, 2.0)
+    assert time.monotonic() - started < 3.0
+
+
+def test_extract_audio_window_stops_promptly_when_cancelled(synthetic_audio_video, hanging_audio_ffmpeg):
+    started = time.monotonic()
+    with pytest.raises(vad.AudioExtractionCancelled):
+        vad.extract_audio_window(str(synthetic_audio_video), 0.0, 2.0,
+                                 cancel_check=lambda: time.monotonic() - started > 0.3)
+    assert time.monotonic() - started < 3.0
+
+
+def test_probe_times_passes_cancellation_through(synthetic_audio_video, hanging_audio_ffmpeg):
+    started = time.monotonic()
+    with pytest.raises(vad.AudioExtractionCancelled):
+        vad.probe_times(str(synthetic_audio_video), 10.0,
+                        cancel_check=lambda: time.monotonic() - started > 0.3)
+    assert time.monotonic() - started < 3.0
+
+
+def test_a_cancel_check_that_never_fires_changes_nothing(synthetic_audio_video):
+    assert vad.probe_times(str(synthetic_audio_video), 10.0, window_frac=(0.0, 1.0),
+                           cancel_check=lambda: False) == \
+        vad.probe_times(str(synthetic_audio_video), 10.0, window_frac=(0.0, 1.0))
