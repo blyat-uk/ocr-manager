@@ -37,7 +37,10 @@ import json
 import logging
 import os
 import subprocess
+import threading
+import time
 import wave
+from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
@@ -1282,6 +1285,146 @@ def test_pool_start_failure_falls_back_to_serial_fingerprinting_with_identical_o
     assert list(serial.items()) == list(pooled.items())
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, f"expected exactly one warning, got {[r.message for r in warnings]}"
+
+
+class _CrashAfterFirstExecutor:
+    """Fake ProcessPoolExecutor: the first submission's future resolves for
+    real (`fn` is called synchronously, inline), and every later
+    submission's future raises BrokenProcessPool only once its result is
+    actually collected, on a short delay -- simulating a worker that died
+    (e.g. OOM-killed) partway through a batch, after at least one file had
+    already come back successfully. No real subprocess involved, so
+    monkeypatching fingerprint.fingerprint_file in the test process
+    actually takes effect (a real pool would re-import it fresh in each
+    worker, defeating the monkeypatch)."""
+
+    def __init__(self, *a, **kw):
+        self._n = 0
+
+    def submit(self, fn, *args, **kwargs):
+        index = self._n
+        self._n += 1
+        future = Future()
+        if index == 0:
+            future.set_result(fn(*args, **kwargs))
+        else:
+            def _break_later():
+                time.sleep(0.05)
+                future.set_exception(BrokenProcessPool("worker died"))
+            threading.Thread(target=_break_later, daemon=True).start()
+        return future
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
+def test_pool_crash_mid_run_falls_back_only_for_unfinished_files(
+    synthetic_episodes, monkeypatch, caplog,
+):
+    """Task-6 review, Important finding 1/2a: a BrokenProcessPool surfacing
+    while COLLECTING results (not at pool start-up) -- e.g. a worker
+    process OOM-killed after finishing some files -- must fall back to
+    serial fingerprinting for only the files not yet finished, log a
+    DISTINCT "crashed after N of M" warning (not the generic "pool
+    unavailable" one used for a pool that never started), and still
+    produce output identical to a clean pooled run with each file
+    fingerprinted exactly once (no file redone after it already succeeded
+    through the pool).
+    """
+    files2 = synthetic_episodes[:2]
+    pooled = pl.analyse(_entries(files2), _SYNTH_CFG, cache_dir=None, workers=2)
+    assert pooled
+
+    real_fingerprint_file = fp.fingerprint_file
+    calls = []
+
+    def counting_fingerprint_file(path, cfg):
+        calls.append(os.path.basename(path))
+        return real_fingerprint_file(path, cfg)
+
+    monkeypatch.setattr(fp, "fingerprint_file", counting_fingerprint_file)
+    monkeypatch.setattr(pl, "ProcessPoolExecutor", lambda *a, **kw: _CrashAfterFirstExecutor())
+
+    with caplog.at_level(logging.WARNING):
+        result = pl.analyse(_entries(files2), _SYNTH_CFG, cache_dir=None, workers=2)
+
+    assert list(result.items()) == list(pooled.items())
+    assert sorted(calls) == sorted(p.name for p in files2), (
+        f"each file must be fingerprinted exactly once, got {calls}"
+    )
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {[r.message for r in warnings]}"
+    assert "crashed after 1 of 2" in warnings[0].message, (
+        f"expected a distinct 'crashed after N of M' warning, got: {warnings[0].message!r}"
+    )
+
+
+class _ImmediateExecutor:
+    """Fake ProcessPoolExecutor whose submit() runs `fn` synchronously and
+    stores whatever it returns or raises on a real Future -- this models a
+    real ProcessPoolExecutor's contract (the callable's own exception
+    surfaces from future.result(), never from submit() itself) without an
+    actual subprocess, so a per-file exception can be injected via a
+    monkeypatched fingerprint_file and still observed exactly as
+    future.result() would deliver it."""
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - mirrors future.set_exception's own contract
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+        return future
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
+def test_genuine_per_file_worker_exception_propagates_without_a_fallback(
+    synthetic_episodes, monkeypatch, caplog,
+):
+    """Task-6 review, Important finding 1/2b: an exception raised BY THE
+    FINGERPRINT FUNCTION inside a worker -- e.g. FileNotFoundError when
+    ffmpeg is missing, or any other OSError from a bad file -- must
+    propagate to the caller unchanged, exactly as before Task 6: no
+    fallback warning, and no serial retry (the previous wide
+    `except (ValueError, OSError, BrokenProcessPool)` around the whole
+    submit+collect loop misclassified this as "pool unavailable" only
+    because FileNotFoundError is an OSError subclass).
+    """
+    files2 = synthetic_episodes[:2]
+    culprit = files2[1].name
+    real_fingerprint_file = fp.fingerprint_file
+    calls = []
+
+    def flaky_fingerprint_file(path, cfg):
+        calls.append(os.path.basename(path))
+        if os.path.basename(path) == culprit:
+            raise FileNotFoundError("ffmpeg binary not found")
+        return real_fingerprint_file(path, cfg)
+
+    monkeypatch.setattr(fp, "fingerprint_file", flaky_fingerprint_file)
+    monkeypatch.setattr(pl, "ProcessPoolExecutor", lambda *a, **kw: _ImmediateExecutor())
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(FileNotFoundError, match="ffmpeg binary not found"):
+            pl.analyse(_entries(files2), _SYNTH_CFG, cache_dir=None, workers=2)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, (
+        f"a genuine per-file worker exception must not log any fallback warning, got: "
+        f"{[r.message for r in warnings]}"
+    )
+    assert calls.count(culprit) == 1, (
+        f"the failing file must not be retried after a genuine worker exception, "
+        f"called {calls.count(culprit)} times"
+    )
 
 
 def test_fingerprint_params_cover_every_field_that_changes_fingerprints():

@@ -242,39 +242,71 @@ def ingest(
             _check_cancel(cancel)
             finish(i, fingerprint.fingerprint_file(files[i].path, cfg), from_cache=False)
     elif misses:
+        # Two separate try/except boundaries, deliberately: a failure
+        # creating/starting the pool (or submitting to it) means "the pool
+        # never ran anything" -- fully safe to retry every miss serially.
+        # A failure surfacing later, while collecting results, could mean
+        # one of two very different things, and they must not be conflated:
+        # a BrokenProcessPool (a worker process died, e.g. OOM-killed) is
+        # still an infrastructure failure -- fall back for whatever is not
+        # yet finished. Any OTHER exception from future.result() is the
+        # fingerprint function's own exception for that one file (a real
+        # decode/IO error, possibly an OSError subclass like
+        # FileNotFoundError) -- that must propagate exactly as it did
+        # before this fallback existed, with no fallback warning and no
+        # retry, or a real per-file error would be silently retried and
+        # misreported as "the pool is unavailable."
         pool = None
         try:
             pool = ProcessPoolExecutor(max_workers=min(workers, len(misses)), mp_context=_pool_context())
             pending = {pool.submit(fingerprint.fingerprint_file, files[i].path, cfg): i for i in misses}
-            while pending:
-                _check_cancel(cancel)
-                completed, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    finish(pending.pop(future), future.result(), from_cache=False)
         except (ValueError, OSError, BrokenProcessPool) as exc:
-            # The process pool itself could not start (e.g. ValueError from
-            # get_context("forkserver") on a platform without it, an OSError
-            # spawning the forkserver process, or a BrokenProcessPool
-            # detected at start-up). Fall back to fingerprinting whatever is
-            # still missing serially, in-process, with the exact same
-            # function -- identical fingerprints, just no parallelism.
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
-                pool = None
+            pool = None
             logger.warning(
-                "Process pool unavailable (%s: %s); falling back to serial fingerprinting.",
+                "Process pool could not start (%s: %s); falling back to serial fingerprinting.",
                 type(exc).__name__, exc,
             )
-            for i in misses:
-                if hashes[i] is None:
-                    _check_cancel(cancel)
-                    finish(i, fingerprint.fingerprint_file(files[i].path, cfg), from_cache=False)
         except BaseException:
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
             raise
-        else:
-            pool.shutdown(wait=True)
+
+        if pool is not None:
+            try:
+                while pending:
+                    _check_cancel(cancel)
+                    completed, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        finish(pending.pop(future), future.result(), from_cache=False)
+            except BrokenProcessPool as exc:
+                pool.shutdown(wait=False, cancel_futures=True)
+                finished_count = sum(1 for i in misses if hashes[i] is not None)
+                logger.warning(
+                    "Process pool crashed after %d of %d files (%s); falling back to serial "
+                    "fingerprinting for the rest.",
+                    finished_count, len(misses), exc,
+                )
+            except BaseException:
+                # Anything else here is the fingerprint function's OWN
+                # exception for one file (surfaced via future.result()),
+                # not a pool infrastructure failure -- shut down and
+                # propagate unchanged, exactly as before this fallback
+                # existed. No fallback warning, no retry.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
+
+        # Reached when the pool never started, or broke mid-run: fingerprint
+        # whatever is still missing serially, in-process, with the exact
+        # same function -- identical fingerprints, just no parallelism. A
+        # no-op when every miss already finished through the pool.
+        for i in misses:
+            if hashes[i] is None:
+                _check_cancel(cancel)
+                finish(i, fingerprint.fingerprint_file(files[i].path, cfg), from_cache=False)
 
     return hashes, durations  # type: ignore[return-value]
 
