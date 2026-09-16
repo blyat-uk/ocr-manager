@@ -128,24 +128,34 @@ CONVERGENCE_STABLE_ROUNDS = 2
 MAX_PROBES_PER_ROUND = 30
 CONSENSUS_Y_DEVIATION_FRAC = 0.10
 CONSENSUS_MAX_HEIGHT_RATIO = 1.5
-# Within-file outlier rejection: "the union consumes every accepted hit"
-# (see _run_round()) is only safe once probing goes deep enough to
-# meaningfully converge (up to MAX_PROBES_PER_ROUND), because that depth
-# makes it likely to eventually see at least one spurious OCR detection
-# somewhere else in the accepted vertical band -- a background sign, a
-# compression artifact, a genuine OCR misfire -- across dozens of probes.
-# Reproduced directly: one such frame moved slay's drift-guard dy from 3px
-# to 162px by itself. Real subtitle text is remarkably stable in
-# Y-POSITION across a single video's own frames (height is NOT used here --
-# see _reject_position_outliers()'s docstring for why a height check
-# would fight the union rule itself); a hit whose vertical center
-# deviates sharply from the median of everything else accepted so far is
-# treated as noise and excluded, mirroring the tolerance philosophy of the
-# old detector (and this module's own cross-file consensus check, above),
-# applied within a single file's own accumulated hits instead of across
-# files.
-OUTLIER_Y_DEVIATION_FRAC = 0.10
-OUTLIER_MIN_REFERENCE_SAMPLES = 3  # need at least this many accepted hits before judging outliers at all
+# Baseline clustering (round 5, replacing round 4's Y-centre outlier
+# rejection -- see _cluster_by_baseline()'s docstring for why Y-centre
+# alone provably rejects genuine content, e.g. a subtitle deliberately
+# repositioned to avoid on-screen graphics, not just noise).
+#
+# Subtitles share a BOTTOM edge (baseline); a second line extends the box
+# upward from that same baseline. A spurious detection elsewhere in the
+# accepted band has a genuinely different baseline. So: group accepted
+# extents by bottom edge within BASELINE_CLUSTER_TOLERANCE_FRAC, and treat
+# the largest cluster as the real subtitle position -- but only once that
+# cluster has recurred at least BASELINE_CLUSTER_MIN_DOMINANT_SIZE times.
+# That minimum-size gate (not just "largest of whatever's seen so far")
+# is what keeps this safe at small sample counts: 2 unrelated noise
+# detections that happen to cluster together must not out-vote 1 genuine
+# hit just by being a 2 vs 1 majority -- real subtitle text recurs at the
+# identical baseline far more reliably than noise does, so requiring the
+# SAME baseline to reappear this many times before trusting it is what
+# actually rules out "2 noise + 1 real" style coincidences, not the
+# clustering step by itself. Value chosen to match this module's other
+# small-sample-distrust constants (WATERMARK_MIN_SAMPLES, etc.), all 3.
+#
+# Tolerance: real per-frame OCR bounding boxes for the SAME baseline jitter
+# by only a few px in practice (observed ~2-5px on the reference corpus);
+# 0.03 of frame height (~32px at 1080p) is generous headroom above that
+# jitter while staying well under any deliberate reposition worth flagging
+# (reproduced case: a 180px shift, ~6x this tolerance at 1080p).
+BASELINE_CLUSTER_TOLERANCE_FRAC = 0.03
+BASELINE_CLUSTER_MIN_DOMINANT_SIZE = 3
 UNIFORM_START_FRAC = 0.40
 UNIFORM_END_FRAC = 0.60
 UNIFORM_STEP_SEC = 0.5
@@ -160,6 +170,12 @@ FLAG_LOW_AGREEMENT = "low-agreement"
 FLAG_STATIC_CONTENT = "static-content"              # watermark/logo rejection (confirmed)
 FLAG_WATERMARK_UNCERTAIN = "static-content?"        # same extent every sample, but not enough
                                                      # temporal spread to confirm -- box is kept
+FLAG_MULTIPLE_POSITIONS = "multiple-positions?"     # a second baseline cluster with >=2 members
+                                                     # was included in the union, not just the
+                                                     # dominant one -- e.g. a genuinely repositioned
+                                                     # subtitle
+FLAG_OUTLIER_DISCARDED = "outlier-discarded?"       # a single hit at a baseline nothing else shared
+                                                     # was excluded from the union -- never silently
 
 
 @dataclass
@@ -408,83 +424,122 @@ def _bounding_union(extents: list[tuple[float, float, float, float] | None],
     return (min_x, min_y, max_x, max_y)
 
 
-def _reject_position_outliers(polys_per_frame, frame_h: float, cutoff_frac: float) -> list[list]:
-    """Returns a copy of `polys_per_frame` with any frame whose in-band
-    extent's Y-CENTER is a positional outlier relative to the median of
-    every other accepted extent replaced by an empty list -- see
-    OUTLIER_Y_DEVIATION_FRAC's module-level comment for why this exists.
-
-    Deliberately position-only, not height-based: a frame's per-frame
-    extent is already the union of everything in-band it contains (see
-    _per_frame_extents()), so a genuine two-line subtitle frame is
-    SUPPOSED to be taller than a one-line frame from the same video --
-    that's the very union rule this module exists to implement (see the
-    module docstring's rule 1). An early version of this function also
-    rejected height outliers and consequently rejected genuine two-line
-    frames as "noise", reintroducing the tightest-box clipping bug from
-    the other direction (caught by
-    test_convergence_captures_a_two_line_subtitle_regardless_of_probe_order).
-    Position is the safe signal: real subtitle text sits at a stable
-    vertical anchor across a single video's own frames regardless of line
-    count, so a frame whose text block center is far from that anchor is
-    something else entirely (a sign, background text, an OCR misfire),
-    not a legitimate variant of the same subtitle.
-
-    Does nothing (returns `polys_per_frame` unchanged) until at least
-    OUTLIER_MIN_REFERENCE_SAMPLES hits are accepted: with too few samples
-    there's no reliable notion of "normal" to judge against yet, and the
-    median itself would be one or two points, trivially matching anything.
-    Uses the median (not the mean) of y-center as the reference
-    specifically because it stays robust with a minority of outliers
-    already mixed in -- no separate "build a clean reference first"
-    bootstrapping pass is needed.
+def _cluster_by_baseline(indexed_baselines: list[tuple[int, float]], tolerance: float,
+                          ) -> list[list[int]]:
+    """Single-linkage gap clustering of (index, baseline) pairs on the
+    baseline value: sort ascending, start a new cluster whenever the gap
+    to the previous value exceeds `tolerance`. Returns clusters as lists
+    of the original indices, in baseline-ascending order within each.
     """
-    extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
-    accepted_idx = [i for i, e in enumerate(extents) if e is not None]
-    if len(accepted_idx) < OUTLIER_MIN_REFERENCE_SAMPLES:
-        return polys_per_frame
+    if not indexed_baselines:
+        return []
+    ordered = sorted(indexed_baselines, key=lambda pair: pair[1])
+    clusters: list[list[int]] = [[ordered[0][0]]]
+    prev_baseline = ordered[0][1]
+    for idx, baseline in ordered[1:]:
+        if baseline - prev_baseline <= tolerance:
+            clusters[-1].append(idx)
+        else:
+            clusters.append([idx])
+        prev_baseline = baseline
+    return clusters
 
-    y_centers = [(extents[i][1] + extents[i][3]) / 2.0 for i in accepted_idx]
-    med_y = median(y_centers)
-    y_tolerance = frame_h * OUTLIER_Y_DEVIATION_FRAC
 
-    filtered = list(polys_per_frame)
-    for i in accepted_idx:
-        e = extents[i]
-        y_center = (e[1] + e[3]) / 2.0
-        if abs(y_center - med_y) > y_tolerance:
-            filtered[i] = []
-    return filtered
+def _baseline_cluster_union(extents: list[tuple[float, float, float, float] | None],
+                             accepted_idx: list[int], frame_h: float,
+                             ) -> tuple[tuple[float, float, float, float], int, str | None]:
+    """Cluster accepted per-frame extents by BOTTOM EDGE (baseline), not
+    Y-centre, and union the dominant cluster's extents -- admitting a
+    genuine two-line frame by construction, since it shares the same
+    baseline as a one-line frame from the same track and only differs in
+    top edge.
+
+    An earlier version of this rejected Y-CENTRE outliers directly instead
+    of clustering by baseline. Reproduced failure: a subtitle legitimately
+    repositioned to avoid on-screen graphics is *also* a Y-centre-position
+    minority, indistinguishable by that signal from real noise -- that
+    version silently dropped it (union (288,797,1344,236) -> (288,977,
+    1344,56)). Baseline clustering tells the two cases apart: a
+    repositioned subtitle's frames share a DIFFERENT baseline with EACH
+    OTHER (forming their own cluster), where noise's baseline is
+    essentially uncorrelated frame to frame (staying singletons).
+
+    Returns (union, agreed_count, position_flag). `position_flag` is
+    FLAG_MULTIPLE_POSITIONS if a second cluster with >=2 members got
+    folded into the union, FLAG_OUTLIER_DISCARDED if any singleton
+    cluster got excluded, both (composed) if both happened, or None.
+    Never discards silently.
+
+    Below BASELINE_CLUSTER_MIN_DOMINANT_SIZE members in the largest
+    cluster, nothing is confidently "the" subtitle yet -- union
+    everything unfiltered rather than guess. This is what keeps 2
+    coincidentally-clustered noise detections from out-voting 1 genuine
+    hit: the pair alone (size 2) can't clear the dominant-size gate any
+    more safely than the singleton can, so neither gets excluded until
+    real evidence (the SAME baseline recurring this many times) exists.
+    """
+    baseline_items = [(i, extents[i][3]) for i in accepted_idx]  # extents[i][3] == max_y (bottom edge)
+    tolerance = frame_h * BASELINE_CLUSTER_TOLERANCE_FRAC
+    clusters = _cluster_by_baseline(baseline_items, tolerance)
+    clusters.sort(key=len, reverse=True)
+    dominant = clusters[0]
+
+    if len(dominant) < BASELINE_CLUSTER_MIN_DOMINANT_SIZE:
+        # Not enough repeated evidence for any single position yet --
+        # union everything rather than confidently exclude on a guess.
+        kept_idx = accepted_idx
+        position_flag = None
+    else:
+        kept_idx = list(dominant)
+        position_flag = None
+        for cluster in clusters[1:]:
+            if len(cluster) >= 2:
+                kept_idx.extend(cluster)
+                position_flag = _compose_flag(position_flag, FLAG_MULTIPLE_POSITIONS)
+            else:
+                position_flag = _compose_flag(position_flag, FLAG_OUTLIER_DISCARDED)
+
+    union = _bounding_union([extents[i] for i in kept_idx])
+    return union, len(kept_idx), position_flag
 
 
 def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
                    sample_times: list[float] | None = None,
-                   ) -> tuple[tuple[float, float, float, float] | None, int, str | None]:
-    """Returns (raw union extent, count of contributing frames, watermark
-    status). The union is None only when there are no in-band polys at all,
-    OR the watermark status is "confirmed" (see _watermark_status()) -- an
-    "uncertain" status still returns the real union, since insufficient
-    evidence must not silently discard a detection.
+                   ) -> tuple[tuple[float, float, float, float] | None, int, str | None, str | None]:
+    """Returns (union extent, count of contributing frames, watermark
+    status, position status). The union is None only when there are no
+    in-band polys at all, OR the watermark status is "confirmed" (see
+    _watermark_status()) -- an "uncertain" watermark status, or any
+    position status, still returns a real union, since insufficient or
+    conflicting evidence must not silently discard a detection.
 
     `sample_times`, if given, must align 1:1 with `polys_per_frame`; only
     the timestamps of frames that actually contributed an in-band poly are
     used (see _watermark_status()).
+
+    Watermark judgement runs first, over ALL accepted extents/timestamps
+    regardless of baseline clustering -- a genuine watermark is, by
+    definition, one cluster with identical extent (including baseline),
+    so clustering doesn't change that judgement; it only matters for
+    telling apart the position of a REAL, moving subtitle from noise once
+    the content isn't static.
     """
     extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
-    accepted = [e for e in extents if e is not None]
-    if not accepted:
-        return None, 0, None
+    accepted_idx = [i for i, e in enumerate(extents) if e is not None]
+    if not accepted_idx:
+        return None, 0, None, None
 
+    accepted = [extents[i] for i in accepted_idx]
     contributing_times = None
     if sample_times is not None and len(sample_times) == len(extents):
-        contributing_times = [t for e, t in zip(extents, sample_times) if e is not None]
+        contributing_times = [sample_times[i] for i in accepted_idx]
 
-    status = _watermark_status(accepted, len(extents), frame_h, contributing_times)
-    union = _bounding_union(extents)
+    watermark_status = _watermark_status(accepted, len(extents), frame_h, contributing_times)
+    if watermark_status == "confirmed":
+        return None, len(accepted_idx), watermark_status, None
 
-    if status == "confirmed":
-        return None, len(accepted), status
-    return union, len(accepted), status
+    union, agreed, position_flag = _baseline_cluster_union(extents, accepted_idx, frame_h)
+    return union, agreed, watermark_status, position_flag
 
 
 def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float = 0.55,
@@ -524,7 +579,9 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     min_height_frac = float(s.get("crop_min_height_fraction", CROP_MIN_HEIGHT_FRACTION))
     cutoff_frac = float(s.get("bottom_half_cutoff", band_frac))
 
-    union, _agreed, _watermark_status_ = _union_extent(polys_per_frame, frame_h, cutoff_frac, sample_times)
+    union, _agreed, _watermark_status_, _position_flag_ = _union_extent(
+        polys_per_frame, frame_h, cutoff_frac, sample_times,
+    )
     if union is None:
         return None
 
@@ -669,13 +726,18 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     "converge" on hits that end up contributing nothing, landing on
     box=None with neither fallback triggered.
 
-    "Consumes every accepted hit" does NOT mean every raw detection: each
-    round's data first passes through _reject_position_outliers(), which
-    drops any hit whose Y-position doesn't match the rest -- probing
-    this deep makes it likely enough to see one spurious OCR detection
-    somewhere in the accepted band that consuming it unfiltered would let
-    a single bad frame decide the box (reproduced directly; see that
-    function's docstring).
+    Deliberately NOT outlier-filtered here. An earlier version ran outlier
+    rejection inside this loop, before the convergence check -- which let
+    discarding evidence manufacture false stability: the FILTERED union
+    could stop growing (and probing stop) while the RAW union was still
+    changing, because the very hit that would have kept it growing had
+    already been thrown away first. Reproduced directly by a re-reviewer.
+    Baseline clustering (the actual outlier-vs-real-content judgement) now
+    runs once, only in _union_extent()/aggregate_box(), AFTER probing has
+    already concluded based on the unfiltered evidence -- see
+    _baseline_cluster_union()'s docstring. This function always returns
+    every accepted hit, filtered or not; detect_crop() decides what to do
+    with them.
 
     `times` is walked in _spread_order(), not the order it's given in --
     spread is still useful here for getting temporal span (needed by the
@@ -737,15 +799,10 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
             polys_per_frame.append(accepted)
             frame_times.append(t)
 
-        # Outlier rejection runs before anything else looks at this
-        # round's data: deep convergence-based probing raises the odds of
-        # seeing a spurious OCR detection somewhere in the accepted band
-        # across many probes, and that single bad frame must not be
-        # allowed to count as a "hit", feed the consensus check, or count
-        # as union growth -- see OUTLIER_Y_DEVIATION_FRAC's module-level
-        # comment.
-        filtered = _reject_position_outliers(polys_per_frame, frame_h, cutoff_frac)
-        extents = _per_frame_extents(filtered, frame_h, cutoff_frac)
+        # Everything below reads the UNFILTERED accumulated data -- see
+        # this function's docstring for why filtering must not happen
+        # before the stop decision.
+        extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
         raw_hits = sum(e is not None for e in extents)
 
         # Consensus fast path: an independent, externally-validated reason
@@ -755,7 +812,7 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
         # shape is what actually protects it from stopping on a
         # not-yet-complete union.
         if len(consensus) >= CONSENSUS_MIN_ENTRIES and raw_hits >= CONSENSUS_STOP_HITS:
-            provisional = aggregate_box(filtered, frame_size, band_frac, settings, frame_times)
+            provisional = aggregate_box(polys_per_frame, frame_size, band_frac, settings, frame_times)
             if provisional is not None:
                 _, py, _, ph = provisional
                 if _consistent_with_consensus(py / frame_h, ph / frame_h, consensus):
@@ -775,10 +832,9 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
         if current_union is not None and stable_rounds >= CONVERGENCE_STABLE_ROUNDS:
             break
 
-    filtered = _reject_position_outliers(polys_per_frame, frame_h, cutoff_frac)
-    extents = _per_frame_extents(filtered, frame_h, cutoff_frac)
+    extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
     raw_hits = sum(e is not None for e in extents)
-    return filtered, sample_pts, raw_hits, frame_times
+    return polys_per_frame, sample_pts, raw_hits, frame_times
 
 
 def detect_crop(video_path: str, duration_sec: float, det_engine,
@@ -813,9 +869,14 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     same extent every sample, spanning more than WATERMARK_MIN_SPAN_SEC;
     box is None), "static-content?" (same extent every sample, but not
     enough temporal spread to confirm; box is still returned -- see
-    _watermark_status()), "ceiling-exceeded" (in-band hits exist but the
-    resulting box is too tall), or "low-agreement" (a box was built, but
-    from fewer than LOW_AGREEMENT_HITS contributing frames).
+    _watermark_status()), "multiple-positions?" (a second baseline
+    cluster with >=2 members got folded into the union alongside the
+    dominant one -- e.g. a genuinely repositioned subtitle), "outlier-
+    discarded?" (a single hit at a baseline nothing else shared was
+    excluded from the union -- see _baseline_cluster_union()),
+    "ceiling-exceeded" (in-band hits exist but the resulting box is too
+    tall), or "low-agreement" (a box was built, but from fewer than
+    LOW_AGREEMENT_HITS contributing frames).
     """
     known_dims = _probe_dimensions(video_path)
     orig_w, orig_h = known_dims
@@ -866,7 +927,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     cutoff_frac = 0.0 if used_full_frame_retry else float(
         (settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)
     )
-    envelope_extent, agreed, watermark_status = _union_extent(
+    envelope_extent, agreed, watermark_status, position_flag = _union_extent(
         polys_per_frame, orig_h, cutoff_frac, frame_times,
     )
     envelope = None
@@ -905,6 +966,11 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         # same subtitle line sampled repeatedly -- kept the box rather
         # than guess, per the review ruling; flag it so a human can.
         flagged = _compose_flag(flagged, FLAG_WATERMARK_UNCERTAIN)
+    if position_flag is not None:
+        # FLAG_MULTIPLE_POSITIONS and/or FLAG_OUTLIER_DISCARDED, already
+        # composed together by _baseline_cluster_union() if both applied.
+        for part in position_flag.split("+"):
+            flagged = _compose_flag(flagged, part)
     if box is not None and 0 < agreed < LOW_AGREEMENT_HITS:
         flagged = _compose_flag(flagged, FLAG_LOW_AGREEMENT)
 
