@@ -105,12 +105,47 @@ TARGET_HEIGHT = 480
 GRAB_POOL_SIZE = 10  # max concurrent ffmpeg subprocesses inside grab_frames()
 
 # detect_crop() orchestration.
-PROBE_BATCH_SIZE = 5          # probes fetched per round before re-checking the stop condition
-STOP_HITS = 5                 # stop once this many probe frames agree
+PROBE_BATCH_SIZE = 5          # probes fetched per batch before re-checking the stop condition
 CONSENSUS_MIN_ENTRIES = 3     # consensus list must have at least this many entries to shortcut
 CONSENSUS_STOP_HITS = 2       # ...at which point this many agreeing hits is enough
+# Convergence stop (replaces a fixed hit-count stop -- see _run_round()):
+# stop once the raw union hasn't grown for this many consecutive batches.
+# 2 ("a couple") means the *earliest* a stop can happen is after 3 batches
+# (15 probes at PROBE_BATCH_SIZE=5): batch 1 always resets the counter (it
+# has no prior union to match), batch 2 must repeat batch 1's union
+# (1 stable round), batch 3 must repeat that again (2 stable rounds ->
+# stop). Requiring 1 repeat alone would let a single lucky coincidence
+# stop early; requiring 2 means the union has now demonstrably stopped
+# growing across two independent additional looks, not just one.
+CONVERGENCE_STABLE_ROUNDS = 2
+# Hard ceiling on probes fetched in one _run_round() call, so content
+# whose union never stabilizes (or that never converges within the
+# candidate list) still has bounded latency. Set to roughly the old
+# brute-force detector's own worst case (30-35 probes, see the brief's
+# background section) so this path's worst case is no worse than what it
+# replaces, while the measured common case (see task-2-report.md) stays
+# far under it.
+MAX_PROBES_PER_ROUND = 30
 CONSENSUS_Y_DEVIATION_FRAC = 0.10
 CONSENSUS_MAX_HEIGHT_RATIO = 1.5
+# Within-file outlier rejection: "the union consumes every accepted hit"
+# (see _run_round()) is only safe once probing goes deep enough to
+# meaningfully converge (up to MAX_PROBES_PER_ROUND), because that depth
+# makes it likely to eventually see at least one spurious OCR detection
+# somewhere else in the accepted vertical band -- a background sign, a
+# compression artifact, a genuine OCR misfire -- across dozens of probes.
+# Reproduced directly: one such frame moved slay's drift-guard dy from 3px
+# to 162px by itself. Real subtitle text is remarkably stable in
+# Y-POSITION across a single video's own frames (height is NOT used here --
+# see _reject_position_outliers()'s docstring for why a height check
+# would fight the union rule itself); a hit whose vertical center
+# deviates sharply from the median of everything else accepted so far is
+# treated as noise and excluded, mirroring the tolerance philosophy of the
+# old detector (and this module's own cross-file consensus check, above),
+# applied within a single file's own accumulated hits instead of across
+# files.
+OUTLIER_Y_DEVIATION_FRAC = 0.10
+OUTLIER_MIN_REFERENCE_SAMPLES = 3  # need at least this many accepted hits before judging outliers at all
 UNIFORM_START_FRAC = 0.40
 UNIFORM_END_FRAC = 0.60
 UNIFORM_STEP_SEC = 0.5
@@ -355,6 +390,73 @@ def _watermark_status(accepted: list[tuple[float, float, float, float]], total_f
     return "confirmed" if span >= WATERMARK_MIN_SPAN_SEC else "uncertain"
 
 
+def _bounding_union(extents: list[tuple[float, float, float, float] | None],
+                     ) -> tuple[float, float, float, float] | None:
+    """Plain min/max bounding box over whichever entries of `extents` are
+    not None, with no watermark judgement involved -- used both by
+    _union_extent() (the final, watermark-aware box) and by _run_round()'s
+    convergence check (just "has the raw union grown", a strictly earlier
+    and simpler question than "is it static content").
+    """
+    accepted = [e for e in extents if e is not None]
+    if not accepted:
+        return None
+    min_x = min(e[0] for e in accepted)
+    min_y = min(e[1] for e in accepted)
+    max_x = max(e[2] for e in accepted)
+    max_y = max(e[3] for e in accepted)
+    return (min_x, min_y, max_x, max_y)
+
+
+def _reject_position_outliers(polys_per_frame, frame_h: float, cutoff_frac: float) -> list[list]:
+    """Returns a copy of `polys_per_frame` with any frame whose in-band
+    extent's Y-CENTER is a positional outlier relative to the median of
+    every other accepted extent replaced by an empty list -- see
+    OUTLIER_Y_DEVIATION_FRAC's module-level comment for why this exists.
+
+    Deliberately position-only, not height-based: a frame's per-frame
+    extent is already the union of everything in-band it contains (see
+    _per_frame_extents()), so a genuine two-line subtitle frame is
+    SUPPOSED to be taller than a one-line frame from the same video --
+    that's the very union rule this module exists to implement (see the
+    module docstring's rule 1). An early version of this function also
+    rejected height outliers and consequently rejected genuine two-line
+    frames as "noise", reintroducing the tightest-box clipping bug from
+    the other direction (caught by
+    test_convergence_captures_a_two_line_subtitle_regardless_of_probe_order).
+    Position is the safe signal: real subtitle text sits at a stable
+    vertical anchor across a single video's own frames regardless of line
+    count, so a frame whose text block center is far from that anchor is
+    something else entirely (a sign, background text, an OCR misfire),
+    not a legitimate variant of the same subtitle.
+
+    Does nothing (returns `polys_per_frame` unchanged) until at least
+    OUTLIER_MIN_REFERENCE_SAMPLES hits are accepted: with too few samples
+    there's no reliable notion of "normal" to judge against yet, and the
+    median itself would be one or two points, trivially matching anything.
+    Uses the median (not the mean) of y-center as the reference
+    specifically because it stays robust with a minority of outliers
+    already mixed in -- no separate "build a clean reference first"
+    bootstrapping pass is needed.
+    """
+    extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
+    accepted_idx = [i for i, e in enumerate(extents) if e is not None]
+    if len(accepted_idx) < OUTLIER_MIN_REFERENCE_SAMPLES:
+        return polys_per_frame
+
+    y_centers = [(extents[i][1] + extents[i][3]) / 2.0 for i in accepted_idx]
+    med_y = median(y_centers)
+    y_tolerance = frame_h * OUTLIER_Y_DEVIATION_FRAC
+
+    filtered = list(polys_per_frame)
+    for i in accepted_idx:
+        e = extents[i]
+        y_center = (e[1] + e[3]) / 2.0
+        if abs(y_center - med_y) > y_tolerance:
+            filtered[i] = []
+    return filtered
+
+
 def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
                    sample_times: list[float] | None = None,
                    ) -> tuple[tuple[float, float, float, float] | None, int, str | None]:
@@ -378,12 +480,7 @@ def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
         contributing_times = [t for e, t in zip(extents, sample_times) if e is not None]
 
     status = _watermark_status(accepted, len(extents), frame_h, contributing_times)
-
-    min_x = min(e[0] for e in accepted)
-    min_y = min(e[1] for e in accepted)
-    max_x = max(e[2] for e in accepted)
-    max_y = max(e[3] for e in accepted)
-    union = (min_x, min_y, max_x, max_y)
+    union = _bounding_union(extents)
 
     if status == "confirmed":
         return None, len(accepted), status
@@ -502,15 +599,18 @@ def _spread_order(times: list[float]) -> list[float]:
     candidates -- vad.probe_times() already picked all of them -- only
     changes visitation order.
 
-    Why this matters: detect_crop() stops probing as soon as it has enough
-    hits, so whichever candidates get visited first determine which
-    samples the watermark check (see WATERMARK_MIN_SPAN_SEC) has to work
-    with. Walking candidates in strict chronological order means a local
-    cluster of nearby hits can satisfy the stop condition before any
-    temporally-spread candidate is ever tried -- the watermark check would
-    then be structurally unable to ever confirm a real watermark, not just
-    correctly abstain on an ambiguous one. Visiting spread-out candidates
-    first makes rule 1 (WATERMARK_MIN_SPAN_SEC) actually fire in practice.
+    Why this matters: whichever candidates get visited first determine
+    which samples the watermark check (see WATERMARK_MIN_SPAN_SEC) has
+    temporal spread to judge with early on. Walking candidates in strict
+    chronological order means a local cluster of nearby hits could
+    otherwise dominate the early batches, giving the watermark check
+    nothing but closely-spaced samples to reason about for longer than
+    necessary. Note what this does NOT do: it doesn't decide which hits
+    end up contributing to the union -- that's _run_round()'s convergence
+    stop, which keeps probing (regardless of visitation order) until the
+    union itself stops growing, precisely so that spread-ordering the
+    *fetch* order can never cause a batch containing a genuine second
+    subtitle line to simply never be looked at.
     """
     if len(times) <= 2:
         return list(times)
@@ -540,26 +640,50 @@ def _map_poly_to_full_frame(poly, geometry: tuple) -> np.ndarray:
 
 
 def _run_round(video_path: str, times: list[float], det_engine, band_frac: float,
-                stop_hits: int, consensus: list[tuple[float, float]] | None,
+                consensus: list[tuple[float, float]] | None,
                 frame_size: tuple[int, int], settings: dict | None,
                 known_dims: tuple[int, int] | None = None,
                 ) -> tuple[list, list[float], int, list[float]]:
-    """Fetch+detect `times` in PROBE_BATCH_SIZE-sized rounds, stopping early
-    once `stop_hits` probe frames have produced an IN-BAND accepted poly
-    (score >= DT_SCORE_THRESHOLD *and* passing the same band cutoff
-    aggregate_box() itself applies -- see _per_frame_extents()), or once
-    CONSENSUS_STOP_HITS is reached with an in-tolerance consensus.
+    """Fetch+detect `times` in PROBE_BATCH_SIZE-sized batches, stopping
+    once the raw in-band union has stopped growing for CONVERGENCE_STABLE_ROUNDS
+    consecutive batches (or CONSENSUS_STOP_HITS is reached with an
+    in-tolerance consensus, or MAX_PROBES_PER_ROUND is hit, or `times` is
+    exhausted) -- NOT once an arbitrary hit count is reached.
+
+    This replaces an earlier fixed-count stop (`raw_hits >= 5`) that, once
+    combined with _spread_order() and PROBE_BATCH_SIZE == 5, let whichever
+    5 probes happened to land in the very first batch become the ENTIRE
+    contributing set: if all 5 scored hits, the loop stopped before ever
+    looking at later batches, silently dropping a genuine second subtitle
+    line if it wasn't among that first five -- exactly the tightest-box
+    clipping the union rule exists to prevent, but now with no signal that
+    anything was missed (see test_convergence_captures_a_two_line_subtitle_
+    regardless_of_probe_order). A union-based estimator has to stop when
+    the *estimate* stops growing, not when it has seen N samples: the
+    union here always consumes every accepted hit found before that point,
+    never just the first batch.
 
     A hit that wouldn't survive aggregate_box()'s own filtering (e.g. text
     detected in the sliver between the grabbed band's top edge and the
-    cutoff line) must not count toward the stop condition either, or
-    detect_crop can stop probing on hits that end up contributing nothing,
-    landing on box=None with neither fallback triggered.
+    cutoff line) must not count toward growth either, or detect_crop can
+    "converge" on hits that end up contributing nothing, landing on
+    box=None with neither fallback triggered.
 
-    `times` is walked in _spread_order(), not the order it's given in, so
-    that if/when enough hits accumulate to stop, they're already spread
-    across real time rather than clustered -- see _spread_order()'s
-    docstring for why the watermark check needs this.
+    "Consumes every accepted hit" does NOT mean every raw detection: each
+    round's data first passes through _reject_position_outliers(), which
+    drops any hit whose Y-position doesn't match the rest -- probing
+    this deep makes it likely enough to see one spurious OCR detection
+    somewhere in the accepted band that consuming it unfiltered would let
+    a single bad frame decide the box (reproduced directly; see that
+    function's docstring).
+
+    `times` is walked in _spread_order(), not the order it's given in --
+    spread is still useful here for getting temporal span (needed by the
+    watermark check) established early, but it no longer decides WHICH
+    hits contribute: it only decides the order batches are looked at in,
+    and the convergence stop (not a hit count) decides when to stop
+    looking, so a late-arriving batch is never silently skipped just for
+    arriving late.
 
     Returns (polys_per_frame, sample_pts_used, raw_hit_count, frame_times).
     Polygons are already mapped to full-frame pixel coordinates.
@@ -573,11 +697,16 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     _, frame_h = frame_size
     cutoff_frac = float((settings or {}).get("bottom_half_cutoff", band_frac))
     raw_hits = 0
+    prior_union: tuple[float, float, float, float] | None = None
+    stable_rounds = 0
 
     times = _spread_order(times)
 
     i = 0
     while i < len(times):
+        if len(sample_pts) >= MAX_PROBES_PER_ROUND:
+            break
+
         chunk = times[i:i + PROBE_BATCH_SIZE]
         i += len(chunk)
 
@@ -608,21 +737,48 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
             polys_per_frame.append(accepted)
             frame_times.append(t)
 
-        raw_hits = sum(
-            e is not None for e in _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
-        )
+        # Outlier rejection runs before anything else looks at this
+        # round's data: deep convergence-based probing raises the odds of
+        # seeing a spurious OCR detection somewhere in the accepted band
+        # across many probes, and that single bad frame must not be
+        # allowed to count as a "hit", feed the consensus check, or count
+        # as union growth -- see OUTLIER_Y_DEVIATION_FRAC's module-level
+        # comment.
+        filtered = _reject_position_outliers(polys_per_frame, frame_h, cutoff_frac)
+        extents = _per_frame_extents(filtered, frame_h, cutoff_frac)
+        raw_hits = sum(e is not None for e in extents)
 
-        if raw_hits >= stop_hits:
-            break
-
+        # Consensus fast path: an independent, externally-validated reason
+        # to trust an early result, unrelated to the convergence check
+        # below. Still count-gated (CONSENSUS_STOP_HITS), but the
+        # consistency check against already-resolved files' median
+        # shape is what actually protects it from stopping on a
+        # not-yet-complete union.
         if len(consensus) >= CONSENSUS_MIN_ENTRIES and raw_hits >= CONSENSUS_STOP_HITS:
-            provisional = aggregate_box(polys_per_frame, frame_size, band_frac, settings, frame_times)
+            provisional = aggregate_box(filtered, frame_size, band_frac, settings, frame_times)
             if provisional is not None:
                 _, py, _, ph = provisional
                 if _consistent_with_consensus(py / frame_h, ph / frame_h, consensus):
                     break
 
-    return polys_per_frame, sample_pts, raw_hits, frame_times
+        # Convergence stop: has the raw union grown since the last batch?
+        # A None union (no in-band hits yet at all) is never "stable" --
+        # there's nothing to converge on, so keep probing until either a
+        # real union appears or the probe budget/candidate list runs out.
+        current_union = _bounding_union(extents)
+        if current_union is not None and current_union == prior_union:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        prior_union = current_union
+
+        if current_union is not None and stable_rounds >= CONVERGENCE_STABLE_ROUNDS:
+            break
+
+    filtered = _reject_position_outliers(polys_per_frame, frame_h, cutoff_frac)
+    extents = _per_frame_extents(filtered, frame_h, cutoff_frac)
+    raw_hits = sum(e is not None for e in extents)
+    return filtered, sample_pts, raw_hits, frame_times
 
 
 def detect_crop(video_path: str, duration_sec: float, det_engine,
@@ -675,7 +831,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         flagged = _compose_flag(flagged, FLAG_NO_SPEECH)
 
     polys_per_frame, used, raw_hits, frame_times = _run_round(
-        video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF, stop_hits=STOP_HITS,
+        video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
         consensus=consensus, frame_size=frame_size, settings=settings, known_dims=known_dims,
     )
     sample_pts.extend(used)
@@ -684,7 +840,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         uniform_times = _uniform_probe_times(duration_sec)
         polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
-            stop_hits=STOP_HITS, consensus=consensus, frame_size=frame_size, settings=settings,
+            consensus=consensus, frame_size=frame_size, settings=settings,
             known_dims=known_dims,
         )
         sample_pts.extend(used)
@@ -698,7 +854,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         # exist in the video; band_frac=1.0 just widens what we look at.
         retry_times = sorted(set(retry_times))
         polys_per_frame, used, raw_hits, frame_times = _run_round(
-            video_path, retry_times, det_engine, band_frac=1.0, stop_hits=STOP_HITS,
+            video_path, retry_times, det_engine, band_frac=1.0,
             consensus=consensus, frame_size=frame_size,
             settings={**(settings or {}), "bottom_half_cutoff": 0.0},
             known_dims=known_dims,
@@ -728,9 +884,18 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     box = aggregate_box(polys_per_frame, frame_size, box_band_frac, box_settings, frame_times)
 
     if box is None and agreed > 0:
-        # watermark_status can only be "confirmed" here (never "uncertain",
-        # which by construction always returns a real union/box) or None
-        # (ceiling exceeded with no watermark involvement at all).
+        # watermark_status can be "confirmed" (aggregate_box's underlying
+        # union was already None -- box=None follows directly), "uncertain"
+        # (the union WAS real, but aggregate_box's own ceiling check
+        # rejected the padded/floored box built from it -- box=None here
+        # comes from the ceiling, not the watermark judgement), or None
+        # (no watermark involvement at all, just a too-tall box). Only the
+        # "confirmed" case is a watermark rejection; the ternary below
+        # resolves both other cases to FLAG_CEILING_EXCEEDED correctly,
+        # but that's the ceiling check's doing, not an "uncertain implies
+        # ceiling" guarantee -- an uncertain union that happens to fit
+        # under the ceiling never reaches this branch at all (box is not
+        # None then; see the "uncertain" flag composition below instead).
         flagged = _compose_flag(
             flagged, FLAG_STATIC_CONTENT if watermark_status == "confirmed" else FLAG_CEILING_EXCEEDED,
         )

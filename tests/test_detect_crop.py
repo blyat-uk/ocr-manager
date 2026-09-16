@@ -113,6 +113,63 @@ def test_watermark_wide_span_is_still_confirmed_and_rejected():
     assert box is None
 
 
+def test_convergence_captures_a_two_line_subtitle_regardless_of_probe_order(monkeypatch):
+    """Regression test for the round-2 fix's own regression: _spread_order()
+    reorders which candidates get probed first, and with a fixed hit-count
+    stop (PROBE_BATCH_SIZE == STOP_HITS == 5), whichever batch happened to
+    land first -- content-blind -- became the ENTIRE contributing set.
+
+    10 candidate timestamps t=0..9, exactly one (t=3) carries a two-line
+    subtitle, the rest single-line. _spread_order(range(10))'s first batch
+    is [0, 9, 4, 2, 6] -- confirmed by direct computation, and matching the
+    reviewer's own reproduction -- which excludes t=3 entirely and, under
+    the old fixed-count stop, would resolve as a confident one-line box
+    with agreed=5 and flagged=None: the second line silently dropped. The
+    union must capture the two-line extent regardless of which batch t=3
+    lands in.
+    """
+    one_line = [_poly(400, 980, 1500, 1030)]
+    two_line = [_poly(400, 920, 1500, 970), _poly(400, 980, 1500, 1030)]
+    times_all = [float(t) for t in range(10)]
+
+    assert crop._spread_order(times_all)[:5] == [0.0, 9.0, 4.0, 2.0, 6.0], (
+        "test assumes this exact first batch -- if _spread_order()'s "
+        "algorithm changes, update or re-derive this expectation"
+    )
+
+    last_chunk_times: list[float] = []
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        # Identity geometry: crop==out, no offset, so _map_poly_to_full_frame
+        # passes the canned polys through unchanged for simple assertions.
+        last_chunk_times[:] = times
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+        return pairs, geometry
+
+    class FakeEngine:
+        def predict(self, frames):
+            results = []
+            for t in last_chunk_times:
+                polys = two_line if t == 3.0 else one_line
+                results.append({"dt_scores": [1.0] * len(polys), "dt_polys": polys})
+            return results
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+
+    polys_per_frame, sample_pts, raw_hits, frame_times = crop._run_round(
+        "dummy.mp4", times_all, FakeEngine(), band_frac=0.55, consensus=None,
+        frame_size=FRAME, settings=None,
+    )
+    assert 3.0 in sample_pts, "the batch containing the two-line subtitle must actually get probed"
+
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=frame_times)
+    assert box is not None
+    x, y, w, h = box
+    assert y <= 920, "union must still reach the upper line even though its batch arrived second"
+    assert y + h >= 1030, "union must still reach the lower line"
+
+
 @pytest.mark.needs_media
 @pytest.mark.slow
 def test_crop_does_not_drift_from_previously_accepted_values(reference_media, detector_truth):
