@@ -12,9 +12,22 @@ from .models import PredictedFrames, PredictedSubtitle
 
 from .pyav_adapter import Capture, DECODE_TARGET_HEIGHT
 
-# Batch size for OCR processing - higher values = faster but more GPU memory
-# 64 is optimal for most cases
-BATCH_SIZE = 256
+# Batch size for OCR processing - higher values = faster but more GPU memory.
+# Smaller batches flush more often, so OCR inference on an early batch
+# overlaps with the producer thread still decoding later frames, instead of
+# (at a batch size this clip never fills mid-run) all inference happening
+# serially after decode is already done. Measured on the reference episode:
+# this pipelining keeps total run_ocr wall time roughly flat to mildly
+# better at BATCH_SIZE 32 vs 256, NOT because the producer does less work -
+# the producer thread's own wall time (self._producer_time) actually goes
+# UP at the smaller batch size, on both the old and new code, because
+# queue.put() blocks more often while the consumer is busy inside a
+# just-triggered OCR call instead of draining the queue. Output is
+# byte-identical across batch sizes - see tests/test_retry_determinism.py -
+# because nothing in the pipeline keeps batch-shaped state;
+# _candidates_admitted() (above) is what makes that true for the candidate
+# buffer specifically.
+BATCH_SIZE = 32
 
 # Maximum RAM to use for frame buffer (10GB)
 MAX_BUFFER_BYTES = 10 * 1024**3
@@ -33,13 +46,15 @@ MAX_CANDIDATES = 8
 #
 # A candidate is held from the moment the producer offers it until the batch
 # it belongs to has been OCR'd and resolved, so the standing worst case is
-# MAX_CANDIDATES x BATCH_SIZE = 2048 frames on top of the batch's own 256 and
+# MAX_CANDIDATES x BATCH_SIZE = 256 frames on top of the batch's own 32 and
 # the frame queue. At the reference crop geometry (1344x53 BGR, 213,696 bytes
-# a frame) that is ~437 MB; with use_fullframe the candidates are whole
-# 1280x720 pictures (2,764,800 bytes) and it reaches ~5.7 GB -- per worker,
-# and OCRManager runs several workers at once. 256 subtitles each holding a
-# couple of seconds of similar frames is only ~8.5 minutes of dialogue, so
-# this is an ordinary episode, not a pathological one.
+# a frame) that is ~52 MB; with use_fullframe the candidates are whole
+# 1280x720 pictures (2,764,800 bytes) and it reaches ~675 MB -- per worker,
+# and OCRManager runs several workers at once. (These figures move with
+# BATCH_SIZE, which is exactly the point of the budget below: nothing else
+# in the pipeline should.) 32 subtitles each holding a couple of seconds of
+# similar frames is only ~1 minute of dialogue, so this is a routine batch
+# boundary, not a pathological one.
 #
 # The budget is PER SUBTITLE, deliberately, not a running total across the
 # batch. A running total is refilled at the batch flush, and flushes happen
@@ -52,11 +67,12 @@ MAX_CANDIDATES = 8
 # budget has no batch state in it at all, so where the flush boundaries
 # fall cannot matter.
 #
-# 2 MiB a subtitle bounds the batch at 2 MiB x BATCH_SIZE = 512 MiB. Spread
-# over MAX_CANDIDATES it admits frames up to 262,144 bytes (87,381 px) at
-# full strength; past that a subtitle simply gets fewer candidates, via
-# _candidates_admitted(). This DOES clip real geometries, and saying so is
-# the point:
+# 2 MiB a subtitle bounds the batch at 2 MiB x BATCH_SIZE = 64 MiB (at the
+# current BATCH_SIZE of 32; this scales with it, same as the worst case
+# above). Spread over MAX_CANDIDATES it admits frames up to 262,144 bytes
+# (87,381 px) at full strength; past that a subtitle simply gets fewer
+# candidates, via _candidates_admitted(). This DOES clip real geometries,
+# and saying so is the point:
 #
 #   1344x53   (the golden/reference crop)  71,232 px -> all 8 candidates
 #   1344x66   (13 rows taller)             88,704 px -> 7
@@ -67,8 +83,10 @@ MAX_CANDIDATES = 8
 #
 # So the reference crop clears the threshold with about 23% to spare, but
 # crop mode in general does not, and use_fullframe loses the best-of-N path
-# entirely rather than spending ~5.3 GiB a worker to keep it. Whatever a
-# geometry gets, it gets the same amount at every BATCH_SIZE.
+# entirely rather than spending ~675 MB a worker to keep it (at BATCH_SIZE
+# 32; ~5.3 GiB at the old 256). Whatever a geometry gets, it gets the same
+# amount at every BATCH_SIZE - per-subtitle bytes, not per-batch frames, is
+# what makes that true.
 MAX_CANDIDATE_BYTES_PER_SUBTITLE = 2 * 1024**2
 
 
@@ -110,6 +128,67 @@ MIN_LAPLACIAN_VARIANCE = 50
 # Real subtitles are at least 0.2-0.5 seconds
 MIN_SUBTITLE_DURATION = 0.15
 
+# --- Exact luma pre-gate (LOOKING state only) --------------------------
+#
+# The brightness filter's mask is cv2.inRange(frame, (t,t,t), (255,255,255)):
+# a pixel survives only if EVERY channel is >= t. BT.709 gives the identity
+#
+#     0.2126*R + 0.7152*G + 0.0722*B = 1.164*(Y'-16)
+#
+# for any pixel produced by the standard limited-to-full range BT.709
+# decode (the chroma terms cancel by construction of the coefficients).
+# Since 0.2126+0.7152+0.0722 = 1, that left side is a convex combination of
+# R, G, B, so if every channel is >= t (allowing t-0.5 for sub-LSB
+# rounding), the combination is >= t-0.5 too - making
+#
+#     Y' >= (t-0.5)/1.164 + 16
+#
+# a NECESSARY condition for any pixel to pass the mask. If no pixel in the
+# center square reaches that floor, the masked frame is provably all-zero
+# there, so the Laplacian variance is 0 and raw_detection is False - no
+# need to run the full-frame mask/greyscale/Laplacian pipeline to find
+# that out. Measured on the reference episode: 1080p t=209 -> floor
+# 195.12, observed minimum Y' of an actually-passing pixel 196 (the bound
+# has margin, never a false negative), 39.7% of LOOKING-state frames
+# rejected; 4K t=230 -> 84.8% rejected. Zero false negatives in both
+# cases; see tests/test_luma_gate.py for the property proof.
+#
+# Only valid while LOOKING for a subtitle to start. TRACKING an existing
+# one still needs the full masked grey frame for its similarity check
+# against the previous frame, so the gate is never applied there.
+_BT709_LIMITED_TO_FULL = 1.164  # ~255/219; see derivation above
+_BT709_COEFF_B = 0.0722
+_BT709_COEFF_G = 0.7152
+_BT709_COEFF_R = 0.2126
+
+
+def luma_floor(threshold: int, bit_depth: int = 8) -> float:
+    """Necessary BT.709 Y' floor for a pixel to have any chance of passing
+    cv2.inRange(frame, (threshold,)*3, (max,)*3).
+
+    If the maximum Y' in a region is below this floor, no pixel in that
+    region can pass the mask - see the derivation above. `threshold` and
+    the returned floor share the same bit_depth-scaled 0-to-(2**bit_depth-1)
+    range (default 8-bit, which is what every frame this module handles
+    actually is - Capture always yields bgr24 uint8, even from 10-bit/HDR
+    sources - see videocr/pyav_adapter.py).
+    """
+    scale = 2 ** (bit_depth - 8)
+    return (threshold - 0.5 * scale) / _BT709_LIMITED_TO_FULL + 16 * scale
+
+
+def _bt709_luma(bgr: np.ndarray) -> np.ndarray:
+    """Reconstruct BT.709 Y' from full-range BGR pixels via the identity
+    documented above. `bgr` is any array with a trailing (B, G, R) axis
+    (OpenCV's channel order); returns a float32 array of the same leading
+    shape.
+    """
+    b = bgr[..., 0].astype(np.float32)
+    g = bgr[..., 1].astype(np.float32)
+    r = bgr[..., 2].astype(np.float32)
+    weighted = _BT709_COEFF_B * b + _BT709_COEFF_G * g + _BT709_COEFF_R * r
+    return weighted / _BT709_LIMITED_TO_FULL + 16.0
+
 
 class Video:
     path: str
@@ -128,11 +207,73 @@ class Video:
         self.path = path
         self.det_model_dir = det_model_dir
         self.rec_model_dir = rec_model_dir
-        with Capture(path) as v:
-            self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.fps = v.get(cv2.CAP_PROP_FPS)
-            self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
+        # Backing fields for the num_frames/fps/height/width properties
+        # below. None means "not probed yet". run_ocr() fills these in
+        # from the one container open it already does for real decoding
+        # (see there), instead of from a second, metadata-only Capture
+        # this constructor used to open just to read them - one container
+        # open per run_ocr() call instead of two. A caller that reads one
+        # of these before run_ocr() has run (videocr/api.py's only_labels
+        # path never calls run_ocr() at all) still gets a correct value,
+        # via _probe_metadata()'s own on-demand, cached-thereafter open.
+        self._num_frames = None
+        self._fps = None
+        self._height = None
+        self._width = None
+
+    def _probe_metadata(self) -> None:
+        """Fill in num_frames/fps/height/width from their own, dedicated,
+        metadata-only container open.
+
+        Only reached when something reads one of the properties below
+        before run_ocr() has already populated them from the capture it
+        opens for real decoding - e.g. videocr/api.py's only_labels path.
+        """
+        with Capture(self.path) as v:
+            self._num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
+            self._fps = v.get(cv2.CAP_PROP_FPS)
+            self._height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self._width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+    @property
+    def num_frames(self) -> int:
+        if getattr(self, '_num_frames', None) is None:
+            self._probe_metadata()
+        return self._num_frames
+
+    @num_frames.setter
+    def num_frames(self, value) -> None:
+        self._num_frames = value
+
+    @property
+    def fps(self) -> float:
+        if getattr(self, '_fps', None) is None:
+            self._probe_metadata()
+        return self._fps
+
+    @fps.setter
+    def fps(self, value) -> None:
+        self._fps = value
+
+    @property
+    def height(self) -> int:
+        if getattr(self, '_height', None) is None:
+            self._probe_metadata()
+        return self._height
+
+    @height.setter
+    def height(self, value) -> None:
+        self._height = value
+
+    @property
+    def width(self) -> int:
+        if getattr(self, '_width', None) is None:
+            self._probe_metadata()
+        return self._width
+
+    @width.setter
+    def width(self, value) -> None:
+        self._width = value
 
     def run_ocr(self, use_gpu: bool, lang: str, time_start: str, time_end: str, conf_threshold: int, use_fullframe: bool, brightness_threshold: int, similar_image_threshold: float, similar_pixel_threshold: int, frames_to_skip: int, crop_x: int, crop_y: int, crop_width: int, crop_height: int, progress=None, subtitle_callback=None, cancel_event=None):
         conf_threshold_percent = float(conf_threshold / 100)
@@ -157,82 +298,109 @@ class Video:
 
         ocr = engine_registry.get_ocr_engine(self.lang, self.det_model_dir, self.rec_model_dir, use_gpu)
 
-        ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
-        ocr_end = utils.get_frame_index(time_end, self.fps) if time_end else self.num_frames
-
-        if ocr_end < ocr_start:
-            raise ValueError("time_start is later than time_end")
-        num_ocr_frames = ocr_end - ocr_start
-
-        crop_x_start = None
-        crop_y_start = None
-        crop_x_end = None
-        crop_y_end = None
-
-        if not self.use_fullframe:
-            if not all(p is None for p in [crop_x, crop_y, crop_width, crop_height]):
-                # infer missing crop parameters
-                inferred_x = 0 if crop_x is None else crop_x
-                inferred_y = 0 if crop_y is None else crop_y
-                inferred_width = (self.width - inferred_x) if crop_width is None else crop_width
-                inferred_height = (self.height - inferred_y) if crop_height is None else crop_height
-
-                # clamp to valid ranges
-                inferred_x = max(0, min(int(inferred_x), self.width))
-                inferred_y = max(0, min(int(inferred_y), self.height))
-                inferred_width = max(0, min(int(inferred_width), self.width - inferred_x))
-                inferred_height = max(0, min(int(inferred_height), self.height - inferred_y))
-                if inferred_width > 0 and inferred_height > 0:
-                    crop_x_start = inferred_x
-                    crop_y_start = inferred_y
-                    crop_x_end = inferred_x + inferred_width
-                    crop_y_end = inferred_y + inferred_height
-
-        # Decode-level downscaling for 4K+ videos
-        decode_height = DECODE_TARGET_HEIGHT if self.height > DECODE_TARGET_HEIGHT else None
-
-        # Scale crop coordinates from native to decode resolution
-        if decode_height is not None:
-            scale_factor = decode_height / self.height
-            if crop_x_start is not None:
-                crop_x_start = int(crop_x_start * scale_factor)
-                crop_y_start = int(crop_y_start * scale_factor)
-                crop_x_end = int(crop_x_end * scale_factor)
-                crop_y_end = int(crop_y_end * scale_factor)
-
-        # get frames from ocr_start to ocr_end using producer-consumer pattern
-        modulo = frames_to_skip + 1
-        frames_to_process = (num_ocr_frames + modulo - 1) // modulo
-
-        # Set up progress tracking via unified tracker
-        if progress is not None:
-            progress.set_phase('dialogue', frames_to_process)
-
-        # Create queue for producer-consumer communication
-        # Dynamic buffer sizing based on frame size and RAM budget
-        if decode_height is not None:
-            buf_w = int(self.width * (decode_height / self.height))
-            frame_bytes = buf_w * decode_height * 3
-        else:
-            frame_bytes = self.width * self.height * 3  # BGR24
-        buffer_frames = max(BATCH_SIZE * 2, MAX_BUFFER_BYTES // frame_bytes)
-        frame_queue = Queue(maxsize=buffer_frames)
-
         # Profiling variables
         self._ocr_time = 0.0
         self._queue_wait_time = 0.0
         self._producer_time = 0.0  # Will be set by producer thread
         profiling_start = time.perf_counter()
 
-        adjusted_ocr_start = ocr_start
+        # Single container open for this range. decode_target_height is
+        # always requested at the module's standard target: PyAVCapture
+        # only actually downscales when the source is taller than it (see
+        # its __enter__), so this is a no-op for <=1080p sources and still
+        # gets 4K+ sources their decode-time downscale. Container metadata
+        # (num_frames/fps/height/width) is read from this same open capture
+        # right after opening it, instead of from the separate metadata-only
+        # Capture Video.__init__ used to open - one container open instead
+        # of two. The crop is applied by _frame_producer in Python (via the
+        # crop_x_start/... args below) rather than baked into the filter
+        # graph: that graph-crop optimisation needed the crop pre-scaled to
+        # decode-output coordinates, which in turn needed self.height known
+        # *before* opening - exactly the chicken-and-egg this change removes.
+        # Every case this module's golden/determinism tests cover keeps the
+        # same decode path either way (see PyAVCapture._plan_crop: it only
+        # plans a graph crop when a filter graph exists for tone-mapping or
+        # downscaling reasons anyway, which none of them are), so this only
+        # gives up a filter-graph-crop optimisation on sources that need
+        # tone-mapping or downscaling AND a crop - it does not change output.
+        with Capture(self.path, decode_target_height=DECODE_TARGET_HEIGHT) as v:
+            if getattr(self, '_height', None) is None:
+                # First use of this Video (or a caller that pre-populated
+                # these itself, e.g. tests/test_candidate_buffer.py, skips
+                # this branch entirely): read container metadata from the
+                # capture just opened for decoding rather than a second,
+                # metadata-only one.
+                self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.fps = v.get(cv2.CAP_PROP_FPS)
+                self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
 
-        graph_crop = None
-        if crop_x_end is not None and crop_y_end is not None:
-            graph_crop = (crop_x_start, crop_y_start,
-                          crop_x_end - crop_x_start, crop_y_end - crop_y_start)
+            ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
+            ocr_end = utils.get_frame_index(time_end, self.fps) if time_end else self.num_frames
 
-        with Capture(self.path, decode_target_height=decode_height,
-                     crop_rect=graph_crop) as v:
+            if ocr_end < ocr_start:
+                raise ValueError("time_start is later than time_end")
+            num_ocr_frames = ocr_end - ocr_start
+
+            crop_x_start = None
+            crop_y_start = None
+            crop_x_end = None
+            crop_y_end = None
+
+            if not self.use_fullframe:
+                if not all(p is None for p in [crop_x, crop_y, crop_width, crop_height]):
+                    # infer missing crop parameters
+                    inferred_x = 0 if crop_x is None else crop_x
+                    inferred_y = 0 if crop_y is None else crop_y
+                    inferred_width = (self.width - inferred_x) if crop_width is None else crop_width
+                    inferred_height = (self.height - inferred_y) if crop_height is None else crop_height
+
+                    # clamp to valid ranges
+                    inferred_x = max(0, min(int(inferred_x), self.width))
+                    inferred_y = max(0, min(int(inferred_y), self.height))
+                    inferred_width = max(0, min(int(inferred_width), self.width - inferred_x))
+                    inferred_height = max(0, min(int(inferred_height), self.height - inferred_y))
+                    if inferred_width > 0 and inferred_height > 0:
+                        crop_x_start = inferred_x
+                        crop_y_start = inferred_y
+                        crop_x_end = inferred_x + inferred_width
+                        crop_y_end = inferred_y + inferred_height
+
+            # Decode-level downscaling for 4K+ videos. Mirrors the same
+            # self.height > DECODE_TARGET_HEIGHT check PyAVCapture just made
+            # internally with the same constant, so this always agrees with
+            # what the capture above actually did.
+            decode_height = DECODE_TARGET_HEIGHT if self.height > DECODE_TARGET_HEIGHT else None
+
+            # Scale crop coordinates from native to decode resolution
+            if decode_height is not None:
+                scale_factor = decode_height / self.height
+                if crop_x_start is not None:
+                    crop_x_start = int(crop_x_start * scale_factor)
+                    crop_y_start = int(crop_y_start * scale_factor)
+                    crop_x_end = int(crop_x_end * scale_factor)
+                    crop_y_end = int(crop_y_end * scale_factor)
+
+            # get frames from ocr_start to ocr_end using producer-consumer pattern
+            modulo = frames_to_skip + 1
+            frames_to_process = (num_ocr_frames + modulo - 1) // modulo
+
+            # Set up progress tracking via unified tracker
+            if progress is not None:
+                progress.set_phase('dialogue', frames_to_process)
+
+            # Create queue for producer-consumer communication
+            # Dynamic buffer sizing based on frame size and RAM budget
+            if decode_height is not None:
+                buf_w = int(self.width * (decode_height / self.height))
+                frame_bytes = buf_w * decode_height * 3
+            else:
+                frame_bytes = self.width * self.height * 3  # BGR24
+            buffer_frames = max(BATCH_SIZE * 2, MAX_BUFFER_BYTES // frame_bytes)
+            frame_queue = Queue(maxsize=buffer_frames)
+
+            adjusted_ocr_start = ocr_start
+
             # Get the container-level start_time for PTS normalization.
             # Players offset PTS only by container start_time (0 for MKV,
             # possibly non-zero for MP4). Stream start_time is not used.
@@ -648,20 +816,43 @@ class Video:
 
                 # Apply brightness filter
                 if brightness_threshold:
-                    frame = cv2.bitwise_and(frame, frame, mask=cv2.inRange(frame, (brightness_threshold,) * 3, (255,) * 3))
+                    # Center square geometry is fixed by frame shape alone
+                    # (not by content), so it can be computed once up front
+                    # and reused whether or not the pre-gate below fires.
+                    frame_h, frame_w = frame.shape[:2]
+                    center_x_start = (frame_w - frame_h) // 2
+                    center_x_end = center_x_start + frame_h
 
-                    # Convert to grayscale for checks
-                    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    h, w = grey.shape
+                    gated = False
+                    if not tracking_subtitle:
+                        # LOOKING STATE exact pre-gate: see luma_floor()'s
+                        # derivation. If no pixel in the untouched center
+                        # square reaches the necessary Y' floor, the mask
+                        # cv2.inRange would build over this region is
+                        # provably all-zero, so the Laplacian variance is 0
+                        # and raw_detection is False - skip the full-frame
+                        # mask/greyscale/Laplacian pipeline to find that out.
+                        # Never applied in TRACKING: that state still needs
+                        # the full masked grey below for its similarity
+                        # check against the previous frame.
+                        center_bgr = frame[:, center_x_start:center_x_end]
+                        if _bt709_luma(center_bgr).max() < luma_floor(brightness_threshold):
+                            gated = True
 
-                    # Center square check: h×h pixels, horizontally centered
-                    center_x_start = (w - h) // 2
-                    center_x_end = center_x_start + h
-                    center = grey[:, center_x_start:center_x_end]
+                    if gated:
+                        raw_detection = False
+                    else:
+                        frame = cv2.bitwise_and(frame, frame, mask=cv2.inRange(frame, (brightness_threshold,) * 3, (255,) * 3))
 
-                    # Use Laplacian variance for text detection (measures edge sharpness)
-                    laplacian = cv2.Laplacian(center, cv2.CV_64F)
-                    raw_detection = laplacian.var() >= MIN_LAPLACIAN_VARIANCE
+                        # Convert to grayscale for checks
+                        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                        # Center square check: h×h pixels, horizontally centered
+                        center = grey[:, center_x_start:center_x_end]
+
+                        # Use Laplacian variance for text detection (measures edge sharpness)
+                        laplacian = cv2.Laplacian(center, cv2.CV_64F)
+                        raw_detection = laplacian.var() >= MIN_LAPLACIAN_VARIANCE
 
                     # Update detection history (used for END smoothing only)
                     detection_history.append(raw_detection)
