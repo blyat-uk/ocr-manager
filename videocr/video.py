@@ -128,66 +128,48 @@ MIN_LAPLACIAN_VARIANCE = 50
 # Real subtitles are at least 0.2-0.5 seconds
 MIN_SUBTITLE_DURATION = 0.15
 
-# --- Exact luma pre-gate (LOOKING state only) --------------------------
+# --- Exact center-mask pre-gate (LOOKING state only) --------------------
 #
 # The brightness filter's mask is cv2.inRange(frame, (t,t,t), (255,255,255)):
-# a pixel survives only if EVERY channel is >= t. BT.709 gives the identity
+# a pixel survives only if EVERY channel is >= t, i.e. min(B,G,R) >= t.
+# cv2.inRange is pointwise (per-pixel), so it commutes with slicing: running
+# it on just the center square gives exactly the same result, there, as
+# running it on the whole frame and then slicing the center out. So if the
+# center square's own mask is empty, that region of the REAL, full-frame
+# mask is empty too - not approximately, exactly, no reconstruction or
+# numerical margin involved - so the greyscale conversion and Laplacian
+# variance the full pipeline would compute over that region are 0 (a
+# uniformly-zero array has zero variance), and raw_detection is False.
+# _center_mask_is_empty() below checks only the small center square instead
+# of paying for the mask/greyscale/Laplacian pipeline over the whole frame
+# to find that out.
 #
-#     0.2126*R + 0.7152*G + 0.0722*B = 1.164*(Y'-16)
-#
-# for any pixel produced by the standard limited-to-full range BT.709
-# decode (the chroma terms cancel by construction of the coefficients).
-# Since 0.2126+0.7152+0.0722 = 1, that left side is a convex combination of
-# R, G, B, so if every channel is >= t (allowing t-0.5 for sub-LSB
-# rounding), the combination is >= t-0.5 too - making
-#
-#     Y' >= (t-0.5)/1.164 + 16
-#
-# a NECESSARY condition for any pixel to pass the mask. If no pixel in the
-# center square reaches that floor, the masked frame is provably all-zero
-# there, so the Laplacian variance is 0 and raw_detection is False - no
-# need to run the full-frame mask/greyscale/Laplacian pipeline to find
-# that out. Measured on the reference episode: 1080p t=209 -> floor
-# 195.12, observed minimum Y' of an actually-passing pixel 196 (the bound
-# has margin, never a false negative), 39.7% of LOOKING-state frames
-# rejected; 4K t=230 -> 84.8% rejected. Zero false negatives in both
-# cases; see tests/test_luma_gate.py for the property proof.
+# (An earlier version of this gate reconstructed a BT.709 luma value from
+# the center square and compared it to a derived floor. That was strictly
+# worse on every axis: reconstructing Y' needs three float32 copies of a
+# non-contiguous view plus a multiply-add-divide pass, where inRange over
+# the same region is a single, already-existing primitive; the floor is a
+# NECESSARY-only bound with a numerical margin, where the center mask is
+# the EXACT condition with no margin needed at all, so it also rejects
+# strictly more frames. It bought nothing and cost more, including at
+# use_fullframe where it net-lost to the full pipeline it was meant to
+# avoid - see tests/test_luma_gate.py.)
 #
 # Only valid while LOOKING for a subtitle to start. TRACKING an existing
 # one still needs the full masked grey frame for its similarity check
 # against the previous frame, so the gate is never applied there.
-_BT709_LIMITED_TO_FULL = 1.164  # ~255/219; see derivation above
-_BT709_COEFF_B = 0.0722
-_BT709_COEFF_G = 0.7152
-_BT709_COEFF_R = 0.2126
 
 
-def luma_floor(threshold: int, bit_depth: int = 8) -> float:
-    """Necessary BT.709 Y' floor for a pixel to have any chance of passing
-    cv2.inRange(frame, (threshold,)*3, (max,)*3).
+def _center_mask_is_empty(center_bgr: np.ndarray, threshold: int) -> bool:
+    """True iff no pixel in `center_bgr` has every channel >= threshold.
 
-    If the maximum Y' in a region is below this floor, no pixel in that
-    region can pass the mask - see the derivation above. `threshold` and
-    the returned floor share the same bit_depth-scaled 0-to-(2**bit_depth-1)
-    range (default 8-bit, which is what every frame this module handles
-    actually is - Capture always yields bgr24 uint8, even from 10-bit/HDR
-    sources - see videocr/pyav_adapter.py).
+    Exactly cv2.inRange(center_bgr, (threshold,)*3, (255,255,255)) having
+    no nonzero entries - i.e. the same per-channel min-threshold mask the
+    brightness filter itself builds, restricted to just the small center
+    square instead of the whole (possibly much larger) frame.
     """
-    scale = 2 ** (bit_depth - 8)
-    return (threshold - 0.5 * scale) / _BT709_LIMITED_TO_FULL + 16 * scale
-
-
-def _bt709_luma(bgr: np.ndarray) -> np.ndarray:
-    """Reconstruct BT.709 Y' from full-range BGR pixels via the identity
-    documented above. `bgr` is any array with a trailing (B, G, R) axis
-    (OpenCV's channel order); returns a float32 array of the same leading
-    shape.
-    """
-    b = bgr[..., 0].astype(np.float32)
-    g = bgr[..., 1].astype(np.float32)
-    r = bgr[..., 2].astype(np.float32)
-    weighted = _BT709_COEFF_B * b + _BT709_COEFF_G * g + _BT709_COEFF_R * r
-    return weighted / _BT709_LIMITED_TO_FULL + 16.0
+    return cv2.countNonZero(cv2.inRange(
+        center_bgr, (threshold,) * 3, (255,) * 3)) == 0
 
 
 class Video:
@@ -222,18 +204,34 @@ class Video:
         self._width = None
 
     def _probe_metadata(self) -> None:
-        """Fill in num_frames/fps/height/width from their own, dedicated,
-        metadata-only container open.
+        """Fill in whichever of num_frames/fps/height/width are still
+        unset, from their own, dedicated, metadata-only container open.
+
+        Only touches fields that are still None, and only opens a
+        container at all if at least one is: a caller that has already
+        set some of these directly (e.g. tests/test_candidate_buffer.py
+        assigns all four before calling run_ocr(); a caller could just as
+        well set only some) keeps what it set instead of a property read
+        for the one it didn't silently overwriting it with the real
+        file's values as a side effect.
 
         Only reached when something reads one of the properties below
-        before run_ocr() has already populated them from the capture it
-        opens for real decoding - e.g. videocr/api.py's only_labels path.
+        while at least one of the four is still unset, before run_ocr()
+        has already populated them from the capture it opens for real
+        decoding - e.g. videocr/api.py's only_labels path.
         """
+        if None not in (getattr(self, '_num_frames', None), getattr(self, '_fps', None),
+                        getattr(self, '_height', None), getattr(self, '_width', None)):
+            return
         with Capture(self.path) as v:
-            self._num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
-            self._fps = v.get(cv2.CAP_PROP_FPS)
-            self._height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self._width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
+            if getattr(self, '_num_frames', None) is None:
+                self._num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
+            if getattr(self, '_fps', None) is None:
+                self._fps = v.get(cv2.CAP_PROP_FPS)
+            if getattr(self, '_height', None) is None:
+                self._height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if getattr(self, '_width', None) is None:
+                self._width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     @property
     def num_frames(self) -> int:
@@ -312,27 +310,39 @@ class Video:
         # (num_frames/fps/height/width) is read from this same open capture
         # right after opening it, instead of from the separate metadata-only
         # Capture Video.__init__ used to open - one container open instead
-        # of two. The crop is applied by _frame_producer in Python (via the
-        # crop_x_start/... args below) rather than baked into the filter
-        # graph: that graph-crop optimisation needed the crop pre-scaled to
-        # decode-output coordinates, which in turn needed self.height known
-        # *before* opening - exactly the chicken-and-egg this change removes.
-        # Every case this module's golden/determinism tests cover keeps the
-        # same decode path either way (see PyAVCapture._plan_crop: it only
-        # plans a graph crop when a filter graph exists for tone-mapping or
-        # downscaling reasons anyway, which none of them are), so this only
-        # gives up a filter-graph-crop optimisation on sources that need
-        # tone-mapping or downscaling AND a crop - it does not change output.
+        # of two.
+        #
+        # The crop can't be passed to the constructor any more, though:
+        # doing so needs it pre-scaled to decode-output coordinates, which
+        # needs self.height known *before* opening - exactly the
+        # chicken-and-egg this change removes. Instead it's configured
+        # below, after opening, via Capture.configure_crop() (PyAVCapture
+        # exposes this so a caller can plan+build the crop into the filter
+        # graph once it knows one, as long as that happens before the
+        # first read()/set() - see pyav_adapter.py). That keeps the graph
+        # -level crop optimisation working for every source that needs a
+        # filter graph anyway (tone-mapped and/or downscaled), which is
+        # the only case PyAVCapture._plan_crop ever plans a graph crop for
+        # in the first place; the golden/determinism cases (1080p SDR, no
+        # downscale) never engaged it even before this file existed, so
+        # they see no difference either way.
         with Capture(self.path, decode_target_height=DECODE_TARGET_HEIGHT) as v:
-            if getattr(self, '_height', None) is None:
-                # First use of this Video (or a caller that pre-populated
-                # these itself, e.g. tests/test_candidate_buffer.py, skips
-                # this branch entirely): read container metadata from the
-                # capture just opened for decoding rather than a second,
-                # metadata-only one.
+            # First use of this Video (or a caller that pre-populated some
+            # or all of these itself, e.g. tests/test_candidate_buffer.py
+            # sets all four before calling run_ocr()): read whichever of
+            # num_frames/fps/height/width are still unset from the capture
+            # just opened for decoding, rather than a second, metadata-only
+            # one. Each field is guarded independently so a caller that set
+            # only some of these keeps what it set - a single all-or-
+            # nothing guard here would silently overwrite the rest of a
+            # partial pre-population with this file's real values.
+            if getattr(self, '_num_frames', None) is None:
                 self.num_frames = int(v.get(cv2.CAP_PROP_FRAME_COUNT))
+            if getattr(self, '_fps', None) is None:
                 self.fps = v.get(cv2.CAP_PROP_FPS)
+            if getattr(self, '_height', None) is None:
                 self.height = int(v.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if getattr(self, '_width', None) is None:
                 self.width = int(v.get(cv2.CAP_PROP_FRAME_WIDTH))
 
             ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
@@ -400,6 +410,22 @@ class Video:
             frame_queue = Queue(maxsize=buffer_frames)
 
             adjusted_ocr_start = ocr_start
+
+            # Bake the (already decode-output-scaled) crop into the filter
+            # graph if this capture supports it and one was actually
+            # inferred; must happen before get_stream_start_time()/set()
+            # below touch anything read()-adjacent (see configure_crop()'s
+            # own precondition). _frame_producer still receives
+            # crop_x_start/... regardless: if the graph didn't take the
+            # crop (v._crop_slice stays None - no filter graph existed for
+            # this source, or PyAV isn't available), it slices in Python
+            # instead, off the identical values either path would use.
+            graph_crop = None
+            if crop_x_end is not None and crop_y_end is not None:
+                graph_crop = (crop_x_start, crop_y_start,
+                              crop_x_end - crop_x_start, crop_y_end - crop_y_start)
+            if hasattr(v, 'configure_crop'):
+                v.configure_crop(graph_crop)
 
             # Get the container-level start_time for PTS normalization.
             # Players offset PTS only by container start_time (0 for MKV,
@@ -825,18 +851,13 @@ class Video:
 
                     gated = False
                     if not tracking_subtitle:
-                        # LOOKING STATE exact pre-gate: see luma_floor()'s
-                        # derivation. If no pixel in the untouched center
-                        # square reaches the necessary Y' floor, the mask
-                        # cv2.inRange would build over this region is
-                        # provably all-zero, so the Laplacian variance is 0
-                        # and raw_detection is False - skip the full-frame
-                        # mask/greyscale/Laplacian pipeline to find that out.
-                        # Never applied in TRACKING: that state still needs
-                        # the full masked grey below for its similarity
-                        # check against the previous frame.
+                        # LOOKING STATE exact pre-gate: see
+                        # _center_mask_is_empty()'s derivation above. Never
+                        # applied in TRACKING: that state still needs the
+                        # full masked grey below for its similarity check
+                        # against the previous frame.
                         center_bgr = frame[:, center_x_start:center_x_end]
-                        if _bt709_luma(center_bgr).max() < luma_floor(brightness_threshold):
+                        if _center_mask_is_empty(center_bgr, brightness_threshold):
                             gated = True
 
                     if gated:

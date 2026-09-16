@@ -284,6 +284,14 @@ class FFmpegNVDECCapture:
         self._seek_pos = 0
         return self
 
+    def configure_crop(self, crop_rect) -> None:
+        """Interface parity with PyAVCapture; this backend never crops in
+        its decode graph (crop_rect was already accepted-but-ignored by
+        the constructor for the same reason - see _crop_request above).
+        Callers can call this unconditionally regardless of backend.
+        """
+        self._crop_request = crop_rect
+
     def __exit__(self, exc_type, exc_value, traceback):
         if not FFMPEG_AVAILABLE:
             self.cap.release()
@@ -383,6 +391,9 @@ class PyAVCapture:
         self.container = None
         self.stream = None
         self._pos = 0
+        # True once read() or set() has been called; configure_crop()
+        # refuses to (re)build the filter graph after that point.
+        self._read_started = False
         self._frame_count = None
         self._fps = None
         self._width = None
@@ -450,6 +461,7 @@ class PyAVCapture:
             self._output_height = self._height
 
         self._pos = 0
+        self._read_started = False
         self._frame_generator = self.container.decode(video=0)
 
         # Whether the stream needs HDR->SDR tone mapping. Resolved before the
@@ -457,6 +469,50 @@ class PyAVCapture:
         # whether a filter graph is going to exist for some other reason.
         self._needs_tonemap, self._tonemap_trc = self._detect_tonemap()
 
+        # Plan-crop + build-graph is a separate, public step (configure_crop,
+        # below) so a caller that does not know its crop until after opening
+        # -- it needs this capture's own self.get(CAP_PROP_FRAME_HEIGHT) etc.
+        # first, e.g. videocr/video.py's run_ocr() -- can still get a crop
+        # baked into the filter graph, by calling configure_crop() itself
+        # once it knows one, before the first read()/set(). Everything
+        # __enter__ already knows by this point (_width/_height/
+        # _output_width/_output_height/_scale_factor/_needs_tonemap/
+        # self.stream) is exactly what that step needs, so nothing here
+        # depends on the crop being known yet. Run it now unconditionally
+        # (with whatever crop_rect the constructor was given, None by
+        # default) so every *existing* caller -- everything that already
+        # passes crop_rect= to the constructor, or none at all -- keeps
+        # getting it fully configured by the time __enter__ returns, same
+        # as before this split.
+        self.configure_crop(self._crop_request)
+
+        return self
+
+    def configure_crop(self, crop_rect) -> None:
+        """(Re)plan the crop and (re)build the filter graph (tone-map
+        and/or downscale and/or crop) for this already-open capture.
+
+        Must be called before the first read()/set() -- the filter graph,
+        once built, is what every read() pushes decoded frames through,
+        so rebuilding it after frames have already been pulled would
+        silently start converting later frames differently mid-stream.
+        __enter__() already calls this once, with whatever crop_rect the
+        constructor was given (None if none), so most callers never need
+        to call it again. A caller that only learns its crop after
+        opening -- because planning it needs native height, which this
+        capture is the one place that has it before decoding starts --
+        calls it again itself, with the crop now known, before touching
+        read()/set(). That rebuilds the graph a second time; harmless,
+        since nothing has been pushed through the first one yet.
+        """
+        self._crop_request = crop_rect
+        if not PYAV_AVAILABLE:
+            return  # cv2.VideoCapture fallback: no filter-graph crop support
+        if self._read_started:
+            raise RuntimeError(
+                "configure_crop() called after decoding already started; "
+                "it must run before the first read()/set()."
+            )
         try:
             # Translate the requested output-space crop into a native-space,
             # aligned, padded decode box (no-op if no crop was requested).
@@ -465,13 +521,17 @@ class PyAVCapture:
             # Set up combined filter graph (tone mapping + scaling)
             self._setup_filter_graph()
         except Exception:
-            # __exit__ does not run when __enter__ raises, so release the
-            # container here rather than leaking an open demuxer.
-            self.container.close()
-            self.container = None
+            # __exit__ does not run when __enter__ raises, so if this is
+            # __enter__'s own call (see above), release the container here
+            # rather than leaking an open demuxer. A later, explicit call
+            # (this capture already returned from __enter__) is inside the
+            # caller's `with` block, so __exit__ still runs normally on the
+            # way out -- closing here first is harmless, __exit__ just finds
+            # self.container already None and does nothing.
+            if self.container is not None:
+                self.container.close()
+                self.container = None
             raise
-
-        return self
 
     def _detect_tonemap(self):
         """(needs_tonemap, transfer_characteristic) for this stream."""
@@ -697,6 +757,7 @@ class PyAVCapture:
 
     def set(self, prop, value):
         """Set video property (compatible with cv2.VideoCapture.set)."""
+        self._read_started = True
         if not PYAV_AVAILABLE:
             return self.cap.set(prop, value)
 
@@ -729,6 +790,7 @@ class PyAVCapture:
             tuple: (success, frame) where frame is BGR numpy array
                    (downscaled if decode_target_height was set)
         """
+        self._read_started = True
         if not PYAV_AVAILABLE:
             ret, frame = self.cap.read()
             if ret:
@@ -832,6 +894,11 @@ else:
                 self._output_width = w
                 self._output_height = h
             return self
+        def configure_crop(self, crop_rect) -> None:
+            """Interface parity with PyAVCapture; this backend never crops
+            in its decode graph. Callers can call this unconditionally
+            regardless of backend."""
+            self._crop_request = crop_rect
         def __exit__(self, exc_type, exc_value, traceback):
             self.cap.release()
         def get(self, prop):
