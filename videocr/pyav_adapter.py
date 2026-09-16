@@ -358,20 +358,8 @@ class FFmpegNVDECCapture:
         -ss is relative to the start time), so this inverts that. Unlike
         set(), it also repositions to ordinal 0.
         """
-        if not FFMPEG_AVAILABLE:
-            return self.cap.set(cv2.CAP_PROP_POS_MSEC, pts * 1000.0)
-
         # The 1e-6 absorbs float noise when `pts` is exactly a frame's PTS.
-        ordinal = max(0, math.ceil((pts - self._container_start_time) * self._fps - 1e-6))
-        if ordinal == self._seek_pos + self._pos:
-            return True
-        if self.proc:
-            self.proc.stdout.close()
-            self.proc.terminate()
-            self.proc.wait()
-        self._start_ffmpeg(ordinal / self._fps if ordinal > 0 else None)
-        self._seek_pos = ordinal
-        self._pos = 0
+        self._reposition(max(0, math.ceil((pts - self._container_start_time) * self._fps - 1e-6)))
         return True
 
     def seek_to_display_time(self, t):
@@ -914,18 +902,21 @@ class PyAVCapture:
         converting them, exactly as set() does.
 
         If a seek lands *after* the target (a demuxer indexing keyframes by
-        DTS can) or yields no frame at all, it retries from further back,
-        until the first decoded frame is at or before the target or the
-        seek reaches the start of the stream.
+        DTS can) or yields no frame at all, it retries from further back
+        (_SEEK_BACKOFF_SECONDS, then twice that, and so on), until the first
+        decoded frame is at or before the target or the seek reaches the
+        start of the stream. What a seek to the start of the stream decodes
+        first is the first frame, so that seek is never retried.
 
         Returns:
-            bool: True if a frame at or after `pts` exists, False at end
-                  of stream.
+            bool: True if a frame at or after `pts` exists. False at end of
+                  stream, and also when all _SEEK_MAX_RETRIES retries still
+                  land after `pts`: frames between `pts` and where the seek
+                  landed may exist, so the landed frame is not handed out as
+                  if it were the first one (a warning is logged). After
+                  False, read()/grab() fail until the next seek.
         """
         self._read_started = True
-        if not PYAV_AVAILABLE:
-            return self.cap.set(cv2.CAP_PROP_POS_MSEC, pts * 1000.0)
-
         time_base = self.stream.time_base
         target_ts = int(round(pts / time_base))
         stream_start = self.stream.start_time if self.stream.start_time is not None else 0
@@ -935,28 +926,25 @@ class PyAVCapture:
             self.container.seek(seek_ts, stream=self.stream)
             self._frame_generator = self.container.decode(video=0)
             self._pending_frame = None
-            # Nothing precedes what a seek to the start of the stream
-            # decodes, and the retries are bounded.
-            may_retry = seek_ts > stream_start and attempt < self._SEEK_MAX_RETRIES
+            from_stream_start = seek_ts <= stream_start
 
             decoded_any = False
             for frame in self._frame_generator:
                 if frame.pts is None:
                     continue
                 frame_pts = float(frame.pts * time_base)
-                if not decoded_any and frame_pts > pts and may_retry:
+                if not decoded_any and frame_pts > pts and not from_stream_start:
                     break  # landed after the target
                 decoded_any = True
                 if frame_pts >= pts:
-                    self._pending_frame = frame
-                    self._pos = int(round(frame_pts * self._fps))
+                    self._park(frame)
                     return True
-            if decoded_any or not may_retry:
-                return False  # end of stream before reaching the target
+            if decoded_any or from_stream_start:
+                return self._no_frame()  # end of stream before reaching the target
+            if attempt == self._SEEK_MAX_RETRIES:
+                return self._no_frame(f"seek_to_pts({pts!r})")
             seek_ts = max(target_ts - backoff, stream_start)
             backoff *= 2
-
-        return False
 
     def seek_to_display_time(self, t):
         """Position the capture so the next read()/grab() returns the frame

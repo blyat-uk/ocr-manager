@@ -752,7 +752,15 @@ class LabelScanner:
                 # Downscale for detection at 720p
                 scaled, scale = self._downscale(frame_cropped, self.SCAN_HEIGHT)
 
-                # Run detection
+                # Run detection. At or below SCAN_HEIGHT `scaled` is this
+                # frame, which the crops for phase 1.5 are cut from below, so
+                # detection gets it read-only: an engine that wrote to its
+                # input would raise here instead of changing those crops.
+                # (The real engine accepts read-only input and returns the
+                # same boxes.)
+                if scaled is frame_cropped:
+                    scaled = frame_cropped.view()
+                    scaled.flags.writeable = False
                 boxes = self._run_detection(det_engine, scaled)
 
                 if boxes:
@@ -761,8 +769,6 @@ class LabelScanner:
                     orig_boxes = self._merge_vertical_fragments(orig_boxes)
                     text_frames.append((frame_idx, pts, orig_boxes))
                     if retain is not None:
-                        # Cut after detection: neither engine writes to its
-                        # input, and below SCAN_HEIGHT `scaled` is this frame.
                         retain.offer(frame_idx, pts, orig_boxes,
                                      [self._crop_box_region(frame_cropped, box)[0] for box in orig_boxes])
 
@@ -786,7 +792,8 @@ class LabelScanner:
         read or the capture lands on a frame with a different PTS: a
         different frame is never substituted for the one asked for.
         """
-        cap.seek_to_pts(pts)
+        if not cap.seek_to_pts(pts):
+            return None
         ret, frame = cap.read()
         if not ret or frame is None or cap.get_last_pts() != pts:
             return None
@@ -810,7 +817,7 @@ class LabelScanner:
             return None
         return frame
 
-    def _batch_ocr_text_frames(self, text_frames, ocr, progress=None, retained=None):
+    def _batch_ocr_text_frames(self, text_frames, ocr, progress=None, retained=None, cancel_event=None):
         """Run OCR on every Phase 1 detection box to annotate with text.
 
         Replaces each bare np.array box with {"box": np.array, "text": str|None}
@@ -823,6 +830,9 @@ class LabelScanner:
         a container start time (tests/test_label_frame_identity.py). The
         video is only opened if some frame has to be fetched.
 
+        Stops before the next text frame once `cancel_event` is set, returning
+        the text frames annotated so far.
+
         Returns augmented text_frames: [(frame_idx, pts, [{"box": ..., "text": ...}, ...]), ...]
         """
         if progress is not None:
@@ -833,6 +843,8 @@ class LabelScanner:
         with contextlib.ExitStack() as stack:
             cap = None
             for frame_idx, pts, boxes in text_frames:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 crops = retained.take(frame_idx, pts, boxes) if retained is not None else None
                 if crops is None:
                     if cap is None:
@@ -2185,8 +2197,10 @@ class LabelScanner:
             return []
 
         # Phase 1.5: Batch OCR to annotate boxes with text
-        text_frames = self._batch_ocr_text_frames(text_frames, ocr, progress, retained=retained)
+        text_frames = self._batch_ocr_text_frames(text_frames, ocr, progress, retained=retained, cancel_event=cancel_event)
         del retained
+        if cancel_event is not None and cancel_event.is_set():
+            return []
 
         # Phase 2: Position grouping (text-aware)
         groups = self._phase2_group_by_position(text_frames, progress)

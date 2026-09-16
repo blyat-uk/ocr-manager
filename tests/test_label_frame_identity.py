@@ -31,6 +31,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import av
@@ -1083,11 +1084,11 @@ def test_seek_to_display_time_retries_from_further_back_when_a_seek_lands_late(c
         assert len(late.seeks) > len(times), "the late seeks never needed a retry, so this proves nothing"
 
 
-@pytest.mark.parametrize("seek_name", ["seek_to_display_time"])
+@pytest.mark.parametrize("seek_name", ["seek_to_pts", "seek_to_display_time"])
 def test_seeks_report_no_frame_when_the_retries_run_out(clips, monkeypatch, caplog, seek_name):
-    """When every allowed seek lands after the target, the seek may not hand
-    out the later frame as if it were the one asked for: it returns False,
-    logs a warning, and the next read() fails."""
+    """When every allowed seek lands after the target, neither seek may hand
+    out the later frame as if it were the one asked for: both return False,
+    log a warning, and the next read() fails."""
     path = _clip(clips, "zero-start-h264")
     reference = _decode_reference(path)
     monkeypatch.setattr(PyAVCapture, "_SEEK_MAX_RETRIES", 1)
@@ -1175,3 +1176,107 @@ def test_opencv_fallback_seek_to_display_time_reads_the_frame_on_screen(clips):
             wrong.append((t, reference[i][0], pts))
     assert not wrong, f"(time, frame on screen PTS, PTS read): {wrong}"
 
+
+# --- phase 1.5 cancellation, and detection input that retained crops share ----
+
+class _CancellingOCR:
+    """Records each crop it is given and sets `cancel` on the second."""
+
+    def __init__(self):
+        self.cancel = threading.Event()
+        self.calls = 0
+
+    def predict(self, crop):
+        self.calls += 1
+        if self.calls == 2:
+            self.cancel.set()
+        return []
+
+
+@pytest.mark.parametrize("retain", [False, True], ids=["fetched", "retained"])
+def test_phase15_stops_once_cancelled(clips, monkeypatch, retain):
+    """A cancel during phase 1.5 stops it before the next text frame: no more
+    OCR, and no more fetching."""
+    from videocr.label_scanner import _RetainedCrops
+
+    scanner = _masked_scanner(_clip(clips, "offset-h264"), None)
+    store = _RetainedCrops(budget_bytes=1 << 30) if retain else None
+    text_frames = scanner._phase1_find_text_frames(_WholeRegionDetector(), None, None, retain=store)
+    assert len(text_frames) >= 6
+    seeks = _Counting(monkeypatch, "seek_to_pts")
+    ocr = _CancellingOCR()
+
+    augmented = scanner._batch_ocr_text_frames(text_frames, ocr, retained=store, cancel_event=ocr.cancel)
+
+    assert ocr.calls == 2, "phase 1.5 went on reading text frames after the cancel"
+    assert len(augmented) == 2
+    assert seeks.calls == (0 if retain else 2)
+
+
+def test_scan_returns_nothing_after_a_cancel_in_phase15(clips, monkeypatch):
+    scanner = _masked_scanner(_clip(clips, "offset-h264"), None)
+    phase2_calls = []
+    monkeypatch.setattr(LabelScanner, "_phase2_group_by_position",
+                        lambda self, text_frames, progress=None: phase2_calls.append(text_frames) or [])
+    ocr = _CancellingOCR()
+
+    assert scanner.scan(_WholeRegionDetector(), ocr, "", "", 1.5, cancel_event=ocr.cancel) == []
+    assert ocr.calls == 2
+    assert phase2_calls == [], "scan went on to phase 2 after a cancel in phase 1.5"
+
+
+class _WritingDetector(_WholeRegionDetector):
+    """A detection engine that (wrongly) writes into the image it is given."""
+
+    def predict(self, frame):
+        frame[:] = 0
+        return super().predict(frame)
+
+
+def test_detection_cannot_write_into_the_frame_retained_crops_are_cut_from(clips):
+    """At or below SCAN_HEIGHT phase 1 hands detection the frame itself, and
+    then cuts the crops phase 1.5 will OCR from that same memory. An engine
+    writing to its input must fail loudly rather than blank those crops."""
+    from videocr.label_scanner import _RetainedCrops
+
+    scanner = _masked_scanner(_clip(clips, "zero-start-h264"), None)
+    with pytest.raises(ValueError, match="read-only"):
+        scanner._phase1_find_text_frames(_WritingDetector(), None, None, retain=_RetainedCrops(1 << 30))
+
+
+def test_detection_sees_the_shared_frame_read_only_and_a_downscaled_copy_as_it_is(clips, monkeypatch):
+    """At or below SCAN_HEIGHT detection is given a read-only view and phase 1
+    still retains every crop. Above it detection gets its own downscaled copy,
+    which shares nothing with the crops: an engine writing to that copy does
+    not raise and does not change them."""
+    from videocr.label_scanner import _RetainedCrops
+
+    seen = []
+
+    class _RecordingDetector(_WholeRegionDetector):
+        def predict(self, frame):
+            seen.append(frame.flags.writeable)
+            return super().predict(frame)
+
+    scanner = _masked_scanner(_clip(clips, "zero-start-h264"), None)
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+    retained = _RetainedCrops(1 << 30)
+    text_frames = scanner._phase1_find_text_frames(_RecordingDetector(), None, None, retain=retained)
+    assert seen and not any(seen), "detection input shared with the retained crops was writable"
+    crops = [crop for idx, pts, boxes in text_frames for crop in retained.take(idx, pts, boxes)]
+    assert len(crops) == len(text_frames)
+
+    scanner = _masked_scanner(_clip(clips, "zero-start-h264-960p"), None)
+    recorder.reads.clear()
+    retained = _RetainedCrops(1 << 30)
+    text_frames = scanner._phase1_find_text_frames(_WritingDetector(), None, None, retain=retained)
+    phase1_frames = dict(recorder.reads)
+    assert len(text_frames) >= 3
+    got = [crop for idx, pts, boxes in text_frames for crop in retained.take(idx, pts, boxes)]
+    expected = []
+    for _, pts, boxes in text_frames:
+        frame = phase1_frames[pts].copy()
+        scanner._apply_label_masks(frame)
+        expected += [scanner._crop_box_region(frame[: scanner.dialogue_cutoff_y, :], box)[0] for box in boxes]
+    _assert_same_crops(got, expected)
