@@ -85,9 +85,15 @@ def stub_pipeline(monkeypatch):
     return frames
 
 
-def _run(monkeypatch, cap_bytes=None):
-    if cap_bytes is not None:
-        monkeypatch.setattr(video_mod, "MAX_CANDIDATE_BUFFER_BYTES", cap_bytes)
+# Captured at import, before any test can patch it.
+PRODUCTION_CAP = video_mod.MAX_CANDIDATE_BUFFER_BYTES
+
+
+def _run(monkeypatch, cap_bytes=PRODUCTION_CAP):
+    # Always set it, never merely leave it: monkeypatch only unwinds at the
+    # end of a test, so a run that skipped this would silently inherit the
+    # cap a previous run in the same test had installed.
+    monkeypatch.setattr(video_mod, "MAX_CANDIDATE_BUFFER_BYTES", cap_bytes)
 
     ocr = CountingOCR()
     monkeypatch.setattr(video_mod.utils, "create_ocr_engine",
@@ -117,6 +123,9 @@ def test_all_candidates_are_buffered_under_the_cap(monkeypatch):
     v, candidates = _run(monkeypatch)
     assert len(v.pred_frames) == SUBTITLES
     assert candidates == SUBTITLES * video_mod.MAX_CANDIDATES
+    # ...and this stream is nowhere near the cap, which is the point.
+    frame_bytes = FRAME_SIZE * FRAME_SIZE * 3
+    assert candidates * frame_bytes < PRODUCTION_CAP
 
 
 def test_candidate_buffer_respects_the_byte_budget(monkeypatch):
@@ -137,7 +146,8 @@ def test_candidate_admission_is_deterministic(monkeypatch):
     texts = [[f.text for f in v.pred_frames] for v, _ in runs]
     assert texts[0] == texts[1]
 
-    full, _ = _run(monkeypatch)
+    full, full_candidates = _run(monkeypatch, cap_bytes=PRODUCTION_CAP)
+    assert full_candidates > runs[0][1], "the comparison run was not unclipped"
     assert [f.text for f in full.pred_frames] == texts[0]
 
 
