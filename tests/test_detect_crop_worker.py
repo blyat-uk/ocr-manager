@@ -5,9 +5,14 @@ core.detect.crop.detect_crop() -- these tests drive it with a stubbed
 detect_crop() (and a stubbed detection-engine constructor) so they never
 touch ffmpeg, ffprobe or a real PaddleOCR model. Every test bounds its
 event loop with a QTimer so a regression that hangs the worker fails the
-test instead of hanging the suite.
+test instead of hanging the suite -- and worker.cleanup() itself is now
+also called with a bound (see CLEANUP_TIMEOUT_MS / ruling B below), since
+an unbounded QThread.wait() right after a bounded event loop would defeat
+the point of bounding the event loop at all.
 """
 import os
+import threading
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -19,6 +24,9 @@ from core.detect.crop import CropResult
 from core.subtitle_detector import SubtitleDetectionWorker
 
 EVENT_LOOP_TIMEOUT_MS = 5000
+CLEANUP_TIMEOUT_MS = 5000
+
+FRAME_SIZE = (1920, 1080)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -41,12 +49,13 @@ def stub_engine_creation(monkeypatch):
         "videocr.utils.create_detection_engine",
         lambda det_model_dir, use_gpu: object(),
     )
-    monkeypatch.setattr(subtitle_detector, "_probe_dimensions", lambda video_path: (1920, 1080))
 
 
-def _run_worker(worker, timeout_ms=EVENT_LOOP_TIMEOUT_MS):
+def _run_worker(worker, timeout_ms=EVENT_LOOP_TIMEOUT_MS, cleanup_timeout_ms=CLEANUP_TIMEOUT_MS):
     """Start `worker`, pump a bounded event loop until finished/error fires
-    (or `timeout_ms` elapses), and return the collected signal emissions.
+    (or `timeout_ms` elapses), then clean up with a bound of its own (see
+    ruling B: an unbounded cleanup() defeats the event-loop bound above),
+    and return the collected signal emissions.
     """
     detected = []
     progress_calls = []
@@ -89,7 +98,7 @@ def _run_worker(worker, timeout_ms=EVENT_LOOP_TIMEOUT_MS):
     worker.start()
     loop.exec()
     timer.stop()
-    worker.cleanup()
+    cleanup_finished = worker.cleanup(timeout_ms=cleanup_timeout_ms)
 
     return {
         "detected": detected,
@@ -97,6 +106,7 @@ def _run_worker(worker, timeout_ms=EVENT_LOOP_TIMEOUT_MS):
         "errors": errors,
         "finished_count": state["finished_count"],
         "timed_out": state["timed_out"],
+        "cleanup_finished": cleanup_finished,
     }
 
 
@@ -104,20 +114,33 @@ def _make_video_files(names, duration=100.0):
     return [(name, f"/videos/{name}", duration) for name in names]
 
 
+def _crop_result(box, hit_pts, sample_pts=None, flagged=None, frame_size=FRAME_SIZE, **kw):
+    """Build a CropResult with the fields the adapter now actually reads
+    (hit_pts, frame_size -- see rulings C/D), defaulting sample_pts to
+    something that deliberately does NOT start with hit_pts[0], so any
+    test using this helper would catch a regression back to deriving the
+    slider position from sample_pts[0]."""
+    if sample_pts is None:
+        sample_pts = [0.1] + list(hit_pts)
+    return CropResult(box=box, sample_pts=sample_pts, hit_pts=list(hit_pts),
+                       flagged=flagged, frame_size=frame_size, **kw)
+
+
 def test_one_file_detected_per_resolved_file_with_right_arguments(monkeypatch):
     results = {
-        "a.mp4": CropResult(
-            box=(10, 900, 1000, 80), sample_pts=[42.5, 50.0],
+        "a.mp4": _crop_result(
+            box=(10, 900, 1000, 80), hit_pts=[42.5], sample_pts=[10.0, 42.5, 50.0],
             agreed=5, probes_used=10, flagged=None,
         ),
-        "b.mp4": CropResult(
-            box=(20, 910, 1000, 90), sample_pts=[30.0],
+        "b.mp4": _crop_result(
+            box=(20, 910, 1000, 90), hit_pts=[30.0], sample_pts=[5.0, 30.0],
             agreed=4, probes_used=8, flagged="low-agreement",
         ),
     }
     calls = []
 
-    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None, settings=None):
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
         filename = os.path.basename(video_path)
         calls.append({
             "video_path": video_path,
@@ -132,15 +155,17 @@ def test_one_file_detected_per_resolved_file_with_right_arguments(monkeypatch):
     outcome = _run_worker(worker)
 
     assert not outcome["timed_out"], "worker did not finish within the bounded event loop"
+    assert outcome["cleanup_finished"] is True
     assert outcome["finished_count"] == 1
     assert not outcome["errors"]
 
     detected = {args[0]: args for args in outcome["detected"]}
     assert set(detected) == {"a.mp4", "b.mp4"}
 
-    # a.mp4: slider = sample_pts[0] / duration * 10000 = 42.5/100*10000 = 4250
+    # a.mp4: slider = hit_pts[0] / duration * 10000 = 42.5/100*10000 = 4250
+    # (NOT sample_pts[0]=10.0, which would give 1000 -- see ruling D)
     assert detected["a.mp4"] == ("a.mp4", 4250, 10, 900, 1000, 80)
-    # b.mp4: slider = 30.0/100*10000 = 3000
+    # b.mp4: slider = hit_pts[0]=30.0 -> 3000 (not sample_pts[0]=5.0 -> 500)
     assert detected["b.mp4"] == ("b.mp4", 3000, 20, 910, 1000, 90)
 
     # progress: monotonically non-decreasing, ends at (2, 2)
@@ -154,13 +179,42 @@ def test_one_file_detected_per_resolved_file_with_right_arguments(monkeypatch):
     assert calls[1]["consensus"] == [(900 / 1080, 80 / 1080)]
 
 
+def test_slider_position_is_derived_from_hit_pts_not_sample_pts(monkeypatch):
+    """Task-3 review ruling D, isolated: sample_pts[0] is the full probe
+    history's first entry -- after a fallback round it is guaranteed to be
+    a frame with no detected text (see core/detect/crop.py). The slider
+    position the worker emits must come from hit_pts[0] (a real hit), not
+    sample_pts[0]."""
+    result = CropResult(
+        box=(0, 900, 100, 50),
+        sample_pts=[1.0, 2.0, 3.0],   # would give slider=100 if used (wrong)
+        hit_pts=[75.0],               # must give slider=7500
+        agreed=5, probes_used=3, flagged=None, frame_size=FRAME_SIZE,
+    )
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        return result
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    worker = SubtitleDetectionWorker(_make_video_files(["a.mp4"]))
+    outcome = _run_worker(worker)
+
+    assert not outcome["timed_out"]
+    assert len(outcome["detected"]) == 1
+    filename, slider_pos, cx, cy, cw, ch = outcome["detected"][0]
+    assert slider_pos == 7500, f"slider must come from hit_pts[0]=75.0, got {slider_pos}"
+
+
 def test_box_none_is_skipped_not_emitted_with_a_zero_box(monkeypatch, caplog):
     results = {
-        "a.mp4": CropResult(box=(10, 900, 1000, 80), sample_pts=[10.0], agreed=5, probes_used=5),
+        "a.mp4": _crop_result(box=(10, 900, 1000, 80), hit_pts=[10.0], agreed=5, probes_used=5),
         "b.mp4": CropResult(box=None, sample_pts=[10.0], agreed=0, probes_used=30, flagged="no-speech"),
     }
 
-    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None, settings=None):
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
         return results[os.path.basename(video_path)]
 
     monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
@@ -186,16 +240,23 @@ def test_cancel_stops_further_work(monkeypatch):
     """detect_crop() runs synchronously on the worker's background thread
     with no artificial delay here, so the only race-free way to pin
     "cancel() stops further work" is to request cancellation from inside
-    the detect_crop call itself (as if the user clicked Cancel while file
-    1 was still being processed) rather than from a cross-thread signal
-    handler racing the background thread's next loop iteration."""
+    the detect_crop call itself (as if the user clicked Cancel while a
+    file was still being processed) rather than from a cross-thread signal
+    handler racing the background thread's next loop iteration.
+
+    Cancellation is requested while b.mp4 is "in flight": a.mp4 (already
+    fully processed beforehand) is still emitted, b.mp4's own result is
+    discarded (a cancelled-mid-file result is not trustworthy -- see
+    SubtitleDetectionWorker._run()), and c.mp4 is never started.
+    """
     results = {
-        name: CropResult(box=(0, 900, 100, 50), sample_pts=[1.0], agreed=5, probes_used=5)
+        name: _crop_result(box=(0, 900, 100, 50), hit_pts=[1.0], agreed=5, probes_used=5)
         for name in ("a.mp4", "b.mp4", "c.mp4")
     }
 
-    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None, settings=None):
-        if os.path.basename(video_path) == "a.mp4":
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        if os.path.basename(video_path) == "b.mp4":
             worker.cancel()
         return results[os.path.basename(video_path)]
 
@@ -208,15 +269,17 @@ def test_cancel_stops_further_work(monkeypatch):
     assert outcome["finished_count"] == 1, "cancellation must still reach a clean finished()"
     detected_names = [args[0] for args in outcome["detected"]]
     assert detected_names == ["a.mp4"], (
-        f"cancel() must stop further files from being processed, got {detected_names}"
+        f"cancel() must stop further files from being processed (and discard the "
+        f"in-flight file's own result), got {detected_names}"
     )
 
 
 def test_exception_in_one_file_does_not_abort_others_or_emit_error(monkeypatch):
-    good_a = CropResult(box=(0, 900, 100, 50), sample_pts=[1.0], agreed=5, probes_used=5)
-    good_c = CropResult(box=(0, 910, 100, 60), sample_pts=[1.0], agreed=5, probes_used=5)
+    good_a = _crop_result(box=(0, 900, 100, 50), hit_pts=[1.0], agreed=5, probes_used=5)
+    good_c = _crop_result(box=(0, 910, 100, 60), hit_pts=[1.0], agreed=5, probes_used=5)
 
-    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None, settings=None):
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
         name = os.path.basename(video_path)
         if name == "b.mp4":
             raise RuntimeError("boom")
@@ -234,3 +297,136 @@ def test_exception_in_one_file_does_not_abort_others_or_emit_error(monkeypatch):
     detected_names = sorted(args[0] for args in outcome["detected"])
     assert detected_names == ["a.mp4", "c.mp4"], "the other files must still resolve"
     assert outcome["progress"][-1] == (3, 3), "the failed file must still count toward progress"
+
+
+def test_cancel_takes_effect_within_one_probe_batch_not_only_between_files(monkeypatch):
+    """Task-3 review ruling A: detect_crop() now takes a cancel_check hook
+    that the worker must wire to its own cancellation flag, checked
+    between probe batches -- not just between files (previously, cancel()
+    only took effect once the CURRENT file's detect_crop() call returned
+    on its own, which could mean waiting out up to 3 internal probe
+    rounds x 30 probes each; main.py's cancel handler calls cleanup()
+    synchronously right after cancel(), so that unbounded wait froze the
+    whole GUI). Simulates a detect_crop() that would run many "batches"
+    (several seconds) unless cancelled, cancels shortly after it starts,
+    and asserts the worker thread finishes well under the time the full,
+    uncancelled detection would have taken.
+    """
+    BATCH_DELAY_S = 0.05
+    MANY_BATCHES = 100  # 100 * 0.05s = 5s if cancellation is not honoured
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        assert cancel_check is not None, "the worker must pass a cancel_check into detect_crop"
+        for _ in range(MANY_BATCHES):
+            if cancel_check():
+                break
+            time.sleep(BATCH_DELAY_S)
+        return CropResult(box=None, sample_pts=[])
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    worker = SubtitleDetectionWorker(_make_video_files(["a.mp4"]))
+    worker.start()
+    time.sleep(BATCH_DELAY_S * 3)  # let a few "batches" happen before cancelling
+    worker.cancel()
+
+    start = time.monotonic()
+    finished = worker.cleanup(timeout_ms=2000)
+    elapsed = time.monotonic() - start
+
+    assert finished is True, "the worker thread must actually finish once cancelled"
+    bound = (MANY_BATCHES * BATCH_DELAY_S) / 2
+    assert elapsed < bound, (
+        f"cancellation must take effect within roughly one batch, not run to "
+        f"completion (took {elapsed:.2f}s, bound {bound:.2f}s)"
+    )
+
+
+def test_cleanup_returns_promptly_even_if_run_never_finishes(monkeypatch):
+    """Task-3 review ruling B: the worker-test event loop is bounded by a
+    QTimer, but the very next call after it used to be an UNBOUNDED
+    QThread.wait() -- if a regression hung _run(), the test wouldn't fail
+    fast; the only backstop left would be pytest-timeout's global 900s.
+    cleanup() now accepts an optional timeout_ms (main.py's own
+    no-argument call is unaffected -- it still waits indefinitely) so a
+    hung worker thread fails this test in seconds.
+    """
+    hang = threading.Event()  # never set by this test until explicitly released below
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        hang.wait()  # simulates a genuinely stuck _run()
+        return CropResult(box=None, sample_pts=[])
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    worker = SubtitleDetectionWorker(_make_video_files(["a.mp4"]))
+    worker.start()
+
+    start = time.monotonic()
+    finished = worker.cleanup(timeout_ms=500)
+    elapsed = time.monotonic() - start
+
+    assert finished is False, "the hung thread must not actually have finished"
+    assert elapsed < 2.0, f"cleanup(timeout_ms=500) must return promptly, took {elapsed:.2f}s"
+
+    # Let the background thread actually exit before the process does, and
+    # tidy up its QThread; bounded again so this can't hang the suite either.
+    hang.set()
+    worker.cleanup(timeout_ms=3000)
+
+
+def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
+    """Task-3 review ruling C: a resolved, boxed file with a non-None flag
+    (multiple-positions?, static-content?, low-agreement, ...) is exactly
+    the kind of uncertain result consensus must not learn from -- it still
+    gets a box/position (the UI can still use it), but it must not enter
+    the consensus pool passed to later files.
+
+    4 files: b.mp4 resolves with a wildly different, flagged shape between
+    two clean files. Asserts b's shape never appears in the consensus
+    passed to c.mp4 or d.mp4, and that the pool used for d.mp4 reflects
+    only a.mp4 and c.mp4.
+    """
+    def crop_result(y, h, flagged=None):
+        return _crop_result(box=(0, y, 100, h), hit_pts=[1.0], agreed=5, probes_used=5, flagged=flagged)
+
+    results = {
+        "a.mp4": crop_result(900, 50),
+        "b.mp4": crop_result(100, 800, flagged="multiple-positions?"),  # wildly different, flagged
+        "c.mp4": crop_result(905, 55),
+        "d.mp4": crop_result(895, 45),
+    }
+    calls = []
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        filename = os.path.basename(video_path)
+        calls.append(list(consensus) if consensus is not None else None)
+        return results[filename]
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    worker = SubtitleDetectionWorker(_make_video_files(["a.mp4", "b.mp4", "c.mp4", "d.mp4"]))
+    outcome = _run_worker(worker)
+
+    assert not outcome["timed_out"]
+    assert outcome["finished_count"] == 1
+
+    detected_names = sorted(args[0] for args in outcome["detected"])
+    assert detected_names == ["a.mp4", "b.mp4", "c.mp4", "d.mp4"], (
+        "a flagged result still gets a box/position -- only consensus excludes it"
+    )
+
+    assert calls[0] == []
+    assert calls[1] == [(900 / 1080, 50 / 1080)]
+    # c.mp4's call: b.mp4 was flagged, so its (100/1080, 800/1080) shape
+    # must be absent here -- the pool must still be just a.mp4's entry.
+    assert calls[2] == [(900 / 1080, 50 / 1080)], (
+        f"the flagged file (b.mp4) must not have entered the consensus pool: {calls[2]}"
+    )
+    # d.mp4's call: only a.mp4 and c.mp4 (both unflagged) have contributed.
+    assert calls[3] == [(900 / 1080, 50 / 1080), (905 / 1080, 55 / 1080)], (
+        f"consensus for d.mp4 must reflect only the unflagged a.mp4/c.mp4 results: {calls[3]}"
+    )

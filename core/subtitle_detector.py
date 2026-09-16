@@ -10,7 +10,7 @@ import logging
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from core.detect.crop import CropResult, _probe_dimensions, detect_crop
+from core.detect.crop import CropResult, detect_crop
 
 logger = logging.getLogger(__name__)
 
@@ -59,17 +59,36 @@ class SubtitleDetectionWorker(QObject):
         self._thread.start()
 
     def cancel(self):
-        """Request cancellation. Honoured between files -- detect_crop()
-        runs a single file's probing/consensus check as one synchronous
-        unit and offers no way to interrupt it mid-call."""
+        """Request cancellation. `detect_crop()` accepts this as a
+        `cancel_check` callable and polls it between probe batches (see
+        core/detect/crop.py's `_run_round()`), so cancellation takes
+        effect within roughly one batch of the file currently being
+        processed, not only once that file finishes."""
         self._cancel_requested = True
 
-    def cleanup(self):
-        """Stop the thread and clean up."""
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait()
+    def _cancel_check(self) -> bool:
+        return self._cancel_requested
+
+    def cleanup(self, timeout_ms: int | None = None) -> bool:
+        """Stop the thread and clean up.
+
+        `timeout_ms=None` (the default) waits indefinitely for the thread
+        to finish, matching every existing caller (main.py's included --
+        unedited). Callers that want a bound (tests, notably: an unbounded
+        `wait()` here would defeat an event-loop timeout guard placed
+        around `start()`) can pass one; this returns True if the thread
+        had actually finished within it, False if the wait timed out. On
+        a timeout the QThread object is deliberately NOT dropped, so it
+        can't be garbage-collected while its OS thread may still be
+        running.
+        """
+        if self._thread is None:
+            return True
+        self._thread.quit()
+        finished = self._thread.wait() if timeout_ms is None else self._thread.wait(timeout_ms)
+        if finished:
             self._thread = None
+        return finished
 
     def _run(self):
         """Run detect_crop() over each file in turn, maintaining cross-file consensus."""
@@ -97,12 +116,20 @@ class SubtitleDetectionWorker(QObject):
                 result: CropResult = detect_crop(
                     full_path, duration, det_engine,
                     consensus=consensus, settings=self._auto_settings,
+                    cancel_check=self._cancel_check,
                 )
             except Exception:
                 logger.exception("Subtitle detection failed for %s", filename)
                 resolved_count += 1
                 self.progress.emit(resolved_count, total)
                 continue
+
+            if self._cancel_requested:
+                # Cancelled mid-file: detect_crop() returned early (see
+                # cancel_check above) with whatever partial evidence it
+                # had gathered, which is not a trustworthy result -- treat
+                # this file as unresolved rather than emit it.
+                break
 
             if result.box is None:
                 # No way for the current UI to show a *reason* for a
@@ -120,20 +147,38 @@ class SubtitleDetectionWorker(QObject):
 
             crop_x, crop_y, crop_w, crop_h = result.box
 
+            if not result.hit_pts:
+                # box is not None should imply at least one contributing
+                # hit (see core/detect/crop.py's detect_crop() docstring),
+                # but this is the one place a wrong position could reach
+                # the UI silently -- refuse to guess rather than fall back
+                # to sample_pts[0], which after a fallback round is
+                # guaranteed to be a frame with no detected text.
+                logger.warning(
+                    "%s: box resolved but hit_pts is empty -- cannot derive a slider "
+                    "position, skipping", filename,
+                )
+                resolved_count += 1
+                self.progress.emit(resolved_count, total)
+                continue
+
             slider_pos = 5000
-            if result.sample_pts and duration > 0:
-                slider_pos = int((result.sample_pts[0] / duration) * 10000)
+            if duration > 0:
+                slider_pos = int((result.hit_pts[0] / duration) * 10000)
                 slider_pos = max(0, min(10000, slider_pos))
 
             self.file_detected.emit(filename, slider_pos, crop_x, crop_y, crop_w, crop_h)
 
-            try:
-                _orig_w, orig_h = _probe_dimensions(full_path)
-                consensus.append((crop_y / orig_h, crop_h / orig_h))
-            except Exception:
-                logger.warning(
-                    "%s: could not probe dimensions for consensus tracking", filename,
-                )
+            # A resolved, boxed file may still be absent from the
+            # consensus pool: either it was flagged (an uncertain/
+            # ambiguous result -- multiple-positions?, outlier-discarded?,
+            # static-content?, low-agreement, etc. -- is exactly what
+            # consensus must not learn from), or its frame dimensions
+            # weren't available to convert the box into (y_frac, h_frac).
+            if result.flagged is None and result.frame_size is not None:
+                _orig_w, orig_h = result.frame_size
+                if orig_h > 0:
+                    consensus.append((crop_y / orig_h, crop_h / orig_h))
 
             resolved_count += 1
             self.progress.emit(resolved_count, total)

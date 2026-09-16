@@ -577,6 +577,100 @@ def test_slay_stray_hit_geometry_stays_rejected_after_adjacency_fix():
     assert box is not None
 
 
+def test_run_round_cancel_check_stops_within_a_couple_of_batches(monkeypatch):
+    """Task-3 review ruling A: cancellation must be checked BETWEEN probe
+    batches, not only after the whole candidate list (or
+    MAX_PROBES_PER_ROUND) is exhausted. 200 candidate timestamps, no text
+    ever detected (nothing to converge on, so without cancellation this
+    would run every batch up to MAX_PROBES_PER_ROUND=30 probes);
+    cancel_check() reports cancelled starting on its 3rd call, so at most
+    2 batches worth of probes (10) should be fetched."""
+    times_all = [float(t) for t in range(200)]
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+        return pairs, geometry
+
+    class FakeEngine:
+        def predict(self, frames):
+            return [{"dt_scores": [], "dt_polys": []} for _ in frames]
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+
+    calls = {"n": 0}
+
+    def cancel_check():
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    polys_per_frame, sample_pts, raw_hits, frame_times = crop._run_round(
+        "dummy.mp4", times_all, FakeEngine(), band_frac=0.55, consensus=None,
+        frame_size=FRAME, settings=None, cancel_check=cancel_check,
+    )
+
+    assert len(sample_pts) <= crop.PROBE_BATCH_SIZE * 3, (
+        f"cancellation must stop probing within a couple of batches, got "
+        f"{len(sample_pts)} probes ({len(sample_pts) / crop.PROBE_BATCH_SIZE} batches)"
+    )
+
+
+def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
+    """Task-3 review ruling D: CropResult.hit_pts must be the timestamps
+    that actually contributed to the kept union, NOT the full probe
+    history (sample_pts). Forces the speech-guided round to find zero
+    hits (so detect_crop() falls back to uniform probing, flagged
+    speech-probes-exhausted), and only ONE of the uniform-fallback probes
+    -- not the first one tried -- carries real text. sample_pts[0] is
+    therefore guaranteed to be a no-text frame by construction; hit_pts[0]
+    must not be.
+    """
+    hit_text = [_poly(400, 980, 1500, 1030)]
+    duration = 60.0
+    uniform_times = crop._uniform_probe_times(duration)
+    hit_time = 25.5
+    assert hit_time in uniform_times and hit_time != uniform_times[0]
+
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(
+        crop.vad, "probe_times",
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [1.0, 2.0, 3.0],
+    )
+
+    last_chunk_times: list[float] = []
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        last_chunk_times[:] = times
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+        return pairs, geometry
+
+    class FakeEngine:
+        def predict(self, frames):
+            results = []
+            for t in last_chunk_times:
+                if t == hit_time:
+                    results.append({"dt_scores": [1.0], "dt_polys": hit_text})
+                else:
+                    results.append({"dt_scores": [], "dt_polys": []})
+            return results
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+
+    result = crop.detect_crop("dummy.mp4", duration, FakeEngine())
+
+    assert result.flagged is not None and crop.FLAG_SPEECH_PROBES_EXHAUSTED in result.flagged
+    assert result.box is not None
+    assert result.sample_pts[0] != hit_time, (
+        "sanity check: the old (buggy) sample_pts[0] basis is NOT the hit frame"
+    )
+    assert result.hit_pts, "hit_pts must not be empty when a box was found"
+    assert result.hit_pts[0] == hit_time, (
+        f"hit_pts[0] must be the real hit timestamp ({hit_time}), got {result.hit_pts[0]}"
+    )
+    assert result.frame_size == (1920, 1080)
+
+
 @pytest.mark.needs_media
 @pytest.mark.slow
 def test_crop_does_not_drift_from_previously_accepted_values(reference_media, detector_truth):

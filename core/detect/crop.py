@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from dataclasses import fields as _dataclass_fields
@@ -204,6 +205,20 @@ class CropResult:
     agreed: int = 0
     probes_used: int = 0
     flagged: str | None = None
+    # The timestamps whose detections actually contributed to the kept
+    # union (survived both the in-band filter and baseline-cluster
+    # admission -- see _baseline_cluster_union()), in chronological order.
+    # NOT the same as sample_pts: sample_pts is the full probe history in
+    # probing order, which after a fallback round is guaranteed to start
+    # with a no-text frame (round 1 only falls back because it found zero
+    # hits). Callers that need "a frame where a subtitle was actually
+    # seen" (e.g. seeding a review UI's initial frame) must use hit_pts,
+    # not sample_pts[0].
+    hit_pts: list[float] = field(default_factory=list)
+    # (width, height) of the original video frame, as already probed by
+    # detect_crop() -- lets callers convert `box` into (y_frac, h_frac)
+    # without a second, redundant dimension probe of their own.
+    frame_size: tuple[int, int] | None = None
 
 
 # --------------------------------------------------------------------------
@@ -482,10 +497,12 @@ def _baseline_cluster_union(extents: list[tuple[float, float, float, float] | No
     OTHER (forming their own cluster), where noise's baseline is
     essentially uncorrelated frame to frame (staying singletons).
 
-    Returns (union, agreed_count, position_flag). `position_flag` is
-    FLAG_MULTIPLE_POSITIONS if a second cluster with >=2 members (or an
-    adjacent singleton -- see below) got folded into the union,
-    FLAG_OUTLIER_DISCARDED if a non-adjacent singleton cluster got
+    Returns (union, kept_idx, position_flag) -- `kept_idx` is the list of
+    indices (into `extents`/`accepted_idx`) that actually contributed to
+    `union`; callers that only need the count use len(kept_idx).
+    `position_flag` is FLAG_MULTIPLE_POSITIONS if a second cluster with
+    >=2 members (or an adjacent singleton -- see below) got folded into
+    the union, FLAG_OUTLIER_DISCARDED if a non-adjacent singleton cluster got
     excluded, both (composed) if both happened, or None. Never discards
     silently.
 
@@ -553,18 +570,27 @@ def _baseline_cluster_union(extents: list[tuple[float, float, float, float] | No
                 position_flag = _compose_flag(position_flag, FLAG_OUTLIER_DISCARDED)
 
     union = _bounding_union([extents[i] for i in kept_idx])
-    return union, len(kept_idx), position_flag
+    return union, kept_idx, position_flag
 
 
-def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
-                   sample_times: list[float] | None = None,
-                   ) -> tuple[tuple[float, float, float, float] | None, int, str | None, str | None]:
-    """Returns (union extent, count of contributing frames, watermark
-    status, position status). The union is None only when there are no
-    in-band polys at all, OR the watermark status is "confirmed" (see
-    _watermark_status()) -- an "uncertain" watermark status, or any
-    position status, still returns a real union, since insufficient or
-    conflicting evidence must not silently discard a detection.
+def _union_extent_detailed(polys_per_frame, frame_h: float, cutoff_frac: float,
+                            sample_times: list[float] | None = None,
+                            ) -> tuple[tuple[float, float, float, float] | None, list[int],
+                                       str | None, str | None]:
+    """As _union_extent(), but returns the KEPT INDICES (into
+    `polys_per_frame`/`sample_times`) that actually contributed to the
+    union, instead of just their count -- detect_crop() uses this to build
+    CropResult.hit_pts (see its docstring). Split out from _union_extent()
+    so that function's existing 4-tuple (union, agreed_count,
+    watermark_status, position_flag) contract -- unpacked by every caller
+    in tests/test_detect_crop.py -- doesn't have to change just to plumb
+    this one extra detail through to detect_crop().
+
+    The union is None only when there are no in-band polys at all, OR the
+    watermark status is "confirmed" (see _watermark_status()) -- an
+    "uncertain" watermark status, or any position status, still returns a
+    real union, since insufficient or conflicting evidence must not
+    silently discard a detection.
 
     `sample_times`, if given, must align 1:1 with `polys_per_frame`; only
     the timestamps of frames that actually contributed an in-band poly are
@@ -580,7 +606,7 @@ def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
     extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
     accepted_idx = [i for i, e in enumerate(extents) if e is not None]
     if not accepted_idx:
-        return None, 0, None, None
+        return None, [], None, None
 
     accepted = [extents[i] for i in accepted_idx]
     contributing_times = None
@@ -589,10 +615,25 @@ def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
 
     watermark_status = _watermark_status(accepted, len(extents), frame_h, contributing_times)
     if watermark_status == "confirmed":
-        return None, len(accepted_idx), watermark_status, None
+        return None, [], watermark_status, None
 
-    union, agreed, position_flag = _baseline_cluster_union(extents, accepted_idx, frame_h)
-    return union, agreed, watermark_status, position_flag
+    union, kept_idx, position_flag = _baseline_cluster_union(extents, accepted_idx, frame_h)
+    return union, kept_idx, watermark_status, position_flag
+
+
+def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
+                   sample_times: list[float] | None = None,
+                   ) -> tuple[tuple[float, float, float, float] | None, int, str | None, str | None]:
+    """Returns (union extent, count of contributing frames, watermark
+    status, position status). Thin wrapper over _union_extent_detailed()
+    that collapses its kept-indices list down to a count, preserving this
+    function's existing public contract -- see _union_extent_detailed()
+    for the full behaviour and for the kept indices themselves.
+    """
+    union, kept_idx, watermark_status, position_flag = _union_extent_detailed(
+        polys_per_frame, frame_h, cutoff_frac, sample_times,
+    )
+    return union, len(kept_idx), watermark_status, position_flag
 
 
 def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float = 0.55,
@@ -770,14 +811,28 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
                 consensus: list[tuple[float, float]] | None,
                 frame_size: tuple[int, int], settings: dict | None,
                 known_dims: tuple[int, int] | None = None,
+                cancel_check: Callable[[], bool] | None = None,
                 ) -> tuple[list, list[float], int, list[float]]:
     """Fetch+detect `times` in PROBE_BATCH_SIZE-sized batches, stopping
     once the raw in-band union has stopped growing for
     CONVERGENCE_STABLE_ROUNDS consecutive batches (or just
     CONSENSUS_STABLE_ROUNDS, when an in-tolerance consensus is available --
     see the "Consensus RELAXES..." comment at the stop check below), or
-    MAX_PROBES_PER_ROUND is hit, or `times` is exhausted -- NEVER once an
-    arbitrary hit count is reached, with or without consensus.
+    MAX_PROBES_PER_ROUND is hit, or `times` is exhausted, or `cancel_check`
+    (a zero-argument callable returning truthy once cancellation has been
+    requested -- stdlib only, e.g. wrapping a threading.Event or a plain
+    flag; this module stays Qt-free, see the module docstring) starts
+    returning True -- NEVER once an arbitrary hit count is reached, with
+    or without consensus.
+
+    `cancel_check` is polled once per iteration, BEFORE fetching the next
+    batch -- so at most one already-in-flight batch (already-dispatched
+    ffmpeg grabs + one det_engine.predict() call) still completes after
+    cancellation is requested, not an unbounded number of them. A caller
+    driving this from a background thread (see core/subtitle_detector.py)
+    can therefore expect cancellation to take effect within roughly one
+    batch, not only once the whole candidate list or MAX_PROBES_PER_ROUND
+    is exhausted.
 
     This replaces an earlier fixed-count stop (`raw_hits >= 5`) that, once
     combined with _spread_order() and PROBE_BATCH_SIZE == 5, let whichever
@@ -845,6 +900,8 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     i = 0
     while i < len(times):
         if len(sample_pts) >= MAX_PROBES_PER_ROUND:
+            break
+        if cancel_check is not None and cancel_check():
             break
 
         chunk = times[i:i + PROBE_BATCH_SIZE]
@@ -923,10 +980,21 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     return polys_per_frame, sample_pts, raw_hits, frame_times
 
 
+def _is_cancelled(cancel_check: Callable[[], bool] | None) -> bool:
+    return cancel_check is not None and cancel_check()
+
+
 def detect_crop(video_path: str, duration_sec: float, det_engine,
                  consensus: list[tuple[float, float]] | None = None,
-                 settings: dict | None = None) -> CropResult:
+                 settings: dict | None = None,
+                 cancel_check: Callable[[], bool] | None = None) -> CropResult:
     """Detect the subtitle crop box for `video_path`.
+
+    `cancel_check`, if given, is a zero-argument callable polled between
+    probe batches (see _run_round()) AND between the fallback rounds
+    below, so a caller driving several files from a background thread
+    (core/subtitle_detector.py) can make Cancel take effect within roughly
+    one batch of one file, not only between whole files.
 
     Orchestration: vad.probe_times() picks candidate timestamps ranked by
     likelihood of carrying dialogue -> grab_frames() fetches them in
@@ -987,21 +1055,22 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     polys_per_frame, used, raw_hits, frame_times = _run_round(
         video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
         consensus=consensus, frame_size=frame_size, settings=settings, known_dims=known_dims,
+        cancel_check=cancel_check,
     )
     sample_pts.extend(used)
 
-    if raw_hits == 0 and speech_probing_available:
+    if raw_hits == 0 and speech_probing_available and not _is_cancelled(cancel_check):
         uniform_times = _uniform_probe_times(duration_sec)
         polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
             consensus=consensus, frame_size=frame_size, settings=settings,
-            known_dims=known_dims,
+            known_dims=known_dims, cancel_check=cancel_check,
         )
         sample_pts.extend(used)
         flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
 
     used_full_frame_retry = False
-    if raw_hits == 0:
+    if raw_hits == 0 and not _is_cancelled(cancel_check):
         retry_times = _uniform_probe_times(duration_sec) if not sample_pts else sample_pts
         # Reuse the already-attempted timestamps for the full-frame retry
         # rather than probing new ones -- we already know these timestamps
@@ -1011,7 +1080,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
             video_path, retry_times, det_engine, band_frac=1.0,
             consensus=consensus, frame_size=frame_size,
             settings={**(settings or {}), "bottom_half_cutoff": 0.0},
-            known_dims=known_dims,
+            known_dims=known_dims, cancel_check=cancel_check,
         )
         sample_pts.extend(used)
         flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
@@ -1020,9 +1089,13 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     cutoff_frac = 0.0 if used_full_frame_retry else float(
         (settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)
     )
-    envelope_extent, agreed, watermark_status, position_flag = _union_extent(
+    envelope_extent, kept_idx, watermark_status, position_flag = _union_extent_detailed(
         polys_per_frame, orig_h, cutoff_frac, frame_times,
     )
+    agreed = len(kept_idx)
+    # Chronological order, not discovery order: kept_idx follows
+    # _cluster_by_baseline()'s baseline-sorted order, not probe order.
+    hit_pts = sorted(frame_times[i] for i in kept_idx)
     envelope = None
     if envelope_extent is not None:
         ex_min_x, ex_min_y, ex_max_x, ex_max_y = envelope_extent
@@ -1074,4 +1147,6 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         agreed=agreed,
         probes_used=len(sample_pts),
         flagged=flagged,
+        hit_pts=hit_pts,
+        frame_size=frame_size,
     )
