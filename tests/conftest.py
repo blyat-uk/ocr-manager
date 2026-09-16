@@ -12,11 +12,11 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 @pytest.fixture(autouse=True)
 def _reset_engine_registry():
-    """Every test starts and ends with an empty OCR engine registry.
+    """Every test starts and ends with an empty OCR engine pool.
 
     Without this, a test that monkeypatches create_ocr_engine /
     create_detection_engine expecting a fresh build per call can silently
-    get back a stale engine cached by an earlier test that happened to use
+    lease an idle engine pooled by an earlier test that happened to use
     the same (lang, det, rec, gpu) / (det, gpu) key -- see
     tests/test_candidate_buffer.py's own in-test reset for the intra-test
     version of this same hazard.

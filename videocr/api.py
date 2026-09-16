@@ -1,3 +1,5 @@
+from contextlib import ExitStack
+
 from . import engine_registry, utils
 from .video import Video
 from .progress import ProgressTracker
@@ -33,15 +35,19 @@ def _get_subtitles_for_range(
         detect_labels: bool, only_labels: bool,
         label_min_duration: float, label_max_duration: float, label_conf_threshold: int, label_conf_threshold_min: int,
         label_mask_crops,
-        progress_callback, subtitle_callback, cancel_event) -> str:
+        progress_callback, subtitle_callback, cancel_event,
+        ocr, det_engine) -> str:
     """Run one time range's dialogue + label passes against an already-open
     `Video`, and return its ASS text.
+
+    `ocr` and `det_engine` (None when no label pass runs) are engines the
+    caller holds leases on for longer than this call -- see `get_subtitles`.
 
     This is the body `get_subtitles` used to run once, directly against a
     freshly-constructed `Video`, before it could take multiple ranges. It is
     unchanged except for taking `v` as a parameter instead of constructing
     it -- which is what lets several ranges share one `Video` (and the
-    container probe / engine registry lookups that come with it) instead of
+    container probe that comes with it) and one engine pair instead of
     each range paying for its own. The label pass still runs once per call,
     i.e. once per range, exactly as before.
     """
@@ -53,12 +59,11 @@ def _get_subtitles_for_range(
     progress.start()
 
     if not only_labels:
-        ocr = v.run_ocr(use_gpu, lang, time_start, time_end, conf_threshold, use_fullframe, brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip, crop_x, crop_y, crop_width, crop_height, progress=progress, subtitle_callback=subtitle_callback, cancel_event=cancel_event)
+        v.run_ocr(use_gpu, lang, time_start, time_end, conf_threshold, use_fullframe, brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip, crop_x, crop_y, crop_width, crop_height, progress=progress, subtitle_callback=subtitle_callback, cancel_event=cancel_event, ocr_engine=ocr)
         if cancel_event is not None and cancel_event.is_set():
             return ""
         dialogue_ass = v.get_subtitles(sim_threshold)
     else:
-        ocr = engine_registry.get_ocr_engine(lang, det_model_dir, rec_model_dir, use_gpu)
         dialogue_ass = None
 
     if detect_labels or only_labels:
@@ -74,7 +79,6 @@ def _get_subtitles_for_range(
             conf_threshold=label_conf_threshold, conf_threshold_min=label_conf_threshold_min, brightness_threshold=brightness_threshold,
             label_mask_crops=label_mask_crops,
         )
-        det_engine = engine_registry.get_detection_engine(det_model_dir, use_gpu)
 
         # Get container-level start_time (set during run_ocr, or fetch independently).
         # This is the playback offset; for MKV it's 0, for MP4 it may be non-zero.
@@ -134,28 +138,42 @@ def get_subtitles(
     # by every range below, instead of one per range. `run_ocr` still opens
     # its own decode session per range (each range decodes a different part
     # of the file, so that part is unavoidable); what this sharing removes is
-    # the repeated `Video` construction/probe, since Task 1's engine registry
-    # already made repeat engine construction free within a process.
+    # the repeated `Video` construction/probe.
     v = Video(video_path, det_model_dir, rec_model_dir)
 
     ass_parts = []
-    for i, (t_start, t_end) in enumerate(ranges):
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        part = _get_subtitles_for_range(
-            v, video_path, t_start, t_end,
-            lang, conf_threshold, sim_threshold, use_fullframe,
-            det_model_dir, rec_model_dir, use_gpu,
-            brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip,
-            crop_x, crop_y, crop_width, crop_height,
-            detect_labels, only_labels,
-            label_min_duration, label_max_duration, label_conf_threshold, label_conf_threshold_min,
-            label_mask_crops,
-            _scaled_progress_callback(progress_callback, i, len(ranges)),
-            subtitle_callback, cancel_event,
-        )
-        if part:
-            ass_parts.append(part)
+    # This file's engines, leased for the whole call: every range's dialogue
+    # pass and label pass runs on the same pair, and no other thread can use
+    # either until the last result from them has been consumed. Engines are
+    # not thread-safe (see videocr/engine_registry.py), and OCR workers run
+    # as threads in one process, so nothing below may use an engine it does
+    # not hold a lease on -- nor keep one, or a result generator, past here.
+    with ExitStack() as leases:
+        ocr = leases.enter_context(
+            engine_registry.lease_ocr_engine(lang, det_model_dir, rec_model_dir, use_gpu))
+        det_engine = None
+        if detect_labels or only_labels:
+            det_engine = leases.enter_context(
+                engine_registry.lease_detection_engine(det_model_dir, use_gpu))
+
+        for i, (t_start, t_end) in enumerate(ranges):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            part = _get_subtitles_for_range(
+                v, video_path, t_start, t_end,
+                lang, conf_threshold, sim_threshold, use_fullframe,
+                det_model_dir, rec_model_dir, use_gpu,
+                brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip,
+                crop_x, crop_y, crop_width, crop_height,
+                detect_labels, only_labels,
+                label_min_duration, label_max_duration, label_conf_threshold, label_conf_threshold_min,
+                label_mask_crops,
+                _scaled_progress_callback(progress_callback, i, len(ranges)),
+                subtitle_callback, cancel_event,
+                ocr, det_engine,
+            )
+            if part:
+                ass_parts.append(part)
 
     if not ass_parts:
         return ""

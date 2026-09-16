@@ -780,8 +780,9 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
     `crop_box` is the file's (x, y, w, h) in native pixels, as the OCR pass
     takes it. `time_ranges` are the file's keep ranges as (start, end) pairs
     ("MM:SS" strings, seconds, or None for open ends) or {"start", "end"}
-    mappings, or None. Engines are passed in (detection-only and full OCR) so
-    a process-wide engine cache can supply them.
+    mappings, or None. Engines are passed in (detection-only and full OCR);
+    the caller must hold a lease on both (videocr.engine_registry) for the
+    whole call, since an engine must never serve two threads at once.
 
     With `folder_plateau` this is the cheap path: 6 frames, analytic seed
     only. A seed inside the plateau gives the value seed - PICK_BELOW_TOP,

@@ -7,6 +7,7 @@ consensus math and crop aggregation all live in core/detect/crop.py's
 detect_crop() -- see that module for the algorithm itself.
 """
 import logging
+from contextlib import ExitStack
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
@@ -91,21 +92,33 @@ class SubtitleDetectionWorker(QObject):
         return finished
 
     def _run(self):
-        """Run detect_crop() over each file in turn, maintaining cross-file consensus."""
+        """Run detect_crop() over each file in turn, maintaining cross-file consensus.
+
+        The detection engine is leased from videocr.engine_registry for the
+        whole run and returned before `finished` is emitted. OCR workers run
+        as threads in this same process, and an engine must never serve two
+        threads at once, so this worker only ever uses the instance it holds
+        a lease on. (No suppress_output() here: the registry's builder
+        already silences construction, and that redirection is process-wide,
+        so it must only ever happen under the registry's construction lock.)
+        """
+        with ExitStack() as lease:
+            try:
+                from videocr import engine_registry
+
+                det_engine = lease.enter_context(engine_registry.lease_detection_engine(None, True))
+            except Exception as e:
+                logger.exception("Failed to create subtitle detection engine")
+                self.error.emit(str(e))
+                return
+            self._detect_files(det_engine)
+
+        self.finished.emit()
+
+    def _detect_files(self, det_engine):
         total = len(self._video_files)
         resolved_count = 0
         consensus: list[tuple[float, float]] = []
-
-        try:
-            from videocr import engine_registry
-            from videocr.utils import suppress_output
-
-            with suppress_output():
-                det_engine = engine_registry.get_detection_engine(None, True)
-        except Exception as e:
-            logger.exception("Failed to create subtitle detection engine")
-            self.error.emit(str(e))
-            return
 
         self.progress.emit(resolved_count, total)
 
@@ -183,5 +196,3 @@ class SubtitleDetectionWorker(QObject):
 
             resolved_count += 1
             self.progress.emit(resolved_count, total)
-
-        self.finished.emit()

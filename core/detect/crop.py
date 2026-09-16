@@ -1398,6 +1398,10 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                  cancel_check: Callable[[], bool] | None = None) -> CropResult:
     """Detect the subtitle crop box for `video_path`.
 
+    `det_engine` must be an engine the caller holds a lease on
+    (videocr.engine_registry) for the whole call: an engine must never serve
+    two threads at once, and OCR workers run as threads in the same process.
+
     `cancel_check`, if given, is a zero-argument callable polled between
     probe batches (see _run_round()) AND between the fallback rounds
     below, so a caller driving several files from a background thread

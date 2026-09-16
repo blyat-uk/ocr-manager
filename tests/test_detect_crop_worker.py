@@ -460,10 +460,48 @@ def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
     )
 
 
+def test_worker_detects_only_on_an_engine_it_holds_a_lease_on(monkeypatch):
+    """OCR workers run as threads in this process too, and a detection engine
+    must never serve two threads at once: every detect_crop() call has to run
+    on an engine this worker's thread has leased, and the lease has to be
+    back in the pool once the run is over."""
+    from videocr import engine_registry
+
+    holders = {}
+    real_checkout, real_checkin = engine_registry._checkout, engine_registry._checkin
+
+    def checkout(*args, **kwargs):
+        engine, token = real_checkout(*args, **kwargs)
+        holders[id(engine)] = threading.get_ident()
+        return engine, token
+
+    def checkin(idle, key, engine, token):
+        holders[id(engine)] = None
+        return real_checkin(idle, key, engine, token)
+
+    monkeypatch.setattr(engine_registry, "_checkout", checkout)
+    monkeypatch.setattr(engine_registry, "_checkin", checkin)
+
+    leased_during_detection = []
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        leased_during_detection.append(holders.get(id(det_engine)) == threading.get_ident())
+        return _crop_result(box=(10, 900, 1000, 80), hit_pts=[42.5])
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    outcome = _run_worker(SubtitleDetectionWorker(_make_video_files(["a.mp4", "b.mp4"])))
+    assert not outcome["timed_out"]
+    assert not outcome["errors"]
+    assert leased_during_detection == [True, True]
+    assert set(holders.values()) == {None}, "the worker kept its lease after finishing"
+
+
 def test_detection_engine_is_shared_across_worker_runs(monkeypatch):
     """Opening a folder twice must not rebuild the detection model: the worker
-    takes its engine from videocr.engine_registry, which builds once per
-    process (5-10 s per build on real PaddleOCR)."""
+    leases its engine from videocr.engine_registry's pool, which keeps it for
+    the next run (5-10 s per build on real PaddleOCR)."""
     builds = []
 
     def counting_builder(det_model_dir, use_gpu):

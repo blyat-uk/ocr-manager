@@ -273,7 +273,27 @@ class Video:
     def width(self, value) -> None:
         self._width = value
 
-    def run_ocr(self, use_gpu: bool, lang: str, time_start: str, time_end: str, conf_threshold: int, use_fullframe: bool, brightness_threshold: int, similar_image_threshold: float, similar_pixel_threshold: int, frames_to_skip: int, crop_x: int, crop_y: int, crop_width: int, crop_height: int, progress=None, subtitle_callback=None, cancel_event=None):
+    def run_ocr(self, use_gpu: bool, lang: str, time_start: str, time_end: str, conf_threshold: int, use_fullframe: bool, brightness_threshold: int, similar_image_threshold: float, similar_pixel_threshold: int, frames_to_skip: int, crop_x: int, crop_y: int, crop_width: int, crop_height: int, progress=None, subtitle_callback=None, cancel_event=None, ocr_engine=None) -> None:
+        """OCR the dialogue region of one time range into `self.pred_frames`.
+
+        `ocr_engine`, when given, must be an engine the caller holds a lease
+        on (`videocr.engine_registry`) for at least the whole of this call --
+        videocr/api.py passes the one it leases for a file's every range and
+        label pass. Without one, this call leases its own and returns it when
+        it finishes. Engines are never shared between concurrent callers, and
+        nothing here keeps the engine (or any result from it) past the call.
+        """
+        args = (use_gpu, lang, time_start, time_end, conf_threshold, use_fullframe,
+                brightness_threshold, similar_image_threshold, similar_pixel_threshold,
+                frames_to_skip, crop_x, crop_y, crop_width, crop_height)
+        options = dict(progress=progress, subtitle_callback=subtitle_callback, cancel_event=cancel_event)
+        if ocr_engine is not None:
+            self._run_ocr_with_engine(ocr_engine, *args, **options)
+            return
+        with engine_registry.lease_ocr_engine(lang, self.det_model_dir, self.rec_model_dir, use_gpu) as ocr:
+            self._run_ocr_with_engine(ocr, *args, **options)
+
+    def _run_ocr_with_engine(self, ocr, use_gpu: bool, lang: str, time_start: str, time_end: str, conf_threshold: int, use_fullframe: bool, brightness_threshold: int, similar_image_threshold: float, similar_pixel_threshold: int, frames_to_skip: int, crop_x: int, crop_y: int, crop_width: int, crop_height: int, progress=None, subtitle_callback=None, cancel_event=None) -> None:
         conf_threshold_percent = float(conf_threshold / 100)
         self.lang = lang
         self.use_fullframe = use_fullframe
@@ -293,8 +313,6 @@ class Video:
         # Candidates for the subtitle currently being tracked by the producer;
         # attached to the tail batch slot when that subtitle ends.
         pending_candidates = []
-
-        ocr = engine_registry.get_ocr_engine(self.lang, self.det_model_dir, self.rec_model_dir, use_gpu)
 
         # Profiling variables
         self._ocr_time = 0.0
@@ -525,8 +543,6 @@ class Video:
 
             # Emit any remaining subtitles (all frames finalized)
             self._emit_pending_subtitles(subtitle_callback, emit_last=True)
-
-        return ocr
 
     def get_subtitles(self, sim_threshold: int) -> str:
         """Generate ASS format subtitles."""
