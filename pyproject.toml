@@ -16,7 +16,9 @@ dependencies = [
     "python-Levenshtein==0.27.3",
     "PyYAML==6.0.2",
     "packaging==25.0",
-    "av>=18.1.0",
+    # Pinned exactly: an av bump changes the bundled swscale and the
+    # wheel's filter inventory, both of which can move OCR output.
+    "av==18.1.0",
     "setuptools>=61.0",
     "rapidfuzz>=3.0.0",
     "jieba3>=1.0.0",

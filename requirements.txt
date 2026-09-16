@@ -13,7 +13,10 @@ thefuzz==0.22.1
 python-Levenshtein==0.27.3
 PyYAML==6.0.2
 packaging==25.0
-av>=18.1.0
+# Pinned exactly: an av bump changes the bundled swscale (output can move
+# silently) and the wheel's filter inventory (the PyAV tone-map chain is
+# chosen from it). Re-pin deliberately, then re-run tools/fidelity_check.py.
+av==18.1.0
 setuptools>=61.0
 rapidfuzz>=3.0.0
 jieba3>=1.0.0
