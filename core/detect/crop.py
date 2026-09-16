@@ -215,14 +215,25 @@ ADJACENT_SINGLETON_MAX_GAP_LINE_HEIGHTS = 1.0
 # ffmpeg processes. Measured crossover, see _prefers_persistent_fetch().
 PERSISTENT_FETCH_MIN_PIXELS = 1920 * 1080
 PERSISTENT_POOL_SIZE = PROBE_BATCH_SIZE   # one container per probe of a batch
-# Decoders whose non-reference-frame skipping (AVDISCARD_NONREF) is exact for
-# an accurate seek: the skipped frames are never referenced AND the decoder
-# still outputs every frame it does decode. Measured pixel-identical to
-# one-shot grabs for h264 and hevc (including temporally scalable hevc);
-# libdav1d (AV1) is the counter-example -- with skipping on it returned a
-# later frame for 14 of 17 requested times -- so anything not listed here
-# decodes every frame. See test_persistent_fetcher_returns_the_frame_at_the_
-# timestamp_it_reports.
+# Decoders for which skipping non-reference frames (AVDISCARD_NONREF) on the
+# way to an accurate-seek target was MEASURED to return the same frame as a
+# full decode: pixel-identical to one-shot grabs for h264 and hevc on the six
+# reference sources (x265 HEVC, 8- and 10-bit, 4K and 1080p) and on synthetic
+# x264 (B-frames, 25 and 24000/1001 fps) and x265 (B-pyramid, temporal layers,
+# 10-bit) clips -- see
+# test_persistent_fetcher_frames_match_one_shot_and_recorded_times_refetch_them.
+# That is evidence for these encodes, not a proof for every h264/hevc stream:
+# - HEVC `_N` NAL unit types only promise "not referenced by pictures of the
+#   same temporal sub-layer"; a picture in a HIGHER sub-layer may still
+#   reference one, and FFmpeg would skip it anyway. x265 marks only truly
+#   unreferenced pictures `_N`, so the temporal-layers clip cannot exercise
+#   that case.
+# - h264 without a VUI bitstream_restriction makes FFmpeg infer the reorder
+#   depth from POC gaps as it decodes; skipped frames change those gaps, so
+#   output order near the target could differ from a full decode.
+# libdav1d (AV1) is the measured counter-example -- with skipping on it
+# returned a later frame for 14 of 17 requested times -- so any codec not
+# listed here decodes every frame.
 NONREF_SKIP_EXACT_CODECS = frozenset({"h264", "hevc"})
 UNIFORM_START_FRAC = 0.40
 UNIFORM_END_FRAC = 0.60
@@ -262,12 +273,16 @@ FLAG_UNKNOWN_REJECTION = "unknown-rejection"        # structural safety net (see
 @dataclass
 class CropResult:
     box: tuple[int, int, int, int] | None
-    # Every frame actually fetched and analysed, in probing order, each
-    # recorded under the time the fetch layer reported for THAT frame --
-    # which for a persistent-container fetch is the decoded frame's own
-    # timestamp (the first frame at or after the requested time), never the
-    # requested time itself. A grab that failed returned no frame and is not
-    # listed. probes_used == len(sample_pts).
+    # One entry per frame actually fetched and analysed, in probing order:
+    # the probe's requested time, which is a time that re-fetches exactly the
+    # analysed frame through core.detect.crop's fetch layer (at-or-after,
+    # ms-rounded -- see _seek_seconds()), on either fetch path. It may precede
+    # that frame's true PTS by up to one frame. Never the frame's own PTS:
+    # on a time base that is not whole milliseconds (e.g. 1/24000 at
+    # 24000/1001 fps) a PTS such as 0.917583 rounds up to 0.918 and would
+    # re-fetch the NEXT frame. A grab that failed returned no frame and is
+    # not listed (it still spends MAX_PROBES_PER_ROUND).
+    # probes_used == len(sample_pts).
     sample_pts: list[float] = field(default_factory=list)
     envelope: tuple[int, int, int, int] | None = None
     agreed: int = 0
@@ -337,7 +352,10 @@ def _seek_seconds(t: float) -> float:
     `ffmpeg -ss`. The persistent path (see _PersistentDecoder.grab()) targets
     exactly the same value, so for any requested time both paths decode the
     same frame -- the first one at or after this time -- and a probe's frame
-    cannot depend on which fetch strategy happened to run.
+    cannot depend on which fetch strategy happened to run. This rounding is
+    also why callers record the REQUESTED time, not the decoded frame's PTS:
+    the requested time maps back to the same frame by construction, a PTS
+    that is not a whole millisecond may not (see CropResult.sample_pts).
     """
     return float(f"{max(0.0, t):.3f}")
 
@@ -382,8 +400,8 @@ def _grab_frames_with_times(video_path: str, times: list[float], band_frac: floa
                              target_height: int, known_dims: tuple[int, int] | None = None,
                              ) -> tuple[list[tuple[float, np.ndarray]], tuple]:
     """Implementation behind grab_frames(): parallel one-shot ffmpeg grabs,
-    bounded to GRAB_POOL_SIZE concurrent processes, returning (time, frame)
-    pairs in request order with failed grabs dropped. Also returns the
+    bounded to GRAB_POOL_SIZE concurrent processes, returning (requested
+    time, frame) pairs in request order with failed grabs dropped. Also returns the
     crop geometry used, so callers (detect_crop) can map detection results
     in the returned frames' coordinate space back to full-frame pixels.
 
@@ -461,11 +479,11 @@ class _PersistentDecoder:
             self._graphs[geometry] = graph
         return graph
 
-    def grab(self, t: float, geometry: tuple) -> tuple[float, np.ndarray]:
+    def grab(self, t: float, geometry: tuple) -> np.ndarray:
         """Accurate seek: the first frame at or after _seek_seconds(t) --
         the same frame `ffmpeg -ss` returns -- cropped and scaled the same
-        way _grab_one() does. Returns (that frame's own container-relative
-        timestamp, image). Raises on any failure; the caller drops and logs.
+        way _grab_one() does. Raises on any failure; the caller drops and
+        logs.
         """
         target = _seek_seconds(t) + self._start_sec
         time_base = self._time_base
@@ -503,7 +521,7 @@ class _PersistentDecoder:
         _orig_w, _orig_h, _cw, _ch, _cx, _cy, out_w, out_h = geometry
         if image.shape != (out_h, out_w, 3):
             raise ValueError(f"filtered frame has shape {image.shape}, expected {(out_h, out_w, 3)}")
-        return round(float(frame.pts * time_base) - self._start_sec, 6), image
+        return image
 
     def close(self) -> None:
         self._graphs.clear()
@@ -532,10 +550,17 @@ class _PersistentFrameFetcher:
     exact (NONREF_SKIP_EXACT_CODECS). Frames are pixel-identical to
     _grab_one() at the same requested time.
 
-    Contract, same as grab_frames(): frames come back in request order,
-    failures are dropped and logged, never raised. Each returned pair is
-    (the decoded frame's own container-relative timestamp, image) -- that
-    timestamp, not the requested one, is what callers must record.
+    Contract, same as _grab_frames_with_times(): (requested time, image)
+    pairs in request order, failures dropped and logged, never raised. The
+    requested time is what callers record -- it re-fetches exactly this frame
+    through either fetch path (see CropResult.sample_pts).
+
+    If EVERY probe of a non-empty batch fails -- PyAV opened the file but
+    cannot decode it, e.g. "cannot decode unknown codec" -- the pool is
+    released and that batch and every later one for this file go through
+    one-shot ffmpeg grabs instead, with a warning. Without that, every probe
+    would be dropped and the file misreported as having no text
+    (speech-probes-exhausted, top-positioned?).
     """
 
     def __init__(self, video_path: str, known_dims: tuple[int, int],
@@ -544,6 +569,7 @@ class _PersistentFrameFetcher:
         self._dims = known_dims
         self._decoders: list[_PersistentDecoder] = []
         self._executor: ThreadPoolExecutor | None = None
+        self._one_shot_fallback = False
         try:
             for _ in range(max(1, pool_size)):
                 self._decoders.append(_PersistentDecoder(video_path))
@@ -555,14 +581,16 @@ class _PersistentFrameFetcher:
 
     def fetch(self, times: list[float], band_frac: float,
               target_height: int) -> tuple[list[tuple[float, np.ndarray]], tuple]:
-        """(pairs, geometry) exactly as _grab_frames_with_times() returns
-        them, except each pair carries the fetched frame's own timestamp."""
+        """(pairs, geometry) exactly as _grab_frames_with_times() returns them."""
+        if self._one_shot_fallback:
+            return _grab_frames_with_times(self._video_path, times, band_frac, target_height,
+                                           known_dims=self._dims)
         orig_w, orig_h = self._dims
         geometry = (orig_w, orig_h) + _crop_geometry(orig_w, orig_h, band_frac, target_height)
         if not times:
             return [], geometry
 
-        results: list[tuple[float, np.ndarray] | None] = [None] * len(times)
+        results: list[np.ndarray | None] = [None] * len(times)
         n_decoders = len(self._decoders)
 
         def work(k: int) -> None:
@@ -573,10 +601,21 @@ class _PersistentFrameFetcher:
                 results[i] = self._grab(decoder, times[i], geometry)
 
         list(self._executor.map(work, range(min(n_decoders, len(times)))))
-        return [r for r in results if r is not None], geometry
+        pairs = [(t, image) for t, image in zip(times, results) if image is not None]
+        if not pairs:
+            logger.warning(
+                "%s: persistent decoders returned no frame for a batch of %d probes; "
+                "using one-shot ffmpeg grabs for the rest of this file",
+                self._video_path, len(times),
+            )
+            self._one_shot_fallback = True
+            self._release()
+            return _grab_frames_with_times(self._video_path, times, band_frac, target_height,
+                                           known_dims=self._dims)
+        return pairs, geometry
 
     def _grab(self, decoder: _PersistentDecoder, t: float,
-              geometry: tuple) -> tuple[float, np.ndarray] | None:
+              geometry: tuple) -> np.ndarray | None:
         try:
             return decoder.grab(t, geometry)
         except (av.error.FFmpegError, OSError, ValueError, EOFError) as exc:
@@ -586,13 +625,16 @@ class _PersistentFrameFetcher:
             )
             return None
 
-    def close(self) -> None:
+    def _release(self) -> None:
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
         decoders, self._decoders = self._decoders, []
         for decoder in decoders:
             decoder.close()
+
+    def close(self) -> None:
+        self._release()
 
 
 def _prefers_persistent_fetch(frame_size: tuple[int, int]) -> bool:
@@ -617,8 +659,8 @@ def _prefers_persistent_fetch(frame_size: tuple[int, int]) -> bool:
     return width * height > PERSISTENT_FETCH_MIN_PIXELS
 
 
-def _open_frame_fetcher(video_path: str,
-                        known_dims: tuple[int, int]) -> _PersistentFrameFetcher | None:
+def _open_frame_fetcher(video_path: str, known_dims: tuple[int, int],
+                        pool_size: int = PERSISTENT_POOL_SIZE) -> _PersistentFrameFetcher | None:
     """The persistent fetcher for this source if the policy wants one, else
     None (one-shot grabs). If the containers cannot be opened, logs a warning
     and returns None: one-shot grabs still work wherever the ffmpeg CLI can
@@ -626,7 +668,7 @@ def _open_frame_fetcher(video_path: str,
     if not _prefers_persistent_fetch(known_dims):
         return None
     try:
-        return _PersistentFrameFetcher(video_path, known_dims)
+        return _PersistentFrameFetcher(video_path, known_dims, pool_size=pool_size)
     except (av.error.FFmpegError, OSError, ValueError) as exc:
         logger.warning(
             "%s: could not open persistent decoders (%s: %s); falling back to one-shot ffmpeg grabs",
@@ -652,7 +694,10 @@ def grab_frames(video_path: str, times: list[float], band_frac: float = 0.55,
     if not times:
         return []
     known_dims = _probe_dimensions(video_path)
-    fetcher = _open_frame_fetcher(video_path, known_dims)
+    # No more containers than frames asked for: each persistent 4K decoder
+    # holds several decoded reference frames.
+    fetcher = _open_frame_fetcher(video_path, known_dims,
+                                  pool_size=min(PERSISTENT_POOL_SIZE, len(times)))
     if fetcher is None:
         pairs, _ = _grab_frames_with_times(video_path, times, band_frac, target_height,
                                            known_dims=known_dims)
@@ -1219,17 +1264,19 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
 
     `fetcher`: the persistent-container fetcher detect_crop() opened for
     this source (see _prefers_persistent_fetch()), or None for one-shot
-    grabs. Either way each fetched frame comes back with the time the fetch
-    layer reports for THAT frame, and that is the time recorded -- in
-    sample_pts and frame_times alike -- never the requested one. The probe
-    budget (MAX_PROBES_PER_ROUND) counts requested probes, so grabs that
-    fail still spend it.
+    grabs. Either way each fetched frame is recorded -- in sample_pts and
+    frame_times alike -- under its probe's requested time: a time that
+    re-fetches exactly the analysed frame through this module's fetch layer
+    (at-or-after, ms-rounded), which may precede the frame's true PTS by up
+    to one frame (see CropResult.sample_pts for why not the PTS). Grabs that
+    fail return no frame and are not recorded, but the probe budget
+    (MAX_PROBES_PER_ROUND) counts requested probes, so they still spend it.
 
     Returns (polys_per_frame, sample_pts_used, raw_hit_count, frame_times).
     Polygons are already mapped to full-frame pixel coordinates.
     `sample_pts_used` lists every frame actually fetched, in probing order.
-    `frame_times` has one entry per entry of `polys_per_frame`, the fetched
-    frame's timestamp (for the watermark temporal-spread check).
+    `frame_times` has one entry per entry of `polys_per_frame`, that frame's
+    recorded time (for the watermark temporal-spread check).
     """
     polys_per_frame: list[list] = []
     frame_times: list[float] = []
@@ -1261,9 +1308,10 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
             )
         else:
             pairs, geometry = fetcher.fetch(chunk, band_frac, TARGET_HEIGHT)
-        # The time of each frame actually fetched, not the requested time:
-        # a UI seeking to a recorded timestamp must land on the frame that
-        # was analysed (Task 2b requirement 4).
+        # Only the probes that returned a frame, each under its requested
+        # time: re-requesting that time (the UI slider, the filmstrip, the
+        # full-frame retry below) lands on exactly the frame analysed here
+        # (Task 2b requirement 4, see CropResult.sample_pts).
         sample_pts.extend(t for t, _frame in pairs)
         if not pairs:
             continue
