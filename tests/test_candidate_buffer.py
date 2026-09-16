@@ -134,7 +134,11 @@ def _run(monkeypatch, slot_budget=PRODUCTION_SLOT_BUDGET,
     # needs its OWN fresh TaggingOCR to track just that run's frames -- the
     # process-wide engine registry would otherwise hand back a stale engine
     # from an earlier call in this same test session instead of the one
-    # just monkeypatched in above.
+    # just monkeypatched in above. conftest.py's autouse reset only runs
+    # between TESTS, not between the several _run() calls one test makes
+    # (test_admitted_candidates_are_identical_across_batch_sizes calls this
+    # four times, once per BATCH_SIZE), so this in-helper reset is still
+    # required, not merely redundant belt-and-braces.
     engine_registry.reset_registry()
 
     v = Video.__new__(Video)
