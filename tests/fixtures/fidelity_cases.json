@@ -26,6 +26,15 @@
       "crop": [288, 786, 1344, 53],
       "brightness": 209,
       "detect_labels": true
+    },
+    {
+      "name": "slay_1080p_multirange_labels",
+      "project": "Slay the Gods S2",
+      "file": "ZS2_-_11_[1080p]TXHBR.mp4",
+      "time_ranges": [["9:30", "10:00"], ["14:00", "14:30"]],
+      "crop": [288, 786, 1344, 53],
+      "brightness": 209,
+      "detect_labels": true
     }
   ]
 }

@@ -6,7 +6,7 @@ stream and a stand-in OCR engine: no media, no GPU, milliseconds.
 import numpy as np
 import pytest
 
-from videocr import video as video_mod
+from videocr import engine_registry, video as video_mod
 from videocr.video import Video
 
 FPS = 25.0
@@ -130,6 +130,16 @@ def _run(monkeypatch, slot_budget=PRODUCTION_SLOT_BUDGET,
     ocr = TaggingOCR()
     monkeypatch.setattr(video_mod.utils, "create_ocr_engine",
                         lambda *a, **k: ocr)
+    # Every call here uses the same (lang, det, rec, gpu) key, but each
+    # needs its OWN fresh TaggingOCR to track just that run's frames -- the
+    # process-wide engine registry would otherwise hand back a stale engine
+    # from an earlier call in this same test session instead of the one
+    # just monkeypatched in above. conftest.py's autouse reset only runs
+    # between TESTS, not between the several _run() calls one test makes
+    # (test_admitted_candidates_are_identical_across_batch_sizes calls this
+    # four times, once per BATCH_SIZE), so this in-helper reset is still
+    # required, not merely redundant belt-and-braces.
+    engine_registry.reset_registry()
 
     v = Video.__new__(Video)
     v.path = "synthetic"
@@ -229,9 +239,16 @@ def test_candidates_admitted_is_a_pure_function_of_frame_size():
 
 
 def test_the_bound_is_actually_needed():
-    """Without a bound the batch holds MAX_CANDIDATES x BATCH_SIZE frames."""
+    """Without a bound the batch holds MAX_CANDIDATES x BATCH_SIZE frames.
+
+    Compared against video_mod.BATCH_SIZE rather than a hardcoded figure,
+    so this keeps meaning what it says (unbounded fullframe buffering is
+    hundreds of MB or more, and the per-subtitle bound scales down with
+    BATCH_SIZE exactly like the buffering it's bounding) at whatever
+    BATCH_SIZE the module is actually set to.
+    """
     fullframe_bytes = 1280 * 720 * 3
     unbounded = video_mod.MAX_CANDIDATES * video_mod.BATCH_SIZE * fullframe_bytes
-    assert unbounded > 5 * 1024**3
+    assert unbounded > 100 * 1024**2
     bounded = video_mod.MAX_CANDIDATE_BYTES_PER_SUBTITLE * video_mod.BATCH_SIZE
-    assert bounded == 512 * 1024**2
+    assert bounded == 2 * 1024**2 * video_mod.BATCH_SIZE

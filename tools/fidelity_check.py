@@ -69,19 +69,32 @@ def run_case(case: Case, root: Path) -> str:
     if not video.exists():
         raise FileNotFoundError(video)
 
-    parts = []
-    for start, end in case.time_ranges:
-        parts.append(get_subtitles(
-            str(video), lang="ch", time_start=start, time_end=end,
-            conf_threshold=95, sim_threshold=82,
-            brightness_threshold=case.brightness,
-            similar_image_threshold=0.3, similar_pixel_threshold=25,
-            frames_to_skip=0,
-            crop_x=case.crop[0], crop_y=case.crop[1],
-            crop_width=case.crop[2], crop_height=case.crop[3],
-            detect_labels=case.detect_labels,
-        ))
-    return "\n".join(parts)
+    kwargs = dict(
+        lang="ch", conf_threshold=95, sim_threshold=82,
+        brightness_threshold=case.brightness,
+        similar_image_threshold=0.3, similar_pixel_threshold=25,
+        frames_to_skip=0,
+        crop_x=case.crop[0], crop_y=case.crop[1],
+        crop_width=case.crop[2], crop_height=case.crop[3],
+        detect_labels=case.detect_labels,
+    )
+
+    # A single range goes through get_subtitles(time_start=, time_end=)
+    # exactly as before. More than one range now goes through time_ranges=
+    # as one call (Stage 2 Track A, Task 2: one engine session per file
+    # instead of one get_subtitles() call per range) instead of the old
+    # loop-and-join here, so this harness -- and tools/bench.py's "ocr"
+    # suite, which calls this function -- actually exercises the code path
+    # it is meant to gate and measure, rather than only the pre-existing
+    # single-range path. digest() hashes only Dialogue lines, and every
+    # case's time_ranges are chronological and non-overlapping, so this is
+    # expected to produce the exact same digest as the old per-range loop;
+    # the slay_1080p_multirange golden is what proves that.
+    if len(case.time_ranges) == 1:
+        start, end = case.time_ranges[0]
+        return get_subtitles(str(video), time_start=start, time_end=end, **kwargs)
+    return get_subtitles(
+        str(video), time_ranges=[tuple(r) for r in case.time_ranges], **kwargs)
 
 
 def verify_case(case: Case, ass: str, golden_dir: Path) -> tuple[str, str]:

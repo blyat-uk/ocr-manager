@@ -104,6 +104,89 @@ def test_crop_in_graph_matches_numpy_slice(downscaled_clip):
         )
 
 
+def test_configure_crop_called_after_enter_matches_slice(downscaled_clip):
+    """The crop can be configured *after* __enter__ has already returned,
+    not only supplied to the constructor. Every other crop test in this
+    file (and in tests/test_capture_hdr.py) passes crop_rect= to the
+    constructor, so none of them exercise this path - which is exactly
+    what videocr/video.py's run_ocr() relies on: it can't know a crop
+    pre-scaled to decode-output coordinates before opening, since that
+    scaling needs the native height this same capture is the one place
+    to learn.
+    """
+    x, y, w, h = _GRAPH_CROP
+    with PyAVCapture(str(downscaled_clip),
+                     decode_target_height=_GRAPH_TARGET_HEIGHT) as cap:
+        full = _read_all(cap, 10)
+    with PyAVCapture(str(downscaled_clip),
+                     decode_target_height=_GRAPH_TARGET_HEIGHT) as cap:
+        # No crop_rect at construction this time - the graph exists
+        # already (downscale needs one), but with no crop yet.
+        assert cap._crop_slice is None
+        assert not cap._crop_graph_active
+        cap.configure_crop(_GRAPH_CROP)
+        assert cap._crop_graph_active
+        cropped = _read_all(cap, 10)
+
+    assert len(full) == len(cropped) == 10
+    for i, (f, c) in enumerate(zip(full, cropped)):
+        expected = f[y:y + h, x:x + w]
+        assert c.shape == expected.shape, f"frame {i} shape {c.shape} != {expected.shape}"
+        assert np.array_equal(c, expected), (
+            f"frame {i} differs, max abs diff "
+            f"{int(np.abs(c.astype(int) - expected.astype(int)).max())}"
+        )
+
+
+def test_reconfiguring_crop_clears_stale_state(downscaled_clip, monkeypatch):
+    """Re-configuring from an active crop to no crop, or to one
+    _plan_crop ends up refusing, must not leave the previous call's crop
+    state behind: a stale _crop_slice/_crop_graph_active would make
+    _frame_producer's `not getattr(v, '_crop_slice', None)` guard
+    (videocr/video.py) skip its own Python-level slice, believing the
+    graph already cropped when it did not -- OCRing the wrong region of
+    the frame.
+    """
+    import videocr.pyav_adapter as pyav_adapter_mod
+
+    with PyAVCapture(str(downscaled_clip),
+                     decode_target_height=_GRAPH_TARGET_HEIGHT,
+                     crop_rect=_GRAPH_CROP) as cap:
+        assert cap._crop_graph_active
+        assert cap._crop_slice is not None
+
+        # Re-configure to no crop at all.
+        cap.configure_crop(None)
+        assert cap._crop_request is None
+        assert cap._crop_slice is None
+        assert cap._crop_native is None
+        assert cap._crop_scaled_size is None
+        assert not cap._crop_graph_active
+
+        # Back to an admitted crop, then to one _plan_crop refuses.
+        # _crop_axis_plan (see its own docstring) is a function of the
+        # capture's native/output *dimensions* alone, never of the crop
+        # rectangle -- so on one capture (fixed dimensions) a crop is
+        # either always admissible or always refused, and a real refused
+        # geometry can't be reached by changing only the crop rect on an
+        # already-admitting capture the way this test needs to. Forcing
+        # the refusal at its actual decision point exercises exactly the
+        # code path test_crop_invariant_holds_across_decode_ratios's own
+        # refused matrix entries take, without depending on hunting for a
+        # specific width/height/target combination that happens to
+        # refuse.
+        cap.configure_crop(_GRAPH_CROP)
+        assert cap._crop_graph_active
+
+        monkeypatch.setattr(pyav_adapter_mod, "_crop_axis_plan", lambda *a, **k: None)
+        cap.configure_crop(_GRAPH_CROP)
+        assert cap._crop_request == _GRAPH_CROP  # still recorded, just refused
+        assert cap._crop_slice is None
+        assert cap._crop_native is None
+        assert cap._crop_scaled_size is None
+        assert not cap._crop_graph_active
+
+
 def test_crop_pts_unchanged(downscaled_clip):
     with PyAVCapture(str(downscaled_clip),
                      decode_target_height=_GRAPH_TARGET_HEIGHT) as cap:
@@ -212,3 +295,73 @@ def test_crop_invariant_holds_across_decode_ratios(
             f"{width}x{height}({pix_fmt})->{decode_target_height} frame {i}: "
             f"max abs diff {int(np.abs(c.astype(int) - expected.astype(int)).max())}"
         )
+
+
+# --------------------------------------------------------------------------
+# Pipeline level: Video.run_ocr() itself, not just PyAVCapture in isolation
+# --------------------------------------------------------------------------
+
+def test_run_ocr_turns_on_the_graph_crop_for_a_downscaled_source(tmp_path, monkeypatch):
+    """The test that would have caught finding 1 (crop_rect only ever fed
+    by tests, so Video.run_ocr() never actually turned the graph crop on
+    in production - see task-3-report.md). Every crop test above (and in
+    tests/test_capture_hdr.py) drives PyAVCapture directly with
+    crop_rect= at the constructor, so none of them would notice run_ocr()
+    itself never calling configure_crop(). Confirmed by reverting the
+    configure_crop() call at videocr/video.py:423-428 in a scratch copy:
+    every other test in this suite and all four golden digests still
+    pass; only this test fails.
+
+    No GPU/OCR needed: OCR engine construction and the producer thread's
+    own decode work are stubbed out, since this only has to observe what
+    run_ocr() did to the capture before any frame is actually processed.
+    """
+    from videocr import engine_registry
+    from videocr.video import Video
+
+    src = tmp_path / "uhd.mp4"
+    _make_clip(src, 3840, 2160, frames=3)
+    # Native-space crop (crop_x/y/width/height are native, per
+    # videocr/video.py's own inference block, clamped against self.width/
+    # self.height before any decode-scale is applied). Scaled by
+    # run_ocr()'s own decode_height/height factor of 0.5 for this
+    # 2160-tall source, this lands on (400, 900, 1024, 96) in the
+    # 1920x1080 decode-target output space - the exact geometry
+    # test_crop_matches_slice_with_decode_downscale already proves the
+    # graph accepts.
+    crop_x, crop_y, crop_w, crop_h = 800, 1800, 2048, 192
+
+    seen = {}
+
+    def spying_frame_producer(self, v, queue, *_a, **_kw):
+        # Record capture state before consuming anything, then end the
+        # run immediately - this test only needs to know what run_ocr()
+        # did to the capture, not decode the clip.
+        seen['crop_graph_active'] = getattr(v, '_crop_graph_active', False)
+        seen['crop_slice'] = getattr(v, '_crop_slice', None)
+        self._producer_time = 0.0
+        queue.put(("done",))
+
+    monkeypatch.setattr(Video, "_frame_producer", spying_frame_producer)
+
+    class _DummyEngine:
+        def predict(self, batch):
+            return [[] for _ in batch]
+
+    monkeypatch.setattr(engine_registry, "get_ocr_engine",
+                        lambda *a, **k: _DummyEngine())
+
+    v = Video(str(src), None, None)
+    v.run_ocr(
+        use_gpu=False, lang='ch', time_start='0:00', time_end='',
+        conf_threshold=95, use_fullframe=False, brightness_threshold=150,
+        similar_image_threshold=0.3, similar_pixel_threshold=25, frames_to_skip=0,
+        crop_x=crop_x, crop_y=crop_y, crop_width=crop_w, crop_height=crop_h,
+    )
+
+    assert seen['crop_graph_active'] is True, (
+        "Video.run_ocr() did not turn the graph crop on for a source "
+        "that needs a filter graph anyway - the exact regression "
+        "finding 1 was."
+    )
+    assert seen['crop_slice'] is not None
