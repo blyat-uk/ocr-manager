@@ -4,8 +4,10 @@
 speech-guided one: it asks `core.detect.vad.probe_times()` for timestamps
 ranked by likelihood of carrying dialogue, grabs just those frames (already
 cropped to the bottom band and downscaled), runs the text-detection engine
-on them, and stops as soon as it has enough agreeing hits -- instead of
-walking the whole 40-60% window at a fixed step.
+on them, and stops once the raw (unfiltered) in-band union has stopped
+growing across consecutive probe batches -- see _run_round()'s
+convergence stop -- instead of walking the whole 40-60% window at a fixed
+step, or stopping once an arbitrary count of probes has agreed.
 
 Two correctness rules this module fixes relative to the old detector
 (`core/subtitle_detector.py`'s `_compute_crop_from_polys`), both pinned by
@@ -184,10 +186,12 @@ FLAG_LOW_AGREEMENT = "low-agreement"
 FLAG_STATIC_CONTENT = "static-content"              # watermark/logo rejection (confirmed)
 FLAG_WATERMARK_UNCERTAIN = "static-content?"        # same extent every sample, but not enough
                                                      # temporal spread to confirm -- box is kept
-FLAG_MULTIPLE_POSITIONS = "multiple-positions?"     # a second baseline cluster with >=2 members
-                                                     # was included in the union, not just the
-                                                     # dominant one -- e.g. a genuinely repositioned
-                                                     # subtitle
+FLAG_MULTIPLE_POSITIONS = "multiple-positions?"     # a second baseline cluster was folded into the
+                                                     # union alongside the dominant one -- either
+                                                     # >=2 members (e.g. a genuinely repositioned
+                                                     # subtitle) or a single hit kept because it sits
+                                                     # adjacent to the dominant cluster (a likely
+                                                     # missing line -- see _baseline_cluster_union())
 FLAG_OUTLIER_DISCARDED = "outlier-discarded?"       # a single hit at a baseline nothing else shared
                                                      # was excluded from the union -- never silently
 
@@ -674,11 +678,28 @@ def _uniform_probe_times(duration_sec: float, start_frac: float = UNIFORM_START_
 
 def _consistent_with_consensus(y_frac: float, h_frac: float,
                                 consensus: list[tuple[float, float]]) -> bool:
+    """Two-sided shape agreement check: consensus may only relax the
+    convergence stop (see _run_round()) when the raw union's height agrees
+    with the series in BOTH directions, not just "not too tall".
+
+    An earlier version only rejected a union that was too TALL relative to
+    consensus (h_frac > med_h * CONSENSUS_MAX_HEIGHT_RATIO); a union that
+    was too SHORT -- e.g. a one-line union checked against a two-line
+    consensus -- passed silently, because "shorter than expected" cleared
+    that same one-sided ratio test trivially. Reproduced: consensus
+    (917/1080, 116/1080) (a two-line series) against a one-line union
+    (977/1080, 56/1080) returned True, RELAXING the stop requirement at
+    exactly the moment the consensus is evidence the box should be
+    TALLER -- the opposite of what "consistent" should license. See
+    test_consensus_never_relaxes_toward_a_union_shorter_than_the_series.
+    """
     if not consensus:
         return True
     med_y = median(c[0] for c in consensus)
     med_h = median(c[1] for c in consensus)
     if med_h > 0 and h_frac > med_h * CONSENSUS_MAX_HEIGHT_RATIO:
+        return False
+    if med_h > 0 and h_frac < med_h / CONSENSUS_MAX_HEIGHT_RATIO:
         return False
     if abs(y_frac - med_y) > CONSENSUS_Y_DEVIATION_FRAC:
         return False
@@ -912,10 +933,15 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     batches, already cropped to the bottom band and downscaled ->
     det_engine.predict() scores each frame's text polygons -> polys
     scoring >= 0.9 that also fall in-band are kept and mapped back to
-    full-frame coordinates -> stop once 5 probe frames agree, or 2 frames
-    agree when `consensus` (a list of (y_frac, h_frac) from already-resolved
-    files) has at least 3 entries and the box is consistent with it ->
-    aggregate_box() unions the accepted polys into one padded, clamped crop.
+    full-frame coordinates -> _run_round() stops once the raw (unfiltered)
+    union has held steady for CONVERGENCE_STABLE_ROUNDS (2) consecutive
+    probe batches, or for just CONSENSUS_STABLE_ROUNDS (1) when
+    `consensus` (a list of (y_frac, h_frac) from already-resolved files)
+    has at least CONSENSUS_MIN_ENTRIES (3) entries and the raw union's own
+    shape agrees with it in BOTH directions -- neither too tall nor too
+    short relative to the series median (see _consistent_with_consensus())
+    -> aggregate_box() unions the accepted polys into one padded, clamped
+    crop.
 
     Fallbacks, in order (flags compose rather than overwrite -- see
     _compose_flag()):
@@ -935,9 +961,11 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     box is None), "static-content?" (same extent every sample, but not
     enough temporal spread to confirm; box is still returned -- see
     _watermark_status()), "multiple-positions?" (a second baseline
-    cluster with >=2 members got folded into the union alongside the
-    dominant one -- e.g. a genuinely repositioned subtitle), "outlier-
-    discarded?" (a single hit at a baseline nothing else shared was
+    cluster got folded into the union alongside the dominant one -- either
+    >=2 members, e.g. a genuinely repositioned subtitle, or a single hit
+    kept because it sits adjacent to the dominant cluster, a likely
+    missing line), "outlier-discarded?" (a single hit at a baseline
+    nothing else shared, and not adjacent to the dominant cluster, was
     excluded from the union -- see _baseline_cluster_union()),
     "ceiling-exceeded" (in-band hits exist but the resulting box is too
     tall), or "low-agreement" (a box was built, but from fewer than

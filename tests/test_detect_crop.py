@@ -437,6 +437,93 @@ def test_consensus_stop_reads_the_unfiltered_union_not_a_clustered_box(monkeypat
     assert y + h >= 1030
 
 
+def test_consensus_never_relaxes_toward_a_union_shorter_than_the_series(monkeypatch):
+    """Round-7 fix: `_consistent_with_consensus()` only rejected a union
+    that was too TALL relative to consensus (`h_frac > med_h *
+    CONSENSUS_MAX_HEIGHT_RATIO`) -- it never rejected one that was too
+    SHORT. Reproduces the review's exact numbers: consensus fixed at the
+    padded TWO-LINE shape (y_frac=917/1080, h_frac=116/1080 -- see
+    test_union_covers_a_two_line_subtitle's fixture), checked against a
+    raw ONE-LINE union (y_frac=977/1080, h_frac=56/1080). That one-line
+    union clears both the too-tall check (56/1080 is nowhere near
+    1.5x116/1080) and the Y-deviation check (|0.905-0.849| < 0.10), so the
+    old, one-sided rule returned True -- RELAXING the stop requirement
+    exactly when the consensus is evidence the box should be TALLER, not
+    proof it's safe to stop early.
+
+    End-to-end: 15 candidate timestamps, a two-line subtitle only at
+    t=6.0, which _spread_order() places in the 3rd batch (not the 1st or
+    2nd). Before the fix: the run incorrectly stabilizes after 2 batches
+    (10 probes) on the one-line-only evidence seen so far, NEVER reaching
+    the batch containing the two-line frame, and resolves to the clipped
+    one-line box (288, 977, 1344, 56) with no signal anything was missed.
+    After the fix, the relaxed (CONSENSUS_STABLE_ROUNDS) stop must not
+    fire on a union that disagrees with consensus in the "too short"
+    direction either, so probing continues, the two-line batch is
+    reached, and the box matches the no-consensus result exactly:
+    (288, 917, 1344, 116).
+    """
+    def one_line_for(t):
+        # Varying width per probe (like different dialogue lines) avoids
+        # the watermark check's "identical extent everywhere" trigger,
+        # without changing the subtitle's Y-position at all.
+        w = 300 + int(t) * 37 % 400
+        x0 = 400 + int(t) * 13 % 200
+        return [_poly(x0, 980, x0 + w, 1030)]
+
+    two_line = [_poly(400, 920, 1500, 970), _poly(400, 980, 1500, 1030)]
+    times_all = [float(t) for t in range(15)]
+    two_line_time = 6.0  # lands in the 3rd batch under _spread_order(range(15))
+    assert crop._spread_order(times_all)[10:15] == [6.0, 8.0, 9.0, 11.0, 13.0], (
+        "test assumes this exact 3rd-batch composition -- if _spread_order()'s "
+        "algorithm changes, update or re-derive this expectation"
+    )
+    consensus = [(917.0 / 1080, 116.0 / 1080)] * 3  # matches the TWO-LINE shape
+
+    last_chunk_times: list[float] = []
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        last_chunk_times[:] = times
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+        return pairs, geometry
+
+    class FakeEngine:
+        def predict(self, frames):
+            results = []
+            for t in last_chunk_times:
+                polys = two_line if t == two_line_time else one_line_for(t)
+                results.append({"dt_scores": [1.0] * len(polys), "dt_polys": polys})
+            return results
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+    polys_per_frame, sample_pts, raw_hits, frame_times = crop._run_round(
+        "dummy.mp4", times_all, FakeEngine(), band_frac=0.55, consensus=consensus,
+        frame_size=FRAME, settings=None,
+    )
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=frame_times)
+
+    assert two_line_time in sample_pts, (
+        "consensus must not relax the stop toward a union SHORTER than the "
+        "series -- the batch containing the two-line subtitle must still "
+        "get probed"
+    )
+    assert box == (288, 917, 1344, 116), (
+        f"the two-line subtitle must not be silently clipped to the "
+        f"one-line box: got {box}"
+    )
+
+
+def test_consistent_with_consensus_rejects_a_union_too_short_for_the_series():
+    """Unit-level pin, isolated from _run_round()'s batching: the exact
+    numbers from the review. A one-line union must NOT be judged
+    consistent with a two-line consensus."""
+    assert crop._consistent_with_consensus(
+        y_frac=977.0 / 1080, h_frac=56.0 / 1080,
+        consensus=[(917.0 / 1080, 116.0 / 1080)],
+    ) is False
+
+
 def test_adjacent_singleton_upper_line_is_included_not_clipped():
     """Round-6 fix 2: an isolated singleton hit directly adjacent to the
     dominant cluster (within ~1 detected line height) is a missing line,
