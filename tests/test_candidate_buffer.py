@@ -1,4 +1,4 @@
-"""The candidate buffer is bounded, and bounded deterministically.
+"""The candidate buffer is bounded, and bounded independently of BATCH_SIZE.
 
 Drives `Video.run_ocr`'s real producer/consumer loop over a synthetic frame
 stream and a stand-in OCR engine: no media, no GPU, milliseconds.
@@ -11,40 +11,69 @@ from videocr.video import Video
 
 FPS = 25.0
 FRAME_SIZE = 64            # 64x64x3 BGR = 12,288 bytes a frame
+FRAME_BYTES = FRAME_SIZE * FRAME_SIZE * 3
 FRAMES_PER_SUBTITLE = 60   # stride is round(fps/4) = 6, so 8 candidates fit
 SUBTITLES = 10
+OFFERED = SUBTITLES * 8    # what the producer offers with nothing in its way
+
+# Budget that admits every offered candidate, and one that binds hard.
+SLOT_BUDGET_OPEN = FRAME_BYTES * 8
+SLOT_BUDGET_TIGHT = FRAME_BYTES * 3
 
 BOX = [[0, 0], [100, 0], [100, 20], [0, 20]]
 
 
-def _frame(value: int) -> np.ndarray:
-    return np.full((FRAME_SIZE, FRAME_SIZE, 3), value, dtype=np.uint8)
+def _frame(value: int, index: int) -> np.ndarray:
+    """A flat frame carrying its own global index in two corner pixels.
+
+    The tag makes each frame individually identifiable in the OCR batches, so
+    tests can compare the admitted *set* and not merely its size. Two pixels
+    is far below the similarity threshold (0.3% of 4,096 px = 12 px), so
+    tagging does not disturb the producer's subtitle segmentation.
+    """
+    frame = np.full((FRAME_SIZE, FRAME_SIZE, 3), value, dtype=np.uint8)
+    frame[0, 0, 0] = index // 256
+    frame[0, 0, 1] = index % 256
+    return frame
+
+
+def _tag(frame) -> int:
+    return int(frame[0, 0, 0]) * 256 + int(frame[0, 0, 1])
 
 
 def _stream() -> list:
-    """SUBTITLES blocks of identical frames. Consecutive blocks differ by far
-    more than similar_pixel_threshold, so the producer starts a new subtitle
-    at every boundary and treats everything within a block as the same one."""
+    """SUBTITLES blocks of near-identical frames. Consecutive blocks differ by
+    far more than similar_pixel_threshold, so the producer starts a new
+    subtitle at every boundary and treats everything within a block as one."""
     frames = []
-    for s in range(SUBTITLES):
-        frames.extend(_frame(10 if s % 2 == 0 else 240)
-                      for _ in range(FRAMES_PER_SUBTITLE))
+    for index in range(SUBTITLES * FRAMES_PER_SUBTITLE):
+        block = index // FRAMES_PER_SUBTITLE
+        frames.append(_frame(10 if block % 2 == 0 else 240, index))
     return frames
 
 
-class CountingOCR:
-    """Returns one fixed low-confidence reading per frame and records the
-    size of every batch it is handed."""
+def _is_candidate_tag(tag: int) -> bool:
+    """A subtitle's first frame opens a block; everything else is a candidate."""
+    return tag % FRAMES_PER_SUBTITLE != 0
+
+
+class TaggingOCR:
+    """Returns one fixed low-confidence reading per frame and records the tag
+    of every frame it is handed, in order."""
 
     def __init__(self):
-        self.batch_sizes = []
+        self.seen = []
 
     def ocr(self, frames):
-        self.batch_sizes.append(len(frames))
+        self.seen.extend(_tag(f) for f in frames)
         return [[[BOX, ("文", 0.5)]] for _ in frames]
 
     def predict(self, frames):
         return self.ocr(frames)
+
+    @property
+    def candidate_tags(self):
+        return sorted(t for t in self.seen if _is_candidate_tag(t))
 
 
 class FakeCapture:
@@ -75,9 +104,14 @@ class FakeCapture:
         return (self.i - 1) / FPS
 
 
+# Captured at import, before any test can patch it.
+PRODUCTION_SLOT_BUDGET = video_mod.MAX_CANDIDATE_BYTES_PER_SUBTITLE
+PRODUCTION_BATCH_SIZE = video_mod.BATCH_SIZE
+
+
 @pytest.fixture(autouse=True)
 def stub_pipeline(monkeypatch):
-    """Pin the OCR result format and swap in the fake capture/engine."""
+    """Pin the OCR result format and swap in the fake capture."""
     monkeypatch.setattr(video_mod.utils, "needs_conversion", lambda: False)
     frames = _stream()
     monkeypatch.setattr(video_mod, "Capture",
@@ -85,17 +119,15 @@ def stub_pipeline(monkeypatch):
     return frames
 
 
-# Captured at import, before any test can patch it.
-PRODUCTION_CAP = video_mod.MAX_CANDIDATE_BUFFER_BYTES
+def _run(monkeypatch, slot_budget=PRODUCTION_SLOT_BUDGET,
+         batch_size=PRODUCTION_BATCH_SIZE):
+    # Always set both, never merely leave them: monkeypatch unwinds at the end
+    # of a test, not the end of a call, so a run that skipped this would
+    # silently inherit whatever a previous run in the same test installed.
+    monkeypatch.setattr(video_mod, "MAX_CANDIDATE_BYTES_PER_SUBTITLE", slot_budget)
+    monkeypatch.setattr(video_mod, "BATCH_SIZE", batch_size)
 
-
-def _run(monkeypatch, cap_bytes=PRODUCTION_CAP):
-    # Always set it, never merely leave it: monkeypatch only unwinds at the
-    # end of a test, so a run that skipped this would silently inherit the
-    # cap a previous run in the same test had installed.
-    monkeypatch.setattr(video_mod, "MAX_CANDIDATE_BUFFER_BYTES", cap_bytes)
-
-    ocr = CountingOCR()
+    ocr = TaggingOCR()
     monkeypatch.setattr(video_mod.utils, "create_ocr_engine",
                         lambda *a, **k: ocr)
 
@@ -112,61 +144,94 @@ def _run(monkeypatch, cap_bytes=PRODUCTION_CAP):
         frames_to_skip=0, crop_x=None, crop_y=None,
         crop_width=None, crop_height=None,
     )
-    # The first batch is the subtitles themselves; every later batch is one
-    # slot's candidates, resolved because the stand-in reads at 0.5 (<0.95).
-    return v, sum(ocr.batch_sizes[1:])
+    return v, ocr.candidate_tags
 
 
-def test_all_candidates_are_buffered_under_the_cap(monkeypatch):
-    """The production cap must not clip an ordinary run: this stream offers
-    the full MAX_CANDIDATES for every one of its subtitles."""
-    v, candidates = _run(monkeypatch)
+BATCH_SIZES = (2, 5, 10, 256)
+
+
+@pytest.mark.parametrize("slot_budget, expected_per_subtitle", [
+    pytest.param(SLOT_BUDGET_TIGHT, 3, id="budget-binds"),
+    pytest.param(SLOT_BUDGET_OPEN, 8, id="budget-open"),
+])
+def test_admitted_candidates_are_identical_across_batch_sizes(
+    monkeypatch, slot_budget, expected_per_subtitle
+):
+    """The rule this whole branch exists to establish: for a fixed video and
+    fixed settings the output cannot depend on BATCH_SIZE.
+
+    A running byte total across the batch broke it. Flushes happen every
+    BATCH_SIZE subtitles and refill such a total, so a smaller BATCH_SIZE
+    refills more often and admits strictly more candidates - measured 80 /
+    50 / 25 / 25 at BATCH_SIZE 2 / 5 / 10 / 256 against a 25-frame budget.
+    _resolve_candidates can rewrite a subtitle's text, so a different
+    admitted set is a different .ass.
+
+    Compares the admitted SET, not its size: two runs could coincidentally
+    keep the same number of different frames.
+    """
+    admitted = {bs: _run(monkeypatch, slot_budget, bs)[1] for bs in BATCH_SIZES}
+
+    reference = admitted[BATCH_SIZES[0]]
+    assert len(reference) == SUBTITLES * expected_per_subtitle
+    for batch_size, tags in admitted.items():
+        assert tags == reference, (
+            f"BATCH_SIZE={batch_size} admitted a different candidate set "
+            f"({len(tags)} frames vs {len(reference)}); OCR output is a "
+            "function of BATCH_SIZE"
+        )
+
+
+def test_budget_is_spent_per_subtitle_not_per_batch(monkeypatch):
+    """Every subtitle gets its own allowance, so a stream of N subtitles
+    admits N x allowance regardless of how the batches are cut."""
+    _, tags = _run(monkeypatch, SLOT_BUDGET_TIGHT, batch_size=256)
+    per_subtitle = {}
+    for tag in tags:
+        per_subtitle.setdefault(tag // FRAMES_PER_SUBTITLE, []).append(tag)
+    assert len(per_subtitle) == SUBTITLES
+    assert all(len(v) == 3 for v in per_subtitle.values())
+
+
+def test_all_candidates_are_admitted_under_the_production_budget(monkeypatch):
+    """This stream's frames are 12,288 bytes, far under the per-frame
+    threshold the production budget implies, so nothing is clipped."""
+    v, tags = _run(monkeypatch)
     assert len(v.pred_frames) == SUBTITLES
-    assert candidates == SUBTITLES * video_mod.MAX_CANDIDATES
-    # ...and this stream is nowhere near the cap, which is the point.
-    frame_bytes = FRAME_SIZE * FRAME_SIZE * 3
-    assert candidates * frame_bytes < PRODUCTION_CAP
+    assert len(tags) == OFFERED
+    assert FRAME_BYTES * video_mod.MAX_CANDIDATES < PRODUCTION_SLOT_BUDGET
 
 
-def test_candidate_buffer_respects_the_byte_budget(monkeypatch):
-    """Past the budget, candidates are dropped rather than buffered."""
-    frame_bytes = FRAME_SIZE * FRAME_SIZE * 3
-    admitted = 25
-    _, candidates = _run(monkeypatch, cap_bytes=frame_bytes * admitted)
-    assert candidates == admitted
+def test_candidates_admitted_is_a_pure_function_of_frame_size():
+    """The sizing table in videocr/video.py's comment, asserted.
+
+    (pixels, expected candidates) at the production budget. These are the
+    geometries the cap does and does not clip; if the budget moves, this
+    fails and the comment gets corrected with it.
+    """
+    budget = video_mod.MAX_CANDIDATE_BYTES_PER_SUBTITLE
+    threshold_px = budget // video_mod.MAX_CANDIDATES // 3
+    assert threshold_px == 87381
+
+    cases = [
+        ((1344, 53), 8),    # the golden / reference crop
+        ((1344, 66), 7),    # 13 rows taller
+        ((1920, 45), 8),    # a wide, thin band
+        ((1920, 46), 7),
+        ((1920, 106), 3),   # a two-line subtitle region
+        ((1280, 720), 0),   # use_fullframe
+    ]
+    for (w, h), expected in cases:
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        assert video_mod._candidates_admitted(frame) == expected, (
+            f"{w}x{h} ({w * h} px)"
+        )
 
 
-def test_candidate_admission_is_deterministic(monkeypatch):
-    """Same stream, same cap, same decisions -- twice over, and the clipped
-    run must still produce the same subtitles as the unclipped one (these
-    candidates all read identically, so dropping some changes nothing)."""
-    frame_bytes = FRAME_SIZE * FRAME_SIZE * 3
-    runs = [_run(monkeypatch, cap_bytes=frame_bytes * 25) for _ in range(2)]
-    assert runs[0][1] == runs[1][1]
-    texts = [[f.text for f in v.pred_frames] for v, _ in runs]
-    assert texts[0] == texts[1]
-
-    full, full_candidates = _run(monkeypatch, cap_bytes=PRODUCTION_CAP)
-    assert full_candidates > runs[0][1], "the comparison run was not unclipped"
-    assert [f.text for f in full.pred_frames] == texts[0]
-
-
-def test_candidate_fits_is_a_pure_function_of_bytes():
-    frame = _frame(0)
-    cap = video_mod.MAX_CANDIDATE_BUFFER_BYTES
-    assert video_mod._candidate_fits(0, frame)
-    assert video_mod._candidate_fits(cap - frame.nbytes, frame)
-    assert not video_mod._candidate_fits(cap - frame.nbytes + 1, frame)
-
-
-def test_reference_crop_workload_is_entirely_under_the_cap():
-    """The cap is chosen to sit above the worst case of the geometry the
-    golden cases (and production) use, so it can never alter their output."""
-    crop_frame_bytes = 1344 * 53 * 3
-    worst_case = video_mod.MAX_CANDIDATES * video_mod.BATCH_SIZE * crop_frame_bytes
-    assert worst_case <= video_mod.MAX_CANDIDATE_BUFFER_BYTES
-
+def test_the_bound_is_actually_needed():
+    """Without a bound the batch holds MAX_CANDIDATES x BATCH_SIZE frames."""
     fullframe_bytes = 1280 * 720 * 3
     unbounded = video_mod.MAX_CANDIDATES * video_mod.BATCH_SIZE * fullframe_bytes
-    assert unbounded > 5 * 1024**3, "the bound this test guards is not needed"
-    assert video_mod.MAX_CANDIDATE_BUFFER_BYTES < unbounded
+    assert unbounded > 5 * 1024**3
+    bounded = video_mod.MAX_CANDIDATE_BYTES_PER_SUBTITLE * video_mod.BATCH_SIZE
+    assert bounded == 512 * 1024**2
