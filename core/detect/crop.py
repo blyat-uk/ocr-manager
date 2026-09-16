@@ -1110,22 +1110,25 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     box_band_frac = 1.0 if used_full_frame_retry else BOTTOM_HALF_CUTOFF
     box = aggregate_box(polys_per_frame, frame_size, box_band_frac, box_settings, frame_times)
 
-    if box is None and agreed > 0:
-        # watermark_status can be "confirmed" (aggregate_box's underlying
-        # union was already None -- box=None follows directly), "uncertain"
-        # (the union WAS real, but aggregate_box's own ceiling check
-        # rejected the padded/floored box built from it -- box=None here
-        # comes from the ceiling, not the watermark judgement), or None
-        # (no watermark involvement at all, just a too-tall box). Only the
-        # "confirmed" case is a watermark rejection; the ternary below
-        # resolves both other cases to FLAG_CEILING_EXCEEDED correctly,
-        # but that's the ceiling check's doing, not an "uncertain implies
-        # ceiling" guarantee -- an uncertain union that happens to fit
-        # under the ceiling never reaches this branch at all (box is not
-        # None then; see the "uncertain" flag composition below instead).
-        flagged = _compose_flag(
-            flagged, FLAG_STATIC_CONTENT if watermark_status == "confirmed" else FLAG_CEILING_EXCEEDED,
-        )
+    if box is None:
+        # Gated on watermark_status directly, NOT on `agreed > 0`: a
+        # CONFIRMED watermark has evidence (every sampled frame matched
+        # it), but _union_extent_detailed() deliberately returns an empty
+        # kept_idx for it (nothing is "kept" into a union -- see its
+        # docstring), so `agreed` (== len(kept_idx)) is always 0 in this
+        # branch. Inferring "was this a watermark" from `agreed > 0` was
+        # wrong the moment agreed stopped being a raw evidence count and
+        # became a kept-union count -- see task-3 review round 2.
+        if watermark_status == "confirmed":
+            flagged = _compose_flag(flagged, FLAG_STATIC_CONTENT)
+        elif agreed > 0:
+            # Real hits exist (a genuine, non-watermark union was found),
+            # but aggregate_box()'s own ceiling check rejected the
+            # resulting padded/floored box as too tall. An "uncertain"
+            # watermark union that happens to fit under the ceiling never
+            # reaches this branch at all (box is not None then; see the
+            # "uncertain" flag composition below instead).
+            flagged = _compose_flag(flagged, FLAG_CEILING_EXCEEDED)
     if box is not None and watermark_status == "uncertain":
         # Same extent every sample, but not enough temporal spread among
         # the contributing probes to tell a real watermark apart from the

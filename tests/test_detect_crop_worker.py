@@ -344,13 +344,25 @@ def test_cancel_takes_effect_within_one_probe_batch_not_only_between_files(monke
 
 
 def test_cleanup_returns_promptly_even_if_run_never_finishes(monkeypatch):
-    """Task-3 review ruling B: the worker-test event loop is bounded by a
-    QTimer, but the very next call after it used to be an UNBOUNDED
-    QThread.wait() -- if a regression hung _run(), the test wouldn't fail
-    fast; the only backstop left would be pytest-timeout's global 900s.
-    cleanup() now accepts an optional timeout_ms (main.py's own
-    no-argument call is unaffected -- it still waits indefinitely) so a
-    hung worker thread fails this test in seconds.
+    """Task-3 review ruling B (and round-2 finding M6): the worker-test
+    event loop is bounded by a QTimer, but the very next call after it
+    used to be an UNBOUNDED QThread.wait() -- if a regression hung
+    _run(), the test wouldn't fail fast; the only backstop left would be
+    pytest-timeout's global 900s. cleanup() now accepts an optional
+    timeout_ms (main.py's own no-argument call is unaffected -- it still
+    waits indefinitely) so a hung worker thread fails this test in
+    seconds.
+
+    Round 2 found that the test itself still trusted cleanup() to honour
+    its own timeout: calling `worker.cleanup(timeout_ms=500)` directly on
+    the test thread means a regression that makes cleanup() IGNORE
+    timeout_ms (e.g. reverting to a bare `self._thread.wait()`) hangs this
+    test too, caught only by the global 900s. The call under test must
+    not be able to block the test thread: it's invoked from a helper
+    thread, joined with a short, hard bound independent of cleanup()'s own
+    behaviour -- if cleanup() ignores its timeout, the helper thread is
+    still alive when the join bound expires, and `not helper.is_alive()`
+    fails within seconds.
     """
     hang = threading.Event()  # never set by this test until explicitly released below
 
@@ -364,17 +376,33 @@ def test_cleanup_returns_promptly_even_if_run_never_finishes(monkeypatch):
     worker = SubtitleDetectionWorker(_make_video_files(["a.mp4"]))
     worker.start()
 
-    start = time.monotonic()
-    finished = worker.cleanup(timeout_ms=500)
-    elapsed = time.monotonic() - start
+    call_result = {}
 
-    assert finished is False, "the hung thread must not actually have finished"
-    assert elapsed < 2.0, f"cleanup(timeout_ms=500) must return promptly, took {elapsed:.2f}s"
+    def call_cleanup():
+        t0 = time.monotonic()
+        call_result["finished"] = worker.cleanup(timeout_ms=500)
+        call_result["elapsed"] = time.monotonic() - t0
+
+    helper = threading.Thread(target=call_cleanup, daemon=True)
+    helper.start()
+    helper.join(timeout=2.0)  # hard bound on the TEST, independent of cleanup()'s own behaviour
+
+    assert not helper.is_alive(), (
+        "cleanup(timeout_ms=500) did not return within 2s -- it must have "
+        "ignored its timeout_ms argument and blocked on an unbounded wait()"
+    )
+    assert call_result.get("finished") is False, "the hung thread must not actually have finished"
+    assert call_result["elapsed"] < 2.0, (
+        f"cleanup(timeout_ms=500) must return promptly, took {call_result['elapsed']:.2f}s"
+    )
 
     # Let the background thread actually exit before the process does, and
-    # tidy up its QThread; bounded again so this can't hang the suite either.
+    # tidy up its QThread -- via another bounded helper, so a regression
+    # here can't hang the suite either.
     hang.set()
-    worker.cleanup(timeout_ms=3000)
+    tidy = threading.Thread(target=lambda: worker.cleanup(timeout_ms=3000), daemon=True)
+    tidy.start()
+    tidy.join(timeout=5.0)
 
 
 def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):

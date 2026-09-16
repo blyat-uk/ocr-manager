@@ -671,6 +671,100 @@ def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
     assert result.frame_size == (1920, 1080)
 
 
+def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0):
+    """Shared plumbing for the end-to-end box=None/flag tests below: drives
+    the real detect_crop() orchestration with vad.probe_times(),
+    _probe_dimensions() and _grab_frames_with_times() faked out, and
+    `predict_fn(t) -> (scores, polys)` controlling what the engine "sees"
+    at each probed timestamp."""
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(
+        crop.vad, "probe_times",
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6): vad_times,
+    )
+
+    last_chunk_times: list[float] = []
+
+    def fake_grab_frames_with_times(video_path, times, band_frac, target_height, known_dims=None):
+        last_chunk_times[:] = times
+        pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
+        geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+        return pairs, geometry
+
+    class FakeEngine:
+        def predict(self, frames):
+            results = []
+            for t in last_chunk_times:
+                scores, polys = predict_fn(t)
+                results.append({"dt_scores": scores, "dt_polys": polys})
+            return results
+
+    monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
+
+    return crop.detect_crop("dummy.mp4", duration, FakeEngine())
+
+
+def test_confirmed_watermark_sets_static_content_flag_end_to_end(monkeypatch):
+    """Task-3 round-2 review, finding 1: _union_extent_detailed()'s
+    confirmed-watermark branch returns an empty kept_idx (by design --
+    nothing is "kept" into a real union), which made detect_crop()'s old
+    `agreed > 0` gate silently skip FLAG_STATIC_CONTENT for exactly the
+    case it exists to flag: a confirmed watermark left result.flagged as
+    None instead of "static-content" -- a silent no-box-no-reason result.
+    Drives detect_crop() end-to-end (not just the pure _union_extent()
+    layer, which existing tests already cover but discard the count) with
+    an identical extent on every sampled frame, spread across well more
+    than WATERMARK_MIN_SPAN_SEC.
+    """
+    same = _poly(1600, 1000, 1850, 1040)
+    watermark_times = crop._uniform_probe_times(60.0)  # 24.0..36.0, 12s span
+
+    result = _detect_crop_with_fakes(
+        monkeypatch, watermark_times, lambda t: ([1.0], [same]),
+    )
+
+    assert result.box is None, "a confirmed watermark must not produce a box"
+    assert result.flagged is not None, (
+        "a confirmed watermark must never resolve with flagged=None -- "
+        "a silent no-box-no-reason result"
+    )
+    assert crop.FLAG_STATIC_CONTENT in result.flagged, (
+        f"expected {crop.FLAG_STATIC_CONTENT!r} in flagged, got {result.flagged!r}"
+    )
+
+
+def test_ceiling_exceeded_sets_a_flag_end_to_end(monkeypatch):
+    """The other box=None exit that depends on `agreed > 0`: real
+    (non-watermark) hits exist, but the resulting box is too tall.
+    Varying x-position per probe (like the existing consensus tests) keeps
+    this from also being classified as a confirmed watermark."""
+    def predict_fn(t):
+        x0 = 100 + (int(t * 10) % 300)
+        return [1.0], [_poly(x0, 600, x0 + 1700, 1070)]  # ~470px tall, way over the 25% ceiling
+
+    ceiling_times = crop._uniform_probe_times(60.0)
+    result = _detect_crop_with_fakes(monkeypatch, ceiling_times, predict_fn)
+
+    assert result.box is None, "an absurdly tall box must still be rejected"
+    assert result.flagged is not None, "ceiling-exceeded must never resolve with flagged=None"
+    assert crop.FLAG_CEILING_EXCEEDED in result.flagged, (
+        f"expected {crop.FLAG_CEILING_EXCEEDED!r} in flagged, got {result.flagged!r}"
+    )
+
+
+def test_no_hits_anywhere_sets_a_flag_end_to_end(monkeypatch):
+    """Third box=None exit: nothing is ever detected, even after every
+    fallback round (uniform probing, then the full-frame retry). Already
+    covered indirectly by the fallback-flag composition logic (independent
+    of the agreed>0 gate this round's regression was in), included here so
+    every box=None exit of detect_crop() is checked the same, explicit
+    way."""
+    result = _detect_crop_with_fakes(monkeypatch, [1.0, 2.0, 3.0], lambda t: ([], []))
+
+    assert result.box is None
+    assert result.flagged is not None, "exhausting every fallback must never resolve with flagged=None"
+
+
 @pytest.mark.needs_media
 @pytest.mark.slow
 def test_crop_does_not_drift_from_previously_accepted_values(reference_media, detector_truth):
