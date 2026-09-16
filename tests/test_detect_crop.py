@@ -57,6 +57,31 @@ def test_static_content_across_all_frames_is_rejected_as_a_watermark():
     assert box is None
 
 
+def test_padding_is_applied_before_the_floor():
+    # Pins the exact padded value (56px) as distinct from the unpadded
+    # value (54px, which happens to equal the 5%-of-1080 floor and so
+    # would pass this same input even with padding deleted entirely).
+    box = crop.aggregate_box([[_poly(400, 980, 1500, 1030)]], FRAME, 0.55, None)
+    assert box == (288, 977, 1344, 56)
+
+
+def test_watermark_rejection_requires_temporal_spread():
+    # Identical extents that all land within one plausible subtitle's own
+    # display duration could be the SAME line, sampled repeatedly -- not
+    # proof of static content. Only real temporal spread across the
+    # contributing samples should trigger watermark rejection.
+    same = _poly(1600, 1000, 1850, 1040)
+    polys_per_frame = [[same]] * 5
+
+    clustered_times = [10.0, 10.3, 10.6, 10.9, 11.2]  # spans 1.2s
+    box = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=clustered_times)
+    assert box is not None, "clustered-in-time identical detections should not be a watermark"
+
+    spread_times = [10.0, 12.0, 14.0, 16.0, 18.0]  # spans 8s
+    box2 = crop.aggregate_box(polys_per_frame, FRAME, 0.55, None, sample_times=spread_times)
+    assert box2 is None, "identical detections spread widely in time look like static content"
+
+
 @pytest.mark.needs_media
 @pytest.mark.slow
 def test_crop_does_not_drift_from_previously_accepted_values(reference_media, detector_truth):

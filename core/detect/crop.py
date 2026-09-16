@@ -59,11 +59,22 @@ MAX_CROP_HEIGHT_FRAC = 0.25
 DT_SCORE_THRESHOLD = 0.9
 
 # Watermark rejection: a box present in every sampled frame, to within this
-# many pixels, is treated as static content (a logo/watermark) rather than
-# a subtitle, but only once there are enough samples for "every frame"
-# to mean something (2 identical frames could just be 2 lucky probes).
-WATERMARK_TOLERANCE_PX = 4.0
+# fraction of frame height, is *suspected* static content (a logo/watermark)
+# rather than a subtitle, but only once there are enough samples for "every
+# frame" to mean something (2 identical frames could just be 2 lucky
+# probes). Expressed as a fraction of frame height, not a fixed pixel count,
+# so it doesn't get twice as strict at 4K as at 1080p (4px at 1080p was the
+# original value this reproduces).
+WATERMARK_TOLERANCE_FRAC = 4.0 / 1080.0
 WATERMARK_MIN_SAMPLES = 3
+# A same-extent match across samples spanning less than this many seconds
+# is NOT enough evidence of static content: vad.probe_times() only
+# guarantees 0.75s minimum separation between picks, so several
+# chronological picks can land inside one displayed subtitle line's own
+# duration, all showing the same text. Require the contributing samples to
+# span more than one plausible subtitle's display duration before calling
+# it a watermark rather than "the same line, sampled repeatedly".
+WATERMARK_MIN_SPAN_SEC = 2.0
 
 # Frame grab defaults.
 TARGET_HEIGHT = 480
@@ -80,6 +91,14 @@ UNIFORM_START_FRAC = 0.40
 UNIFORM_END_FRAC = 0.60
 UNIFORM_STEP_SEC = 0.5
 LOW_AGREEMENT_HITS = 3        # fewer accepted hits than this and we still flag the result
+
+# CropResult.flagged reason strings.
+FLAG_NO_SPEECH = "no-speech"                        # true silence / no audio stream at all
+FLAG_SPEECH_PROBES_EXHAUSTED = "speech-probes-exhausted"  # audio has speech, but no text found there
+FLAG_TOP_POSITIONED = "top-positioned?"
+FLAG_CEILING_EXCEEDED = "ceiling-exceeded"
+FLAG_LOW_AGREEMENT = "low-agreement"
+FLAG_STATIC_CONTENT = "static-content"              # watermark/logo rejection
 
 
 @dataclass
@@ -135,7 +154,15 @@ def _crop_geometry(orig_w: int, orig_h: int, band_frac: float,
 
 def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
                crop_y: int, out_w: int, out_h: int) -> np.ndarray | None:
-    """Grab a single frame at time `t`, already cropped+scaled. None on failure."""
+    """Grab a single frame at time `t`, already cropped+scaled. None on failure.
+
+    Every failure mode of the ffmpeg invocation itself (missing binary,
+    permission error, timeout, ...) is caught here and turned into a
+    logged None, matching grab_frames()'s documented "failures are dropped,
+    not raised" contract -- only `subprocess.run()`'s own raise sites need
+    catching; a short/garbled read is handled separately below via a
+    length check, not an exception.
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", f"{max(0.0, t):.3f}", "-i", video_path,
@@ -145,8 +172,11 @@ def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, check=False, timeout=30)
-    except subprocess.TimeoutExpired:
-        logger.warning("grab_frames: timed out grabbing t=%.3f from %s", t, video_path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "grab_frames: failed to grab t=%.3f from %s (%s: %s)",
+            t, video_path, type(exc).__name__, exc,
+        )
         return None
     expected = out_w * out_h * 3
     if result.returncode != 0 or len(result.stdout) != expected:
@@ -159,18 +189,24 @@ def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
 
 
 def _grab_frames_with_times(video_path: str, times: list[float], band_frac: float,
-                             target_height: int,
+                             target_height: int, known_dims: tuple[int, int] | None = None,
                              ) -> tuple[list[tuple[float, np.ndarray]], tuple]:
     """Implementation behind grab_frames(): parallel one-shot ffmpeg grabs,
     bounded to GRAB_POOL_SIZE concurrent processes, returning (time, frame)
     pairs in request order with failed grabs dropped. Also returns the
     crop geometry used, so callers (detect_crop) can map detection results
     in the returned frames' coordinate space back to full-frame pixels.
+
+    `known_dims`: (width, height) if the caller already knows it (detect_crop
+    always does, from its own opening _probe_dimensions() call) -- skips
+    the ffprobe re-spawn this function would otherwise do on every batch.
+    grab_frames() itself never passes this, so it stays independently
+    callable/testable exactly as documented.
     """
     if not times:
-        return [], (0, 0, 0, 0, 0, 0)
+        return [], (0, 0, 0, 0, 0, 0, 0, 0)
 
-    orig_w, orig_h = _probe_dimensions(video_path)
+    orig_w, orig_h = known_dims if known_dims is not None else _probe_dimensions(video_path)
     geometry = _crop_geometry(orig_w, orig_h, band_frac, target_height)
     crop_w, crop_h, crop_x, crop_y, out_w, out_h = geometry
 
@@ -219,7 +255,10 @@ def _per_frame_extents(polys_per_frame, frame_h: float, cutoff_frac: float,
                         ) -> list[tuple[float, float, float, float] | None]:
     """Per probed frame: the union extent of its in-band polys (center_y at
     or below `cutoff_frac` of frame height), or None if that frame had no
-    in-band poly. Shared by aggregate_box() and detect_crop()'s reporting.
+    in-band poly. Shared by aggregate_box() and detect_crop() -- both the
+    final box computation AND the "did this probe frame count as a hit"
+    decision use this exact same acceptance test, so a detection that
+    won't contribute to the box can never be counted as a hit either.
     """
     cutoff_y = frame_h * cutoff_frac
     extents: list[tuple[float, float, float, float] | None] = []
@@ -243,29 +282,62 @@ def _per_frame_extents(polys_per_frame, frame_h: float, cutoff_frac: float,
     return extents
 
 
-def _is_watermark(accepted: list[tuple[float, float, float, float]], total_frames: int) -> bool:
-    """True if the same extent (within WATERMARK_TOLERANCE_PX) appears in
-    every one of `total_frames` sampled frames -- static content, not a
-    subtitle, since subtitles change between samples."""
+def _is_watermark(accepted: list[tuple[float, float, float, float]], total_frames: int,
+                   frame_h: float, contributing_times: list[float] | None = None) -> bool:
+    """True if the same extent (within WATERMARK_TOLERANCE_FRAC of frame
+    height) appears in every one of `total_frames` sampled frames --
+    *and*, when timestamps are available, those samples span more than
+    WATERMARK_MIN_SPAN_SEC. Static content is present continuously;
+    several chronological probes landing inside one subtitle's own
+    display duration would also look identical without being static.
+
+    `contributing_times` is optional: aggregate_box()'s public, pure API
+    doesn't require callers to supply sample timestamps (the 7 unit tests
+    in tests/test_detect_crop.py call it without any), so when it's None
+    this falls back to the extent-identity check alone -- the behaviour
+    those tests pin. detect_crop() (the actual orchestration this rule
+    exists to protect) always supplies real probe timestamps, so the
+    temporal-spread requirement is live on the path that matters.
+    """
     if len(accepted) != total_frames or total_frames < WATERMARK_MIN_SAMPLES:
         return False
+    tolerance = frame_h * WATERMARK_TOLERANCE_FRAC
     first = accepted[0]
-    return all(
-        all(abs(a - b) <= WATERMARK_TOLERANCE_PX for a, b in zip(e, first))
+    same_extent = all(
+        all(abs(a - b) <= tolerance for a, b in zip(e, first))
         for e in accepted[1:]
     )
+    if not same_extent:
+        return False
+    if contributing_times is not None and len(contributing_times) >= 2:
+        span = max(contributing_times) - min(contributing_times)
+        if span < WATERMARK_MIN_SPAN_SEC:
+            return False
+    return True
 
 
 def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
+                   sample_times: list[float] | None = None,
                    ) -> tuple[tuple[float, float, float, float] | None, int, bool]:
     """Returns (raw union extent or None, count of contributing frames,
-    whether the result looks like a watermark)."""
+    whether the result looks like a watermark).
+
+    `sample_times`, if given, must align 1:1 with `polys_per_frame`; only
+    the timestamps of frames that actually contributed an in-band poly are
+    used (see _is_watermark).
+    """
     extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
     accepted = [e for e in extents if e is not None]
     if not accepted:
         return None, 0, False
-    if _is_watermark(accepted, len(extents)):
+
+    contributing_times = None
+    if sample_times is not None and len(sample_times) == len(extents):
+        contributing_times = [t for e, t in zip(extents, sample_times) if e is not None]
+
+    if _is_watermark(accepted, len(extents), frame_h, contributing_times):
         return None, len(accepted), True
+
     min_x = min(e[0] for e in accepted)
     min_y = min(e[1] for e in accepted)
     max_x = max(e[2] for e in accepted)
@@ -274,7 +346,8 @@ def _union_extent(polys_per_frame, frame_h: float, cutoff_frac: float,
 
 
 def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float = 0.55,
-                   settings: dict | None = None) -> tuple[int, int, int, int] | None:
+                   settings: dict | None = None,
+                   sample_times: list[float] | None = None) -> tuple[int, int, int, int] | None:
     """Union of accepted text-detection polygons across sampled frames, into
     one padded, clamped crop box -- or None if there's nothing to build a
     box from (no in-band polys, the box exceeds the height ceiling, or the
@@ -290,6 +363,12 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     `automation` keys (crop_width_fraction, crop_vertical_padding,
     crop_min_height_fraction, bottom_half_cutoff). None means the defaults
     at the top of this module.
+    `sample_times`: optional, one timestamp per entry of `polys_per_frame`
+    (same length, same order) -- lets the watermark check require real
+    temporal spread among the contributing samples instead of only extent
+    identity. Optional and keyword-friendly precisely so the plain
+    positional calls in tests/test_detect_crop.py's pure tests keep working
+    unchanged; see _is_watermark()'s docstring.
     """
     frame_w, frame_h = frame_size
     s = settings or {}
@@ -298,7 +377,7 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     min_height_frac = float(s.get("crop_min_height_fraction", CROP_MIN_HEIGHT_FRACTION))
     cutoff_frac = float(s.get("bottom_half_cutoff", band_frac))
 
-    union, _agreed, is_watermark = _union_extent(polys_per_frame, frame_h, cutoff_frac)
+    union, _agreed, is_watermark = _union_extent(polys_per_frame, frame_h, cutoff_frac, sample_times)
     if union is None:
         return None
 
@@ -353,6 +432,19 @@ def _consistent_with_consensus(y_frac: float, h_frac: float,
     return True
 
 
+def _compose_flag(existing: str | None, new: str) -> str:
+    """Combine flag reasons instead of one silently clobbering another --
+    e.g. "speech probes found nothing" AND "had to widen past the bottom
+    band" can both be true of the same result, and both are useful to a
+    reviewer deciding whether to trust the box."""
+    if not existing:
+        return new
+    parts = existing.split("+")
+    if new in parts:
+        return existing
+    return f"{existing}+{new}"
+
+
 def _map_poly_to_full_frame(poly, geometry: tuple) -> np.ndarray:
     """Map a polygon from a grabbed (cropped+scaled) frame's coordinate
     space back to full original-frame pixel coordinates."""
@@ -369,26 +461,41 @@ def _map_poly_to_full_frame(poly, geometry: tuple) -> np.ndarray:
 def _run_round(video_path: str, times: list[float], det_engine, band_frac: float,
                 stop_hits: int, consensus: list[tuple[float, float]] | None,
                 frame_size: tuple[int, int], settings: dict | None,
-                ) -> tuple[list, list[float], int]:
+                known_dims: tuple[int, int] | None = None,
+                ) -> tuple[list, list[float], int, list[float]]:
     """Fetch+detect `times` in PROBE_BATCH_SIZE-sized rounds, stopping early
-    once `stop_hits` probe frames have produced a >=0.9-scoring poly, or
-    once CONSENSUS_STOP_HITS is reached with an in-tolerance consensus.
+    once `stop_hits` probe frames have produced an IN-BAND accepted poly
+    (score >= DT_SCORE_THRESHOLD *and* passing the same band cutoff
+    aggregate_box() itself applies -- see _per_frame_extents()), or once
+    CONSENSUS_STOP_HITS is reached with an in-tolerance consensus.
 
-    Returns (polys_per_frame, sample_pts_used, raw_hit_count). Polygons are
-    already mapped to full-frame pixel coordinates.
+    A hit that wouldn't survive aggregate_box()'s own filtering (e.g. text
+    detected in the sliver between the grabbed band's top edge and the
+    cutoff line) must not count toward the stop condition either, or
+    detect_crop can stop probing on hits that end up contributing nothing,
+    landing on box=None with neither fallback triggered.
+
+    Returns (polys_per_frame, sample_pts_used, raw_hit_count, frame_times).
+    Polygons are already mapped to full-frame pixel coordinates.
+    `frame_times` has one entry per entry of `polys_per_frame`, the probe
+    timestamp that produced it (for the watermark temporal-spread check).
     """
     polys_per_frame: list[list] = []
+    frame_times: list[float] = []
     sample_pts: list[float] = []
-    raw_hits = 0
     consensus = consensus or []
     _, frame_h = frame_size
+    cutoff_frac = float((settings or {}).get("bottom_half_cutoff", band_frac))
+    raw_hits = 0
 
     i = 0
     while i < len(times):
         chunk = times[i:i + PROBE_BATCH_SIZE]
         i += len(chunk)
 
-        pairs, geometry = _grab_frames_with_times(video_path, chunk, band_frac, TARGET_HEIGHT)
+        pairs, geometry = _grab_frames_with_times(
+            video_path, chunk, band_frac, TARGET_HEIGHT, known_dims=known_dims,
+        )
         sample_pts.extend(chunk)
         if not pairs:
             continue
@@ -398,7 +505,7 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
         frames = [frame for _, frame in pairs]
         results = list(det_engine.predict(frames))
 
-        for item in results:
+        for (t, _frame), item in zip(pairs, results):
             scores = item.get("dt_scores")
             if scores is None:
                 scores = []
@@ -411,20 +518,23 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
                 if float(score) >= DT_SCORE_THRESHOLD
             ]
             polys_per_frame.append(accepted)
-            if accepted:
-                raw_hits += 1
+            frame_times.append(t)
+
+        raw_hits = sum(
+            e is not None for e in _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
+        )
 
         if raw_hits >= stop_hits:
             break
 
         if len(consensus) >= CONSENSUS_MIN_ENTRIES and raw_hits >= CONSENSUS_STOP_HITS:
-            provisional = aggregate_box(polys_per_frame, frame_size, band_frac, settings)
+            provisional = aggregate_box(polys_per_frame, frame_size, band_frac, settings, frame_times)
             if provisional is not None:
                 _, py, _, ph = provisional
                 if _consistent_with_consensus(py / frame_h, ph / frame_h, consensus):
                     break
 
-    return polys_per_frame, sample_pts, raw_hits
+    return polys_per_frame, sample_pts, raw_hits, frame_times
 
 
 def detect_crop(video_path: str, duration_sec: float, det_engine,
@@ -436,48 +546,58 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     likelihood of carrying dialogue -> grab_frames() fetches them in
     batches, already cropped to the bottom band and downscaled ->
     det_engine.predict() scores each frame's text polygons -> polys
-    scoring >= 0.9 are kept and mapped back to full-frame coordinates ->
-    stop once 5 probe frames agree, or 2 frames agree when `consensus`
-    (a list of (y_frac, h_frac) from already-resolved files) has at least
-    3 entries and the box is consistent with it -> aggregate_box() unions
-    the accepted polys into one padded, clamped crop.
+    scoring >= 0.9 that also fall in-band are kept and mapped back to
+    full-frame coordinates -> stop once 5 probe frames agree, or 2 frames
+    agree when `consensus` (a list of (y_frac, h_frac) from already-resolved
+    files) has at least 3 entries and the box is consistent with it ->
+    aggregate_box() unions the accepted polys into one padded, clamped crop.
 
-    Fallbacks, in order:
+    Fallbacks, in order (flags compose rather than overwrite -- see
+    _compose_flag()):
     - vad.probe_times() returns [] (true digital silence / no audio
       stream): fall back to uniform 0.5s probing over the same 40-60%
       window immediately. flagged="no-speech".
-    - Speech-guided probes are exhausted with zero hits (audio exists but
-      no visible text at any sampled timestamp): fall back to the same
-      uniform probing. flagged="no-speech".
+    - Speech-guided probes are exhausted with zero in-band hits (audio
+      exists and has speech, but no visible text at any sampled
+      timestamp): fall back to the same uniform probing.
+      flagged="speech-probes-exhausted" (NOT "no-speech" -- there was
+      speech, just no detected text at those timestamps).
     - The bottom band yields nothing at all, even after the uniform
       fallback: retry once on full frames (band_frac=1.0, no position
-      cutoff). flagged="top-positioned?".
+      cutoff). flagged gains "top-positioned?".
+    A result can also be flagged "static-content" (watermark rejected;
+    see _is_watermark()), "ceiling-exceeded" (in-band hits exist but the
+    resulting box is too tall), or "low-agreement" (a box was built, but
+    from fewer than LOW_AGREEMENT_HITS contributing frames).
     """
-    orig_w, orig_h = _probe_dimensions(video_path)
+    known_dims = _probe_dimensions(video_path)
+    orig_w, orig_h = known_dims
     frame_size = (orig_w, orig_h)
 
     sample_pts: list[float] = []
     flagged: str | None = None
 
     times = vad.probe_times(video_path, duration_sec, window_frac=(0.40, 0.60))
-    if not times:
+    speech_probing_available = bool(times)
+    if not speech_probing_available:
         times = _uniform_probe_times(duration_sec)
-        flagged = "no-speech"
+        flagged = _compose_flag(flagged, FLAG_NO_SPEECH)
 
-    polys_per_frame, used, raw_hits = _run_round(
+    polys_per_frame, used, raw_hits, frame_times = _run_round(
         video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF, stop_hits=STOP_HITS,
-        consensus=consensus, frame_size=frame_size, settings=settings,
+        consensus=consensus, frame_size=frame_size, settings=settings, known_dims=known_dims,
     )
     sample_pts.extend(used)
 
-    if raw_hits == 0 and flagged != "no-speech":
+    if raw_hits == 0 and speech_probing_available:
         uniform_times = _uniform_probe_times(duration_sec)
-        polys_per_frame, used, raw_hits = _run_round(
+        polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
             stop_hits=STOP_HITS, consensus=consensus, frame_size=frame_size, settings=settings,
+            known_dims=known_dims,
         )
         sample_pts.extend(used)
-        flagged = "no-speech"
+        flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
 
     used_full_frame_retry = False
     if raw_hits == 0:
@@ -486,19 +606,22 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         # rather than probing new ones -- we already know these timestamps
         # exist in the video; band_frac=1.0 just widens what we look at.
         retry_times = sorted(set(retry_times))
-        polys_per_frame, used, raw_hits = _run_round(
+        polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, retry_times, det_engine, band_frac=1.0, stop_hits=STOP_HITS,
             consensus=consensus, frame_size=frame_size,
             settings={**(settings or {}), "bottom_half_cutoff": 0.0},
+            known_dims=known_dims,
         )
         sample_pts.extend(used)
-        flagged = "top-positioned?"
+        flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
         used_full_frame_retry = True
 
     cutoff_frac = 0.0 if used_full_frame_retry else float(
         (settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)
     )
-    envelope_extent, agreed, is_watermark = _union_extent(polys_per_frame, orig_h, cutoff_frac)
+    envelope_extent, agreed, is_watermark = _union_extent(
+        polys_per_frame, orig_h, cutoff_frac, frame_times,
+    )
     envelope = None
     if envelope_extent is not None:
         ex_min_x, ex_min_y, ex_max_x, ex_max_y = envelope_extent
@@ -511,13 +634,12 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         **(settings or {}), "bottom_half_cutoff": 0.0,
     }
     box_band_frac = 1.0 if used_full_frame_retry else BOTTOM_HALF_CUTOFF
-    box = aggregate_box(polys_per_frame, frame_size, box_band_frac, box_settings)
+    box = aggregate_box(polys_per_frame, frame_size, box_band_frac, box_settings, frame_times)
 
-    if not used_full_frame_retry:
-        if box is None and agreed > 0:
-            flagged = "ceiling-exceeded" if not is_watermark else flagged
-        elif box is not None and 0 < agreed < LOW_AGREEMENT_HITS and flagged is None:
-            flagged = "low-agreement"
+    if box is None and agreed > 0:
+        flagged = _compose_flag(flagged, FLAG_STATIC_CONTENT if is_watermark else FLAG_CEILING_EXCEEDED)
+    elif box is not None and 0 < agreed < LOW_AGREEMENT_HITS:
+        flagged = _compose_flag(flagged, FLAG_LOW_AGREEMENT)
 
     return CropResult(
         box=box,
