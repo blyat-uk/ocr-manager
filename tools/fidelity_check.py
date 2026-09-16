@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Golden-file fidelity harness.
 
 Runs a fixed set of OCR cases and compares the produced ASS against stored
@@ -85,6 +84,27 @@ def run_case(case: Case, root: Path) -> str:
     return "\n".join(parts)
 
 
+def verify_case(case: Case, ass: str, golden_dir: Path) -> tuple[str, str]:
+    """Compare produced ASS text against the stored golden for one case.
+
+    Callers must confirm the golden exists before calling this (main() does
+    so before ever running OCR — see the golden-existence guard there); this
+    function assumes it does.
+
+    Returns (verdict, message) where verdict is "OK" or "FAIL". On FAIL,
+    writes `<case>.actual.ass` into golden_dir with the produced content so
+    the mismatch can be inspected.
+    """
+    golden = golden_dir / f"{case.name}.ass"
+    want = digest(golden.read_text(encoding="utf-8"))
+    got = digest(ass)
+    if want == got:
+        return "OK", f"OK   {case.name} ({got[:12]})"
+
+    (golden_dir / f"{case.name}.actual.ass").write_text(ass, encoding="utf-8")
+    return "FAIL", f"FAIL {case.name}: golden {want[:12]} != produced {got[:12]}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--capture", action="store_true", help="write goldens instead of verifying")
@@ -101,6 +121,13 @@ def main() -> int:
     failures = 0
     for case in cases:
         golden = GOLDEN_DIR / f"{case.name}.ass"
+
+        # Check this before paying for (possibly minutes of) OCR below.
+        if not args.capture and not golden.exists():
+            print(f"MISSING GOLDEN {case.name} — run with --capture")
+            failures += 1
+            continue
+
         try:
             ass = run_case(case, root)
         except FileNotFoundError as exc:
@@ -112,19 +139,10 @@ def main() -> int:
             print(f"WROTE {case.name} ({digest(ass)[:12]})")
             continue
 
-        if not golden.exists():
-            print(f"MISSING GOLDEN {case.name} — run with --capture")
+        verdict, message = verify_case(case, ass, GOLDEN_DIR)
+        print(message)
+        if verdict == "FAIL":
             failures += 1
-            continue
-
-        want = digest(golden.read_text(encoding="utf-8"))
-        got = digest(ass)
-        if want == got:
-            print(f"OK   {case.name} ({got[:12]})")
-        else:
-            failures += 1
-            print(f"FAIL {case.name}: golden {want[:12]} != produced {got[:12]}")
-            (GOLDEN_DIR / f"{case.name}.actual.ass").write_text(ass, encoding="utf-8")
 
     return 1 if failures else 0
 
