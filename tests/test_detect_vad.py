@@ -95,10 +95,104 @@ def test_probe_times_are_inside_the_window_and_ordered(synthetic_audio_video):
     times = vad.probe_times(str(synthetic_audio_video), duration_sec=10.0, window_frac=(0.0, 1.0))
     assert times == sorted(times)
     assert all(0.0 <= t <= 10.0 for t in times)
-    # The fixture's bursts are at 1-3s, 5-6s, 8-9s: known midpoints 2.0, 5.5, 8.5.
     # A probe_times() that always returned [] would pass the two asserts above
     # vacuously (sorted([]) == [] and all() over [] are both trivially true).
-    assert len(times) == 3, f"expected 3 burst midpoints, got {times}"
-    assert times[0] == pytest.approx(2.0, abs=0.15)
-    assert times[1] == pytest.approx(5.5, abs=0.15)
-    assert times[2] == pytest.approx(8.5, abs=0.15)
+    # probe_times() is rank-based (see module docstring): it does not return
+    # segment midpoints, it returns the top-ranked, spread-out energy peaks.
+    # For a 10s window with _PEAK_TARGET_SPACING_SEC=2.5, that's exactly 4
+    # candidates, and each must land near one of the fixture's three known
+    # bursts (1-3s, 5-6s, 8-9s) -- not in a silent stretch between them.
+    assert len(times) == 4, f"expected 4 ranked candidates, got {times}"
+    bursts = [(1.0, 3.0), (5.0, 6.0), (8.0, 9.0)]
+    for t in times:
+        assert any(s - 0.5 <= t <= e + 0.5 for s, e in bursts), (
+            f"candidate {t} does not fall near any known burst {bursts}"
+        )
+
+
+# --- Round 3: probe_times() must not inherit speech_segments()'s threshold
+# collapses. These drive vad._probe_candidates() -- the exact ranking logic
+# probe_times() calls, factored out so it can run on synthetic samples
+# without shelling out to ffmpeg for every construction -- with the two
+# constructions the round-2 re-review used to break speech_segments() twice.
+
+
+@pytest.mark.parametrize("occupancy", [0.85, 0.90, 0.95, 1.0])
+def test_probe_candidates_survive_compressed_dynamic_range(occupancy):
+    # Reproduces the round-2 finding: speech_segments()'s threshold is
+    # min(floor + 6dB margin, ceiling). Loudness-normalised/compressed
+    # dialogue (routine for broadcast/streaming masters) can have an internal
+    # amplitude spread under that 6dB margin, so only the top ~1% (the
+    # ceiling percentile) clears the threshold, and those isolated 20ms
+    # frames then fail _MIN_SEGMENT_SEC: 0 segments, despite the window being
+    # almost entirely "speech". Construction matches the reviewer's repro
+    # script exactly (per-frame amplitude wobbling within a narrow 3dB band).
+    rng = np.random.default_rng(0)
+    hop = int(0.02 * SR)
+
+    def tone_varied(duration_s, freq=1000.0, amp_db_range=(30.0, 33.0)):
+        n_frames = int(duration_s * SR / hop)
+        t = np.arange(hop) / SR
+        out = []
+        for i in range(n_frames):
+            db = rng.uniform(*amp_db_range)
+            amp = 10 ** (db / 20.0) / 1000.0
+            phase = i * hop / SR
+            out.append((amp * np.sin(2 * np.pi * freq * (t + phase))).astype(np.float32))
+        return np.concatenate(out)
+
+    total = 10.0
+    active_sec = total * occupancy
+    sil_sec = total - active_sec
+    samples = np.concatenate([_silence(sil_sec / 2), tone_varied(active_sec), _silence(sil_sec / 2)])
+
+    # The trigger is real and is documented, not fixed, in speech_segments():
+    assert vad.speech_segments(samples, SR) == [], (
+        "if this starts passing, the compressed-dynamic-range limitation "
+        "documented in the module docstring may no longer apply"
+    )
+
+    candidates = vad._probe_candidates(samples, SR, start=0.0, length=total)
+    assert candidates, f"probe_times must not collapse to zero at occupancy={occupancy}"
+    assert candidates == sorted(candidates)
+    active_lo, active_hi = sil_sec / 2, sil_sec / 2 + active_sec
+    assert all(active_lo - 0.5 <= t <= active_hi + 0.5 for t in candidates)
+
+
+def test_probe_candidates_survive_dialogue_under_music():
+    # Reproduces the round-2 finding: speech_segments()'s in-band-fraction
+    # gate is computed against *total* spectral energy, so a concurrent
+    # broadband layer (bass + hiss, standing in for background music/effects)
+    # dilutes the denominator without touching the in-band numerator.
+    # Construction matches the reviewer's repro script exactly.
+    rng = np.random.default_rng(0)
+    music_amp = 0.2  # ~2/3 the dialogue's amplitude -- "modest", not overwhelming
+    speech_amp = 0.3
+    duration_s = 2.0
+    n = int(duration_s * SR)
+    t = np.arange(n) / SR
+    speech = speech_amp * np.sin(2 * np.pi * 1000.0 * t)
+    bass = music_amp * np.sin(2 * np.pi * 150.0 * t)
+    hiss = music_amp * 0.6 * rng.standard_normal(n)
+    mixed = (speech + bass + hiss).astype(np.float32)
+    samples = np.concatenate([_silence(1.0), mixed, _silence(1.0)])
+
+    candidates = vad._probe_candidates(samples, SR, start=0.0, length=4.0)
+    assert candidates, "probe_times must not collapse to zero for dialogue under modest music"
+    assert candidates == sorted(candidates)
+    assert all(1.0 - 0.5 <= t <= 3.0 + 0.5 for t in candidates)
+
+
+@pytest.mark.parametrize("samples,label", [
+    (_tone(3.0), "clean in-band tone"),
+    (_tone(3.0, freq=60.0, amp=0.9), "out-of-band tone"),
+    (0.3 * np.random.default_rng(1).standard_normal(SR * 3).astype(np.float32), "broadband noise"),
+    (np.full(SR * 3, 1e-4, dtype=np.float32), "near-silent constant"),
+])
+def test_probe_candidates_never_empty_for_nonsilent_audio(samples, label):
+    candidates = vad._probe_candidates(samples, SR, start=0.0, length=len(samples) / SR)
+    assert candidates, f"probe_times must return a candidate for non-silent audio ({label})"
+
+
+def test_probe_candidates_empty_only_for_true_digital_silence():
+    assert vad._probe_candidates(_silence(3.0), SR, start=0.0, length=3.0) == []

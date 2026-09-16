@@ -1,14 +1,38 @@
 """Speech detection used to choose frames worth inspecting for subtitles.
 
+Two functions here answer two different questions, deliberately:
+
+- ``speech_segments()`` / ``probe_times()``'s sibling for the Stage 3 UI
+  speech lane makes a speech/not-speech DECISION: it thresholds, and an
+  empty result means "no confident speech found here" -- NOT "no speech
+  present". It is a best-effort detector. Two rounds of review found two
+  distinct constructions (loudness-normalised dialogue with a narrow
+  internal dB spread; in-band dialogue under a concurrent broadband music
+  layer) that make its threshold return zero segments even though a human
+  listening would call both "speech". Both are real, both are documented
+  here rather than chased further: a hard threshold over synthetic and
+  real-world audio will always have *a* failure boundary somewhere, and
+  this function's job -- flagging likely-speech spans for a UI a human
+  reviews -- tolerates that. See git history / task-1-report.md for the
+  specific repro constructions if tightening this further is ever needed.
+
+- ``probe_times()`` does NOT call ``speech_segments()`` and does NOT
+  threshold at all, on purpose: its consumer doesn't need a speech/silence
+  decision, it needs candidate timestamps ranked by how likely they are to
+  carry dialogue. It ranks the in-band energy envelope by magnitude and
+  spreads picks across the window (non-max suppression), so it degrades
+  gracefully to "least bad candidates" instead of silently returning
+  nothing on content this module's threshold-based detector cannot
+  confidently call. See probe_times()'s docstring for the guarantee.
+
 Frames sampled at the midpoint of detected speech contain a visible subtitle
 far more often than uniformly spaced probes, because uniform probes 0.5s
 apart are highly autocorrelated: they sit inside the same silent action
 scene together. Measured on two reference episodes (full-episode duration,
 subtitle presence taken from that project's chi/*.ass OCR output, itself an
-under-reporting oracle so these are lower bounds): speech-guided hit rate
-0.37-0.56 vs uniform 0.5s hit rate 0.18-0.36, a 1.55-2.05x improvement. See
-.superpowers/sdd/2026-09-16-stage2b-detectors/task-1-report.md for the full
-measurement.
+under-reporting oracle so these are lower bounds) -- see
+.superpowers/sdd/2026-09-16-stage2b-detectors/task-1-report.md for the
+measurement and its most recent (rank-based probe_times()) numbers.
 """
 from __future__ import annotations
 
@@ -23,9 +47,24 @@ _HOP_SEC = 0.020
 _FLOOR_PERCENTILE = 20.0
 _CEILING_PERCENTILE = 99.0
 _THRESHOLD_MARGIN_DB = 6.0
-_MIN_INBAND_FRACTION = 0.5
+# Speech-band concentration required of a frame in speech_segments(). Genuine
+# in-band content measures ~1.0; a purely out-of-band source leaking through
+# the band mask measures ~0.003-0.004 (see test_out_of_band_energy_is_not_speech).
+# 0.15 keeps ~25x headroom below that leakage while tolerating dialogue under
+# a concurrent broadband music layer as heavy as the speech itself (measured
+# in-band fraction ~0.31-0.58 for music amplitude 0.1x-0.5x the dialogue's).
+_MIN_INBAND_FRACTION = 0.15
 _CLOSE_GAP_SEC = 0.2
 _MIN_SEGMENT_SEC = 0.25
+# probe_times(): minimum spacing enforced between ranked candidates, and the
+# target spacing used to size how many candidates a window gets. Both are
+# picked, not measured: ~0.75s is below typical dialogue-line spacing (so it
+# doesn't merge distinct lines into one pick), and ~2.5s reproduces roughly
+# the candidate density speech_segments() produced organically on the
+# reference corpus prior to this rewrite (see task-1-report.md round 3).
+_PEAK_MIN_SEPARATION_SEC = 0.75
+_PEAK_TARGET_SPACING_SEC = 2.5
+_SILENCE_AMPLITUDE_EPS = 1e-6
 
 
 def extract_audio_window(video_path: str, start_sec: float, duration_sec: float,
@@ -115,11 +154,106 @@ def speech_segments(samples: np.ndarray, sample_rate: int = SAMPLE_RATE
     return [(s, e) for s, e in merged if (e - s) >= _MIN_SEGMENT_SEC]
 
 
+def _inband_energy_envelope(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
+    """Per-frame in-band (speech-band) energy, linear magnitude sum, one value
+    per _HOP_SEC frame. No threshold, no dB conversion: this is a ranking
+    signal, not a decision, so a monotonic transform of it would be wasted
+    work."""
+    hop = max(1, int(round(_HOP_SEC * sample_rate)))
+    n_frames = samples.size // hop
+    if n_frames == 0:
+        return np.array([], dtype=np.float64), hop
+
+    frames = samples[: n_frames * hop].reshape(n_frames, hop)
+    window = np.hanning(hop).astype(np.float32)
+    spectrum = np.abs(np.fft.rfft(frames * window, axis=1))
+    freqs = np.fft.rfftfreq(hop, d=1.0 / sample_rate)
+    band = (freqs >= _BAND_LOW_HZ) & (freqs <= _BAND_HIGH_HZ)
+    if not band.any():
+        return np.zeros(n_frames, dtype=np.float64), hop
+    return spectrum[:, band].sum(axis=1), hop
+
+
+def _rank_peaks(energy: np.ndarray, hop: int, sample_rate: int,
+                min_separation_sec: float, max_candidates: int) -> list[float]:
+    """Greedy non-max suppression over the energy envelope: take the highest
+    remaining frame, suppress a min_separation_sec window around it, repeat.
+
+    This is rank-based, not threshold-based: there is no value a frame must
+    clear to be picked, only relative order. A perfectly flat envelope (equal
+    energy everywhere -- the exact construction that collapses a percentile
+    threshold, see task-1-report.md round 3) still yields max_candidates
+    picks, spread across the window by the suppression step, because nothing
+    here depends on the *magnitude* of the gap between picks.
+
+    Returns frame-time offsets in seconds relative to the envelope's start,
+    chronological. Always returns at least one pick when energy is non-empty
+    and max_candidates >= 1.
+    """
+    n = energy.size
+    if n == 0 or max_candidates < 1:
+        return []
+
+    min_sep_frames = max(1, int(round(min_separation_sec * sample_rate / hop)))
+    order = np.argsort(energy)[::-1]
+    taken = np.zeros(n, dtype=bool)
+    picks: list[int] = []
+    for idx in order:
+        if taken[idx]:
+            continue
+        picks.append(int(idx))
+        if len(picks) >= max_candidates:
+            break
+        lo, hi = max(0, idx - min_sep_frames), min(n, idx + min_sep_frames + 1)
+        taken[lo:hi] = True
+
+    picks.sort()
+    return [p * hop / sample_rate for p in picks]
+
+
+def _probe_candidates(samples: np.ndarray, sample_rate: int,
+                      start: float, length: float) -> list[float]:
+    """The ranking logic behind probe_times(), factored out so it can be
+    driven directly with synthetic samples in tests without going through
+    ffmpeg. Not a reimplementation: probe_times() calls exactly this.
+
+    `start`/`length` are the window's absolute position (seconds); returned
+    timestamps are absolute. See probe_times() for the guarantee this
+    provides.
+    """
+    if samples.size == 0 or not np.any(np.abs(samples) > _SILENCE_AMPLITUDE_EPS):
+        return []  # true digital silence: nothing to rank
+
+    energy, hop = _inband_energy_envelope(samples, sample_rate)
+    if energy.size == 0:
+        # Window shorter than one analysis frame, but audio is present:
+        # still honor the guarantee with the one candidate we can offer.
+        return [start + length / 2.0]
+
+    max_candidates = max(1, round(length / _PEAK_TARGET_SPACING_SEC))
+    peaks = _rank_peaks(energy, hop, sample_rate, _PEAK_MIN_SEPARATION_SEC, max_candidates)
+    return [start + p for p in peaks]
+
+
 def probe_times(video_path: str, duration_sec: float,
                 window_frac: tuple[float, float] = (0.40, 0.60)) -> list[float]:
-    """Absolute timestamps worth sampling, as speech-segment midpoints.
+    """Absolute timestamps worth sampling, ranked by in-band energy.
 
-    Chronological, never longest-first: long segments are music and action.
+    Deliberately NOT a speech/not-speech decision and deliberately does not
+    call speech_segments(): the consumer needs candidates ranked by how
+    likely they are to carry dialogue, not a threshold crossing. Candidates
+    are the top local-energy picks in the speech band, spread across the
+    window by non-max suppression so they are not clustered.
+
+    Guarantee: if the window's audio is not true digital silence, this
+    returns at least one candidate -- worst case "least bad candidate",
+    never an empty result that silently loses the speedup this module
+    exists to provide. Returns [] only when the window is true digital
+    silence (or degenerate: non-positive duration/window).
+
+    Chronological, never highest-energy-first: long high-energy spans are
+    frequently music and action, not dialogue, so the consumer should see
+    candidates in time order rather than energy order.
     """
     if duration_sec <= 0:
         return []
@@ -129,4 +263,4 @@ def probe_times(video_path: str, duration_sec: float,
         return []
 
     samples = extract_audio_window(video_path, start, length)
-    return [start + (s + e) / 2.0 for s, e in speech_segments(samples)]
+    return _probe_candidates(samples, SAMPLE_RATE, start, length)
