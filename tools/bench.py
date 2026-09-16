@@ -258,6 +258,7 @@ def _install_ocr_instrumentation():
     orig_create_ocr = vc_utils.create_ocr_engine
     orig_create_det = vc_utils.create_detection_engine
     orig_capture_read = vc_pyav.Capture.read
+    orig_capture_grab = vc_pyav.Capture.grab
     orig_scan = vc_label.LabelScanner.scan
     orig_queue_put = queue_mod.Queue.put
 
@@ -299,6 +300,16 @@ def _install_ocr_instrumentation():
             stats["frames_decoded"] += 1
         return result
 
+    def counting_grab(self, *a, **kw):
+        # grab() decodes a frame without converting it (label phase 1 skips
+        # most frames this way), so it is a decoded frame. Its time is left
+        # out of decode_s, which keeps meaning read() time as before (label
+        # phase time is already inside label_scan_s).
+        result = orig_capture_grab(self, *a, **kw)
+        if result:
+            stats["frames_decoded"] += 1
+        return result
+
     def timed_scan(self, *a, **kw):
         t0 = time.perf_counter()
         result = orig_scan(self, *a, **kw)
@@ -313,6 +324,7 @@ def _install_ocr_instrumentation():
     vc_utils.create_ocr_engine = timed_create_ocr
     vc_utils.create_detection_engine = timed_create_det
     vc_pyav.Capture.read = timed_read
+    vc_pyav.Capture.grab = counting_grab
     vc_label.LabelScanner.scan = timed_scan
     queue_mod.Queue.put = counting_put
 
@@ -320,6 +332,7 @@ def _install_ocr_instrumentation():
         vc_utils.create_ocr_engine = orig_create_ocr
         vc_utils.create_detection_engine = orig_create_det
         vc_pyav.Capture.read = orig_capture_read
+        vc_pyav.Capture.grab = orig_capture_grab
         vc_label.LabelScanner.scan = orig_scan
         queue_mod.Queue.put = orig_queue_put
 
@@ -437,47 +450,47 @@ def _run_crop_case(key: str, entry: dict) -> dict | None:
     (same-thread) connection's slot call immediately with no queued/event
     -loop dispatch needed."""
     from PyQt6.QtCore import QCoreApplication
+    from core import subtitle_detector
     from core.subtitle_detector import SubtitleDetectionWorker
-    from videocr import pyav_adapter as vc_pyav
 
     QCoreApplication.instance() or QCoreApplication([])
 
     video = entry["video"]
     duration = _probe_duration_seconds(video)
 
-    probe_count = {"n": 0}
-    orig_read = vc_pyav.Capture.read
+    # The detector's own result, not the worker's file_detected signal: the
+    # worker withholds boxes that are not auto-applicable, which are still
+    # measured detections, and only the result knows how many probes it used
+    # (crop fetches probes through core.detect.crop's own fetch layer, never
+    # Capture.read(), so counting reads always reported 0).
+    results = []
+    orig_detect_crop = subtitle_detector.detect_crop
 
-    def counting_read(self, *a, **kw):
-        result = orig_read(self, *a, **kw)
-        ret = result[0] if isinstance(result, tuple) else result
-        if ret:
-            probe_count["n"] += 1
+    def recording_detect_crop(*a, **kw):
+        result = orig_detect_crop(*a, **kw)
+        results.append(result)
         return result
 
-    detected = {}
-
-    def on_detected(filename, slider_pos, cx, cy, cw, ch):
-        detected[filename] = (cx, cy, cw, ch)
-
-    vc_pyav.Capture.read = counting_read
+    subtitle_detector.detect_crop = recording_detect_crop
     try:
         worker = SubtitleDetectionWorker([(video.name, str(video), duration)])
-        worker.file_detected.connect(on_detected)
         t0 = time.perf_counter()
         worker._run()
         elapsed = time.perf_counter() - t0
     finally:
-        vc_pyav.Capture.read = orig_read
+        subtitle_detector.detect_crop = orig_detect_crop
 
-    if video.name not in detected:
+    if not results or results[-1].box is None:
         print(f"SKIP crop/{key}: detector did not resolve a crop for {video.name}", file=sys.stderr)
         return None
 
-    cx, cy, cw, ch = detected[video.name]
+    result = results[-1]
+    cx, cy, cw, ch = result.box
     extra = {
-        "probes": probe_count["n"],
+        "probes": result.probes_used,
         "detected": {"x": cx, "y": cy, "width": cw, "height": ch},
+        "flagged": result.flagged,
+        "auto_applicable": result.auto_applicable,
     }
 
     truth = _ocr_json_crop(entry["dir"], video.name)
