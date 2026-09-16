@@ -4,27 +4,47 @@ from .progress import ProgressTracker
 from .pyav_adapter import assert_reference_backend
 
 
-def get_subtitles(
-        video_path: str, lang='ch', time_start='0:00', time_end='',
-        conf_threshold=75, sim_threshold=80, use_fullframe=False,
-        det_model_dir=None, rec_model_dir=None, use_gpu=True,
-        brightness_threshold=None, similar_image_threshold=1.0, similar_pixel_threshold=25, frames_to_skip=1,
-        crop_x=None, crop_y=None, crop_width=None, crop_height=None,
-        detect_labels=True, only_labels=False,
-        label_min_duration=1.0, label_max_duration=5.0, label_conf_threshold=95, label_conf_threshold_min=75,
-        label_mask_crops=None,
-        progress_callback=None, subtitle_callback=None, cancel_event=None) -> str:
+def _scaled_progress_callback(progress_callback, range_index: int, total_ranges: int):
+    """Wrap `progress_callback` so several ranges report one continuous
+    0-100 sweep instead of each range restarting its own 0-100 run.
 
-    # Every production OCR run enters here (core/ocr_worker.py calls this and
-    # save_subtitles_to_file, which wraps it). Refuse before decoding a single
-    # frame if the bit-exact reference backend is not the one that would run:
-    # an `av` that fails to import silently demotes the whole run to the
-    # PTS-estimating fallback, which is how a previous release shipped output
-    # that could not be reproduced. OCR_ALLOW_FFMPEG_FALLBACK=1 opts in.
-    assert_reference_backend()
+    Mirrors the scaling `core/ocr_worker.py` used to apply itself when it
+    looped over ranges and called `get_subtitles` once per range; now that
+    the loop lives here (see `get_subtitles`), the scaling moved with it.
+    """
+    if progress_callback is None or total_ranges <= 1:
+        return progress_callback
 
-    v = Video(video_path, det_model_dir, rec_model_dir)
+    base = int(range_index * 100 / total_ranges)
+    span = int(100 / total_ranges)
 
+    def scaled(phase_name, percent):
+        progress_callback(phase_name, base + int(percent * span / 100))
+
+    return scaled
+
+
+def _get_subtitles_for_range(
+        v: Video, video_path: str, time_start: str, time_end: str,
+        lang: str, conf_threshold: int, sim_threshold: int, use_fullframe: bool,
+        det_model_dir, rec_model_dir, use_gpu: bool,
+        brightness_threshold, similar_image_threshold: float, similar_pixel_threshold: int, frames_to_skip: int,
+        crop_x, crop_y, crop_width, crop_height,
+        detect_labels: bool, only_labels: bool,
+        label_min_duration: float, label_max_duration: float, label_conf_threshold: int, label_conf_threshold_min: int,
+        label_mask_crops,
+        progress_callback, subtitle_callback, cancel_event) -> str:
+    """Run one time range's dialogue + label passes against an already-open
+    `Video`, and return its ASS text.
+
+    This is the body `get_subtitles` used to run once, directly against a
+    freshly-constructed `Video`, before it could take multiple ranges. It is
+    unchanged except for taking `v` as a parameter instead of constructing
+    it -- which is what lets several ranges share one `Video` (and the
+    container probe / engine registry lookups that come with it) instead of
+    each range paying for its own. The label pass still runs once per call,
+    i.e. once per range, exactly as before.
+    """
     progress = ProgressTracker(
         include_dialogue=not only_labels,
         include_labels=detect_labels or only_labels,
@@ -75,6 +95,66 @@ def get_subtitles(
             return utils.merge_ass_output(dialogue_ass, labels, v.width, v.height)
 
     return dialogue_ass if dialogue_ass else ""
+
+
+def get_subtitles(
+        video_path: str, lang='ch', time_start='0:00', time_end='',
+        conf_threshold=75, sim_threshold=80, use_fullframe=False,
+        det_model_dir=None, rec_model_dir=None, use_gpu=True,
+        brightness_threshold=None, similar_image_threshold=1.0, similar_pixel_threshold=25, frames_to_skip=1,
+        crop_x=None, crop_y=None, crop_width=None, crop_height=None,
+        detect_labels=True, only_labels=False,
+        label_min_duration=1.0, label_max_duration=5.0, label_conf_threshold=95, label_conf_threshold_min=75,
+        label_mask_crops=None,
+        time_ranges: list[tuple[str, str]] | None = None,
+        progress_callback=None, subtitle_callback=None, cancel_event=None) -> str:
+
+    # Every production OCR run enters here (core/ocr_worker.py calls this and
+    # save_subtitles_to_file, which wraps it). Refuse before decoding a single
+    # frame if the bit-exact reference backend is not the one that would run:
+    # an `av` that fails to import silently demotes the whole run to the
+    # PTS-estimating fallback, which is how a previous release shipped output
+    # that could not be reproduced. OCR_ALLOW_FFMPEG_FALLBACK=1 opts in.
+    assert_reference_backend()
+
+    # One `Video` -- and the container probe its constructor does -- shared
+    # by every range below, instead of one per range. `run_ocr` still opens
+    # its own decode session per range (each range decodes a different part
+    # of the file, so that part is unavoidable); what this sharing removes is
+    # the repeated `Video` construction/probe, since Task 1's engine registry
+    # already made repeat engine construction free within a process.
+    v = Video(video_path, det_model_dir, rec_model_dir)
+
+    ranges = time_ranges if time_ranges else [(time_start, time_end)]
+
+    ass_parts = []
+    for i, (t_start, t_end) in enumerate(ranges):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        part = _get_subtitles_for_range(
+            v, video_path, t_start, t_end,
+            lang, conf_threshold, sim_threshold, use_fullframe,
+            det_model_dir, rec_model_dir, use_gpu,
+            brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip,
+            crop_x, crop_y, crop_width, crop_height,
+            detect_labels, only_labels,
+            label_min_duration, label_max_duration, label_conf_threshold, label_conf_threshold_min,
+            label_mask_crops,
+            _scaled_progress_callback(progress_callback, i, len(ranges)),
+            subtitle_callback, cancel_event,
+        )
+        if part:
+            ass_parts.append(part)
+
+    if not ass_parts:
+        return ""
+    if len(ass_parts) == 1:
+        return ass_parts[0]
+
+    # Multiple ranges: merge with the same ordering/dedup rules the old
+    # per-range loop in core/ocr_worker.py used -- header from the first
+    # part, every Dialogue line from every part, sorted by start timestamp.
+    return utils.merge_ass_documents(ass_parts)
 
 
 def save_subtitles_to_file(

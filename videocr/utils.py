@@ -3,6 +3,7 @@ import datetime
 import io
 import logging
 import os
+import re
 import sys
 import warnings
 import yaml
@@ -365,3 +366,60 @@ def format_labels_only_ass(labels, play_res_x: int, play_res_y: int) -> str:
     sanitized_lines = sanitize_ass_dialogues(label_lines)
 
     return header + "".join(sanitized_lines)
+
+
+# ASS timestamp pattern: H:MM:SS.CC
+_ASS_TIME_RE = re.compile(r'(\d+):(\d{2}):(\d{2})\.(\d{2})')
+
+
+def _ass_time_to_centiseconds(ts: str) -> int:
+    """Convert ASS timestamp H:MM:SS.CC to centiseconds for sorting."""
+    m = _ASS_TIME_RE.match(ts)
+    if not m:
+        return 0
+    h, mn, s, cs = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    return h * 360000 + mn * 6000 + s * 100 + cs
+
+
+def merge_ass_documents(ass_strings: list[str]) -> str:
+    """Merge multiple complete ASS documents into one, combining Dialogue
+    lines sorted by start timestamp.
+
+    Takes the header from the first document and extracts Dialogue lines
+    from all of them. This is what `get_subtitles` uses to combine the
+    per-range output produced when it is given `time_ranges` -- ported
+    unchanged (same ordering, same "first header wins" rule, no further
+    dedup) from the merge `core/ocr_worker.py` used to do itself when it
+    called `get_subtitles` once per range and stitched the results
+    together by hand.
+    """
+    if len(ass_strings) == 1:
+        return ass_strings[0]
+
+    # Split first output into header and dialogue lines
+    header_lines = []
+    all_dialogues = []
+
+    for i, ass_text in enumerate(ass_strings):
+        for line in ass_text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith('Dialogue:'):
+                all_dialogues.append(stripped)
+            elif i == 0:
+                # Only keep header from the first output
+                header_lines.append(line)
+
+    # Sort dialogues by start timestamp
+    def _sort_key(dialogue_line: str) -> int:
+        # Dialogue: 0,H:MM:SS.CC,H:MM:SS.CC,...
+        parts = dialogue_line.split(',', 2)
+        if len(parts) >= 2:
+            return _ass_time_to_centiseconds(parts[1].strip())
+        return 0
+
+    all_dialogues.sort(key=_sort_key)
+
+    header = ''.join(header_lines)
+    if not header.endswith('\n'):
+        header += '\n'
+    return header + '\n'.join(all_dialogues) + '\n'
