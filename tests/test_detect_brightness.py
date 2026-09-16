@@ -1288,6 +1288,26 @@ def test_a_short_dim_line_is_flagged_whether_or_not_verification_picked_its_stri
     assert requested == [[100.0 + dim_at]]
 
 
+@pytest.mark.parametrize("core, own_level", [(233, 227), (228, 222)])
+def test_an_unverified_strips_line_is_its_lowest_grid_reading_not_its_own_level_reading(monkeypatch, core, own_level):
+    """An unverified strip is also masked at its own level speculatively,
+    before its grid readings are known. When the grid does read it, its line
+    is the LOWEST grid reading (罢了 at 217) -- not the own-level reading (罢),
+    which here is also what the pick reads: preferring it would call the line
+    safe and lose 了 without a flag. (With core 223, as above, the own level
+    is 217 itself, so both readings agree and cannot tell the two apart.)"""
+    assert B._seed_from_level(core) == own_level
+    requested = _nineteen_text_strips(monkeypatch, {9: core})
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(),
+                                 _DimReadsOCR(lambda t: "罢了" if t == 217 else "罢"))
+
+    assert result.plateau == (217, 247) and result.value == 227
+    assert result.flagged == "dim-text?"
+    assert not result.auto_applicable
+    assert requested == [[109.0]]
+
+
 def test_clean_unverified_text_strips_raise_no_flag(monkeypatch):
     requested = _nineteen_text_strips(monkeypatch)
     ocr = _DimReadsOCR(lambda t: "")

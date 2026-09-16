@@ -192,7 +192,8 @@ NEIGHBOUR_FETCH_CHUNK = 8
 # counts as lost and the result is flagged "dim-text?" for review. Each
 # candidate costs up to 4 neighbour frames, ~0.75 s at 4K; clutter that
 # survives only low thresholds (a burned-in HUD) can make every strip a
-# candidate, and 8 already covers twice the most any reference file needed (4).
+# candidate. The most any reference file needed is 5 (XWZ 170 and 172), so 8
+# leaves 3 candidates of headroom, not double.
 MAX_NEIGHBOUR_CANDIDATES = 8
 
 
