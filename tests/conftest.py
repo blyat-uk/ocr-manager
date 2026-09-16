@@ -25,6 +25,39 @@ def synthetic_video(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def offset_video(tmp_path_factory) -> Path:
+    """Same as synthetic_video, but muxed with -output_ts_offset so the
+    container's start_time (and every frame's PTS) is offset by 1.5s.
+
+    This exercises the container start-time path that a fresh,
+    edit-list-free MP4 (like synthetic_video) cannot: its start_time is
+    genuinely 0, so a test built only on it can't tell a correct
+    start-time implementation from a hardcoded `return 0.0`.
+    """
+    out = tmp_path_factory.mktemp("media") / "offset.mp4"
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=0.4",
+        "-output_ts_offset", "1.5",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-g", "5", str(out),
+    ])
+    # Verify the mechanism actually produced a non-zero container
+    # start_time on this ffmpeg build before any test relies on it.
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=start_time",
+         "-of", "json", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    start_time = float(json.loads(probe.stdout)["format"]["start_time"])
+    assert start_time == pytest.approx(1.5, abs=1e-3), (
+        f"-output_ts_offset did not produce the expected container "
+        f"start_time on this ffmpeg build (got {start_time}); "
+        "the offset_video fixture needs a different mechanism here."
+    )
+    return out
+
+
+@pytest.fixture(scope="session")
 def synthetic_subtitle_video(tmp_path_factory) -> Path:
     """75 frames, 640x360, 25 fps. A white bar sits in the subtitle band
     for frames 25-49 only, so gating and timing can be asserted exactly."""

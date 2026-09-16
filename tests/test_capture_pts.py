@@ -4,7 +4,7 @@ import subprocess
 import cv2
 import pytest
 
-from videocr.pyav_adapter import Capture, FFmpegNVDECCapture
+from videocr.pyav_adapter import Capture, FFmpegNVDECCapture, PyAVCapture
 
 
 def ffprobe_pts(path, count):
@@ -16,6 +16,15 @@ def ffprobe_pts(path, count):
     )
     frames = json.loads(out.stdout)["frames"]
     return [float(f["pts_time"]) for f in frames]
+
+
+def ffprobe_format_start_time(path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=start_time",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(json.loads(out.stdout)["format"]["start_time"])
 
 
 def test_pyav_pts_matches_ffprobe(synthetic_video):
@@ -41,9 +50,33 @@ def test_fallback_first_frame_pts_is_zero_based(synthetic_video):
     assert got == pytest.approx(expected, abs=1e-3)
 
 
-def test_container_start_time_is_reported(synthetic_video):
-    with Capture(str(synthetic_video)) as cap:
-        assert cap.get_stream_start_time() >= 0.0
+def test_container_start_time_is_reported(offset_video):
+    """Both backends must report the container's actual start_time, not a
+    hardcoded 0.0. offset_video has a genuine non-zero start_time (~1.5s,
+    via -output_ts_offset), so a backend that ignores start_time and
+    always returns 0.0 fails this test."""
+    expected_start = ffprobe_format_start_time(offset_video)
+    assert expected_start == pytest.approx(1.5, abs=1e-3)
+
+    with PyAVCapture(str(offset_video)) as pyav_cap:
+        assert pyav_cap.get_stream_start_time() == pytest.approx(expected_start, abs=1e-3)
+
+    ffmpeg_cap = FFmpegNVDECCapture(str(offset_video), use_gpu=False)
+    with ffmpeg_cap as c:
+        assert c.get_stream_start_time() == pytest.approx(expected_start, abs=1e-3)
+
+
+def test_fallback_pts_includes_container_start_time(offset_video):
+    """The container start-time offset must reach the reported PTS values,
+    not just get_stream_start_time(). Read the first frame of offset_video
+    and confirm its PTS matches ffprobe's true (offset) pts_time -- this
+    fails if the offset is computed but never added in read()."""
+    expected = ffprobe_pts(offset_video, 1)
+    cap = FFmpegNVDECCapture(str(offset_video), use_gpu=False)
+    with cap as c:
+        ok, _frame = c.read()
+        assert ok
+        assert c.get_last_pts() == pytest.approx(expected[0], abs=1e-3)
 
 
 def test_fallback_reseek_to_same_frame_is_not_a_noop(synthetic_video):

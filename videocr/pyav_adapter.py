@@ -196,6 +196,7 @@ class FFmpegNVDECCapture:
 
         self._start_ffmpeg()
         self._pos = 0
+        self._seek_pos = 0
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
