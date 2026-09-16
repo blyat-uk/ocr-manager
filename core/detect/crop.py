@@ -271,8 +271,29 @@ FLAG_UNKNOWN_REJECTION = "unknown-rejection"        # structural safety net (see
                                                      # does, a specific flag is missing above it.
 
 
+# Which flags leave a box safe to apply without review -- see
+# CropResult.auto_applicable for the classification of every flag.
+INFORMATIONAL_FLAGS = frozenset({FLAG_NO_SPEECH, FLAG_SPEECH_PROBES_EXHAUSTED})
+BLOCKING_FLAGS = frozenset({
+    FLAG_TOP_POSITIONED, FLAG_CEILING_EXCEEDED, FLAG_LOW_AGREEMENT, FLAG_STATIC_CONTENT,
+    FLAG_WATERMARK_UNCERTAIN, FLAG_MULTIPLE_POSITIONS, FLAG_OUTLIER_DISCARDED, FLAG_CANCELLED,
+    FLAG_UNKNOWN_REJECTION,
+})
+
+
 @dataclass
 class CropResult:
+    """One file's crop detection.
+
+    Apply `box` without review only when `auto_applicable`. `flagged` is
+    None or FLAG_* reasons joined by "+". Cancellation (FLAG_CANCELLED) does
+    not raise: the result keeps whatever box the evidence gathered so far
+    gives, which may be clipped. The times in `sample_pts` / `hit_pts`
+    re-fetch their frames through THIS module's fetch layer (grab_frames),
+    whose pixels are not the OCR pass's, and on some sources not even its
+    frames -- see grab_frames() and core/detect/__init__.py.
+    """
+
     box: tuple[int, int, int, int] | None
     # One entry per frame actually fetched and analysed, in probing order:
     # the probe's requested time, which is a time that re-fetches exactly the
@@ -303,6 +324,32 @@ class CropResult:
     # detect_crop() -- lets callers convert `box` into (y_frac, h_frac)
     # without a second, redundant dimension probe of their own.
     frame_size: tuple[int, int] | None = None
+
+    @property
+    def auto_applicable(self) -> bool:
+        """True only when there is a box and every flag on it is
+        informational: the flag says how the probes were chosen, not that
+        the box is in doubt. An unrecognised flag blocks.
+
+        | flag                    | box     | class         | why |
+        |-------------------------|---------|---------------|-----|
+        | no-speech               | kept    | informational | No audio stream or digital silence, so probes are uniform 0.5 s steps over 40-60% -- the old detector's own probing, whose boxes were applied unreviewed. The box passes every rule below. |
+        | speech-probes-exhausted | kept    | informational | Speech-guided probes found no text, so the same uniform probing ran; same reasoning. |
+        | top-positioned?         | kept    | blocking      | From the full-frame retry, with no bottom-band cutoff: signs, titles or scene text anywhere in frame qualify. The old bottom-half detector could never return such a box. |
+        | low-agreement           | kept    | blocking      | Under LOW_AGREEMENT_HITS contributing frames: the union needs several frames to catch a second line, so the box may clip one. |
+        | static-content?         | kept    | blocking      | Same extent in every sample over too short a span to rule out a logo or watermark. |
+        | multiple-positions?     | kept    | blocking      | A second baseline cluster (a repositioned subtitle, or a lone adjacent line) was folded into the union: the box may be inflated or span two positions. |
+        | outlier-discarded?      | kept    | blocking      | A hit at a baseline nothing else shared was left out. Noise or a once-seen subtitle elsewhere -- the code cannot tell, and if it was a subtitle the box misses it. |
+        | cancelled               | partial | blocking      | Probing was cut short; the box is from partial evidence and may be clipped. |
+        | static-content          | None    | blocking      | Confirmed watermark; no box. |
+        | ceiling-exceeded        | None    | blocking      | Union taller than MAX_CROP_HEIGHT_FRAC; no box. |
+        | unknown-rejection       | None    | blocking      | Safety net: no box and no specific flag. |
+        """
+        if self.box is None:
+            return False
+        if not self.flagged:
+            return True
+        return all(part in INFORMATIONAL_FLAGS for part in self.flagged.split("+"))
 
 
 # --------------------------------------------------------------------------

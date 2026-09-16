@@ -134,7 +134,7 @@ def test_one_file_detected_per_resolved_file_with_right_arguments(monkeypatch):
         ),
         "b.mp4": _crop_result(
             box=(20, 910, 1000, 90), hit_pts=[30.0], sample_pts=[5.0, 30.0],
-            agreed=4, probes_used=8, flagged="low-agreement",
+            agreed=4, probes_used=8, flagged="no-speech",
         ),
     }
     calls = []
@@ -405,17 +405,49 @@ def test_cleanup_returns_promptly_even_if_run_never_finishes(monkeypatch):
     tidy.join(timeout=5.0)
 
 
+@pytest.mark.parametrize("flagged", [
+    "top-positioned?", "low-agreement", "static-content?", "multiple-positions?",
+    "outlier-discarded?", "cancelled", "no-speech+top-positioned?", "speech-probes-exhausted+low-agreement",
+])
+def test_a_box_that_is_not_auto_applicable_is_logged_not_emitted(monkeypatch, caplog, flagged):
+    """M8: the old bottom-half detector could never return a top-positioned?
+    box, and none of these flags' boxes may be applied without review. Today's
+    UI has nowhere to show a flag, so such a box is withheld and logged with
+    its flags; the files around it are unaffected."""
+    results = {
+        "a.mp4": _crop_result(box=(10, 900, 1000, 80), hit_pts=[10.0], agreed=5, probes_used=5),
+        "b.mp4": _crop_result(box=(10, 100, 1000, 80), hit_pts=[20.0], agreed=5, probes_used=5, flagged=flagged),
+        "c.mp4": _crop_result(box=(10, 905, 1000, 75), hit_pts=[30.0], agreed=5, probes_used=5,
+                              flagged="no-speech"),
+    }
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None,
+                          settings=None, cancel_check=None):
+        return results[os.path.basename(video_path)]
+
+    monkeypatch.setattr(subtitle_detector, "detect_crop", fake_detect_crop)
+
+    with caplog.at_level("INFO"):
+        outcome = _run_worker(SubtitleDetectionWorker(_make_video_files(["a.mp4", "b.mp4", "c.mp4"])))
+
+    assert not outcome["timed_out"] and not outcome["errors"]
+    assert [args[0] for args in outcome["detected"]] == ["a.mp4", "c.mp4"]
+    assert outcome["progress"][-1] == (3, 3), "a withheld file still counts toward progress"
+    assert any("b.mp4" in rec.getMessage() and flagged in rec.getMessage() for rec in caplog.records), (
+        "a withheld box must be logged with its flags")
+
+
 def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
     """Task-3 review ruling C: a resolved, boxed file with a non-None flag
     (multiple-positions?, static-content?, low-agreement, ...) is exactly
-    the kind of uncertain result consensus must not learn from -- it still
-    gets a box/position (the UI can still use it), but it must not enter
-    the consensus pool passed to later files.
+    the kind of uncertain result consensus must not learn from -- it must
+    not enter the consensus pool passed to later files. That includes a box
+    with only an informational flag (no-speech), which is emitted.
 
     4 files: b.mp4 resolves with a wildly different, flagged shape between
-    two clean files. Asserts b's shape never appears in the consensus
-    passed to c.mp4 or d.mp4, and that the pool used for d.mp4 reflects
-    only a.mp4 and c.mp4.
+    two clean files; c.mp4 carries an informational flag. Asserts b's shape
+    never appears in the consensus passed to c.mp4 or d.mp4, and that the
+    pool used for d.mp4 reflects only a.mp4.
     """
     def crop_result(y, h, flagged=None):
         return _crop_result(box=(0, y, 100, h), hit_pts=[1.0], agreed=5, probes_used=5, flagged=flagged)
@@ -423,7 +455,7 @@ def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
     results = {
         "a.mp4": crop_result(900, 50),
         "b.mp4": crop_result(100, 800, flagged="multiple-positions?"),  # wildly different, flagged
-        "c.mp4": crop_result(905, 55),
+        "c.mp4": crop_result(905, 55, flagged="no-speech"),
         "d.mp4": crop_result(895, 45),
     }
     calls = []
@@ -443,8 +475,8 @@ def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
     assert outcome["finished_count"] == 1
 
     detected_names = sorted(args[0] for args in outcome["detected"])
-    assert detected_names == ["a.mp4", "b.mp4", "c.mp4", "d.mp4"], (
-        "a flagged result still gets a box/position -- only consensus excludes it"
+    assert detected_names == ["a.mp4", "c.mp4", "d.mp4"], (
+        "only auto-applicable results are emitted (see the test above)"
     )
 
     assert calls[0] == []
@@ -454,9 +486,9 @@ def test_flagged_results_are_excluded_from_the_consensus_pool(monkeypatch):
     assert calls[2] == [(900 / 1080, 50 / 1080)], (
         f"the flagged file (b.mp4) must not have entered the consensus pool: {calls[2]}"
     )
-    # d.mp4's call: only a.mp4 and c.mp4 (both unflagged) have contributed.
-    assert calls[3] == [(900 / 1080, 50 / 1080), (905 / 1080, 55 / 1080)], (
-        f"consensus for d.mp4 must reflect only the unflagged a.mp4/c.mp4 results: {calls[3]}"
+    # d.mp4's call: only a.mp4 (unflagged) has contributed.
+    assert calls[3] == [(900 / 1080, 50 / 1080)], (
+        f"consensus for d.mp4 must reflect only the unflagged a.mp4 result: {calls[3]}"
     )
 
 

@@ -1823,6 +1823,68 @@ def test_crop_does_not_drift_from_previously_accepted_values(reference_media, de
             print(f"{key}: box grew {oh}px -> {nh}px (expected where two-line subtitles occur)")
 
 
+# --- Which results may be applied without review ---------------------------
+
+
+def _module_flags():
+    return {value for name, value in vars(crop).items() if name.startswith("FLAG_")}
+
+
+def test_every_crop_flag_is_classified_as_informational_or_blocking():
+    """A flag added later must be classified on purpose, not default into
+    either set by omission."""
+    assert crop.INFORMATIONAL_FLAGS | crop.BLOCKING_FLAGS == _module_flags()
+    assert not crop.INFORMATIONAL_FLAGS & crop.BLOCKING_FLAGS
+    assert crop.INFORMATIONAL_FLAGS == {crop.FLAG_NO_SPEECH, crop.FLAG_SPEECH_PROBES_EXHAUSTED}
+
+
+BOX = (288, 900, 1344, 90)
+
+
+@pytest.mark.parametrize("flagged", [None, crop.FLAG_NO_SPEECH, crop.FLAG_SPEECH_PROBES_EXHAUSTED])
+def test_a_box_with_only_informational_flags_is_auto_applicable(flagged):
+    assert crop.CropResult(box=BOX, flagged=flagged).auto_applicable
+
+
+@pytest.mark.parametrize("flag", sorted({crop.FLAG_TOP_POSITIONED, crop.FLAG_LOW_AGREEMENT,
+                                          crop.FLAG_WATERMARK_UNCERTAIN, crop.FLAG_MULTIPLE_POSITIONS,
+                                          crop.FLAG_OUTLIER_DISCARDED, crop.FLAG_CANCELLED}))
+def test_a_box_with_any_blocking_flag_is_not_auto_applicable(flag):
+    assert not crop.CropResult(box=BOX, flagged=flag).auto_applicable
+    # Composed after an informational flag (the order detect_crop() composes in).
+    assert not crop.CropResult(box=BOX, flagged=f"{crop.FLAG_NO_SPEECH}+{flag}").auto_applicable
+    assert not crop.CropResult(box=BOX, flagged=f"{flag}+{crop.FLAG_SPEECH_PROBES_EXHAUSTED}").auto_applicable
+
+
+@pytest.mark.parametrize("flagged", [None, crop.FLAG_NO_SPEECH, crop.FLAG_STATIC_CONTENT,
+                                     crop.FLAG_CEILING_EXCEEDED, crop.FLAG_UNKNOWN_REJECTION])
+def test_no_box_is_never_auto_applicable(flagged):
+    assert not crop.CropResult(box=None, flagged=flagged).auto_applicable
+
+
+def test_an_unrecognised_flag_blocks():
+    assert not crop.CropResult(box=BOX, flagged="something-new?").auto_applicable
+    assert not crop.CropResult(box=BOX, flagged=f"{crop.FLAG_NO_SPEECH}+something-new?").auto_applicable
+
+
+def test_a_cancelled_detection_with_a_partial_box_is_not_auto_applicable(monkeypatch):
+    """Cancellation keeps whatever box the evidence so far gives -- possibly
+    clipped -- so the result must say it cannot be applied."""
+    calls = {"n": 0}
+
+    def cancel_after_first_batch():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    result = _detect_crop_with_fakes(
+        monkeypatch, [float(t) for t in range(20, 40)],
+        lambda t: ([1.0], [_poly(400 + int(t), 980, 1500, 1030)]),
+        cancel_check=cancel_after_first_batch,
+    )
+    assert result.box is not None and crop.FLAG_CANCELLED in result.flagged
+    assert not result.auto_applicable
+
+
 # --- Files without an audio stream ------------------------------------------
 
 

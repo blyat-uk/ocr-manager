@@ -159,6 +159,22 @@ class SubtitleDetectionWorker(QObject):
                 self.progress.emit(resolved_count, total)
                 continue
 
+            if not result.auto_applicable:
+                # A box exists but one of its flags says it cannot be applied
+                # unreviewed (top-positioned?, low-agreement, static-content?,
+                # multiple-positions?, outlier-discarded?, cancelled, ...; see
+                # CropResult.auto_applicable). The old bottom-half detector
+                # never produced most of these, and this UI has nowhere to
+                # show why a box is doubtful, so it is withheld and logged
+                # rather than applied silently. Stage 3 surfaces flags.
+                logger.warning(
+                    "%s: crop %s not applied, needs review (flagged=%s, agreed=%d, probes_used=%d)",
+                    filename, result.box, result.flagged, result.agreed, result.probes_used,
+                )
+                resolved_count += 1
+                self.progress.emit(resolved_count, total)
+                continue
+
             crop_x, crop_y, crop_w, crop_h = result.box
 
             if not result.hit_pts:
@@ -183,12 +199,11 @@ class SubtitleDetectionWorker(QObject):
 
             self.file_detected.emit(filename, slider_pos, crop_x, crop_y, crop_w, crop_h)
 
-            # A resolved, boxed file may still be absent from the
-            # consensus pool: either it was flagged (an uncertain/
-            # ambiguous result -- multiple-positions?, outlier-discarded?,
-            # static-content?, low-agreement, etc. -- is exactly what
-            # consensus must not learn from), or its frame dimensions
-            # weren't available to convert the box into (y_frac, h_frac).
+            # An emitted file may still be absent from the consensus pool:
+            # consensus learns only from unflagged results (an informational
+            # flag such as no-speech still keeps a file out, as before), and
+            # needs the frame dimensions to convert the box into
+            # (y_frac, h_frac).
             if result.flagged is None and result.frame_size is not None:
                 _orig_w, orig_h = result.frame_size
                 if orig_h > 0:
