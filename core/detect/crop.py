@@ -107,7 +107,6 @@ GRAB_POOL_SIZE = 10  # max concurrent ffmpeg subprocesses inside grab_frames()
 # detect_crop() orchestration.
 PROBE_BATCH_SIZE = 5          # probes fetched per batch before re-checking the stop condition
 CONSENSUS_MIN_ENTRIES = 3     # consensus list must have at least this many entries to shortcut
-CONSENSUS_STOP_HITS = 2       # ...at which point this many agreeing hits is enough
 # Convergence stop (replaces a fixed hit-count stop -- see _run_round()):
 # stop once the raw union hasn't grown for this many consecutive batches.
 # 2 ("a couple") means the *earliest* a stop can happen is after 3 batches
@@ -118,6 +117,13 @@ CONSENSUS_STOP_HITS = 2       # ...at which point this many agreeing hits is eno
 # stop early; requiring 2 means the union has now demonstrably stopped
 # growing across two independent additional looks, not just one.
 CONVERGENCE_STABLE_ROUNDS = 2
+# Consensus (>=CONSENSUS_MIN_ENTRIES already-resolved files, see
+# _run_round()) RELAXES this requirement to just 1 stable round when the
+# RAW union's shape already agrees with it -- legitimate evidence this
+# file's band matches the series, but never a substitute for stability
+# itself: a stop still requires the raw union to have been observed
+# unchanged across a batch boundary, not merely "enough hits seen".
+CONSENSUS_STABLE_ROUNDS = 1
 # Hard ceiling on probes fetched in one _run_round() call, so content
 # whose union never stabilizes (or that never converges within the
 # candidate list) still has bounded latency. Set to roughly the old
@@ -156,6 +162,14 @@ CONSENSUS_MAX_HEIGHT_RATIO = 1.5
 # (reproduced case: a 180px shift, ~6x this tolerance at 1080p).
 BASELINE_CLUSTER_TOLERANCE_FRAC = 0.03
 BASELINE_CLUSTER_MIN_DOMINANT_SIZE = 3
+# An isolated (singleton-cluster) hit is kept, not discarded, if it sits
+# within this many detected line heights of the dominant cluster's own
+# union -- see _baseline_cluster_union()'s docstring. "About one line
+# height" per the review ruling: a genuine missing line (OCR caught only
+# one line of a two-line subtitle on that probe) sits directly against
+# the kept union with little to no gap; real noise measured on the
+# reference corpus sat ~2.4 line heights away, comfortably outside this.
+ADJACENT_SINGLETON_MAX_GAP_LINE_HEIGHTS = 1.0
 UNIFORM_START_FRAC = 0.40
 UNIFORM_END_FRAC = 0.60
 UNIFORM_STEP_SEC = 0.5
@@ -465,10 +479,29 @@ def _baseline_cluster_union(extents: list[tuple[float, float, float, float] | No
     essentially uncorrelated frame to frame (staying singletons).
 
     Returns (union, agreed_count, position_flag). `position_flag` is
-    FLAG_MULTIPLE_POSITIONS if a second cluster with >=2 members got
-    folded into the union, FLAG_OUTLIER_DISCARDED if any singleton
-    cluster got excluded, both (composed) if both happened, or None.
-    Never discards silently.
+    FLAG_MULTIPLE_POSITIONS if a second cluster with >=2 members (or an
+    adjacent singleton -- see below) got folded into the union,
+    FLAG_OUTLIER_DISCARDED if a non-adjacent singleton cluster got
+    excluded, both (composed) if both happened, or None. Never discards
+    silently.
+
+    A singleton cluster is NOT automatically discarded: if it sits
+    ADJACENT to the dominant cluster's own union -- within about one
+    detected line height of its nearest edge -- it's kept and folded in
+    instead, because a lone hit touching the known-good region is almost
+    always a missing line (OCR caught only one line of a two-line
+    subtitle on that particular probe), not noise. "Line height" is the
+    median individual-extent height within the dominant cluster itself
+    (not the union's own height, which can already include admitted
+    multi-line members), and the gap is measured relative to it, not in
+    absolute pixels, so this scales correctly across resolutions the same
+    way BASELINE_CLUSTER_TOLERANCE_FRAC does. Reproduced: an isolated
+    upper-line-only frame sitting ~10px above a ~50px-tall dominant
+    cluster (gap ~0.2 line heights) was wrongly discarded before this,
+    clipping the box back down to one line; a genuinely unrelated
+    detection (reproduced: ~2.4 line heights away) still isn't adjacent
+    and stays discarded -- see
+    test_slay_stray_hit_geometry_stays_rejected_after_adjacency_fix.
 
     Below BASELINE_CLUSTER_MIN_DOMINANT_SIZE members in the largest
     cluster, nothing is confidently "the" subtitle yet -- union
@@ -492,9 +525,25 @@ def _baseline_cluster_union(extents: list[tuple[float, float, float, float] | No
     else:
         kept_idx = list(dominant)
         position_flag = None
+        dominant_top = min(extents[i][1] for i in dominant)
+        dominant_bottom = max(extents[i][3] for i in dominant)
+        line_height = median(extents[i][3] - extents[i][1] for i in dominant)
+        adjacency_limit = line_height * ADJACENT_SINGLETON_MAX_GAP_LINE_HEIGHTS
         for cluster in clusters[1:]:
             if len(cluster) >= 2:
                 kept_idx.extend(cluster)
+                position_flag = _compose_flag(position_flag, FLAG_MULTIPLE_POSITIONS)
+                continue
+            j = cluster[0]
+            s_top, s_bottom = extents[j][1], extents[j][3]
+            if s_bottom <= dominant_top:
+                gap = dominant_top - s_bottom
+            elif s_top >= dominant_bottom:
+                gap = s_top - dominant_bottom
+            else:
+                gap = 0.0  # overlaps the dominant union already
+            if gap <= adjacency_limit:
+                kept_idx.append(j)
                 position_flag = _compose_flag(position_flag, FLAG_MULTIPLE_POSITIONS)
             else:
                 position_flag = _compose_flag(position_flag, FLAG_OUTLIER_DISCARDED)
@@ -702,10 +751,12 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
                 known_dims: tuple[int, int] | None = None,
                 ) -> tuple[list, list[float], int, list[float]]:
     """Fetch+detect `times` in PROBE_BATCH_SIZE-sized batches, stopping
-    once the raw in-band union has stopped growing for CONVERGENCE_STABLE_ROUNDS
-    consecutive batches (or CONSENSUS_STOP_HITS is reached with an
-    in-tolerance consensus, or MAX_PROBES_PER_ROUND is hit, or `times` is
-    exhausted) -- NOT once an arbitrary hit count is reached.
+    once the raw in-band union has stopped growing for
+    CONVERGENCE_STABLE_ROUNDS consecutive batches (or just
+    CONSENSUS_STABLE_ROUNDS, when an in-tolerance consensus is available --
+    see the "Consensus RELAXES..." comment at the stop check below), or
+    MAX_PROBES_PER_ROUND is hit, or `times` is exhausted -- NEVER once an
+    arbitrary hit count is reached, with or without consensus.
 
     This replaces an earlier fixed-count stop (`raw_hits >= 5`) that, once
     combined with _spread_order() and PROBE_BATCH_SIZE == 5, let whichever
@@ -737,7 +788,13 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     already concluded based on the unfiltered evidence -- see
     _baseline_cluster_union()'s docstring. This function always returns
     every accepted hit, filtered or not; detect_crop() decides what to do
-    with them.
+    with them. Nothing in this loop -- including the consensus check
+    below -- may call aggregate_box() (or anything else that runs
+    clustering) while probing is still in progress: an earlier version's
+    consensus check did exactly that, evaluating a filtered/clustered
+    provisional box instead of the raw evidence, which is a second way
+    the same bug (a judged view manufacturing a stop decision) can creep
+    back in even after this loop itself stopped filtering directly.
 
     `times` is walked in _spread_order(), not the order it's given in --
     spread is still useful here for getting temporal span (needed by the
@@ -805,19 +862,6 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
         extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
         raw_hits = sum(e is not None for e in extents)
 
-        # Consensus fast path: an independent, externally-validated reason
-        # to trust an early result, unrelated to the convergence check
-        # below. Still count-gated (CONSENSUS_STOP_HITS), but the
-        # consistency check against already-resolved files' median
-        # shape is what actually protects it from stopping on a
-        # not-yet-complete union.
-        if len(consensus) >= CONSENSUS_MIN_ENTRIES and raw_hits >= CONSENSUS_STOP_HITS:
-            provisional = aggregate_box(polys_per_frame, frame_size, band_frac, settings, frame_times)
-            if provisional is not None:
-                _, py, _, ph = provisional
-                if _consistent_with_consensus(py / frame_h, ph / frame_h, consensus):
-                    break
-
         # Convergence stop: has the raw union grown since the last batch?
         # A None union (no in-band hits yet at all) is never "stable" --
         # there's nothing to converge on, so keep probing until either a
@@ -829,7 +873,28 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
             stable_rounds = 0
         prior_union = current_union
 
-        if current_union is not None and stable_rounds >= CONVERGENCE_STABLE_ROUNDS:
+        # Consensus RELAXES the convergence requirement -- it never
+        # replaces it. A trustworthy cross-file consensus (>=3 already-
+        # resolved files) whose median shape agrees with the RAW union
+        # lowers how many consecutive stable batches are needed, from
+        # CONVERGENCE_STABLE_ROUNDS down to CONSENSUS_STABLE_ROUNDS. It
+        # can NEVER stop on a hit count alone (that was the original bug:
+        # 2 hits plus a matching provisional box could stop probing after
+        # a single batch, with zero stability confirmed at all), and the
+        # check MUST read `current_union` -- the same raw, unclustered
+        # union the plain convergence check above uses -- never a box
+        # built via aggregate_box()/_baseline_cluster_union(), which
+        # would evaluate a filtered/judged view instead of the evidence
+        # actually gathered so far. Same principle as the convergence
+        # stop itself: nothing may stop probing on a filtered view.
+        required_stable_rounds = CONVERGENCE_STABLE_ROUNDS
+        if current_union is not None and len(consensus) >= CONSENSUS_MIN_ENTRIES:
+            y_frac = current_union[1] / frame_h
+            h_frac = (current_union[3] - current_union[1]) / frame_h
+            if _consistent_with_consensus(y_frac, h_frac, consensus):
+                required_stable_rounds = min(required_stable_rounds, CONSENSUS_STABLE_ROUNDS)
+
+        if current_union is not None and stable_rounds >= required_stable_rounds:
             break
 
     extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
