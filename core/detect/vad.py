@@ -1,9 +1,14 @@
 """Speech detection used to choose frames worth inspecting for subtitles.
 
 Frames sampled at the midpoint of detected speech contain a visible subtitle
-far more often than uniformly spaced probes (measured hit rate 0.45-0.81 vs
-0.26-0.55), because uniform probes 0.5s apart are highly autocorrelated: they
-sit inside the same silent action scene together.
+far more often than uniformly spaced probes, because uniform probes 0.5s
+apart are highly autocorrelated: they sit inside the same silent action
+scene together. Measured on two reference episodes (full-episode duration,
+subtitle presence taken from that project's chi/*.ass OCR output, itself an
+under-reporting oracle so these are lower bounds): speech-guided hit rate
+0.37-0.56 vs uniform 0.5s hit rate 0.18-0.36, a 1.55-2.05x improvement. See
+.superpowers/sdd/2026-09-16-stage2b-detectors/task-1-report.md for the full
+measurement.
 """
 from __future__ import annotations
 
@@ -15,8 +20,10 @@ SAMPLE_RATE = 16000
 _BAND_LOW_HZ = 300.0
 _BAND_HIGH_HZ = 3400.0
 _HOP_SEC = 0.020
-_THRESHOLD_PERCENTILE = 40.0
+_FLOOR_PERCENTILE = 20.0
+_CEILING_PERCENTILE = 99.0
 _THRESHOLD_MARGIN_DB = 6.0
+_MIN_INBAND_FRACTION = 0.5
 _CLOSE_GAP_SEC = 0.2
 _MIN_SEGMENT_SEC = 0.25
 
@@ -54,10 +61,36 @@ def speech_segments(samples: np.ndarray, sample_rate: int = SAMPLE_RATE
     if not band.any():
         return []
 
-    energy = spectrum[:, band].sum(axis=1)
-    energy_db = 20.0 * np.log10(np.maximum(energy, 1e-10))
-    threshold = np.percentile(energy_db, _THRESHOLD_PERCENTILE) + _THRESHOLD_MARGIN_DB
-    active = energy_db >= threshold
+    # Two independent gates, both required:
+    #
+    # 1. Loudness, relative to *this window's own* quiet frames. The floor is
+    #    a low percentile (not an assumed-majority high one), so it tracks the
+    #    quiet part of the window regardless of how much of the window is
+    #    speech. The threshold is then capped at a *high* (not maximum)
+    #    percentile: a literal max is one outlier frame away from pinning the
+    #    cutoff to a single sample (e.g. a frame straddling a silence/speech
+    #    boundary can transiently exceed the steady-state level). Capping
+    #    means a uniformly loud window is classified as uniformly active
+    #    instead of collapsing to zero when floor+margin overshoots the top
+    #    of the window's own range.
+    # 2. Band concentration: what fraction of this frame's total spectral
+    #    energy actually sits in the speech band. Loudness alone can't tell
+    #    genuine speech-band content from an out-of-band source (e.g. a bass
+    #    hum) whose sidelobes leak a little energy into the band — that
+    #    leakage can be "loud" relative to a silent window's own floor while
+    #    still being globally dominated by out-of-band energy. Genuine
+    #    speech-band content concentrates almost all of its energy in-band;
+    #    leakage does not.
+    inband_energy = spectrum[:, band].sum(axis=1)
+    total_energy = spectrum.sum(axis=1)
+    inband_fraction = inband_energy / np.maximum(total_energy, 1e-12)
+
+    energy_db = 20.0 * np.log10(np.maximum(inband_energy, 1e-10))
+    floor = np.percentile(energy_db, _FLOOR_PERCENTILE)
+    ceiling = np.percentile(energy_db, _CEILING_PERCENTILE)
+    threshold = min(floor + _THRESHOLD_MARGIN_DB, ceiling)
+
+    active = (energy_db >= threshold) & (inband_fraction >= _MIN_INBAND_FRACTION)
     if not active.any():
         return []
 

@@ -46,6 +46,43 @@ def test_silence_yields_no_segments():
     assert vad.speech_segments(_silence(3.0), SR) == []
 
 
+def test_close_runs_merge_into_one_segment():
+    # Gap of 0.1s is <= _CLOSE_GAP_SEC (0.2s): the two runs must merge.
+    samples = np.concatenate([_silence(0.5), _tone(0.3), _silence(0.1), _tone(0.3), _silence(0.5)])
+    segs = vad.speech_segments(samples, SR)
+    assert len(segs) == 1, f"runs 0.1s apart should merge, got {segs}"
+    assert segs[0][0] == pytest.approx(0.5, abs=0.05)
+    assert segs[0][1] == pytest.approx(1.2, abs=0.05)
+
+
+def test_distant_runs_stay_separate():
+    # Gap of 0.4s is > _CLOSE_GAP_SEC (0.2s): the two runs must stay separate.
+    samples = np.concatenate([_silence(0.5), _tone(0.3), _silence(0.4), _tone(0.3), _silence(0.5)])
+    segs = vad.speech_segments(samples, SR)
+    assert len(segs) == 2, f"runs 0.4s apart should stay separate, got {segs}"
+
+
+@pytest.mark.parametrize("occupancy", [0.2, 0.4, 0.6, 0.8, 0.95])
+def test_detected_duration_tracks_occupancy_without_collapsing(occupancy):
+    # Regression test for a cliff-edge failure: a percentile-order-statistic
+    # threshold that assumes speech is a small minority of the window can
+    # overshoot the window's own maximum energy once speech occupancy rises
+    # past the assumed minority fraction, collapsing detection from full
+    # recall to zero with no signal distinguishing it from genuine silence.
+    # Detected duration must track true active duration at every occupancy,
+    # never collapse to zero while speech is present.
+    total_sec = 10.0
+    active_sec = total_sec * occupancy
+    silence_sec = total_sec - active_sec
+    samples = np.concatenate([
+        _silence(silence_sec / 2), _tone(active_sec), _silence(silence_sec / 2),
+    ])
+    segs = vad.speech_segments(samples, SR)
+    detected_sec = sum(e - s for s, e in segs)
+    assert detected_sec > 0, f"collapsed to zero at occupancy={occupancy}"
+    assert detected_sec == pytest.approx(active_sec, abs=0.3)
+
+
 def test_extract_audio_window_returns_mono_float(synthetic_audio_video):
     samples = vad.extract_audio_window(str(synthetic_audio_video), 0.0, 2.0)
     assert samples.ndim == 1
@@ -58,3 +95,10 @@ def test_probe_times_are_inside_the_window_and_ordered(synthetic_audio_video):
     times = vad.probe_times(str(synthetic_audio_video), duration_sec=10.0, window_frac=(0.0, 1.0))
     assert times == sorted(times)
     assert all(0.0 <= t <= 10.0 for t in times)
+    # The fixture's bursts are at 1-3s, 5-6s, 8-9s: known midpoints 2.0, 5.5, 8.5.
+    # A probe_times() that always returned [] would pass the two asserts above
+    # vacuously (sorted([]) == [] and all() over [] are both trivially true).
+    assert len(times) == 3, f"expected 3 burst midpoints, got {times}"
+    assert times[0] == pytest.approx(2.0, abs=0.15)
+    assert times[1] == pytest.approx(5.5, abs=0.15)
+    assert times[2] == pytest.approx(8.5, abs=0.15)
