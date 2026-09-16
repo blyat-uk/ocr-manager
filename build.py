@@ -54,6 +54,7 @@ def main():
         "PyQt6>=6.5.0",
         "opencv-python>=4.8.0",
         "numpy>=1.24.0",
+        "scipy>=1.14.0",
         "pyinstaller>=6.0.0",
     ], check=True)
 
