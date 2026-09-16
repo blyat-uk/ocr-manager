@@ -975,13 +975,14 @@ def _fallback_phase34_run(scanner, reference, recorder, monkeypatch, capture_cls
 def test_ffmpeg_fallback_phases_3_and_4_read_the_frame_on_screen(clips, monkeypatch, clip_id):
     """The subprocess backend positions by frame ordinal and reports PTS as
     ordinal / fps + container start; the frame on screen is judged by those
-    PTS and that backend's own frames."""
+    PTS and that backend's own frames. Label masks are applied to its frames
+    in place, so they must be writable."""
     if not pyav_adapter.FFMPEG_AVAILABLE:
         pytest.skip("ffmpeg CLI not available")
     path = _clip(clips, clip_id)
     reference = _every_frame(CpuFFmpegCapture, path)
-    # No label masks: this backend's frames are read-only views of the pipe.
-    scanner = _scanner(path, None)
+    scanner = _phase34_scanner(path)
+    assert scanner.label_mask_crops
     recorder = _Recorder()
     recorder.install(monkeypatch, FFmpegNVDECCapture)
 
@@ -1141,11 +1142,11 @@ with pyav_adapter.Capture(path) as cap:
         frames.append((cap.get_last_pts(), frame.copy()))
     out = []
     for t in times:
-        cap.seek_to_display_time(t)
+        found = cap.seek_to_display_time(t)
         ok, frame = cap.read()
         pts = cap.get_last_pts() if ok else None
         index = next((i for i, (p, f) in enumerate(frames) if p == pts and np.array_equal(f, frame)), None) if ok else None
-        out.append([t, pts, index])
+        out.append([t, found, ok, index])
 print(json.dumps({"pts": [p for p, _ in frames], "reads": out}))
 """
 
@@ -1153,11 +1154,12 @@ print(json.dumps({"pts": [p for p, _ in frames], "reads": out}))
 def test_opencv_fallback_seek_to_display_time_reads_the_frame_on_screen(clips):
     """OpenCVCapture only exists when neither PyAV nor the ffmpeg CLI does, so
     it is exercised in a subprocess that hides both. It reports PTS as
-    (ordinal + 1) / fps; the frame on screen is judged by those."""
+    (ordinal + 1) / fps; the frame on screen is judged by those. Past the last
+    frame it returns False and the next read fails, as the other backends do."""
     path = _clip(clips, "zero-start-h264")
     fps = 25.0
     times = [k / fps for k in range(0, 101, 3)] + [k / fps - 2e-6 for k in range(1, 101, 5)]
-    times += [k / fps + 0.5 / fps for k in range(0, 100, 4)] + [0.0, -1.0, 0.5 / fps, 4.02, 5.0]
+    times += [k / fps + 0.5 / fps for k in range(0, 100, 4)] + [0.0, -1.0, 0.5 / fps, 4.02, 4.04 - 2e-6, 4.04, 4.1, 5.0]
     probe = subprocess.run([sys.executable, "-c", _OPENCV_PROBE, str(path), json.dumps(times)],
                            capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1])
     assert probe.returncode == 0, probe.stderr[-2000:]
@@ -1165,14 +1167,15 @@ def test_opencv_fallback_seek_to_display_time_reads_the_frame_on_screen(clips):
     reference = [(p, None) for p in result["pts"]]
     assert len(reference) == FRAMES
     wrong = []
-    for t, pts, index in result["reads"]:
+    for t, found, read_ok, index in result["reads"]:
         i = _on_screen(reference, t, fps)
         if i is None:
-            if pts is not None:
-                wrong.append((t, None, pts))
-        elif index != i:
-            wrong.append((t, reference[i][0], pts))
-    assert not wrong, f"(time, frame on screen PTS, PTS read): {wrong}"
+            if found or read_ok:
+                wrong.append((t, "past the end", found, read_ok))
+        elif not (found and read_ok and index == i):
+            wrong.append((t, reference[i][0], found, read_ok, index))
+    assert not wrong, f"(time, frame on screen PTS, seek result, read ok, frame index read): {wrong}"
+    assert any(_on_screen(reference, t, fps) is None for t, *_ in result["reads"])
 
 
 # --- phase 1.5 cancellation, and detection input that retained crops share ----
@@ -1308,3 +1311,47 @@ def test_phase4_forward_scan_runs_to_the_last_frame_and_stops_past_it(clips, mon
     assert end == with_frame[-1]
     assert len(detector.calls) == len(with_frame)
     assert seeks.calls == len(with_frame) + 1, "the forward scan went on seeking past the last frame"
+
+
+@pytest.mark.parametrize("target", ["the position before the seek", "position 0"])
+def test_ffmpeg_fallback_set_restarts_the_pipe_a_seek_past_the_end_stopped(clips, target):
+    """A display-time seek past the last frame stops the pipe. A later
+    set(CAP_PROP_POS_FRAMES, n) must start it again even when n is the
+    position the pipe had before, or 0 -- positions set() otherwise treats as
+    "already there"."""
+    if not pyav_adapter.FFMPEG_AVAILABLE:
+        pytest.skip("ffmpeg CLI not available")
+    path = _clip(clips, "zero-start-h264")
+    reference = _every_frame(CpuFFmpegCapture, path)
+    with CpuFFmpegCapture(str(path)) as cap:
+        assert cap.seek_to_display_time(reference[40][0])
+        assert cap.read()[0]
+        position = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        assert position == 41
+        assert not cap.seek_to_display_time(reference[-1][0] + 1.0)
+        assert cap.read() == (False, None)
+
+        n = position if target == "the position before the seek" else 0
+        assert cap.set(cv2.CAP_PROP_POS_FRAMES, n)
+        ok, frame = cap.read()
+        assert ok and cap.get_last_pts() == reference[n][0] and np.array_equal(frame, reference[n][1])
+
+
+def test_ffmpeg_fallback_frames_are_writable_so_label_masks_apply(clips):
+    """Every label phase blacks out mask regions in the frame it read."""
+    if not pyav_adapter.FFMPEG_AVAILABLE:
+        pytest.skip("ffmpeg CLI not available")
+    path = _clip(clips, "zero-start-h264")
+    scanner = _phase34_scanner(path)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("videocr.label_scanner.Capture", CpuFFmpegCapture)
+        text_frames = scanner._phase1_find_text_frames(_WholeRegionDetector(), None, "0:01")
+    assert len(text_frames) >= 2
+    with CpuFFmpegCapture(str(path)) as cap:
+        ok, frame = cap.read()
+        assert ok and frame.flags.writeable
+        scanner._apply_label_masks(frame)
+        x, y, w, h = MASKS[0]
+        assert not frame[y:y + h, x:x + w].any()
+        ok, following = cap.read()
+        assert ok and following[y:y + h, x:x + w].any(), "masking one frame changed the next"

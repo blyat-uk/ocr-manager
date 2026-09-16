@@ -335,16 +335,11 @@ class FFmpegNVDECCapture:
 
         if prop == cv2.CAP_PROP_POS_FRAMES:
             target_pos = int(value)
-            if target_pos != (self._seek_pos + self._pos) and target_pos > 0:
-                # Restart FFmpeg with seek
-                if self.proc:
-                    self.proc.stdout.close()
-                    self.proc.terminate()
-                    self.proc.wait()
-                seek_time = target_pos / self._fps
-                self._start_ffmpeg(seek_time)
-                self._seek_pos = target_pos
-                self._pos = 0
+            # Positions <= 0 leave a running pipe where it is, as they always
+            # have; but a pipe a past-the-end seek stopped restarts for any
+            # position, including the one it was at.
+            if target_pos > 0 or self.proc is None:
+                self._reposition(max(0, target_pos))
             return True
         return False
 
@@ -429,7 +424,9 @@ class FFmpegNVDECCapture:
             raw = self.proc.stdout.read(self._frame_size)
             if len(raw) != self._frame_size:
                 return False, None
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._output_height, self._output_width, 3)
+            # A writable copy: callers modify frames in place (label masks),
+            # and a view of the immutable pipe bytes would refuse that.
+            frame = np.frombuffer(bytearray(raw), dtype=np.uint8).reshape(self._output_height, self._output_width, 3)
             # PTS of THIS frame is derived from its index, which is the position
             # before the increment. Add the seek origin and the container start.
             self._last_pts = (
@@ -1220,7 +1217,8 @@ else:
             reports PTS as (ordinal + 1) / fps, so the frame on screen at `t`
             is the last ordinal whose reported PTS is at most
             `t` + DISPLAY_TIME_TOLERANCE, or ordinal 0 when `t` precedes it.
-            A `t` past the last frame shows up as read() failing."""
+            Returns False when that ordinal is at or past the frame count
+            OpenCV reports, leaving the capture at the end so read() fails."""
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             ordinal = 0
             if fps:
@@ -1231,6 +1229,10 @@ else:
                     ordinal -= 1
                 while (ordinal + 2) / fps <= limit:
                     ordinal += 1
+            frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count > 0 and ordinal >= frame_count:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+                return False
             return self.cap.set(cv2.CAP_PROP_POS_FRAMES, ordinal)
         def get_last_pts(self) -> float:
             return self._last_pts
