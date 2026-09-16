@@ -388,10 +388,10 @@ def _probe_dimensions(video_path: str) -> tuple[int, int]:
 # - pixels: un-tone-mapped probes were 74-114 levels off the tone-mapped ones
 #   on over 99% of pixels (now 0.01-0.03 levels off a graph that scales
 #   before bgr24, 0.02-0.07 off PyAVCapture + cv2 resize);
-# - detect_crop() boxes moved 1-7 px on 5 of 6 HDR clips. On the 203-nit PQ
+# - detect_crop() boxes moved 1-7 px on all 6 HDR clips. On the 203-nit PQ
 #   clip the box bottom sat 3 px short at 1080p and 7 px short at 2160p (the
 #   padding there is 3.2 / 6.5 px), from 9 and 8 contributing frames instead
-#   of 11-12. For scale: resampling differences of ~1.5 levels alone move a
+#   of 12. For scale: resampling differences of ~1.5 levels alone move a
 #   box 1-3 px on the SDR control, so the 1080p shifts are near the
 #   detector's own jitter; the 2160p shift and the pixel gap are not.
 # - cost: detect_crop() on the PQ clips went 0.82 -> 1.21 s (1080p) and
