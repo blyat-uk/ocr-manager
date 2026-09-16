@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import List
 from queue import Queue, Empty
-from threading import Thread, Event
+from threading import Thread
 import cv2
 import numpy as np
 import time
@@ -25,8 +25,8 @@ TARGET_VIDEO_HEIGHT = 720
 # Text smaller than this becomes difficult for OCR to read reliably
 MIN_CROP_HEIGHT = 150
 
-# Maximum OCR retry attempts when confidence is below threshold
-MAX_OCR_RETRIES = 10
+# Maximum alternative frames OCR'd for one low-confidence subtitle
+MAX_CANDIDATES = 8
 
 # Maximum gap between frames to merge into same subtitle (in seconds)
 # 0.3s allows for occasional OCR failures without splitting subtitles
@@ -78,6 +78,13 @@ class Video:
         batch_end_indices = []
         batch_pts_start = []  # PTS values for batch timing
         batch_pts_end = []
+        # Alternative readings buffered per batch slot, parallel to batch_frames.
+        # batch_candidates[i] holds the candidate frames offered for the
+        # subtitle whose first frame is batch_frames[i].
+        batch_candidates = []
+        # Candidates for the subtitle currently being tracked by the producer;
+        # attached to the tail batch slot when that subtitle ends.
+        pending_candidates = []
 
         ocr = utils.create_ocr_engine(self.lang, self.det_model_dir, self.rec_model_dir, use_gpu)
 
@@ -148,13 +155,6 @@ class Video:
         self._producer_time = 0.0  # Will be set by producer thread
         profiling_start = time.perf_counter()
 
-        # Retry state - shared between producer and consumer threads
-        # When confidence is below threshold, consumer sets retry_needed to trigger
-        # producer to send subsequent similar frames for OCR retry
-        retry_needed = Event()
-        retry_count = [0]  # Mutable container for thread-safe counter
-        retry_best = [None]  # Best (confidence, PredictedFrames) seen during retry
-
         adjusted_ocr_start = ocr_start
 
         graph_crop = None
@@ -173,7 +173,7 @@ class Video:
             v.set(cv2.CAP_PROP_POS_FRAMES, ocr_start)
 
             # Start producer thread for frame reading
-            producer = Thread(target=self._frame_producer, args=(v, frame_queue, adjusted_ocr_start, num_ocr_frames, modulo, crop_x_start, crop_y_start, crop_x_end, crop_y_end, brightness_threshold, similar_image_threshold, similar_pixel_threshold, progress, retry_needed, retry_count, self.fps, cancel_event))
+            producer = Thread(target=self._frame_producer, args=(v, frame_queue, adjusted_ocr_start, num_ocr_frames, modulo, crop_x_start, crop_y_start, crop_x_end, crop_y_end, brightness_threshold, similar_image_threshold, similar_pixel_threshold, progress, self.fps, cancel_event))
             producer.start()
 
             # Consumer loop - process messages from queue
@@ -194,11 +194,11 @@ class Video:
                     msg_type = msg[0]
 
                     if msg_type == "done":
-                        # Finalize any pending retry before exiting
-                        if retry_best[0] is not None:
-                            self.pred_frames[-1] = retry_best[0][1]
-                            retry_needed.clear()
-                            retry_best[0] = None
+                        # The last tracked subtitle is finished - hand its
+                        # candidates to the batch slot they belong to.
+                        if batch_candidates:
+                            batch_candidates[-1].extend(pending_candidates)
+                        pending_candidates = []
                         break
                     elif msg_type == "extend":
                         # Similar frame - extend end_index and pts_end of previous
@@ -209,46 +209,33 @@ class Video:
                         elif self.pred_frames:
                             self.pred_frames[-1].end_index = frame_idx
                             self.pred_frames[-1].pts_end = pts
-                    elif msg_type == "retry":
-                        # Retry frame - OCR single frame and check confidence
-                        frame, frame_idx, pts = msg[1], msg[2], msg[3]
-                        ocr_start_time = time.perf_counter()
-                        if utils.needs_conversion():
-                            result = list(ocr.predict([frame]))[0]
-                        else:
-                            result = ocr.ocr([frame])[0]
-                        self._ocr_time += time.perf_counter() - ocr_start_time
-
-                        # Create temp PredictedFrames to check confidence (preserve original PTS)
-                        original_pts_start = self.pred_frames[-1].pts_start
-                        temp_pred = PredictedFrames(self.pred_frames[-1].start_index, [result], conf_threshold_percent, self.lang, pts=original_pts_start)
-                        temp_pred.end_index = frame_idx
-                        temp_pred.pts_end = pts
-
-                        # Track best result
-                        if retry_best[0] is None or temp_pred.confidence > retry_best[0][0]:
-                            retry_best[0] = (temp_pred.confidence, temp_pred)
-
-                        # Check if good enough or max retries reached
-                        if temp_pred.confidence >= conf_threshold:
-                            # Good confidence - use best result and exit retry mode
-                            self.pred_frames[-1] = retry_best[0][1]
-                            retry_needed.clear()
-                            retry_count[0] = 0
-                            retry_best[0] = None
-                        elif retry_count[0] >= MAX_OCR_RETRIES:
-                            # Max retries - use best we found
-                            self.pred_frames[-1] = retry_best[0][1]
-                            retry_needed.clear()
-                            retry_count[0] = 0
-                            retry_best[0] = None
+                    elif msg_type == "candidate":
+                        # Buffer an alternative reading for the CURRENT subtitle.
+                        # Whether it gets OCR'd is decided when the subtitle's
+                        # batch is processed, from that subtitle's own
+                        # first-reading confidence - never from queue depth.
+                        pending_candidates.append(msg[1])
                     elif msg_type == "frame":
-                        # New different frame - finalize any pending retry first
-                        if retry_best[0] is not None:
-                            self.pred_frames[-1] = retry_best[0][1]
-                            retry_needed.clear()
-                            retry_count[0] = 0
-                            retry_best[0] = None
+                        # A new subtitle starts here, so the previous one is
+                        # complete: hand its candidates to its batch slot.
+                        if batch_candidates:
+                            batch_candidates[-1].extend(pending_candidates)
+                        pending_candidates = []
+
+                        # Flush a full batch only at this subtitle boundary, so
+                        # a slot is never closed while candidates are still
+                        # arriving for it.
+                        if len(batch_frames) >= BATCH_SIZE:
+                            batch_base = len(self.pred_frames)
+                            self._process_batch(ocr, batch_frames, batch_start_indices, batch_end_indices, batch_pts_start, batch_pts_end, conf_threshold_percent)
+                            self._resolve_batch_candidates(ocr, batch_candidates, conf_threshold, batch_base)
+                            self._emit_pending_subtitles(subtitle_callback)
+                            batch_frames = []
+                            batch_start_indices = []
+                            batch_end_indices = []
+                            batch_pts_start = []
+                            batch_pts_end = []
+                            batch_candidates = []
 
                         frame, frame_idx, pts = msg[1], msg[2], msg[3]
                         batch_frames.append(frame)
@@ -256,30 +243,15 @@ class Video:
                         batch_end_indices.append(frame_idx)
                         batch_pts_start.append(pts)
                         batch_pts_end.append(pts)
-
-                        # Process batch when full
-                        if len(batch_frames) >= BATCH_SIZE:
-                            self._process_batch(ocr, batch_frames, batch_start_indices, batch_end_indices, batch_pts_start, batch_pts_end, conf_threshold_percent)
-                            self._emit_pending_subtitles(subtitle_callback)
-                            batch_frames = []
-                            batch_start_indices = []
-                            batch_end_indices = []
-                            batch_pts_start = []
-                            batch_pts_end = []
-                            # Check if last processed frame needs retry
-                            if self.pred_frames and self.pred_frames[-1].confidence < conf_threshold:
-                                retry_needed.set()
-                                retry_best[0] = (self.pred_frames[-1].confidence, self.pred_frames[-1])
+                        batch_candidates.append([])
             finally:
                 producer.join()
 
             # Process remaining frames in batch
             if batch_frames:
+                batch_base = len(self.pred_frames)
                 self._process_batch(ocr, batch_frames, batch_start_indices, batch_end_indices, batch_pts_start, batch_pts_end, conf_threshold_percent)
-                # Check if last processed frame needs retry
-                if self.pred_frames and self.pred_frames[-1].confidence < conf_threshold:
-                    retry_needed.set()
-                    retry_best[0] = (self.pred_frames[-1].confidence, self.pred_frames[-1])
+                self._resolve_batch_candidates(ocr, batch_candidates, conf_threshold, batch_base)
 
             # Emit any remaining subtitles (all frames finalized)
             self._emit_pending_subtitles(subtitle_callback, emit_last=True)
@@ -397,6 +369,71 @@ class Video:
             pred_frame.pts_end = pts_end
             self.pred_frames.append(pred_frame)
 
+    def _resolve_batch_candidates(self, ocr, batch_candidates: list, conf_threshold: int, base: int) -> None:
+        """Resolve buffered candidates for every slot of the batch just OCR'd.
+
+        `batch_candidates[i]` belongs to the subtitle that `_process_batch`
+        turned into `self.pred_frames[base + i]`, where `base` is the length
+        of `pred_frames` captured before that batch was appended. Binding the
+        slot index this way keeps the mapping exact and independent of
+        BATCH_SIZE, which is what makes the result reproducible.
+        """
+        for offset, candidates in enumerate(batch_candidates):
+            if not candidates:
+                continue
+            index = base + offset
+            if index >= len(self.pred_frames):
+                break
+            self._resolve_candidates(ocr, candidates, conf_threshold,
+                                     target=self.pred_frames[index])
+
+    def _resolve_candidates(self, ocr, candidates: list, conf_threshold: int, target=None) -> None:
+        """Improve one subtitle's text using its buffered alternative frames.
+
+        Runs only when the subtitle's own first reading scored below
+        conf_threshold. Timing is never modified: only `text`, `lines` and
+        `confidence` of the existing PredictedFrames are replaced.
+        """
+        if not candidates or not self.pred_frames:
+            return
+        if target is None:
+            target = self.pred_frames[-1]
+        if self._confidence_pct(target) >= conf_threshold:
+            return
+
+        ocr_start_time = time.perf_counter()
+        if utils.needs_conversion():
+            results = list(ocr.predict(candidates))
+        else:
+            results = ocr.ocr(candidates)
+        self._ocr_time += time.perf_counter() - ocr_start_time
+
+        best = target
+        for pred_data in results:
+            alt = PredictedFrames(target.start_index, [pred_data], 0, self.lang,
+                                  pts=target.pts_start)
+            # An empty reading carries the sentinel confidence of 100; it must
+            # never be allowed to win and blank out a subtitle that has text.
+            if not alt.lines:
+                continue
+            if self._confidence_pct(alt) > self._confidence_pct(best):
+                best = alt
+        if best is not target:
+            target.lines = best.lines
+            target.text = best.text
+            target.confidence = best.confidence
+
+    @staticmethod
+    def _confidence_pct(pred) -> float:
+        """PredictedFrames.confidence on a 0-100 scale.
+
+        `confidence` is the mean word score (0-1) when the frame has text, and
+        exactly 100 when PaddleOCR returned nothing at all. Normalise the
+        former; leave the sentinel alone so empty frames never trigger work.
+        """
+        conf = pred.confidence
+        return conf if conf > 1.0 else conf * 100.0
+
     def _emit_pending_subtitles(self, subtitle_callback, emit_last=False):
         """Emit pending subtitle detections via callback."""
         if subtitle_callback is None:
@@ -420,7 +457,7 @@ class Video:
 
         self._last_emitted_idx = limit
 
-    def _frame_producer(self, v, queue: Queue, ocr_start: int, num_ocr_frames: int, modulo: int, crop_x_start, crop_y_start, crop_x_end, crop_y_end, brightness_threshold: int, similar_image_threshold: int, similar_pixel_threshold: int, progress, retry_needed: Event, retry_count: list, fps: float, cancel_event=None) -> None:
+    def _frame_producer(self, v, queue: Queue, ocr_start: int, num_ocr_frames: int, modulo: int, crop_x_start, crop_y_start, crop_x_end, crop_y_end, brightness_threshold: int, similar_image_threshold: int, similar_pixel_threshold: int, progress, fps: float, cancel_event=None) -> None:
         """Producer thread: reads frames and puts eligible ones in queue.
 
         Uses a two-state approach for efficiency:
@@ -435,8 +472,14 @@ class Video:
         detection_history = []  # Track last 3 detection results for END smoothing only
         producer_start = time.perf_counter()
         current_pts = None  # Track PTS of current frame
-        # Buffer for retro-check: store previous frame data for instant start detection
-        prev_frame_data = None  # (frame, grey, frame_idx, pts)
+
+        # Deterministic best-of-N: while tracking one subtitle, every
+        # CANDIDATE_STRIDE-th frame is offered as an alternative reading,
+        # up to MAX_CANDIDATES. This schedule is a function of the frame
+        # stream alone, never of consumer state.
+        candidate_stride = max(1, int(round(fps / 4.0)))  # ~4 per second
+        frames_in_subtitle = 0
+        candidates_sent = 0
 
         for i in range(num_ocr_frames):
             if cancel_event is not None and cancel_event.is_set():
@@ -505,13 +548,11 @@ class Video:
                             # Text found - start tracking immediately
                             tracking_subtitle = True
                             prev_grey = grey
-                            retry_count[0] = 0
                             # Reset history to current detection for clean END tracking
                             detection_history = [True]
                             queue.put(("frame", frame, i + ocr_start, current_pts))
-                        else:
-                            # No text - buffer this frame for potential retro-check
-                            prev_frame_data = (frame.copy(), grey.copy(), i + ocr_start, current_pts)
+                            frames_in_subtitle = 0
+                            candidates_sent = 0
                         if progress is not None:
                             progress.update(1)
                         continue
@@ -524,7 +565,6 @@ class Video:
                             tracking_subtitle = False
                             prev_grey = None
                             detection_history = []
-                            prev_frame_data = None
                             if progress is not None:
                                 progress.update(1)
                             continue
@@ -537,14 +577,14 @@ class Video:
                             pixel_threshold = int(total_pixels * similar_image_threshold / 100.0)
 
                             if np.count_nonzero(absdiff) < pixel_threshold:
-                                # Similar frame
-                                if retry_needed.is_set() and retry_count[0] < MAX_OCR_RETRIES:
-                                    # Low confidence - retry OCR on this frame
-                                    queue.put(("retry", frame.copy(), i + ocr_start, current_pts))
-                                    retry_count[0] += 1
-                                else:
-                                    # Normal extend
-                                    queue.put(("extend", i + ocr_start, current_pts))
+                                # Similar frame - extend, and offer an
+                                # alternative reading on the fixed schedule.
+                                frames_in_subtitle += 1
+                                if (candidates_sent < MAX_CANDIDATES
+                                        and frames_in_subtitle % candidate_stride == 0):
+                                    queue.put(("candidate", frame.copy(), i + ocr_start, current_pts))
+                                    candidates_sent += 1
+                                queue.put(("extend", i + ocr_start, current_pts))
                                 prev_grey = grey
                                 if progress is not None:
                                     progress.update(1)
@@ -552,8 +592,9 @@ class Video:
 
                         # Different text - OCR new subtitle
                         prev_grey = grey
-                        retry_count[0] = 0
                         queue.put(("frame", frame, i + ocr_start, current_pts))
+                        frames_in_subtitle = 0
+                        candidates_sent = 0
                         if progress is not None:
                             progress.update(1)
                         continue
@@ -566,11 +607,12 @@ class Video:
                         total_pixels = grey.shape[0] * grey.shape[1]
                         pixel_threshold = int(total_pixels * similar_image_threshold / 100.0)
                         if np.count_nonzero(absdiff) < pixel_threshold:
-                            if retry_needed.is_set() and retry_count[0] < MAX_OCR_RETRIES:
-                                queue.put(("retry", frame.copy(), i + ocr_start, current_pts))
-                                retry_count[0] += 1
-                            else:
-                                queue.put(("extend", i + ocr_start, current_pts))
+                            frames_in_subtitle += 1
+                            if (candidates_sent < MAX_CANDIDATES
+                                    and frames_in_subtitle % candidate_stride == 0):
+                                queue.put(("candidate", frame.copy(), i + ocr_start, current_pts))
+                                candidates_sent += 1
+                            queue.put(("extend", i + ocr_start, current_pts))
                             prev_grey = grey
                             if progress is not None:
                                 progress.update(1)
@@ -578,8 +620,9 @@ class Video:
                     prev_grey = grey
 
                 # Different frame - send for OCR
-                retry_count[0] = 0
                 queue.put(("frame", frame, i + ocr_start, current_pts))
+                frames_in_subtitle = 0
+                candidates_sent = 0
                 if progress is not None:
                     progress.update(1)
             else:
