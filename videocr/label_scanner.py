@@ -17,6 +17,7 @@ Key principles:
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import cv2
 import numpy as np
@@ -41,6 +42,55 @@ class LabelResult:
     bbox_y_max: float = None
 
 
+class _RetainedCrops:
+    """Phase 1's OCR crops, kept for phase 1.5 up to a byte budget.
+
+    Phase 1 already holds each text frame at native resolution when it
+    finds boxes in it, and phase 1.5 only ever OCRs
+    `_crop_box_region(frame[:cutoff], box)` for each of those boxes. Keeping
+    just those crops (copies, so the frame itself is released) lets phase
+    1.5 skip re-fetching the frame -- a seek plus a decode from the previous
+    keyframe, ~0.18-0.25 s per text frame at 4K -- without holding whole
+    4K frames (~22 MB each once sliced to the dialogue cutoff).
+
+    Admission is per text frame and all-or-nothing, since phase 1.5 needs
+    the frame anyway if any of its crops is missing. A frame whose crops do
+    not fit in what is left of the budget is not kept, and phase 1.5 fetches
+    it by PTS instead. Phase 1.5 takes each entry once, releasing its bytes.
+    """
+
+    def __init__(self, budget_bytes):
+        self.budget_bytes = budget_bytes
+        self.nbytes = 0
+        self.peak_nbytes = 0
+        self.refused = 0
+        self._entries = {}
+
+    @staticmethod
+    def _size(crops):
+        return sum(crop.nbytes for crop in crops if crop is not None)
+
+    def offer(self, frame_idx, pts, boxes, crops):
+        size = self._size(crops)
+        if self.nbytes + size > self.budget_bytes:
+            self.refused += 1
+            return False
+        self._entries[(frame_idx, pts)] = (boxes, crops)
+        self.nbytes += size
+        self.peak_nbytes = max(self.peak_nbytes, self.nbytes)
+        return True
+
+    def take(self, frame_idx, pts, boxes):
+        """The crops kept for this text frame, or None. Only returned for the
+        very `boxes` list phase 1 recorded them against."""
+        entry = self._entries.pop((frame_idx, pts), None)
+        if entry is None:
+            return None
+        kept_boxes, crops = entry
+        self.nbytes -= self._size(crops)
+        return crops if kept_boxes is boxes else None
+
+
 class LabelScanner:
     SCAN_HEIGHT = 720  # Detection resolution (up from 480)
     RECOGNIZE_HEIGHT = 720  # Max dimension for OCR crops
@@ -50,6 +100,11 @@ class LabelScanner:
     OCR_CONFIDENCE_THRESHOLD = 0.95
     TEXT_SIMILARITY_THRESHOLD = 0.85  # For back-to-back label detection
     MERGE_TEXT_SIMILARITY = 0.80  # Text match threshold for Phase 2 merge
+    # Most phase 1 may keep in crops for phase 1.5 per scan (see _RetainedCrops).
+    # Measured on 4K label runs: 212 MB for 5 min (136 text frames, 178 boxes)
+    # and 152 MB for 7 min (151 frames, 226 boxes), so this covers about ten
+    # minutes of label-dense 4K; frames past it are fetched by PTS instead.
+    PHASE15_RETAIN_BUDGET_BYTES = 512 * 1024 * 1024
 
     def __init__(self, video_path, fps, width, height, num_frames, crop_x, crop_y, crop_width, crop_height, label_min_duration=1.0, label_max_duration=5.0, conf_threshold=95, conf_threshold_min=75, brightness_threshold=None, label_mask_crops=None):
         self.video_path = video_path
@@ -635,7 +690,7 @@ class LabelScanner:
     # Phase 1: Detection Scan
     # ------------------------------------------------------------------
 
-    def _phase1_find_text_frames(self, det_engine, time_start, time_end, progress=None, cancel_event=None):
+    def _phase1_find_text_frames(self, det_engine, time_start, time_end, progress=None, cancel_event=None, retain=None):
         """Sparse sampling at 720p to identify frames containing text outside dialogue region.
 
         Every frame in the range is decoded, but only every
@@ -644,6 +699,10 @@ class LabelScanner:
         PTS are identical to reading every frame and keeping every Nth
         (pinned by tests/test_label_sampling.py). Decoding stays at native
         resolution.
+
+        If `retain` (a _RetainedCrops) is given, the native-resolution crop
+        phase 1.5 will OCR for each box is offered to it, so phase 1.5 need
+        not fetch the frame again.
 
         Returns list of (frame_idx, pts, boxes) where boxes are in original (cropped frame) coords.
         """
@@ -701,6 +760,11 @@ class LabelScanner:
                     orig_boxes = [box / scale for box in boxes]
                     orig_boxes = self._merge_vertical_fragments(orig_boxes)
                     text_frames.append((frame_idx, pts, orig_boxes))
+                    if retain is not None:
+                        # Cut after detection: neither engine writes to its
+                        # input, and below SCAN_HEIGHT `scaled` is this frame.
+                        retain.offer(frame_idx, pts, orig_boxes,
+                                     [self._crop_box_region(frame_cropped, box)[0] for box in orig_boxes])
 
                 if progress is not None:
                     progress.update(1)
@@ -728,43 +792,56 @@ class LabelScanner:
             return None
         return frame
 
-    def _batch_ocr_text_frames(self, text_frames, ocr):
+    def _batch_ocr_text_frames(self, text_frames, ocr, retained=None):
         """Run OCR on every Phase 1 detection box to annotate with text.
 
         Replaces each bare np.array box with {"box": np.array, "text": str|None}
         so Phase 2 can use text similarity in addition to spatial proximity.
 
-        Each frame is fetched by the PTS phase 1 recorded, not by its
-        frame_idx: phase 1 counts frame_idx from where its own read started,
-        which is not the position set(CAP_PROP_POS_FRAMES) seeks to once the
-        file has a container start time (tests/test_label_frame_identity.py).
+        Crops phase 1 kept in `retained` are OCR'd as they are. Any other
+        frame is fetched by the PTS phase 1 recorded, not by its frame_idx:
+        phase 1 counts frame_idx from where its own read started, which is
+        not the position set(CAP_PROP_POS_FRAMES) seeks to once the file has
+        a container start time (tests/test_label_frame_identity.py). The
+        video is only opened if some frame has to be fetched.
 
         Returns augmented text_frames: [(frame_idx, pts, [{"box": ..., "text": ...}, ...]), ...]
         """
         augmented = []
 
-        with Capture(self.video_path) as cap:
+        with contextlib.ExitStack() as stack:
+            cap = None
             for frame_idx, pts, boxes in text_frames:
-                frame = self._read_frame_at_pts(cap, pts)
-                if frame is None:
+                crops = retained.take(frame_idx, pts, boxes) if retained is not None else None
+                if crops is None:
+                    if cap is None:
+                        cap = stack.enter_context(Capture(self.video_path))
+                    crops = self._fetch_crops(cap, pts, boxes)
+
+                if crops is None:
                     # Keep boxes without text if frame unreadable
                     augmented.append((frame_idx, pts, [{"box": box, "text": None} for box in boxes]))
-                    continue
-
-                self._apply_label_masks(frame)
-
-                # Slice to dialogue cutoff (same as Phase 1)
-                frame_cropped = frame[: self.dialogue_cutoff_y, :]
-
-                annotated_boxes = []
-                for box in boxes:
-                    crop, _ = self._crop_box_region(frame_cropped, box)
-                    text, conf = self._run_ocr_on_crop(ocr, crop)
-                    annotated_boxes.append({"box": box, "text": text})
-
-                augmented.append((frame_idx, pts, annotated_boxes))
+                else:
+                    annotated_boxes = []
+                    for box, crop in zip(boxes, crops):
+                        text, conf = self._run_ocr_on_crop(ocr, crop)
+                        annotated_boxes.append({"box": box, "text": text})
+                    augmented.append((frame_idx, pts, annotated_boxes))
 
         return augmented
+
+    def _fetch_crops(self, cap, pts, boxes):
+        """Re-read the frame phase 1 sampled at `pts` and crop `boxes` out of
+        it exactly as phase 1 would have; None if the frame cannot be read."""
+        frame = self._read_frame_at_pts(cap, pts)
+        if frame is None:
+            return None
+
+        self._apply_label_masks(frame)
+
+        # Slice to dialogue cutoff (same as Phase 1)
+        frame_cropped = frame[: self.dialogue_cutoff_y, :]
+        return [self._crop_box_region(frame_cropped, box)[0] for box in boxes]
 
     # ------------------------------------------------------------------
     # Phase 2: Position Grouping
@@ -2085,13 +2162,15 @@ class LabelScanner:
         Returns:
             List of LabelResult with normalized PTS values.
         """
-        # Phase 1: Detection scan
-        text_frames = self._phase1_find_text_frames(det_engine, time_start, time_end, progress, cancel_event=cancel_event)
+        # Phase 1: Detection scan, keeping the crops phase 1.5 will OCR
+        retained = _RetainedCrops(self.PHASE15_RETAIN_BUDGET_BYTES)
+        text_frames = self._phase1_find_text_frames(det_engine, time_start, time_end, progress, cancel_event=cancel_event, retain=retained)
         if not text_frames or (cancel_event is not None and cancel_event.is_set()):
             return []
 
         # Phase 1.5: Batch OCR to annotate boxes with text
-        text_frames = self._batch_ocr_text_frames(text_frames, ocr)
+        text_frames = self._batch_ocr_text_frames(text_frames, ocr, retained=retained)
+        del retained
 
         # Phase 2: Position grouping (text-aware)
         groups = self._phase2_group_by_position(text_frames, progress)

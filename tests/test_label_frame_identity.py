@@ -46,7 +46,11 @@ CLIPS = {
     "offset-h265-10bit": ("mp4", "yuv420p10le", "libx265", "25", ["-output_ts_offset", "1.5"]),
     "offset-h264-23.976fps": ("mp4", "yuv420p", "libx264", "24000/1001", ["-output_ts_offset", "1.5"]),
     "offset-h264-mkv": ("mkv", "yuv420p", "libx264", "25", ["-output_ts_offset", "1.5"]),
+    # Taller than LabelScanner.SCAN_HEIGHT above the dialogue cutoff, so
+    # phase 1 detects on a downscaled copy rather than on the frame itself.
+    "zero-start-h264-960p": ("mp4", "yuv420p", "libx264", "25", []),
 }
+SIZES = {"zero-start-h264-960p": "1280x960"}
 
 # Phase 1's own sampling (every 0.5 s), and every frame.
 SAMPLING = [pytest.param(None, id="every-0.5s"), pytest.param("every-frame", id="every-frame")]
@@ -60,12 +64,12 @@ RANGES = [
 ]
 
 
-def _encode(path, pix_fmt, codec, rate, extra):
+def _encode(path, pix_fmt, codec, rate, extra, size="320x240"):
     gop = (["-x265-params", "keyint=10:min-keyint=10:log-level=error"]
            if codec == "libx265" else ["-g", "10"])
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "lavfi", "-i", f"testsrc2=size=320x240:rate={rate}",
+         "-f", "lavfi", "-i", f"testsrc2=size={size}:rate={rate}",
          "-frames:v", str(FRAMES), "-pix_fmt", pix_fmt, "-c:v", codec,
          *gop, *extra, str(path)],
         check=True, capture_output=True,
@@ -105,7 +109,7 @@ def clips(tmp_path_factory):
     out = {}
     for cid, (ext, pix_fmt, codec, rate, extra) in CLIPS.items():
         path = root / f"{cid}.{ext}"
-        _encode(path, pix_fmt, codec, rate, extra)
+        _encode(path, pix_fmt, codec, rate, extra, SIZES.get(cid, "320x240"))
         expected_start = 1.5 if extra else 0.0
         assert _start_time(path) == pytest.approx(expected_start, abs=1e-3), cid
         assert _assert_adjacent_frames_differ(path) == FRAMES, cid
@@ -389,3 +393,162 @@ def test_seek_to_pts_retries_from_further_back_when_a_seek_lands_late(clips, cli
         # Frames far enough in that the first seek lands after them.
         _assert_seek_lands(cap, frames, [60, 75, 99, 62])
         assert len(late.seeks) > 4, "the late seeks never needed a retry, so this proves nothing"
+
+
+# --- retained crops: phase 1.5 without re-fetching ----------------------------
+
+# A label mask inside the region phase 1.5 crops from, so crops taken before
+# the mask is applied could not compare equal.
+MASKS = [(20, 30, 90, 40)]
+
+
+def _masked_scanner(path, sampling):
+    scanner = _scanner(path, sampling)
+    scanner.label_mask_crops = MASKS
+    return scanner
+
+
+class _TwoBandDetector:
+    """Two separate wide boxes per sample (so neither covers the whole
+    region, and a frame's crops are more than one)."""
+
+    def predict(self, frame):
+        h, w = frame.shape[:2]
+        return [{"dt_polys": [
+            [[0, 0], [w - 1, 0], [w - 1, h // 3], [0, h // 3]],
+            [[w // 4, h // 2], [w - 1, h // 2], [w - 1, h - 1], [w // 4, h - 1]],
+        ]}]
+
+
+class _Counting:
+    """Counts calls to a PyAVCapture method."""
+
+    def __init__(self, monkeypatch, name):
+        self.calls = 0
+        real = getattr(PyAVCapture, name)
+        counter = self
+
+        def counted(cap, *args, **kwargs):
+            counter.calls += 1
+            return real(cap, *args, **kwargs)
+
+        monkeypatch.setattr(PyAVCapture, name, counted)
+
+
+def _expected_crops(scanner, text_frames, phase1_frames):
+    """What phase 1.5 must OCR, computed from the frames phase 1 read."""
+    expected = []
+    for _, pts, boxes in text_frames:
+        frame = phase1_frames[pts].copy()
+        scanner._apply_label_masks(frame)
+        for box in boxes:
+            crop, _ = scanner._crop_box_region(frame[: scanner.dialogue_cutoff_y, :], box)
+            crop, _ = scanner._resize_max_dimension(crop, scanner.RECOGNIZE_HEIGHT)
+            expected.append(crop)
+    return expected
+
+
+def _assert_same_crops(got, expected):
+    assert len(got) == len(expected)
+    for i, (g, e) in enumerate(zip(got, expected)):
+        assert g.shape == e.shape and np.array_equal(g, e), f"OCR crop {i} differs"
+
+
+@pytest.mark.parametrize("sampling", SAMPLING)
+@pytest.mark.parametrize("clip_id", list(CLIPS))
+def test_retained_crops_are_what_phase15_would_have_fetched(clips, monkeypatch, clip_id, sampling):
+    from videocr.label_scanner import _RetainedCrops
+
+    scanner = _masked_scanner(clips[clip_id], sampling)
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+    retained = _RetainedCrops(budget_bytes=1 << 30)
+
+    text_frames = scanner._phase1_find_text_frames(_TwoBandDetector(), None, None, retain=retained)
+    phase1_frames = dict(recorder.reads)
+    assert len(text_frames) >= 3 and retained.refused == 0
+
+    seeks = _Counting(monkeypatch, "seek_to_pts")
+    ocr = recorder.ocr()
+    recorder.last = (None, None)
+    augmented = scanner._batch_ocr_text_frames(text_frames, ocr, retained=retained)
+    assert seeks.calls == 0, "phase 1.5 fetched frames although phase 1 kept every crop"
+    assert retained.nbytes == 0, "phase 1.5 did not release the crops it used"
+    retained_crops = [crop for _, _, crop in recorder.ocr_calls]
+
+    # The same text frames through the fetch path, which the tests above
+    # pin to phase 1's frames.
+    recorder.ocr_calls.clear()
+    fetched = scanner._batch_ocr_text_frames(text_frames, ocr)
+    assert seeks.calls == len(text_frames)
+    fetched_crops = [crop for _, _, crop in recorder.ocr_calls]
+
+    expected = _expected_crops(scanner, text_frames, phase1_frames)
+    _assert_same_crops(retained_crops, expected)
+    _assert_same_crops(fetched_crops, expected)
+    assert [(i, p, [e["text"] for e in b]) for i, p, b in augmented] == \
+        [(i, p, [e["text"] for e in b]) for i, p, b in fetched]
+
+
+@pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h265-10bit"])
+def test_crops_over_the_budget_are_fetched_by_pts(clips, monkeypatch, clip_id):
+    from videocr.label_scanner import _RetainedCrops
+
+    scanner = _masked_scanner(clips[clip_id], "every-frame")
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+
+    # Size one text frame's crops, then allow a little under a third of them.
+    probe = _RetainedCrops(budget_bytes=1 << 30)
+    text_frames = scanner._phase1_find_text_frames(_TwoBandDetector(), None, None, retain=probe)
+    per_frame = probe.nbytes // len(text_frames)
+    budget = per_frame * len(text_frames) // 3 + per_frame // 2
+
+    recorder.reads.clear()
+    retained = _RetainedCrops(budget_bytes=budget)
+    text_frames = scanner._phase1_find_text_frames(_TwoBandDetector(), None, None, retain=retained)
+    phase1_frames = dict(recorder.reads)
+    assert retained.refused > 0 and retained.refused < len(text_frames)
+    assert retained.peak_nbytes <= budget
+
+    seeks = _Counting(monkeypatch, "seek_to_pts")
+    recorder.last = (None, None)
+    scanner._batch_ocr_text_frames(text_frames, recorder.ocr(), retained=retained)
+    assert seeks.calls == retained.refused
+    _assert_same_crops([crop for _, _, crop in recorder.ocr_calls],
+                       _expected_crops(scanner, text_frames, phase1_frames))
+
+
+def test_retained_crops_are_only_used_for_the_boxes_they_were_cut_for(clips):
+    from videocr.label_scanner import _RetainedCrops
+
+    boxes = [np.zeros((4, 2), dtype=np.float32)]
+    crops = [np.ones((3, 5, 3), dtype=np.uint8)]
+    retained = _RetainedCrops(budget_bytes=100)
+    assert retained.offer(12, 0.48, boxes, crops)
+    assert retained.nbytes == 45
+    assert not retained.offer(24, 0.96, boxes, [np.ones((10, 10, 3), dtype=np.uint8)])
+    assert retained.refused == 1
+
+    # A different boxes list for the same frame (even an equal one) is a miss.
+    assert retained.take(12, 0.48, [b.copy() for b in boxes]) is None
+    assert retained.nbytes == 0
+    assert retained.offer(12, 0.48, boxes, crops)
+    assert retained.take(12, 0.48, boxes) is crops
+    assert retained.take(12, 0.48, boxes) is None
+
+
+def test_scan_serves_phase15_from_phase1_without_opening_the_video_again(clips, monkeypatch):
+    scanner = _masked_scanner(clips["offset-h264"], None)
+    opens = _Counting(monkeypatch, "__enter__")
+    seeks = _Counting(monkeypatch, "seek_to_pts")
+    monkeypatch.setattr(LabelScanner, "_phase2_group_by_position", lambda self, text_frames, progress=None: [])
+
+    recorder = _Recorder()
+    recorder.install(monkeypatch, PyAVCapture)
+    recorder.last = (None, None)
+    scanner.scan(_TwoBandDetector(), recorder.ocr(), "", "", 1.5)
+
+    assert len(recorder.ocr_calls) >= 3
+    assert opens.calls == 1, "phase 1.5 opened the video although phase 1 kept every crop"
+    assert seeks.calls == 0
