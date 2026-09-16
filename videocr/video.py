@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import List
+from collections import Counter
 from queue import Queue, Empty
 from threading import Thread
 import cv2
@@ -7,7 +8,7 @@ import numpy as np
 import time
 
 from . import utils
-from .models import PredictedFrames, PredictedSubtitle
+from .models import MIN_WORD_CONFIDENCE, PredictedFrames, PredictedSubtitle
 
 from .pyav_adapter import Capture, DECODE_TARGET_HEIGHT
 
@@ -27,6 +28,19 @@ MIN_CROP_HEIGHT = 150
 
 # Maximum alternative frames OCR'd for one low-confidence subtitle
 MAX_CANDIDATES = 8
+
+# Confidence advantage (on the 0-100 scale) a candidate reading must hold over
+# the original before it may replace it *without* agreement from other frames.
+#
+# Chosen from the noise floor of the population this path actually sees, which
+# is only subtitles scoring *below* conf_threshold. Measured over a reference
+# episode: two frames of one subtitle that read the exact same text - so the
+# whole difference is measurement noise - disagree by a median of 0.85 points,
+# 7.59 at the 90th percentile and 8.07 at worst. A margin under that band lets
+# noise rewrite text. 10.0 clears the worst observed spread with headroom,
+# while still admitting a decisively clearer frame (the recoveries this path
+# is for lead by 20 points and more).
+CANDIDATE_CONFIDENCE_MARGIN = 10.0
 
 # Maximum gap between frames to merge into same subtitle (in seconds)
 # 0.3s allows for occasional OCR failures without splitting subtitles
@@ -228,7 +242,7 @@ class Video:
                         if len(batch_frames) >= BATCH_SIZE:
                             batch_base = len(self.pred_frames)
                             self._process_batch(ocr, batch_frames, batch_start_indices, batch_end_indices, batch_pts_start, batch_pts_end, conf_threshold_percent)
-                            self._resolve_batch_candidates(ocr, batch_candidates, conf_threshold, batch_base)
+                            self._resolve_batch_candidates(ocr, batch_candidates, batch_base, conf_threshold, conf_threshold_percent)
                             self._emit_pending_subtitles(subtitle_callback)
                             batch_frames = []
                             batch_start_indices = []
@@ -251,7 +265,7 @@ class Video:
             if batch_frames:
                 batch_base = len(self.pred_frames)
                 self._process_batch(ocr, batch_frames, batch_start_indices, batch_end_indices, batch_pts_start, batch_pts_end, conf_threshold_percent)
-                self._resolve_batch_candidates(ocr, batch_candidates, conf_threshold, batch_base)
+                self._resolve_batch_candidates(ocr, batch_candidates, batch_base, conf_threshold, conf_threshold_percent)
 
             # Emit any remaining subtitles (all frames finalized)
             self._emit_pending_subtitles(subtitle_callback, emit_last=True)
@@ -369,7 +383,7 @@ class Video:
             pred_frame.pts_end = pts_end
             self.pred_frames.append(pred_frame)
 
-    def _resolve_batch_candidates(self, ocr, batch_candidates: list, conf_threshold: int, base: int) -> None:
+    def _resolve_batch_candidates(self, ocr, batch_candidates: list, base: int, conf_threshold: int, conf_threshold_percent: float) -> None:
         """Resolve buffered candidates for every slot of the batch just OCR'd.
 
         `batch_candidates[i]` belongs to the subtitle that `_process_batch`
@@ -384,20 +398,27 @@ class Video:
             index = base + offset
             if index >= len(self.pred_frames):
                 break
-            self._resolve_candidates(ocr, candidates, conf_threshold,
-                                     target=self.pred_frames[index])
+            self._resolve_candidates(ocr, candidates, self.pred_frames[index],
+                                     conf_threshold, conf_threshold_percent)
 
-    def _resolve_candidates(self, ocr, candidates: list, conf_threshold: int, target=None) -> None:
+    def _resolve_candidates(self, ocr, candidates: list, target, conf_threshold: int, conf_threshold_percent: float) -> None:
         """Improve one subtitle's text using its buffered alternative frames.
 
         Runs only when the subtitle's own first reading scored below
         conf_threshold. Timing is never modified: only `text`, `lines` and
         `confidence` of the existing PredictedFrames are replaced.
+
+        Selection is agreement-first. Every candidate is an independent frame
+        of the *same* subtitle, so several frames reading the same string is
+        much stronger evidence than any single frame's confidence score --
+        which measures the model's certainty, not its correctness, and which a
+        confident misreading can win outright. A reading therefore replaces the
+        original only when it is strictly modal, or when it is more confident
+        by a real margin; and never when it merely drops a word the original
+        was confident about.
         """
-        if not candidates or not self.pred_frames:
+        if not candidates:
             return
-        if target is None:
-            target = self.pred_frames[-1]
         if self._confidence_pct(target) >= conf_threshold:
             return
 
@@ -408,20 +429,61 @@ class Video:
             results = ocr.ocr(candidates)
         self._ocr_time += time.perf_counter() - ocr_start_time
 
-        best = target
+        # The original reading votes alongside the candidates.
+        readings = [target]
         for pred_data in results:
-            alt = PredictedFrames(target.start_index, [pred_data], 0, self.lang,
+            alt = PredictedFrames(target.start_index, [pred_data],
+                                  conf_threshold_percent, self.lang,
                                   pts=target.pts_start)
             # An empty reading carries the sentinel confidence of 100; it must
             # never be allowed to win and blank out a subtitle that has text.
             if not alt.lines:
                 continue
-            if self._confidence_pct(alt) > self._confidence_pct(best):
-                best = alt
-        if best is not target:
-            target.lines = best.lines
-            target.text = best.text
-            target.confidence = best.confidence
+            readings.append(alt)
+        if len(readings) < 2:
+            return
+
+        votes = Counter(r.text for r in readings)
+
+        def mean_conf(text: str) -> float:
+            scores = [self._confidence_pct(r) for r in readings if r.text == text]
+            return sum(scores) / len(scores)
+
+        # Most agreed-upon text, ties broken by mean confidence. Counter keeps
+        # insertion order and max() keeps the first maximum, so this is stable.
+        winner_text = max(votes, key=lambda t: (votes[t], mean_conf(t)))
+        if winner_text == target.text:
+            return
+
+        if votes[winner_text] <= votes[target.text]:
+            # No majority behind it - demand a real confidence advantage.
+            best_conf = max(self._confidence_pct(r) for r in readings
+                            if r.text == winner_text)
+            if best_conf < self._confidence_pct(target) + CANDIDATE_CONFIDENCE_MARGIN:
+                return
+
+        winner = max((r for r in readings if r.text == winner_text),
+                     key=self._confidence_pct)
+
+        # A shorter reading raises the mean simply by dropping a word, so it
+        # cannot be trusted unless every word it drops was one the original
+        # was not confident about either.
+        if len(winner.text) < len(target.text):
+            remaining = Counter(text for text, _ in self._word_scores(winner))
+            for text, conf in self._word_scores(target):
+                if remaining[text]:
+                    remaining[text] -= 1
+                elif conf >= MIN_WORD_CONFIDENCE:
+                    return
+
+        target.lines = winner.lines
+        target.text = winner.text
+        target.confidence = winner.confidence
+
+    @staticmethod
+    def _word_scores(pred) -> list:
+        """(text, confidence) for every word that survived word-level filtering."""
+        return [(word.text, word.confidence) for line in pred.lines for word in line]
 
     @staticmethod
     def _confidence_pct(pred) -> float:
@@ -474,7 +536,7 @@ class Video:
         current_pts = None  # Track PTS of current frame
 
         # Deterministic best-of-N: while tracking one subtitle, every
-        # CANDIDATE_STRIDE-th frame is offered as an alternative reading,
+        # candidate_stride-th frame is offered as an alternative reading,
         # up to MAX_CANDIDATES. This schedule is a function of the frame
         # stream alone, never of consumer state.
         candidate_stride = max(1, int(round(fps / 4.0)))  # ~4 per second

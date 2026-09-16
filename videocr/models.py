@@ -5,6 +5,12 @@ from thefuzz import fuzz
 
 from . import utils
 
+# Word-level floor: below this a detection is obvious garbage (like "2" at 18%)
+# and is dropped before lines are assembled, so every word that survives into
+# PredictedFrames.lines scored at least this much.
+MIN_WORD_CONFIDENCE = 0.5
+
+
 @dataclass
 class PredictedText:
     __slots__ = 'bounding_box', 'confidence', 'text'
@@ -42,8 +48,6 @@ class PredictedFrames:
         # Collect all words, merging them first before applying confidence threshold
         # This ensures "你竟掌握了" (93%) + "鲲鹏道法" (97%) becomes one line with avg 95%
         # rather than filtering "你竟掌握了" and keeping only "鲲鹏道法"
-        MIN_WORD_CONFIDENCE = 0.5  # Filter obvious garbage (like "2" at 18%)
-
         words = []
         total_conf = 0
         word_count = 0
