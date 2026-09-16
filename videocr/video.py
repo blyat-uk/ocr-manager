@@ -8,7 +8,7 @@ import numpy as np
 import time
 
 from . import utils
-from .models import MIN_WORD_CONFIDENCE, PredictedFrames, PredictedSubtitle
+from .models import PredictedFrames, PredictedSubtitle
 
 from .pyav_adapter import Capture, DECODE_TARGET_HEIGHT
 
@@ -455,35 +455,34 @@ class Video:
         if winner_text == target.text:
             return
 
+        winner = max((r for r in readings if r.text == winner_text),
+                     key=self._confidence_pct)
+
         if votes[winner_text] <= votes[target.text]:
-            # No majority behind it - demand a real confidence advantage.
+            # Nothing corroborates this reading, so demand a real confidence
+            # advantage...
             best_conf = max(self._confidence_pct(r) for r in readings
                             if r.text == winner_text)
             if best_conf < self._confidence_pct(target) + CANDIDATE_CONFIDENCE_MARGIN:
                 return
-
-        winner = max((r for r in readings if r.text == winner_text),
-                     key=self._confidence_pct)
-
-        # A shorter reading raises the mean simply by dropping a word, so it
-        # cannot be trusted unless every word it drops was one the original
-        # was not confident about either.
-        if len(winner.text) < len(target.text):
-            remaining = Counter(text for text, _ in self._word_scores(winner))
-            for text, conf in self._word_scores(target):
-                if remaining[text]:
-                    remaining[text] -= 1
-                elif conf >= MIN_WORD_CONFIDENCE:
-                    return
+            # ...and refuse it outright if it is shorter. Dropping a word
+            # raises the mean for free, so on one frame's opinion alone a
+            # shorter reading is indistinguishable from a frame that merely
+            # failed to detect the word. The guard is unconditional here:
+            # PredictedFrames already discards every word below
+            # MIN_WORD_CONFIDENCE before assembling `lines`, so a dropped word
+            # the original was *not* confident about cannot occur.
+            if len(winner.text) < len(target.text):
+                return
+        # A strictly modal winner needs no length guard: several independent
+        # frames of this subtitle agreeing that the trailing glyphs are absent
+        # is exactly the evidence the guard would be asking for. One frame
+        # hallucinating extra characters must not outvote the frames that do
+        # not see them.
 
         target.lines = winner.lines
         target.text = winner.text
         target.confidence = winner.confidence
-
-    @staticmethod
-    def _word_scores(pred) -> list:
-        """(text, confidence) for every word that survived word-level filtering."""
-        return [(word.text, word.confidence) for line in pred.lines for word in line]
 
     @staticmethod
     def _confidence_pct(pred) -> float:

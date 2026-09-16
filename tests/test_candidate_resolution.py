@@ -191,20 +191,36 @@ def test_a_lone_dissenter_beyond_the_margin_is_accepted():
     assert target.text == "清楚的"
 
 
-def test_a_winner_that_drops_a_confident_word_is_refused():
-    """Dropping a word raises the mean for free; that is not evidence."""
-    target = make_target([("跟温祈墨顺利汇合", 0.90), ("7元", 0.80)])
+def test_an_uncorroborated_shorter_winner_is_refused():
+    """Dropping a word raises the mean for free; one frame's word is not enough.
+
+    The lone dissenter here clears the confidence margin comfortably, so only
+    the length guard can be what refuses it.
+    """
+    target = make_target([("跟温祈墨顺利汇合", 0.60), ("7元", 0.60)])
     v = make_video([target])
 
-    ocr = FakeOCR({
-        f"c{i}": reading(("跟温祈墨顺利汇合", 0.99)) for i in range(3)
-    })
+    ocr = FakeOCR({"c0": reading(("跟温祈墨顺利汇合", 0.99))})
+    v._resolve_candidates(ocr, ["c0"], target,
+                          CONF_THRESHOLD, CONF_THRESHOLD_PERCENT)
+
+    assert target.text == "跟温祈墨顺利汇合7元"
+
+
+def test_a_modal_shorter_winner_is_accepted():
+    """Several frames agreeing the trailing glyphs are absent is the evidence.
+
+    This is the OCR-artifact case ('...7元'): one frame hallucinates trailing
+    characters, the rest do not see them, and the majority must win.
+    """
+    target = make_target([("全员已待命", 0.77), ("7元", 0.60)])
+    v = make_video([target])
+
+    ocr = FakeOCR({f"c{i}": reading(("全员已待命", 0.95)) for i in range(3)})
     v._resolve_candidates(ocr, ["c0", "c1", "c2"], target,
                           CONF_THRESHOLD, CONF_THRESHOLD_PERCENT)
 
-    assert target.text == "跟温祈墨顺利汇合7元", (
-        "a shorter winner may not drop a word the original was confident about"
-    )
+    assert target.text == "全员已待命"
 
 
 def test_a_winner_may_still_lengthen_a_subtitle():
