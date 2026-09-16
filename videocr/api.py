@@ -117,6 +117,19 @@ def get_subtitles(
     # that could not be reproduced. OCR_ALLOW_FFMPEG_FALLBACK=1 opts in.
     assert_reference_backend()
 
+    if time_ranges is not None:
+        # Caller opted into the multi-range path explicitly, so an empty
+        # list is a caller error, not "no ranges given" -- silently falling
+        # back to time_start/time_end here would OCR the entire file instead
+        # of failing on a clearly-wrong argument. Checked before opening
+        # anything, so a bad call fails instantly rather than after paying
+        # for a container probe first.
+        if not time_ranges:
+            raise ValueError("time_ranges must contain at least one (start, end) pair")
+        ranges = time_ranges
+    else:
+        ranges = [(time_start, time_end)]
+
     # One `Video` -- and the container probe its constructor does -- shared
     # by every range below, instead of one per range. `run_ocr` still opens
     # its own decode session per range (each range decodes a different part
@@ -124,8 +137,6 @@ def get_subtitles(
     # the repeated `Video` construction/probe, since Task 1's engine registry
     # already made repeat engine construction free within a process.
     v = Video(video_path, det_model_dir, rec_model_dir)
-
-    ranges = time_ranges if time_ranges else [(time_start, time_end)]
 
     ass_parts = []
     for i, (t_start, t_end) in enumerate(ranges):

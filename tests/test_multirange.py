@@ -1,12 +1,18 @@
 """Pins get_subtitles(time_ranges=...) as output-neutral against the old
 per-range approach: one get_subtitles() call per range, merged by hand.
 
-Runs the slay_1080p_multirange fidelity case both ways -- through two
-get_subtitles() calls merged by videocr.utils.merge_ass_documents (the
-merge core/ocr_worker.py used to do itself before this task), and through
-one get_subtitles() call with time_ranges -- and asserts the digest() of
-both matches each other and the committed golden. This is the proof that
-sharing one Video/engine session across ranges does not change output.
+Runs two fidelity cases both ways -- through two get_subtitles() calls
+merged by videocr.utils.merge_ass_documents (the merge core/ocr_worker.py
+used to do itself before this task), and through one get_subtitles() call
+with time_ranges -- and asserts the digest() of both matches each other and
+the committed golden. This is the proof that sharing one Video/engine
+session across ranges does not change output.
+
+Covers both detect_labels=False (slay_1080p_multirange) and
+detect_labels=True (slay_1080p_multirange_labels): the label pass still
+runs once per range against the shared Video, and a shared Video could
+plausibly leak state into it (e.g. via v.fps/v.width/v.height or
+v._stream_start_time) in a way the no-labels case can't exercise.
 """
 import pytest
 
@@ -14,12 +20,12 @@ from tools.fidelity_check import GOLDEN_DIR, digest, load_cases
 from videocr.api import get_subtitles
 from videocr.utils import merge_ass_documents
 
-CASE_NAME = "slay_1080p_multirange"
+CASE_NAMES = ["slay_1080p_multirange", "slay_1080p_multirange_labels"]
 
 
-def _case():
+def _case(name):
     cases = {c.name: c for c in load_cases()}
-    return cases[CASE_NAME]
+    return cases[name]
 
 
 def _kwargs(case):
@@ -36,8 +42,9 @@ def _kwargs(case):
 
 @pytest.mark.needs_media
 @pytest.mark.slow
-def test_time_ranges_matches_old_per_range_calls_and_golden(reference_media):
-    case = _case()
+@pytest.mark.parametrize("case_name", CASE_NAMES)
+def test_time_ranges_matches_old_per_range_calls_and_golden(reference_media, case_name):
+    case = _case(case_name)
     video = reference_media["slay"]["video"]
     kwargs = _kwargs(case)
 
