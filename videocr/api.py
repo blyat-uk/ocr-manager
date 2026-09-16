@@ -1,6 +1,7 @@
 from . import utils
 from .video import Video
 from .progress import ProgressTracker
+from .pyav_adapter import assert_reference_backend
 
 
 def get_subtitles(
@@ -13,6 +14,14 @@ def get_subtitles(
         label_min_duration=1.0, label_max_duration=5.0, label_conf_threshold=95, label_conf_threshold_min=75,
         label_mask_crops=None,
         progress_callback=None, subtitle_callback=None, cancel_event=None) -> str:
+
+    # Every production OCR run enters here (core/ocr_worker.py calls this and
+    # save_subtitles_to_file, which wraps it). Refuse before decoding a single
+    # frame if the bit-exact reference backend is not the one that would run:
+    # an `av` that fails to import silently demotes the whole run to the
+    # PTS-estimating fallback, which is how a previous release shipped output
+    # that could not be reproduced. OCR_ALLOW_FFMPEG_FALLBACK=1 opts in.
+    assert_reference_backend()
 
     v = Video(video_path, det_model_dir, rec_model_dir)
 
