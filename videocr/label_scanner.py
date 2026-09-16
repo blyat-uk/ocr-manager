@@ -792,7 +792,7 @@ class LabelScanner:
             return None
         return frame
 
-    def _batch_ocr_text_frames(self, text_frames, ocr, retained=None):
+    def _batch_ocr_text_frames(self, text_frames, ocr, progress=None, retained=None):
         """Run OCR on every Phase 1 detection box to annotate with text.
 
         Replaces each bare np.array box with {"box": np.array, "text": str|None}
@@ -807,6 +807,9 @@ class LabelScanner:
 
         Returns augmented text_frames: [(frame_idx, pts, [{"box": ..., "text": ...}, ...]), ...]
         """
+        if progress is not None:
+            progress.set_phase("label_p1_5", len(text_frames))
+
         augmented = []
 
         with contextlib.ExitStack() as stack:
@@ -827,6 +830,9 @@ class LabelScanner:
                         text, conf = self._run_ocr_on_crop(ocr, crop)
                         annotated_boxes.append({"box": box, "text": text})
                     augmented.append((frame_idx, pts, annotated_boxes))
+
+                if progress is not None:
+                    progress.update(1)
 
         return augmented
 
@@ -2169,7 +2175,7 @@ class LabelScanner:
             return []
 
         # Phase 1.5: Batch OCR to annotate boxes with text
-        text_frames = self._batch_ocr_text_frames(text_frames, ocr, retained=retained)
+        text_frames = self._batch_ocr_text_frames(text_frames, ocr, progress, retained=retained)
         del retained
 
         # Phase 2: Position grouping (text-aware)

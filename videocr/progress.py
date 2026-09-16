@@ -41,13 +41,19 @@ class ProgressTracker:
 
         Label phases are weighted internally within the labels progress range:
         - Phase 1: 20% (detection scan - sparse sampling at 720p)
-        - Phase 2: 10% (position grouping - pure spatial, fast)
+        - Phase 1.5: 5% (OCR of every phase 1 detection box)
+        - Phase 2: 5% (position grouping - pure spatial, fast)
         - Phase 3: 40% (crop, clean, recognize - dual OCR at intervals)
         - Phase 4: 30% (timing refinement - detection scan for start/end)
+
+        Phase 1.5's 5 comes out of phase 2, which measured under 0.1% of
+        the label scan on two 4K runs where phase 1.5 (OCR of crops phase 1
+        kept) measured 6-7%.
         """
         self._label_weights = {
             'label_p1': 20,
-            'label_p2': 10,
+            'label_p1_5': 5,
+            'label_p2': 5,
             'label_p3': 40,
             'label_p4': 30,
         }
@@ -63,7 +69,7 @@ class ProgressTracker:
         """Begin a new phase with known work units.
 
         Args:
-            phase: Phase identifier ('dialogue', 'label_p1', 'label_p2', 'label_p3', 'label_p4').
+            phase: Phase identifier ('dialogue', 'label_p1', 'label_p1_5', 'label_p2', 'label_p3', 'label_p4').
             total_units: Total work units in this phase.
             desc: Optional description (ignored, uses task-based descriptions).
         """
