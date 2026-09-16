@@ -157,7 +157,13 @@ class Video:
 
         adjusted_ocr_start = ocr_start
 
-        with Capture(self.path, decode_target_height=decode_height) as v:
+        graph_crop = None
+        if crop_x_end is not None and crop_y_end is not None:
+            graph_crop = (crop_x_start, crop_y_start,
+                          crop_x_end - crop_x_start, crop_y_end - crop_y_start)
+
+        with Capture(self.path, decode_target_height=decode_height,
+                     crop_rect=graph_crop) as v:
             # Get the container-level start_time for PTS normalization.
             # Players offset PTS only by container start_time (0 for MKV,
             # possibly non-zero for MP4). Stream start_time is not used.
@@ -445,8 +451,10 @@ class Video:
                         progress.update(1)
                     continue
 
-                # Apply crop (coordinates pre-scaled if decode downscaling is active)
-                if not self.use_fullframe:
+                # Apply crop (coordinates pre-scaled if decode downscaling is active).
+                # If the capture already cropped inside its filter graph
+                # (v._crop_slice is set), skip the redundant Python slice.
+                if not self.use_fullframe and not getattr(v, '_crop_slice', None):
                     if crop_x_end is not None and crop_y_end is not None:
                         frame = frame[crop_y_start:crop_y_end, crop_x_start:crop_x_end]
                     else:

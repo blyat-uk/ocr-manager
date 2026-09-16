@@ -71,10 +71,12 @@ class FFmpegNVDECCapture:
     Falls back to CPU decoding if NVDEC is not available.
     """
 
-    def __init__(self, video_path, use_gpu=True, decode_target_height=None):
+    def __init__(self, video_path, use_gpu=True, decode_target_height=None, crop_rect=None):
         self.path = video_path
         self.use_gpu = use_gpu
         self._decode_target_height = decode_target_height
+        self._crop_request = crop_rect  # Accepted for interface parity; ignored.
+        self._crop_slice = None  # Never set: callers keep slicing in Python.
         self.proc = None
         self._pos = 0
         self._frame_count = None
@@ -293,7 +295,9 @@ class PyAVCapture:
     Uses FFmpeg's NVDEC for hardware-accelerated video decoding on NVIDIA GPUs.
     """
 
-    def __init__(self, video_path, use_gpu=True, decode_target_height=None):
+    _CROP_PAD = 8  # margin decoded around the crop, sliced off after conversion
+
+    def __init__(self, video_path, use_gpu=True, decode_target_height=None, crop_rect=None):
         self.path = video_path
         self.use_gpu = use_gpu
         self._decode_target_height = decode_target_height
@@ -311,6 +315,12 @@ class PyAVCapture:
         self._last_pts = None  # Last frame's PTS in seconds
         # Combined filter graph for tone mapping and/or scaling (None = fast path)
         self._filter_graph = None
+        # Crop-in-filter-graph state
+        self._crop_request = crop_rect   # (x, y, w, h) in decode-output coords
+        self._crop_slice = None          # (y0, y1, x0, x1) applied after conversion
+        self._crop_native = None         # (x, y, w, h) in native decode coords
+        self._crop_scaled_size = None    # (w, h) the scale stage should target
+        self._crop_graph_active = False  # True once the graph actually cropped
 
     def __enter__(self):
         if not PYAV_AVAILABLE:
@@ -359,10 +369,49 @@ class PyAVCapture:
         self._pos = 0
         self._frame_generator = self.container.decode(video=0)
 
+        # Translate the requested output-space crop into a native-space,
+        # aligned, padded decode box (no-op if no crop was requested).
+        self._plan_crop()
+
         # Set up combined filter graph (tone mapping + scaling)
         self._setup_filter_graph()
 
         return self
+
+    def _plan_crop(self):
+        """Translate the requested output-space crop into a native-space,
+        aligned, padded decode box plus the exact slice to take afterwards.
+
+        Alignment: chroma subsampling needs even coordinates, and on the
+        downscale path the native-resolution box must map to whole output
+        pixels, so we align to `2 / scale_factor`. A padding margin absorbs
+        swscale's filter taps at the crop edges; it is sliced off after
+        conversion via `self._crop_slice`.
+        """
+        if self._crop_request is None:
+            return
+
+        x, y, w, h = (int(v) for v in self._crop_request)
+        out_w, out_h = self._output_width, self._output_height
+        x = max(0, min(x, out_w)); y = max(0, min(y, out_h))
+        w = max(1, min(w, out_w - x)); h = max(1, min(h, out_h - y))
+
+        inv = 1.0 / self._scale_factor if self._scale_factor < 1.0 else 1.0
+        align = max(2, int(round(2 * inv)))
+
+        # Padded box in OUTPUT space, aligned down/up to `align`.
+        px0 = max(0, ((x - self._CROP_PAD) // align) * align)
+        py0 = max(0, ((y - self._CROP_PAD) // align) * align)
+        px1 = min(out_w, -(-(x + w + self._CROP_PAD) // align) * align)
+        py1 = min(out_h, -(-(y + h + self._CROP_PAD) // align) * align)
+
+        # Same box in NATIVE space, where the crop filter runs.
+        n_x0 = int(round(px0 * inv)); n_y0 = int(round(py0 * inv))
+        n_w = int(round((px1 - px0) * inv)); n_h = int(round((py1 - py0) * inv))
+
+        self._crop_native = (n_x0, n_y0, n_w, n_h)
+        self._crop_scaled_size = (px1 - px0, py1 - py0)
+        self._crop_slice = (y - py0, y - py0 + h, x - px0, x - px0 + w)
 
     def _setup_filter_graph(self):
         """Build a unified PyAV filter graph for HDR tone mapping and/or downscaling."""
@@ -375,8 +424,9 @@ class PyAVCapture:
             pass
 
         needs_scale = self._scale_factor < 1.0
+        needs_crop = self._crop_slice is not None
 
-        if not needs_tonemap and not needs_scale:
+        if not needs_tonemap and not needs_scale and not needs_crop:
             self._filter_graph = None
             return
 
@@ -397,13 +447,23 @@ class PyAVCapture:
                 tonemap.link_to(bt709)
                 last = bt709
 
+            if needs_crop:
+                n_x0, n_y0, n_w, n_h = self._crop_native
+                crop = graph.add('crop', f'{n_w}:{n_h}:{n_x0}:{n_y0}')
+                last.link_to(crop)
+                last = crop
+
             # Scale after tone mapping (operates on uint8 bgr24 for efficiency)
             fmt_out = graph.add('format', 'bgr24')
             last.link_to(fmt_out)
             last = fmt_out
 
             if needs_scale:
-                scale = graph.add('scale', f'{self._output_width}:{self._output_height}')
+                if needs_crop:
+                    sw, sh = self._crop_scaled_size
+                else:
+                    sw, sh = self._output_width, self._output_height
+                scale = graph.add('scale', f'{sw}:{sh}')
                 last.link_to(scale)
                 last = scale
 
@@ -412,10 +472,14 @@ class PyAVCapture:
 
             graph.configure()
             self._filter_graph = graph
+            if needs_crop:
+                self._crop_graph_active = True
         except Exception:
-            # Graceful fallback: proceed without filtering
+            # Graceful fallback: proceed without filtering. read() will slice
+            # the full frame with the original output-space rectangle instead.
             self._filter_graph = None
             self._scale_factor = 1.0
+            self._crop_graph_active = False
 
     def __exit__(self, exc_type, exc_value, traceback):
         if not PYAV_AVAILABLE:
@@ -511,6 +575,17 @@ class PyAVCapture:
             else:
                 img = frame.to_ndarray(format='bgr24')
 
+            if self._crop_slice is not None:
+                y0, y1, x0, x1 = self._crop_slice
+                if self._crop_graph_active:
+                    img = img[y0:y1, x0:x1]
+                else:
+                    # Graph unavailable: slice the full frame with the original
+                    # output-space rectangle instead.
+                    rx, ry, rw, rh = self._crop_request
+                    img = img[ry:ry + rh, rx:rx + rw]
+                img = np.ascontiguousarray(img)
+
             return True, img
         except StopIteration:
             return False, None
@@ -550,9 +625,11 @@ elif FFMPEG_AVAILABLE:
 else:
     # Fallback to OpenCV wrapper
     class OpenCVCapture:
-        def __init__(self, video_path, use_gpu=True, decode_target_height=None):
+        def __init__(self, video_path, use_gpu=True, decode_target_height=None, crop_rect=None):
             self.path = video_path
             self._decode_target_height = decode_target_height
+            self._crop_request = crop_rect  # Accepted for interface parity; ignored.
+            self._crop_slice = None  # Never set: callers keep slicing in Python.
             self._last_pts = None
             self._scale_factor = 1.0
             self._output_width = None
