@@ -216,7 +216,8 @@ class _ScriptedOCR:
             idx = _identity(img, len(self.texts))
             variant, conf = self.scripts[idx].get(_masked_threshold(img), ("", 0.0))
             base = self.texts[idx]
-            text = {"ok": base, "short": base[:-1], "wrong": "口口口口", "junk": "A", "": ""}[variant]
+            text = {"ok": base, "short": base[:-1], "fragment": base[-2:], "wrong": "口口口口",
+                    "okjunk": base + "\n1", "junk": "A", "colon": ":", "mx": "MX", "m": "M", "": ""}[variant]
             out.append(_ocr_item(text, conf))
         return out
 
@@ -320,6 +321,58 @@ def test_a_strip_that_reads_text_at_only_one_threshold_carries_no_evidence():
 
     assert plateau == (175, 225)
     assert value == 205
+
+
+@pytest.mark.parametrize("junk", [
+    {200: ("junk", 0.95)},                        # 'A' once
+    {200: ("junk", 0.95), 205: ("colon", 0.95)},  # 'A' then ':' -- one-character readings never match each other
+    {200: ("mx", 0.95), 205: ("m", 0.95)},        # 'MX' then 'M'
+])
+def test_one_off_junk_readings_stay_excluded_under_near_matching(junk):
+    steady = {t: ("ok", 0.99) for t in range(175, 230, 5)}
+    engine = _ScriptedOCR([steady, steady, steady, steady, junk], TEXTS + ["标志"])
+
+    value, plateau, _ = B.verify_with_ocr(_probe_strips(5), 200, engine)
+
+    assert plateau == (175, 225)
+    assert value == 205
+
+
+def test_an_eroding_line_that_reads_differently_at_each_threshold_is_still_evidence():
+    # The line reads whole at 175, then only its last two characters at 180,
+    # then nothing: no exact repeat, but the same line eroding. It must hold
+    # the plateau down where it still reads, not be dropped as noise.
+    steady = {t: ("ok", 0.99) for t in range(175, 230, 5)}
+    eroding = {175: ("ok", 0.99), 180: ("fragment", 0.99)}
+    engine = _ScriptedOCR([steady, steady, steady, eroding], TEXTS)
+
+    _, plateau, _ = B.verify_with_ocr(_probe_strips(), 200, engine)
+
+    assert plateau == (175, 175)
+
+
+def test_near_matching_readings_tie_on_support_and_the_most_repeated_one_is_the_modal():
+    # At 175 clutter adds a stray "1" line to the reading; from 180 up the line
+    # reads clean. Both readings near-match each other (equal support), so the
+    # modal must be the one repeated most -- not the one seen first.
+    steady = {t: ("ok", 0.99) for t in range(175, 230, 5)}
+    cluttered_low = dict(steady)
+    cluttered_low[175] = ("okjunk", 0.99)
+    engine = _ScriptedOCR([steady, steady, steady, cluttered_low], TEXTS)
+
+    _, plateau, _ = B.verify_with_ocr(_probe_strips(), 200, engine)
+
+    assert plateau == (180, 225)
+
+
+def test_a_single_one_threshold_hole_inside_a_readable_band_is_tolerated():
+    steady = {t: ("ok", 0.99) for t in range(175, 230, 5)}
+    holed = {175: ("ok", 0.99), 180: ("ok", 0.99), 190: ("ok", 0.99), 195: ("ok", 0.99), 200: ("ok", 0.99)}
+    engine = _ScriptedOCR([steady, steady, steady, holed], TEXTS)
+
+    _, plateau, _ = B.verify_with_ocr(_probe_strips(), 200, engine)
+
+    assert plateau == (175, 200)   # the holed strip is evidence: its loss from 205 up counts
 
 
 def test_a_strip_whose_readings_are_scattered_carries_no_evidence():
@@ -609,6 +662,145 @@ def test_a_plateau_too_narrow_for_the_safety_margin_is_flagged(monkeypatch):
     assert not result.auto_applicable
 
 
+def test_a_plateau_exactly_as_wide_as_the_margin_is_not_narrow(monkeypatch):
+    text = [_probe_strip(0, 1) for _ in range(16)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _WindowOCR(225, 245))
+
+    assert result.plateau == (225, 245)
+    assert result.value == 225
+    assert result.flagged is None
+
+
+class _StyleOCR:
+    """Bright strips (glyph core >= 250) read one line; dimmer strips read a
+    second style, whose reading differs at each threshold where it still
+    reads -- as an eroding line does."""
+
+    def predict(self, images):
+        out = []
+        for img in images:
+            line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
+            if np.count_nonzero(line.min(axis=2)) < _GlyphReadingOCR.CORE_PX // 2:
+                out.append(_ocr_item("", 0.0))
+            elif int(line.max()) >= 250:
+                out.append(_ocr_item("你好世界", 0.99))
+            else:
+                out.append(_ocr_item("旁白第二种样式文本"[: 9 - _masked_threshold(img) % 3], 0.99))
+        return out
+
+
+def _level_strip(core):
+    strip = _glyph_strip(core=(core,) * 3)
+    strip[-1, :255] = np.arange(1, 256, dtype=np.uint8)[:, None]   # threshold readout for _StyleOCR
+    return strip
+
+
+def test_a_dim_style_whose_readings_vary_as_it_erodes_is_not_erased(monkeypatch):
+    # Reviewer's scenario: 12 bright strips, 4 of a dimmer style readable only
+    # at 217 and 222 (seed 242), reading a different string at each.
+    text = [_level_strip(250) for _ in range(12)] + [_level_strip(223) for _ in range(4)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _StyleOCR())
+
+    # Their varying readings agree only partly with their own modal, so the
+    # plateau closes where they stop reading -- or below -- and is too narrow
+    # to apply without review.
+    assert result.plateau[1] <= 222
+    assert result.value <= 222
+    assert "narrow-plateau?" in result.flagged.split("+")
+    assert not result.auto_applicable
+
+
+@pytest.mark.parametrize("kept, thin", [(7, True), (8, False)])
+def test_thin_evidence_threshold(monkeypatch, kept, thin):
+    per_round = [kept // 3 + (1 if r < kept % 3 else 0) for r in range(3)]
+    rounds = [[_glyph_strip()] * n + [_ramp_strip(top=200)] * (24 - n) for n in per_round]
+    _fake_source(monkeypatch, rounds=rounds)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _GlyphReadingOCR())
+
+    assert ("thin-evidence?" in (result.flagged or "").split("+")) is thin
+
+
+def test_thin_evidence_counts_strips_usable_as_evidence_not_detected_text(monkeypatch):
+    # 16 strips the detector calls text, but only 6 ever read: 10 are logos
+    # or noise that verification cannot use.
+    texts = [f"第{i}行字幕文本" for i in range(16)]
+    strips = [_probe_strip(i, 16) for i in range(16)]
+    steady = {t: ("ok", 0.99) for t in range(220, 256, 5)}
+    scripts = [steady] * 6 + [{}] * 10
+    _fake_source(monkeypatch, strips + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ScriptedOCR(scripts, texts))
+
+    assert result.plateau == (220, 255)
+    assert result.flagged == "thin-evidence?"
+
+
+class _BrightOnlyOCR(_GlyphReadingOCR):
+    """Never reads strips below the bright style: they are logos, not lines."""
+
+    def predict(self, images):
+        self.calls += 1
+        out = []
+        for img in images:
+            line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
+            kept = np.count_nonzero(line.min(axis=2))
+            out.append(_ocr_item("你好世界", 0.99) if kept >= self.CORE_PX // 2 and int(line.max()) >= 250
+                       else _ocr_item("", 0.0))
+        return out
+
+
+@pytest.mark.parametrize("dim_core", [
+    200,   # reads nowhere in the window (seed 242 -> 217..252)
+    217,   # reads only at the window's lowest threshold
+])
+def test_text_strips_too_dim_for_the_window_are_re_read_at_their_own_level(monkeypatch, dim_core):
+    # Controller's scenario: 11 bright strips set the seed; 5 strips of a
+    # dimmer style never enter the plateau. Re-read at their own seed
+    # threshold (round5(level) - 8) they read, so the dim style is reported.
+    text = [_glyph_strip() for _ in range(11)] + [_glyph_strip(core=(dim_core,) * 3) for _ in range(5)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+    ocr = _GlyphReadingOCR()
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
+
+    assert result.seed == 242
+    assert result.plateau == (217, 247)
+    assert result.flagged == "dim-text?"
+    assert not result.auto_applicable
+    assert ocr.calls == 2, "verification and the re-reads are one OCR batch each"
+
+
+def test_a_dim_strip_that_would_not_trip_the_gate_at_its_own_level_is_not_re_read(monkeypatch):
+    # The OCR pass never OCRs a frame whose masked centre stays quiet, so a
+    # dim strip with nothing in the centre square is not dim TEXT to it.
+    off_centre = _glyph_strip(core=(200,) * 3)
+    off_centre[:, CENTRE_X0:CENTRE_X0 + H] = BG
+    text = [_glyph_strip() for _ in range(11)] + [off_centre.copy() for _ in range(5)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+    ocr = _GlyphReadingOCR()
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
+
+    assert result.flagged is None
+    assert ocr.calls == 1
+
+
+def test_text_strips_that_read_nothing_even_at_their_own_level_are_not_dim_text(monkeypatch):
+    text = [_glyph_strip() for _ in range(11)] + [_glyph_strip(core=(200,) * 3) for _ in range(5)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _BrightOnlyOCR())
+
+    assert result.plateau == (217, 247)
+    assert result.flagged is None
+    assert result.auto_applicable
+
+
 def test_detect_flags_a_verification_that_finds_no_plateau(monkeypatch):
     text = [_glyph_strip() for _ in range(16)]
     _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
@@ -686,6 +878,7 @@ def test_cancellation_before_verification_skips_the_ocr_batch(monkeypatch):
     (None, True),
     ("no-clean-threshold", True),
     ("narrow-plateau?", False),
+    ("dim-text?", False),
     ("no-clean-threshold+narrow-plateau?", False),
     ("thin-evidence?", False),
     ("no-plateau?", False),
@@ -705,23 +898,24 @@ def test_only_clean_or_clutter_only_results_are_auto_applicable(flagged, applica
 # Two-tier cheap path
 # --------------------------------------------------------------------------
 
-def test_cheap_path_takes_its_own_seed_when_it_lands_inside_the_folder_plateau(monkeypatch):
+def test_cheap_path_picks_its_own_seed_minus_the_margin(monkeypatch):
     dim = _glyph_strip(core=(235,) * 3)   # seed round5(235) - 8 = 227
     calls = _fake_source(monkeypatch, _interleave([dim] * 3, [_ramp_strip()] * 3))
 
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
-                                 folder_plateau=(210, 255))
+                                 folder_plateau=(200, 255))
 
     assert [n for n, _ in calls] == [6]
     assert result.flagged is None
     assert result.seed == 227
-    assert result.value == 227
-    assert result.plateau == (210, 255)
+    assert result.value == 207
+    assert result.plateau == (200, 255)
 
 
-def test_cheap_path_never_goes_above_the_folder_plateaus_safe_pick(monkeypatch):
-    # Seed 242 is inside (220, 250), but full detection on this folder would
-    # pick 250 - 20 = 230: the seed itself sits where short lines were lost.
+def test_cheap_path_is_not_bounded_by_the_folder_plateaus_top(monkeypatch):
+    # The folder plateau is an intersection of other files' plateaus: its top
+    # says nothing about this file's own top, but this file's seed sits at or
+    # just under it (XWZ 173: folder top 252, own plateau 217-247).
     _fake_source(monkeypatch, _interleave([_glyph_strip()] * 3, [_ramp_strip()] * 3))
 
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
@@ -729,17 +923,18 @@ def test_cheap_path_never_goes_above_the_folder_plateaus_safe_pick(monkeypatch):
 
     assert result.flagged is None
     assert result.seed == 242
-    assert result.value == 230
+    assert result.value == 222
 
 
-def test_cheap_path_never_goes_below_a_narrow_folder_plateau(monkeypatch):
-    dim = _glyph_strip(core=(235,) * 3)   # seed 227
+@pytest.mark.parametrize("folder", [(220, 235), (215, 255)])
+def test_cheap_path_never_goes_below_the_folder_plateau_and_says_so(monkeypatch, folder):
+    dim = _glyph_strip(core=(235,) * 3)   # seed 227; 227 - 20 = 207 would leave the plateau
     _fake_source(monkeypatch, _interleave([dim] * 3, [_ramp_strip()] * 3))
 
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
-                                 folder_plateau=(220, 235))
+                                 folder_plateau=folder)
 
-    assert result.value == 220          # 235 - 20 = 215 would leave the plateau
+    assert result.value == folder[0]
     assert result.flagged == "narrow-plateau?"
 
 

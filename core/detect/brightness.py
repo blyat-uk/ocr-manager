@@ -37,10 +37,16 @@ gate_floor + 5 ("bias high"). Running the real OCR pass at those picks lost
 short subtitle lines on 4 of 13 reference projects, every loss 0-10 below the
 plateau top; see PICK_BELOW_TOP.
 
+Text strips that verification could not use because they read nowhere in
+its window (or only at its lowest threshold) are re-read once at their own
+seed threshold; any that read there are a dimmer style the window never saw,
+flagged "dim-text?".
+
 Cheap path (`folder_plateau` given): 6 frames, analytic seed only. A seed
-inside the folder plateau is accepted, capped at the plateau's own pick;
-otherwise the result is flagged "escalate" for the caller to re-run full
-detection.
+inside the folder plateau is accepted and picked PICK_BELOW_TOP below itself
+(a file's own seed sits at or just under its own plateau top), never below
+the plateau's start; otherwise the result is flagged "escalate" for the
+caller to re-run full detection.
 
 Which results a caller may apply without review: `BrightnessResult.
 auto_applicable`. No Qt imports (core/detect/ is Qt-free).
@@ -93,8 +99,9 @@ CHEAP_SAMPLE_FRAMES = 6
 # sample misses. Each round's slot offset puts its frames between the earlier
 # rounds' frames.
 SAMPLE_ROUND_PHASES = (0.5, 0.0, 0.25)
-# Fewer text strips than this after every round: the plateau's top is not
-# trustworthy (see above), so the result is flagged "thin-evidence?".
+# Fewer strips than this that verification could use as evidence (see
+# _modal_text): the plateau's top is not trustworthy (see above), so the result
+# is flagged "thin-evidence?".
 THIN_EVIDENCE_STRIPS = 8
 
 # --- Analytic seed
@@ -117,10 +124,13 @@ VERIFY_STEP = 5
 # threshold's agreement AND the mean confidence clears MIN_MEAN_CONFIDENCE.
 AGREEMENT_TOLERANCE = 0.02
 MIN_MEAN_CONFIDENCE = 0.97
-# A strip is evidence only when its most frequent non-empty reading recurs at
-# this many thresholds: a logo or speck read once ('A', ':', 'MX' on the
-# reference corpus) is noise, while a dim line readable at two or three of the
-# lowest thresholds is exactly the evidence that must shrink the plateau.
+# A strip is evidence only when its modal reading is supported by this many
+# thresholds' readings, counting near matches (_near_reading): a logo or speck
+# read once ('A', ':', 'MX' on the reference corpus) is noise, while a dim
+# line readable at two or three of the lowest thresholds is exactly the
+# evidence that must shrink the plateau -- even though an eroding line rarely
+# reads the same string twice (CrossFire: 苍蝇 at 220, 苍绳 at 225; Body
+# Refining: 才也会有半分心动 then 半分).
 MIN_READING_REPEATS = 2
 # The pick sits this far below the plateau's top (never below its start).
 # The plateau is measured on sampled mid-subtitle frames; the OCR pass also
@@ -139,10 +149,11 @@ FLAG_NO_CLEAN_THRESHOLD = "no-clean-threshold"  # informational: empty frames tr
 FLAG_NEEDS_CROP = "needs-crop"              # no crop box: nothing measured
 FLAG_RANGES_EMPTY = "ranges-empty?"         # keep ranges select nothing in the file: nothing measured
 FLAG_NO_TEXT = "no-text"                    # no sampled strip had text: nothing to seed from
-FLAG_THIN_EVIDENCE = "thin-evidence?"       # fewer than THIN_EVIDENCE_STRIPS text strips
+FLAG_THIN_EVIDENCE = "thin-evidence?"       # fewer than THIN_EVIDENCE_STRIPS strips usable as evidence
 FLAG_COLOURED_TEXT = "coloured-text?"       # implausibly low seed; not verified
 FLAG_NO_PLATEAU = "no-plateau?"             # OCR verification found no valid run; value is the seed
 FLAG_NARROW_PLATEAU = "narrow-plateau?"     # plateau narrower than PICK_BELOW_TOP: no safe margin
+FLAG_DIM_TEXT = "dim-text?"                 # text strips unreadable in the window read at their own level
 FLAG_ESCALATE = "escalate"                  # cheap path: seed outside the folder plateau (or no text)
 FLAG_CANCELLED = "cancelled"                # cancel_check fired: result incomplete
 
@@ -184,7 +195,7 @@ class BrightnessResult:
         trips the gate). Every other flag -- alone or composed -- means the
         value was not measured, not verified, or not safe: needs-crop,
         ranges-empty?, no-text, thin-evidence?, coloured-text?, no-plateau?,
-        narrow-plateau?, escalate, cancelled."""
+        narrow-plateau?, dim-text?, escalate, cancelled."""
         return self.flagged is None or self.flagged == FLAG_NO_CLEAN_THRESHOLD
 
 
@@ -281,6 +292,11 @@ def _round_half_up(value: float, step: int) -> int:
     return int(math.floor(value / step + 0.5)) * step
 
 
+def _seed_from_level(level: float) -> int:
+    seed = _round_half_up(level, SEED_ROUND) - SEED_MARGIN
+    return int(min(SEED_MAX, max(SEED_MIN, seed)))
+
+
 def analytic_seed(strips: list[np.ndarray], polys_per_strip) -> int:
     """round5(median over frames of each frame's median glyph level) - 8,
     clamped to [100, 245]. Strips without polygons are ignored.
@@ -294,8 +310,7 @@ def analytic_seed(strips: list[np.ndarray], polys_per_strip) -> int:
               if level is not None]
     if not levels:
         raise ValueError("no strip has text polygons with glyph pixels to seed from")
-    seed = _round_half_up(float(np.median(levels)), SEED_ROUND) - SEED_MARGIN
-    return int(min(SEED_MAX, max(SEED_MIN, seed)))
+    return _seed_from_level(float(np.median(levels)))
 
 
 def gate_floor(empty_strips: list[np.ndarray]) -> int | None:
@@ -358,34 +373,60 @@ def _reading(pred) -> tuple[str, float]:
     return frame.text, float(frame.confidence)
 
 
-def _modal_text(readings: list[tuple[str, float]]) -> str | None:
-    """The strip's modal text over its NON-EMPTY readings (ties broken by mean
-    confidence, then by the lowest threshold) -- or None when the strip is no
-    evidence at all:
+def _is_subsequence(short: str, long: str) -> bool:
+    remaining = iter(long)
+    return all(ch in remaining for ch in short)
 
-    - its modal reading recurs at fewer than MIN_READING_REPEATS thresholds
-      (a logo or speck OCR'd once), or
-    - its readable thresholds do not form one band: text a subtitle carries
-      appears at every threshold between where clutter stops drowning it and
-      where erosion starts eating it, so readings scattered across the grid
-      (two or more unreadable thresholds between readable ones) are noise.
-      A single unreadable threshold inside the band is tolerated once.
+
+def _near_reading(a: str, b: str) -> bool:
+    """Two readings of the same line: at most one edit per three characters of
+    the longer (3 * Levenshtein <= its length), or the shorter -- at least two
+    characters -- is the longer with characters dropped (erosion removes
+    glyphs: 才也会有半分心动 -> 半分). Symmetric. Single-character readings
+    only match themselves, so one-character junk never supports anything."""
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if 3 * Levenshtein.distance(short, long) <= len(long):
+        return True
+    return len(short) >= 2 and _is_subsequence(short, long)
+
+
+def _modal_text(readings: list[tuple[str, float]]) -> str | None:
+    """The strip's modal text over its NON-EMPTY readings -- or None when the
+    strip is no evidence at all.
+
+    The modal is the distinct reading with the most support, where a
+    threshold's reading supports a candidate when it is a near match
+    (_near_reading) -- an eroding line reads slightly differently at each of
+    its last thresholds, and exact repeats would drop it. Ties go to the most
+    exact repeats, then the higher mean confidence, then the reading seen at
+    the lowest threshold.
+
+    None when:
+    - the modal's support is under MIN_READING_REPEATS (a logo or speck OCR'd
+      once), or
+    - the readable thresholds do not form one band: a subtitle's legibility
+      runs unbroken between where clutter stops drowning it and where erosion
+      starts eating it, so readings scattered across the grid (two or more
+      unreadable thresholds between readable ones, or more than one hole) are
+      noise. A single one-threshold hole is tolerated.
 
     Empty readings of an evidential strip are disagreement: a dim line
     readable only at the lowest thresholds shrinks the plateau to them.
     """
-    counts: Counter = Counter()
-    conf_sums: dict[str, float] = {}
-    readable = []
-    for j, (text, conf) in enumerate(readings):
-        if text:
-            readable.append(j)
-            counts[text] += 1
-            conf_sums[text] = conf_sums.get(text, 0.0) + conf
-    if not counts:
+    readable = [j for j, (text, _) in enumerate(readings) if text]
+    if not readable:
         return None
-    modal = max(counts, key=lambda t: (counts[t], conf_sums[t] / counts[t]))
-    if counts[modal] < MIN_READING_REPEATS:
+    texts = [readings[j][0] for j in readable]
+    first_seen: dict[str, int] = {}
+    conf_sums: dict[str, float] = {}
+    exact = Counter(texts)
+    for j in readable:
+        text, conf = readings[j]
+        first_seen.setdefault(text, j)
+        conf_sums[text] = conf_sums.get(text, 0.0) + conf
+    support = {c: sum(_near_reading(t, c) for t in texts) for c in exact}
+    modal = max(exact, key=lambda c: (support[c], exact[c], conf_sums[c] / exact[c], -first_seen[c]))
+    if support[modal] < MIN_READING_REPEATS:
         return None
     holes = [b - a - 1 for a, b in zip(readable, readable[1:]) if b - a > 1]
     if any(h > 1 for h in holes) or len(holes) > 1:
@@ -420,6 +461,74 @@ def _widest_run(valid: list[bool]) -> tuple[int, int] | None:
     return max(candidates, key=lambda r: (r[1] - r[0], r[1]))
 
 
+@dataclass
+class _Verification:
+    value: int
+    plateau: tuple[int, int] | None
+    curve: list[tuple[int, float]]
+    grid: list[int]
+    chosen: list[int]                 # indices into the strips verified
+    modals: list[str | None]          # per chosen strip; None = not evidence
+    readable: list[list[int]]         # per chosen strip: grid indices that read text
+    readings: list[list[tuple[str, float]]]  # per chosen strip, per grid threshold
+
+    @property
+    def evidence(self) -> int:
+        return sum(m is not None for m in self.modals)
+
+
+def _verify(strips: list[np.ndarray], seed: int, ocr_engine) -> _Verification:
+    grid = _threshold_grid(seed)
+    picks = _spread_pick(list(range(len(strips))), VERIFY_STRIPS)
+    if not grid or not picks:
+        return _Verification(seed, None, [(t, 0.0) for t in grid], grid, picks, [None] * len(picks),
+                             [[] for _ in picks], [[] for _ in picks])
+
+    empty = ("", 0.0)
+    readings = [[empty] * len(grid) for _ in picks]
+    batch, slots = [], []
+    for i, index in enumerate(picks):
+        for j, t in enumerate(grid):
+            masked = ocr_view.mask(strips[index], t)
+            if ocr_view.gate_fires(masked):
+                batch.append(masked)
+                slots.append((i, j))
+    if batch:
+        for (i, j), pred in zip(slots, _ocr_predict(ocr_engine, batch)):
+            readings[i][j] = _reading(pred)
+
+    modals = [_modal_text(per_t) for per_t in readings]
+    readable = [[j for j, (text, _) in enumerate(per_t) if text] for per_t in readings]
+
+    def result(value, plateau, curve):
+        return _Verification(value, plateau, curve, grid, picks, modals, readable, readings)
+
+    agreement = [0.0] * len(grid)
+    confidence = [0.0] * len(grid)
+    counted = 0
+    for per_t, modal in zip(readings, modals):
+        if modal is None:
+            continue
+        counted += 1
+        for j, (text, conf) in enumerate(per_t):
+            agreement[j] += _similarity(text, modal)
+            confidence[j] += conf
+    if counted == 0:
+        return result(seed, None, [(t, 0.0) for t in grid])
+    agreement = [a / counted for a in agreement]
+    confidence = [c / counted for c in confidence]
+    curve = [(t, agreement[j] * confidence[j]) for j, t in enumerate(grid)]
+
+    best = max(agreement)
+    valid = [agreement[j] >= best - AGREEMENT_TOLERANCE and confidence[j] >= MIN_MEAN_CONFIDENCE
+             for j in range(len(grid))]
+    run = _widest_run(valid)
+    if run is None:
+        return result(seed, None, curve)
+    lo, hi = grid[run[0]], grid[run[1]]
+    return result(max(lo, hi - PICK_BELOW_TOP), (lo, hi), curve)
+
+
 def verify_with_ocr(strips: list[np.ndarray], seed: int, ocr_engine
                     ) -> tuple[int, tuple[int, int] | None, list[tuple[int, float]]]:
     """OCR-verify thresholds around `seed` and pick one inside the plateau,
@@ -430,8 +539,10 @@ def verify_with_ocr(strips: list[np.ndarray], seed: int, ocr_engine
     OCR'd there, so it reads as empty here; the rest are OCR'd in ONE batch.
     Each strip's modal text and whether it counts as evidence: _modal_text().
     Each t scores:
-      agreement = mean over strips of 1 - CER(reading at t, strip's modal text)
-      confidence = mean over strips of the reading's confidence (0 if empty)
+      agreement = mean over evidential strips of 1 - CER(reading at t, the
+                  strip's modal text)
+      confidence = mean over evidential strips of the reading's confidence
+                  (0 if empty)
     A t is valid when agreement >= best agreement - 0.02 and confidence >=
     0.97. The plateau is the widest run of valid thresholds (_widest_run()),
     and the pick is PICK_BELOW_TOP below its top, or its start if that is
@@ -439,49 +550,34 @@ def verify_with_ocr(strips: list[np.ndarray], seed: int, ocr_engine
 
     When no t is valid the plateau is None and the value is the seed.
     """
-    grid = _threshold_grid(seed)
-    chosen = _spread_pick(list(strips), VERIFY_STRIPS)
-    if not grid or not chosen:
-        return seed, None, [(t, 0.0) for t in grid]
+    v = _verify(strips, seed, ocr_engine)
+    return v.value, v.plateau, v.curve
 
-    empty = ("", 0.0)
-    readings = [[empty] * len(grid) for _ in chosen]
-    batch, slots = [], []
-    for i, strip in enumerate(chosen):
-        for j, t in enumerate(grid):
-            masked = ocr_view.mask(strip, t)
-            if ocr_view.gate_fires(masked):
-                batch.append(masked)
-                slots.append((i, j))
-    if batch:
-        for (i, j), pred in zip(slots, _ocr_predict(ocr_engine, batch)):
-            readings[i][j] = _reading(pred)
 
-    agreement = [0.0] * len(grid)
-    confidence = [0.0] * len(grid)
-    counted = 0
-    for per_t in readings:
-        modal = _modal_text(per_t)
-        if modal is None:
+def _dim_text_rereads(strips: list[np.ndarray], polys_per_strip, verification: _Verification,
+                      ocr_engine) -> list[tuple[int, int, str]]:
+    """Re-read, at its own threshold, every verified strip that was no
+    evidence because it read nowhere in the window or only at the window's
+    lowest threshold -- a subtitle style dimmer than the median, which the
+    seed's window never reaches. Its own threshold is the seed formula applied
+    to that strip alone. Masked strips that do not trip the gate are not
+    OCR'd, as in verification; the rest go in one batch. Returns (strip index,
+    threshold, text read) for each strip re-read."""
+    batch, meta = [], []
+    for k, index in enumerate(verification.chosen):
+        if verification.modals[k] is not None or verification.readable[k] not in ([], [0]):
             continue
-        counted += 1
-        for j, (text, conf) in enumerate(per_t):
-            agreement[j] += _similarity(text, modal)
-            confidence[j] += conf
-    if counted == 0:
-        return seed, None, [(t, 0.0) for t in grid]
-    agreement = [a / counted for a in agreement]
-    confidence = [c / counted for c in confidence]
-    curve = [(t, agreement[j] * confidence[j]) for j, t in enumerate(grid)]
-
-    best = max(agreement)
-    valid = [agreement[j] >= best - AGREEMENT_TOLERANCE and confidence[j] >= MIN_MEAN_CONFIDENCE
-             for j in range(len(grid))]
-    run = _widest_run(valid)
-    if run is None:
-        return seed, None, curve
-    lo, hi = grid[run[0]], grid[run[1]]
-    return max(lo, hi - PICK_BELOW_TOP), (lo, hi), curve
+        level = _glyph_level(strips[index], polys_per_strip[index])
+        if level is None:
+            continue
+        t = _seed_from_level(level)
+        masked = ocr_view.mask(strips[index], t)
+        if ocr_view.gate_fires(masked):
+            batch.append(masked)
+            meta.append((index, t))
+    if not batch:
+        return []
+    return [(index, t, _reading(pred)[0]) for (index, t), pred in zip(meta, _ocr_predict(ocr_engine, batch))]
 
 
 # --------------------------------------------------------------------------
@@ -500,10 +596,12 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
     a process-wide engine cache can supply them.
 
     With `folder_plateau` this is the cheap path: 6 frames, analytic seed
-    only. A seed inside the plateau becomes the value, capped the way full
-    detection picks (top - PICK_BELOW_TOP, never below the plateau's start);
-    otherwise the result carries flagged == "escalate" and the caller must run
-    full detection (call again without `folder_plateau`).
+    only. A seed inside the plateau gives the value seed - PICK_BELOW_TOP,
+    never below the plateau's start ("narrow-plateau?" when that clamp bites):
+    a file's own seed sits at or just under its own plateau top, which the
+    folder plateau's top does not bound. Otherwise the result carries
+    flagged == "escalate" and the caller must run full detection (call again
+    without `folder_plateau`).
 
     `cancel_check`: a zero-argument callable polled before each sampling
     round and before OCR verification; once it returns truthy the result is
@@ -545,8 +643,8 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
         if seed is None or not lo <= seed <= hi:
             fallback = DEFAULT_BRIGHTNESS if seed is None else seed
             return BrightnessResult(fallback, None, fallback, None, FLAG_ESCALATE, [])
-        flagged = FLAG_NARROW_PLATEAU if hi - lo < PICK_BELOW_TOP else None
-        return BrightnessResult(min(seed, max(lo, hi - PICK_BELOW_TOP)), (lo, hi), seed, None, flagged, [])
+        flagged = FLAG_NARROW_PLATEAU if seed - PICK_BELOW_TOP < lo else None
+        return BrightnessResult(max(lo, seed - PICK_BELOW_TOP), (lo, hi), seed, None, flagged, [])
 
     floor = gate_floor(empty_strips)
     # No empty strips: the floor was not measured, which is not evidence of clutter.
@@ -554,8 +652,6 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
     if seed is None:
         return BrightnessResult(DEFAULT_BRIGHTNESS, None, DEFAULT_BRIGHTNESS, floor,
                                 _compose_flag(flagged, FLAG_NO_TEXT), [])
-    if len(text_strips) < THIN_EVIDENCE_STRIPS:
-        flagged = _compose_flag(flagged, FLAG_THIN_EVIDENCE)
     if seed < IMPLAUSIBLE_SEED:
         # The min-channel mask erases coloured (e.g. yellow) glyphs at any
         # useful threshold; OCR around a meaningless seed proves nothing.
@@ -563,11 +659,16 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
 
     if _is_cancelled(cancel_check):
         return cancelled(seed, floor)
-    value, plateau, curve = verify_with_ocr(text_strips, seed, ocr_engine)
+    verification = _verify(text_strips, seed, ocr_engine)
+    value, plateau = verification.value, verification.plateau
+    if verification.evidence < THIN_EVIDENCE_STRIPS:
+        flagged = _compose_flag(flagged, FLAG_THIN_EVIDENCE)
     if plateau is None:
         flagged = _compose_flag(flagged, FLAG_NO_PLATEAU)
     elif plateau[1] - plateau[0] < PICK_BELOW_TOP:
         flagged = _compose_flag(flagged, FLAG_NARROW_PLATEAU)
+    if any(text for _, _, text in _dim_text_rereads(text_strips, text_polys, verification, ocr_engine)):
+        flagged = _compose_flag(flagged, FLAG_DIM_TEXT)
     if floor is not None and value < floor + GATE_FLOOR_MARGIN:
         flagged = _compose_flag(flagged, FLAG_NO_CLEAN_THRESHOLD)
-    return BrightnessResult(int(value), plateau, seed, floor, flagged, curve)
+    return BrightnessResult(int(value), plateau, seed, floor, flagged, verification.curve)

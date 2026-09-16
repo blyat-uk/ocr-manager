@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 
 import av
 import cv2
@@ -263,12 +264,18 @@ def grab_ocr_strips(video_path: str, crop_box, times: list[float]) -> list[np.nd
     def work(chunk: list[int]) -> None:
         # Each worker seeks forward through its own ascending share of the
         # times; one container per thread (PyAV releases the GIL to decode).
-        try:
-            with Capture(video_path, decode_target_height=decode_height, crop_rect=graph_crop) as cap:
-                read_chunk(cap, chunk)
-        except FETCH_ERRORS as exc:
-            logger.warning("%s: dropped %d frame(s), capture failed (%s: %s)",
-                           video_path, sum(results[i] is None for i in chunk), type(exc).__name__, exc)
+        # Only OPENING the container is guarded here: seek/read failures are
+        # handled per frame in read_chunk, and anything else raised there is a
+        # bug to surface, not a capture failure to log away.
+        with ExitStack() as stack:
+            try:
+                cap = stack.enter_context(
+                    Capture(video_path, decode_target_height=decode_height, crop_rect=graph_crop))
+            except FETCH_ERRORS as exc:
+                logger.warning("%s: dropped %d frame(s), capture failed to open (%s: %s)",
+                               video_path, len(chunk), type(exc).__name__, exc)
+                return
+            read_chunk(cap, chunk)
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr-view-grab") as pool:
         list(pool.map(work, [order[k::workers] for k in range(workers)]))

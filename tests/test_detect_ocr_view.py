@@ -235,6 +235,16 @@ def _encode_cmd(path, size, pix_fmt, frames, gop, hdr):
             *(_HDR_ARGS if hdr else []), str(path)]
 
 
+def _stream_pix_fmt(path):
+    import av
+
+    container = av.open(str(path))
+    try:
+        return container.streams.video[0].codec_context.pix_fmt
+    finally:
+        container.close()
+
+
 def _stream_is_pq(path):
     import av
     from videocr import pyav_adapter
@@ -252,8 +262,9 @@ def encoder(tmp_path_factory):
 
     Probes this ffmpeg build once per (pix_fmt, hdr) with a tiny clip and
     SKIPS -- visibly, with the reason -- when libx264 cannot write that pixel
-    format or the PQ tag does not reach the stream, instead of failing on a
-    missing build feature."""
+    format (fails, or silently writes a different one, e.g. 8-bit for 10-bit)
+    or the PQ tag does not reach the stream, instead of failing on a missing
+    build feature."""
     probe_dir = tmp_path_factory.mktemp("encoder-probe")
     problems = {}
 
@@ -266,6 +277,9 @@ def encoder(tmp_path_factory):
                 last_line = (result.stderr.strip().splitlines() or ["no error output"])[-1]
                 problems[key] = (f"this ffmpeg cannot encode {pix_fmt}{' with PQ setparams' if hdr else ''} "
                                  f"via libx264: {last_line}")
+            elif _stream_pix_fmt(probe) != pix_fmt:
+                problems[key] = (f"this ffmpeg's libx264 wrote {_stream_pix_fmt(probe)} when asked for {pix_fmt} "
+                                 f"(no {pix_fmt} support; it picks the nearest format silently)")
             elif hdr and not _stream_is_pq(probe):
                 problems[key] = "this ffmpeg build does not write the PQ transfer tag via setparams"
             else:
@@ -399,6 +413,14 @@ def test_a_frame_that_fails_to_seek_is_dropped_and_the_rest_keep_their_order(mon
 
     assert [int(s[0, 0, 0]) for s in strips] == [75, 25, 100, 200, 125, 175, 150]
     assert all(s.shape == (40, 640, 3) for s in strips)
+
+
+def test_a_bug_while_reading_is_raised_not_logged_as_a_capture_failure(monkeypatch):
+    # round(NaN * fps) is a programming error, not an I/O failure: it must not
+    # be swallowed as "capture failed" and silently drop the rest of a chunk.
+    monkeypatch.setattr(OV, "Capture", _fake_capture_class())
+    with pytest.raises(ValueError):
+        OV.grab_ocr_strips("fake.mp4", (0, 300, 640, 40), [1.0, float("nan")])
 
 
 def test_a_decoder_that_cannot_open_drops_its_frames_instead_of_raising(monkeypatch):
