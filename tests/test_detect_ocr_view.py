@@ -4,6 +4,7 @@ The mirror tests drive the real `videocr.video.Video.run_ocr` (with a fake
 capture, or a real one on encoded clips) and compare what it hands the OCR
 engine against ocr_view's own view of the same frames.
 """
+import logging
 import subprocess
 
 import cv2
@@ -366,9 +367,10 @@ def test_a_file_that_cannot_be_opened_yields_no_strips(tmp_path):
     assert OV.grab_ocr_strips(str(tmp_path / "missing.mp4"), (0, 0, 100, 40), [1.0, 2.0]) == []
 
 
-def _fake_capture_class(fail_seek_at=None, fail_open_decoder=False):
+def _fake_capture_class(fail_seek_at=None, fail_open_decoder=False, fail_close=None):
     """640x360 @ 25 fps; frame k is filled with k % 256 so a strip names the
-    frame it came from."""
+    frame it came from. fail_close: "decoder" (the per-worker captures) or
+    "every capture" raise an FFmpegError while closing."""
 
     class FakeCapture:
         def __init__(self, path, use_gpu=True, decode_target_height=None, crop_rect=None):
@@ -382,6 +384,9 @@ def _fake_capture_class(fail_seek_at=None, fail_open_decoder=False):
             return self
 
         def __exit__(self, *exc):
+            if fail_close == "every capture" or (fail_close == "decoder" and self._decoder):
+                import av
+                raise av.error.FFmpegError(5, "close failed")
             return False
 
         def get(self, prop):
@@ -426,3 +431,18 @@ def test_a_bug_while_reading_is_raised_not_logged_as_a_capture_failure(monkeypat
 def test_a_decoder_that_cannot_open_drops_its_frames_instead_of_raising(monkeypatch):
     monkeypatch.setattr(OV, "Capture", _fake_capture_class(fail_open_decoder=True))
     assert OV.grab_ocr_strips("fake.mp4", (0, 300, 640, 40), [1.0, 2.0]) == []
+
+
+@pytest.mark.parametrize("fail_close", ["decoder", "every capture"])
+def test_an_error_closing_a_capture_is_logged_not_raised(monkeypatch, caplog, fail_close):
+    # By the time a container closes, its frames have been read: a failing
+    # close must not throw them away or abort detection.
+    monkeypatch.setattr(OV, "Capture", _fake_capture_class(fail_close=fail_close))
+
+    with caplog.at_level(logging.WARNING, logger=OV.logger.name):
+        strips = OV.grab_ocr_strips("fake.mp4", (0, 300, 640, 40), [1.0, 2.0, 3.0])
+        timing = OV.video_timing("fake.mp4")
+
+    assert [int(s[0, 0, 0]) for s in strips] == [25, 50, 75]
+    assert timing == (100.0, 25.0)
+    assert "close failed" in caplog.text

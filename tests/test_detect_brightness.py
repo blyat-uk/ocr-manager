@@ -499,6 +499,19 @@ class _ExplodingOCR:
         raise AssertionError("the OCR engine must not be used on this path")
 
 
+class _FnOCR:
+    """answer(identity, threshold) -> text, both read back out of a
+    _probe_strip's pixels."""
+
+    def __init__(self, answer, n):
+        self.answer, self.n = answer, n
+        self.calls = 0
+
+    def predict(self, images):
+        self.calls += 1
+        return [_ocr_item(self.answer(_identity(img, self.n), _masked_threshold(img)), 0.99) for img in images]
+
+
 def _fake_source(monkeypatch, strips=None, rounds=None):
     """Stand in for the frame source: every call returns `strips` (cycled),
     or the next entry of `rounds`, as (time, strip) pairs with distinct times.
@@ -521,12 +534,31 @@ def _fake_neighbours(monkeypatch, provider):
     Returns the list of centre-time batches requested."""
     requested = []
 
-    def fake(video_path, crop_box, time_ranges, centres):
+    def fake(video_path, crop_box, time_ranges, centres, cancel_check=None):
         requested.append(list(centres))
         return {t: [(t + 0.4 * (k + 1), strip) for k, strip in enumerate(provider(t))] for t in centres}
 
     monkeypatch.setattr(B, "_neighbour_strips", fake)
     return requested
+
+
+_REAL_NEIGHBOUR_STRIPS = B._neighbour_strips
+
+
+def _real_neighbour_fetch(monkeypatch, provider, duration=600.0, fps=25.0):
+    """Run the real _neighbour_strips (clamping, keep ranges, fetch chunks)
+    over a fake file of `duration` s at `fps` whose frame at time t is
+    provider(t). Returns the times requested, one list per grab."""
+    grabs = []
+
+    def grab(video_path, crop_box, times):
+        grabs.append(list(times))
+        return [(t, provider(t)) for t in times]
+
+    monkeypatch.setattr(B, "_neighbour_strips", _REAL_NEIGHBOUR_STRIPS)
+    monkeypatch.setattr(OV, "video_timing", lambda video_path: (duration, fps))
+    monkeypatch.setattr(OV, "grab_ocr_strips_at", grab)
+    return grabs
 
 
 def _interleave(a, b):
@@ -772,14 +804,14 @@ class _BrightOnlyOCR(_GlyphReadingOCR):
         return out
 
 
-@pytest.mark.parametrize("dim_core", [
-    200,   # reads nowhere in the window (seed 242 -> 217..252)
-    217,   # reads only at the window's lowest threshold
+@pytest.mark.parametrize("dim_core, ocr_calls", [
+    (200, 2),   # reads nowhere in the window (seed 242 -> 217..252): re-read at its own level, one batch
+    (217, 1),   # reads at the window's lowest threshold: that reading is its line, no re-read
 ])
-def test_text_strips_too_dim_for_the_window_are_re_read_at_their_own_level(monkeypatch, dim_core):
+def test_text_strips_too_dim_for_the_window_are_flagged(monkeypatch, dim_core, ocr_calls):
     # Controller's scenario: 11 bright strips set the seed; 5 strips of a
-    # dimmer style never enter the plateau. Re-read at their own seed
-    # threshold (round5(level) - 8) they read, so the dim style is reported.
+    # dimmer style never enter the plateau. Their line reads at their own
+    # level but not at the pick, and no neighbour frame shows it there.
     text = [_glyph_strip() for _ in range(11)] + [_glyph_strip(core=(dim_core,) * 3) for _ in range(5)]
     _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
     ocr = _GlyphReadingOCR()
@@ -790,7 +822,7 @@ def test_text_strips_too_dim_for_the_window_are_re_read_at_their_own_level(monke
     assert result.plateau == (217, 247)
     assert result.flagged == "dim-text?"
     assert not result.auto_applicable
-    assert ocr.calls == 2, "verification and the re-reads are one OCR batch each"
+    assert ocr.calls == ocr_calls, "verification, then at most one batch of own-level re-reads"
 
 
 def test_a_dim_strip_that_would_not_trip_the_gate_at_its_own_level_is_not_re_read(monkeypatch):
@@ -859,7 +891,7 @@ def test_a_dim_strip_whose_neighbours_read_its_line_at_the_pick_was_a_fade(monke
     assert result.flagged is None
     assert result.auto_applicable
     assert len(requested) == 1 and len(requested[0]) == 5, "one fetch for the five dim strips"
-    assert ocr.calls == 2, "own-level re-reads and neighbours share one OCR batch"
+    assert ocr.calls == 3, "verification, the own-level re-reads, then the neighbours: one batch each"
 
 
 @pytest.mark.parametrize("neighbour", [
@@ -919,21 +951,25 @@ def test_a_strip_that_reads_at_the_pick_itself_is_not_checked_for_dim_text(monke
     assert requested == []
 
 
-def test_a_strip_used_as_evidence_is_not_checked_for_dim_text_even_at_a_bridged_dip(monkeypatch):
+@pytest.mark.parametrize("neighbours, flagged", [
+    ([_probe_strip(16, 17)], None),   # a neighbour frame reads the line at the pick
+    ([], "dim-text?"),                # nothing shows it there
+])
+def test_an_evidential_strip_that_misses_the_pick_is_checked_like_any_other(monkeypatch, neighbours, flagged):
     # Strip 0 misses one threshold -- exactly the pick, 235 -- inside a band
-    # it otherwise reads; the plateau bridges that dip. The strip is evidence
-    # already, so the dim-text check must leave it alone.
-    texts = [f"第{i}行字幕文本" for i in range(16)]
-    steady = {t: ("ok", 0.99) for t in range(220, 256, 5)}
-    holed = {t: v for t, v in steady.items() if t != 235}
-    _fake_source(monkeypatch, [_probe_strip(i, 16) for i in range(16)] + [_ramp_strip(top=200)] * 8)
-    requested = _fake_neighbours(monkeypatch, lambda t: [])
+    # it otherwise reads; the plateau bridges that dip. Being evidence says
+    # nothing about the pick: its line is not read there on this frame.
+    line = "第0行字幕文本"
+    holed = _FnOCR(lambda i, t: "" if i == 0 and t == 235 else (line if i in (0, 16) else f"第{i}行字幕文本"), 17)
+    strips = [_probe_strip(i, 16) for i in range(16)]
+    _fake_source(monkeypatch, strips + [_ramp_strip(top=200)] * 8)
+    requested = _fake_neighbours(monkeypatch, lambda t: neighbours)
 
-    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ScriptedOCR([holed] + [steady] * 15, texts))
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), holed)
 
     assert result.plateau == (220, 255) and result.value == 235
-    assert result.flagged is None
-    assert requested == []
+    assert result.flagged == flagged
+    assert requested == [[100.0]], "neighbours fetched for strip 0 only"
 
 
 @pytest.mark.parametrize("t, duration, spans, expected", [
@@ -948,15 +984,292 @@ def test_neighbour_times_stay_inside_the_file_and_the_keep_range(t, duration, sp
     assert np.allclose(B._neighbour_times(t, duration, 25.0, spans), expected)
 
 
+def test_neighbour_frames_are_fetched_only_inside_the_keep_range(monkeypatch):
+    # The dim strips sit at 111-115 s, the keep range is 111.0-115.5 s. The
+    # OCR pass never reads a frame outside it, so no such frame may count as
+    # the line surviving: 110.2, 110.6 and 115.8 must never be fetched.
+    _fade_scene(monkeypatch, lambda t: [])
+    grabs = _real_neighbour_fetch(monkeypatch, lambda t: _glyph_strip())
+
+    B.detect_brightness("v.mp4", CROP, [(111.0, 115.5)], _FakeDet(), _MarkedOCR())
+
+    fetched = sorted(t for grab in grabs for t in grab)
+    assert len(fetched) == 18
+    assert all(111.0 <= t <= 115.5 for t in fetched), fetched
+
+
+class _DimReadsOCR:
+    """Strips whose glyph cores reach 250 read one bright line; dimmer strips
+    read reads(threshold). Either reads only while half its cores survive."""
+
+    def __init__(self, reads):
+        self.reads = reads
+        self.calls = 0
+
+    def predict(self, images):
+        self.calls += 1
+        out = []
+        for img in images:
+            line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
+            if np.count_nonzero(line.min(axis=2)) < _GlyphReadingOCR.CORE_PX // 2:
+                out.append(_ocr_item("", 0.0))
+            elif int(line.max()) >= 250:
+                out.append(_ocr_item("你好世界今天", 0.99))
+            else:
+                out.append(_ocr_item(self.reads(_masked_threshold(img)), 0.99))
+        return out
+
+
+@pytest.mark.parametrize("n_dim", [1, 4])
+@pytest.mark.parametrize("at_217, at_222", [
+    ("罢了", "罢"),          # Stay Low Profile
+    ("10", "1"),             # Legend of Soldier's countdown
+    ("芊芊", "芊"),          # Legendary Twins
+    ("好", "奷"),            # Legendary Twins
+    ("苍蝇", "苍绳"),        # CrossFire
+    ("天地玄黄宇宙", "天也玄簧宇由"),   # six characters, three substitutions
+])
+def test_short_dim_lines_the_pick_erases_are_flagged(monkeypatch, n_dim, at_217, at_222):
+    # Reviewer's scenario: a line readable only at 217 and 222 (glyph core
+    # 223), reading differently at each -- too short or too changed to count
+    # as evidence, so the plateau (217-247) ignores it and the pick 227
+    # erases it. Its most complete reading, 217's, is not read at the pick.
+    strips = [_level_strip(250) for _ in range(16 - n_dim)] + [_level_strip(223) for _ in range(n_dim)]
+    _fake_source(monkeypatch, strips + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(),
+                                 _DimReadsOCR(lambda t: at_217 if t == 217 else at_222))
+
+    assert result.plateau == (217, 247) and result.value == 227
+    assert result.flagged == "dim-text?"
+    assert not result.auto_applicable
+
+
+class _KeyedOCR(_GlyphReadingOCR):
+    """Reads while half the glyph cores survive: keys[k] when a 255 marker sits
+    at row -3, column 10 + k; otherwise the bright line."""
+
+    BRIGHT = "你好世界今天"
+
+    def __init__(self, keys):
+        super().__init__()
+        self.keys = keys
+
+    def predict(self, images):
+        self.calls += 1
+        out = []
+        for img in images:
+            line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
+            if np.count_nonzero(line.min(axis=2)) < self.CORE_PX // 2:
+                out.append(_ocr_item("", 0.0))
+                continue
+            marked = np.flatnonzero(img[-3, 10:10 + len(self.keys), 0] == 255)
+            out.append(_ocr_item(self.keys[marked[0]] if marked.size else self.BRIGHT, 0.99))
+        return out
+
+
+def _keyed(strip, k):
+    strip = strip.copy()
+    strip[-3, 10 + k] = 255
+    return strip
+
+
+def _partly_dim_strip():
+    """A dim-style strip (core 200) whose first 7 of 12 glyphs are a little
+    brighter (235): at the pick 227 more than half the cores survive, so OCR
+    reads what is left of the line -- a fragment."""
+    strip = _glyph_strip(core=(200,) * 3)
+    for k in range(7):
+        x0 = GLYPH_X0 + k * GLYPH_PITCH
+        strip[GLYPH_Y0 + 1:GLYPH_Y1 - 1, x0 + 1:x0 + GLYPH_W - 1] = 235
+    return strip
+
+
+FULL_LINE = "旁白第二种样式文本"
+
+
+@pytest.mark.parametrize("own, neighbour_text, neighbour, flagged", [
+    # control: a fade -- the neighbour shows the dim strip's whole line at the pick
+    (FULL_LINE, FULL_LINE, "bright", None),
+    # a DIFFERENT bright line that happens to contain the dim line's characters in order
+    ("你的", "你说的对", "bright", "dim-text?"),
+    # the dim style survives the pick only as a fragment of its line
+    (FULL_LINE, "样式", "partly dim", "dim-text?"),
+    (FULL_LINE, "第二种样", "partly dim", "dim-text?"),
+    # the dim reading carries clutter; the neighbour shows an unrelated short line
+    ("旁白文字\n12:30", "12", "bright", "dim-text?"),
+])
+def test_only_a_neighbour_showing_the_same_line_makes_a_dim_strip_a_fade(monkeypatch, own, neighbour_text,
+                                                                          neighbour, flagged):
+    # Reviewer's discriminator scenarios: 11 bright strips, 5 dim ones (core
+    # 200) reading `own` at their own level 192; the pick is 227. One
+    # neighbour frame reads `neighbour_text` there, the rest stay dim.
+    keys = [own, neighbour_text]
+    dim = _keyed(_glyph_strip(core=(200,) * 3), 0)
+    base = _glyph_strip() if neighbour == "bright" else _partly_dim_strip()
+    _fake_source(monkeypatch, [_glyph_strip() for _ in range(11)] + [dim] * 5 + [_ramp_strip(top=200)] * 8)
+    _fake_neighbours(monkeypatch, lambda t: [_keyed(base, 1)] + [_glyph_strip(core=(200,) * 3)] * 3)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _KeyedOCR(keys))
+
+    assert result.value == 227
+    assert result.flagged == flagged
+
+
+def test_a_fragment_that_wins_the_modal_does_not_hide_the_full_line(monkeypatch):
+    # Strip 15 reads the full line at 220 and 225, and only the fragment 样式
+    # from 230 up: 样式 is its modal, the plateau is 230-255 and the pick 235
+    # keeps only the fragment. Its most complete reading is the full line.
+    answer = _FnOCR(lambda i, t: f"字幕第{i}行文本" if i < 15 else (FULL_LINE if t in (220, 225) else "样式"), 16)
+    _fake_source(monkeypatch, [_probe_strip(i, 16) for i in range(16)] + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), answer)
+
+    assert result.plateau == (230, 255) and result.value == 235
+    assert result.flagged == "dim-text?"
+    assert not result.auto_applicable
+
+
+@pytest.mark.parametrize("clutter, fetched, flagged", [
+    # 你好世界\n1 against 你好世界: 2 edits in 6 characters, within a third --
+    # the pick reads the line, nothing to check
+    ("\n1", False, None),
+    # a longer clutter line is more than a third of the reading: the pick's
+    # clean reading is not "the same line" and no neighbour carries the
+    # clutter, so the strip goes to review
+    ("\n12:30", True, "dim-text?"),
+])
+def test_clutter_on_the_lowest_threshold_reading(monkeypatch, clutter, fetched, flagged):
+    answer = _FnOCR(lambda i, t: f"字幕第{i}行文本" if i < 15 else ("你好世界" + clutter if t == 220 else "你好世界"), 16)
+    _fake_source(monkeypatch, [_probe_strip(i, 16) for i in range(16)] + [_ramp_strip(top=200)] * 8)
+    requested = _fake_neighbours(monkeypatch, lambda t: [])
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), answer)
+
+    assert result.plateau == (225, 255) and result.value == 235
+    assert result.flagged == flagged
+    assert bool(requested) is fetched
+
+
+def test_a_strip_the_gate_skips_at_the_pick_has_no_reading_there(monkeypatch):
+    # Strip 15's centre square holds only a 222-level speck: the OCR pass
+    # OCRs that frame at 220 and skips it from 225 up, whatever OCR would
+    # read. At the pick (235) its line is gone.
+    strips = [_probe_strip(i, 16) for i in range(16)]
+    strips[15][:, CENTRE_X0:CENTRE_X0 + H] = 0
+    strips[15][27, CENTRE_X0 + 20] = 222
+    _fake_source(monkeypatch, strips + [_ramp_strip(top=200)] * 8)
+    requested = _fake_neighbours(monkeypatch, lambda t: [])
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _FnOCR(lambda i, t: f"字幕第{i}行文本", 16))
+
+    assert result.plateau == (220, 255) and result.value == 235
+    assert result.flagged == "dim-text?"
+    assert requested == [[115.0]]
+
+
+# Pairs of DIFFERENT real subtitle lines from the reference corpus that a
+# subsequence rule pairs up: a short line contained in a longer one.
+DIFFERENT_LINES = [
+    ("师父", "是我害了师父们"),
+    ("老祖", "姬家老祖姬无法"),
+    ("叶辰", "他自称叶辰"),
+    ("其实", "其实我的替身早已是抱着必死的决心"),
+    ("宠物", "要直接收他为自己的怪兽宠物"),
+    ("冬梨", "我们小冬梨真乖"),
+    ("师父", "只要你答应师父日后好好修炼"),
+    # round 3's corpus run: a fading strip's own-level reading, and a neighbour
+    # frame that showed the next or previous line instead
+    ("救命丹用给刚才那个女孩了", "抱歉"),
+    ("我免费给你挖来", "若往后姐姐你要矿石"),
+    ("只待阵基落成", "启动大阵"),
+    ("他自称叶辰", "谎称自己是挖矿人"),
+    ("便是关乎诸天安危", "神女"),
+    ("届时", "晉升大帝"),
+    ("这诸天万域", "帝望终究是废物一个"),
+    ("修成正果", "今日便让天地为庐"),
+    # an empty reading never shows a line
+    ("", "届时"),
+]
+
+# Round 3's corpus run: each of the twelve fading strips' own-level reading,
+# and the neighbour reading of the same line at the pick.
+SAME_LINE_FADES = [
+    ("才也不会有半分心动", "刚才也不会有半分心动"),        # Body Refining 010
+    ("救命丹用给刚才那个女孩了", "救命丹用给刚才那个女孩了"),  # XWZ 169
+    ("我免费给你挖来", "我免费给你挖来"),                  # XWZ 170
+    ("只待阵基落成", "只待阵基落成"),
+    ("他自称叶辰", "他自称叶辰"),
+    ("便是关乎诸天安危", "便是关乎诸天安危"),
+    ("届时", "届时"),                                      # XWZ 171
+    ("杀入阳星救", "杀入九阳星救人"),                      # XWZ 172
+    ("休想过去", "休想过去"),
+    ("这诸天万域", "这诸天万域"),
+    ("叶辰", "叶辰"),
+    ("修成正果", "修成正果"),                              # XWZ 173
+]
+
+
+@pytest.mark.parametrize("a, b", DIFFERENT_LINES)
+def test_different_lines_and_fragments_are_not_the_same_line(a, b):
+    assert not B._same_line(a, b)
+    assert not B._same_line(b, a)
+
+
+@pytest.mark.parametrize("a, b", SAME_LINE_FADES)
+def test_readings_of_one_fading_line_are_the_same_line(a, b):
+    assert B._same_line(a, b)
+    assert B._same_line(b, a)
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("你好世界\n1", "你好世界", True),   # a clutter line's newline and text are edits: 2 in 6
+    ("你好\n1", "你好", False),          # 2 in 4: a short line cannot absorb one
+    ("你 好 世 界", "你好世界", True),    # spaces removed, as PredictedSubtitle.is_similar_to does
+    ("", "", False),                     # an empty reading never matches, not even another empty one
+])
+def test_same_line_normalisation(a, b, same):
+    assert B._same_line(a, b) is same
+    assert B._same_line(b, a) is same
+
+
+@pytest.mark.parametrize("cancel_at_poll, ocr_calls, frames_fetched", [
+    (3, 1, 0),        # poll 3: before the own-level re-read batch
+    (4, 2, 0),        # poll 4: before the first neighbour fetch
+    (5, 2, 8),        # poll 5: between the first and second fetch
+    (7, 2, 20),       # poll 7: before the neighbour OCR batch
+    (None, 3, 20),    # never: the check completes
+])
+def test_cancellation_is_polled_through_the_dim_text_check(monkeypatch, cancel_at_poll, ocr_calls, frames_fetched):
+    # 5 dim strips (111-115 s) re-read at their own level; 4 neighbours each,
+    # 20 frames fetched 8 at a time. Polls 1-2 are sampling and verification.
+    _fade_scene(monkeypatch, lambda t: [])
+    grabs = _real_neighbour_fetch(monkeypatch, lambda t: _glyph_strip())
+    polls = []
+
+    def cancel_check():
+        polls.append(1)
+        return cancel_at_poll is not None and len(polls) >= cancel_at_poll
+
+    ocr = _MarkedOCR()
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr, cancel_check=cancel_check)
+
+    assert result.flagged == ("cancelled" if cancel_at_poll else None)
+    assert ocr.calls == ocr_calls
+    assert sum(len(grab) for grab in grabs) == frames_fetched
+
+
 def test_text_strips_that_read_nothing_even_at_their_own_level_are_not_dim_text(monkeypatch):
     text = [_glyph_strip() for _ in range(11)] + [_glyph_strip(core=(200,) * 3) for _ in range(5)]
     _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+    requested = _fake_neighbours(monkeypatch, lambda t: [])
 
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _BrightOnlyOCR())
 
     assert result.plateau == (217, 247)
     assert result.flagged is None
     assert result.auto_applicable
+    assert requested == [], "no line to lose: no neighbour frames fetched"
 
 
 def test_detect_flags_a_verification_that_finds_no_plateau(monkeypatch):
@@ -1082,6 +1395,18 @@ def test_cheap_path_is_not_bounded_by_the_folder_plateaus_top(monkeypatch):
     assert result.flagged is None
     assert result.seed == 242
     assert result.value == 222
+
+
+def test_cheap_path_landing_exactly_on_the_folder_plateaus_start_is_not_narrow(monkeypatch):
+    dim = _glyph_strip(core=(235,) * 3)   # seed 227; 227 - 20 = 207, the plateau's start: no clamp
+    _fake_source(monkeypatch, _interleave([dim] * 3, [_ramp_strip()] * 3))
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
+                                 folder_plateau=(207, 255))
+
+    assert result.value == 207
+    assert result.flagged is None
+    assert result.auto_applicable
 
 
 @pytest.mark.parametrize("folder", [(220, 235), (215, 255)])

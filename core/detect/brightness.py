@@ -37,14 +37,17 @@ gate_floor + 5 ("bias high"). Running the real OCR pass at those picks lost
 short subtitle lines on 4 of 13 reference projects, every loss 0-10 below the
 plateau top; see PICK_BELOW_TOP.
 
-Text strips that verification could not use because they read nowhere in
-its window (or only at its lowest threshold) are re-read once at their own
-seed threshold. One that reads there is either a frame caught mid-fade --
-lost at any threshold, including a hand-tuned one -- or a dimmer style the
-pick would lose for good. Its neighbour frames (+/- 0.4 and 0.8 s), masked at
-the pick, tell them apart: if any reads the same line, the line survives at
-the pick and the strip was a fade; otherwise the result is flagged
-"dim-text?".
+Dim-text check: the most complete reading of a line must be readable at the
+pick, on its own frame or a nearby one. For every verified text strip --
+evidence or not -- its line is its reading at the lowest threshold where it
+reads anything (or, when it reads nowhere in the window, its reading at its
+own seed threshold). When the strip's reading at the pick is not that same
+line (_same_line), it was caught mid-fade -- lost at any threshold,
+including a hand-tuned one -- or it is a line the pick loses for good: a
+dimmer style, a short line, or a fragment of it that won the modal. Its
+neighbour frames (+/- 0.4 and 0.8 s), masked at the pick, tell them apart:
+if any reads the same line, the line survives; otherwise the result is
+flagged "dim-text?". The check only adds a flag; it never moves the value.
 
 Cheap path (`folder_plateau` given): 6 frames, analytic seed only. A seed
 inside the folder plateau is accepted and picked PICK_BELOW_TOP below itself
@@ -157,12 +160,19 @@ FLAG_THIN_EVIDENCE = "thin-evidence?"       # fewer than THIN_EVIDENCE_STRIPS st
 FLAG_COLOURED_TEXT = "coloured-text?"       # implausibly low seed; not verified
 FLAG_NO_PLATEAU = "no-plateau?"             # OCR verification found no valid run; value is the seed
 FLAG_NARROW_PLATEAU = "narrow-plateau?"     # plateau narrower than PICK_BELOW_TOP: no safe margin
-FLAG_DIM_TEXT = "dim-text?"                 # a line readable at its own level never reads at the pick
-
-# Neighbour frames checked around a dim strip, in seconds.
-NEIGHBOUR_OFFSETS_SEC = (-0.8, -0.4, 0.4, 0.8)
+FLAG_DIM_TEXT = "dim-text?"                 # a strip's most complete line is not read at the pick, nor nearby
 FLAG_ESCALATE = "escalate"                  # cheap path: seed outside the folder plateau (or no text)
 FLAG_CANCELLED = "cancelled"                # cancel_check fired: result incomplete
+
+# --- Dim-text check
+# Neighbour frames checked around a strip whose line the pick loses, in seconds.
+NEIGHBOUR_OFFSETS_SEC = (-0.8, -0.4, 0.4, 0.8)
+# Neighbour frames fetched per grab; cancel_check is polled before each, so a
+# cancel waits for at most one grab (~1.5 s at 4K). 8 gives each of the
+# SAMPLE_WORKERS containers two frames: 16 frames of XWZ 170 (4K 10-bit,
+# load 12-21) took 3.0-3.2 s in grabs of 8, 2.9-3.0 s in one grab and
+# 3.4-3.5 s in grabs of 4.
+NEIGHBOUR_FETCH_CHUNK = 8
 
 
 @dataclass
@@ -215,6 +225,11 @@ def _compose_flag(existing: str | None, new: str) -> str:
 
 def _is_cancelled(cancel_check: Callable[[], bool] | None) -> bool:
     return cancel_check is not None and bool(cancel_check())
+
+
+class _Cancelled(Exception):
+    """cancel_check fired inside a step of full detection; detect_brightness
+    returns its "cancelled" result."""
 
 
 def _ocr_predict(ocr_engine, images: list[np.ndarray]) -> list:
@@ -273,11 +288,14 @@ def _neighbour_times(t: float, duration: float, fps: float, spans) -> list[float
     return out
 
 
-def _neighbour_strips(video_path: str, crop_box, time_ranges,
-                      centres: list[float]) -> dict[float, list[tuple[float, np.ndarray]]]:
+def _neighbour_strips(video_path: str, crop_box, time_ranges, centres: list[float],
+                      cancel_check: Callable[[], bool] | None = None
+                      ) -> dict[float, list[tuple[float, np.ndarray]]]:
     """(time, strip) neighbours (see _neighbour_times) for each centre time,
-    fetched in one grab through the OCR pass's own capture chain. A frame that
-    cannot be read is simply missing."""
+    clamped to the keep ranges, fetched through the OCR pass's own capture
+    chain NEIGHBOUR_FETCH_CHUNK frames at a time. A frame that cannot be read
+    is simply missing. Raises _Cancelled when cancel_check fires before a
+    grab."""
     try:
         duration, fps = ocr_view.video_timing(video_path)
     except ocr_view.FETCH_ERRORS as exc:
@@ -285,7 +303,12 @@ def _neighbour_strips(video_path: str, crop_box, time_ranges,
         return {t: [] for t in centres}
     spans = ocr_view.keep_spans(duration, time_ranges) if time_ranges else None
     wanted = {t: _neighbour_times(t, duration, fps, spans) for t in centres}
-    fetched = dict(ocr_view.grab_ocr_strips_at(video_path, crop_box, sorted({nt for ts in wanted.values() for nt in ts})))
+    ordered = sorted({nt for ts in wanted.values() for nt in ts})
+    fetched = {}
+    for k in range(0, len(ordered), NEIGHBOUR_FETCH_CHUNK):
+        if _is_cancelled(cancel_check):
+            raise _Cancelled
+        fetched.update(ocr_view.grab_ocr_strips_at(video_path, crop_box, ordered[k:k + NEIGHBOUR_FETCH_CHUNK]))
     return {t: [(nt, fetched[nt]) for nt in ts if nt in fetched] for t, ts in wanted.items()}
 
 
@@ -429,11 +452,34 @@ def _near_reading(a: str, b: str) -> bool:
     the longer (3 * Levenshtein <= its length), or the shorter -- at least two
     characters -- is the longer with characters dropped (erosion removes
     glyphs: 才也会有半分心动 -> 半分). Symmetric. Single-character readings
-    only match themselves, so one-character junk never supports anything."""
+    only match themselves, so one-character junk never supports anything.
+    For modal support within one strip only; across frames the dim-text
+    check uses the stricter _same_line."""
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     if 3 * Levenshtein.distance(short, long) <= len(long):
         return True
     return len(short) >= 2 and _is_subsequence(short, long)
+
+
+def _same_line(a: str, b: str) -> bool:
+    """Whether two readings show the same subtitle line, for the dim-text
+    check: 3 * Levenshtein(a, b) <= max(len(a), len(b)) -- at most one edit
+    per three characters of the longer -- after removing spaces, as the OCR
+    pass does when it compares subtitle texts (PredictedSubtitle.
+    is_similar_to; a no-op on 'ch' readings, which PredictedFrames already
+    joins without spaces). Newlines stay, as they do there: a clutter line is
+    a real difference, so "你好世界\n1" is still 你好世界 (2 edits in 6) but
+    "你好世界\n12:30" is not (6 in 10). An empty reading never matches.
+
+    Deliberately stricter than _near_reading, which also accepts a shorter
+    reading contained in order in the longer: that suits one strip eroding
+    across thresholds, but across frames it pairs different lines (师父 and
+    是我害了师父们; 叶辰 and 他自称叶辰 on the reference corpus) and a line
+    with its own fragment (样式 of 旁白第二种样式文本)."""
+    a, b = a.replace(" ", ""), b.replace(" ", "")
+    if not a or not b:
+        return False
+    return 3 * Levenshtein.distance(a, b) <= max(len(a), len(b))
 
 
 def _modal_text(readings: list[tuple[str, float]]) -> str | None:
@@ -601,58 +647,83 @@ def verify_with_ocr(strips: list[np.ndarray], seed: int, ocr_engine
 
 
 def _dim_text_check(video_path: str, crop_box, time_ranges, strips: list[np.ndarray], times: list[float],
-                    polys_per_strip, verification: _Verification, ocr_engine) -> list[dict]:
-    """Find lines the pick would lose that verification never saw.
+                    polys_per_strip, verification: _Verification, ocr_engine,
+                    cancel_check: Callable[[], bool] | None = None) -> list[dict]:
+    """Check that every verified strip's most complete line is read at the pick.
 
-    Candidates are verified strips that were no evidence because they read
-    nowhere in the window or only at its lowest threshold, and that do not
-    read at the pick itself. Each is masked at its own threshold (the seed
-    formula applied to that strip alone); its neighbour frames are masked at
-    the PICK. Everything that trips the gate goes to OCR in one batch.
+    For each strip verification OCR'd (evidence or not):
+    - its line is its reading at the lowest grid threshold that reads
+      anything. A strip that reads nowhere in the window is masked at its own
+      threshold (the seed formula applied to that strip alone) and, when that
+      trips the gate, re-read there -- all such strips in ONE OCR batch. A
+      strip still without a reading carries no text and is dropped.
+    - its reading at the pick is verification's own (gated) reading there.
+    - when that is _same_line as its line, the line survives on its own frame.
+    - otherwise the strip is a candidate: its neighbour frames are fetched,
+      masked at the PICK and, where they trip the gate, OCR'd -- all
+      candidates' neighbours in ONE batch. The line survives when any
+      neighbour reads the same line.
 
-    Returns one record per candidate whose own-threshold mask tripped the gate:
-    {index, time, threshold, text (read at its own threshold), neighbours:
-    [(time, text read at the pick)], survives (a neighbour's reading near-
-    matches `text`)}. A record with text and not `survives` is a dim line.
+    cancel_check is polled before each OCR batch and each neighbour grab;
+    raises _Cancelled when it fires.
+
+    Returns one record per strip with a line: {index, time, threshold (where
+    the line was read), text (the line), at_pick, candidate, neighbours:
+    [(time, text read at the pick)], survives}. A record that does not
+    survive is a line the pick loses.
     """
-    pick_j = verification.grid.index(verification.value) if verification.value in verification.grid else None
-    pending = []
+    grid, pick = verification.grid, verification.value
+    # The pick is always a grid threshold (the seed, or a plateau edge or
+    # 20 below its top); were it not, nothing would count as read there.
+    pick_j = grid.index(pick) if pick in grid else None
+    records, rereads = [], []
     for k, index in enumerate(verification.chosen):
-        if verification.modals[k] is not None or verification.readable[k] not in ([], [0]):
-            continue
-        if pick_j is not None and verification.readings[k] and verification.readings[k][pick_j][0]:
+        per_t = verification.readings[k]
+        record = dict(index=index, time=times[index], threshold=None, text="", at_pick="",
+                      candidate=False, neighbours=[], survives=True)
+        if pick_j is not None and per_t:
+            record["at_pick"] = per_t[pick_j][0]
+        lowest = next((j for j, (text, _) in enumerate(per_t) if text), None)
+        if lowest is not None:
+            record.update(threshold=grid[lowest], text=per_t[lowest][0])
+            records.append(record)
             continue
         level = _glyph_level(strips[index], polys_per_strip[index])
         if level is None:
             continue
-        t = _seed_from_level(level)
-        masked = ocr_view.mask(strips[index], t)
+        own = _seed_from_level(level)
+        masked = ocr_view.mask(strips[index], own)
         if ocr_view.gate_fires(masked):
-            pending.append((index, t, masked))
-    if not pending:
-        return []
+            record["threshold"] = own
+            records.append(record)
+            rereads.append((record, masked))
+    if rereads:
+        if _is_cancelled(cancel_check):
+            raise _Cancelled
+        for (record, _), pred in zip(rereads, _ocr_predict(ocr_engine, [masked for _, masked in rereads])):
+            record["text"] = _reading(pred)[0]
+    records = [record for record in records if record["text"]]
 
-    neighbours = _neighbour_strips(video_path, crop_box, time_ranges, [times[index] for index, _, _ in pending])
+    candidates = [record for record in records if not _same_line(record["at_pick"], record["text"])]
+    if not candidates:
+        return records
+    neighbours = _neighbour_strips(video_path, crop_box, time_ranges, [record["time"] for record in candidates],
+                                   cancel_check=cancel_check)
     batch, slots = [], []
-    records = []
-    for r, (index, t, masked) in enumerate(pending):
-        records.append(dict(index=index, time=times[index], threshold=t, text="", neighbours=[], survives=False))
-        batch.append(masked)
-        slots.append((r, None))
-        for neighbour_time, strip in neighbours.get(times[index], []):
-            neighbour_masked = ocr_view.mask(strip, verification.value)
-            if ocr_view.gate_fires(neighbour_masked):
-                batch.append(neighbour_masked)
-                slots.append((r, neighbour_time))
-    for (r, neighbour_time), pred in zip(slots, _ocr_predict(ocr_engine, batch)):
-        text = _reading(pred)[0]
-        if neighbour_time is None:
-            records[r]["text"] = text
-        else:
-            records[r]["neighbours"].append((neighbour_time, text))
-    for record in records:
-        record["survives"] = bool(record["text"]) and any(
-            text and _near_reading(text, record["text"]) for _, text in record["neighbours"])
+    for record in candidates:
+        record["candidate"] = True
+        for neighbour_time, strip in neighbours.get(record["time"], []):
+            masked = ocr_view.mask(strip, pick)
+            if ocr_view.gate_fires(masked):
+                batch.append(masked)
+                slots.append((record, neighbour_time))
+    if batch:
+        if _is_cancelled(cancel_check):
+            raise _Cancelled
+        for (record, neighbour_time), pred in zip(slots, _ocr_predict(ocr_engine, batch)):
+            record["neighbours"].append((neighbour_time, _reading(pred)[0]))
+    for record in candidates:
+        record["survives"] = any(_same_line(text, record["text"]) for _, text in record["neighbours"])
     return records
 
 
@@ -680,8 +751,9 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
     without `folder_plateau`).
 
     `cancel_check`: a zero-argument callable polled before each sampling
-    round and before OCR verification; once it returns truthy the result is
-    returned flagged "cancelled".
+    round, before OCR verification, and before each OCR batch and neighbour
+    grab of the dim-text check; once it returns truthy the result is returned
+    flagged "cancelled".
     """
     if crop_box is None:
         return BrightnessResult(DEFAULT_BRIGHTNESS, None, DEFAULT_BRIGHTNESS, None, FLAG_NEEDS_CROP, [])
@@ -745,9 +817,12 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
         flagged = _compose_flag(flagged, FLAG_NO_PLATEAU)
     elif plateau[1] - plateau[0] < PICK_BELOW_TOP:
         flagged = _compose_flag(flagged, FLAG_NARROW_PLATEAU)
-    dim = _dim_text_check(video_path, crop_box, time_ranges, text_strips, text_times, text_polys,
-                          verification, ocr_engine)
-    if any(record["text"] and not record["survives"] for record in dim):
+    try:
+        dim = _dim_text_check(video_path, crop_box, time_ranges, text_strips, text_times, text_polys,
+                              verification, ocr_engine, cancel_check=cancel_check)
+    except _Cancelled:
+        return cancelled(seed, floor)
+    if not all(record["survives"] for record in dim):
         flagged = _compose_flag(flagged, FLAG_DIM_TEXT)
     if floor is not None and value < floor + GATE_FLOOR_MARGIN:
         flagged = _compose_flag(flagged, FLAG_NO_CLEAN_THRESHOLD)

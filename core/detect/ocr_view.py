@@ -47,6 +47,29 @@ SAMPLE_EDGE_EXCLUDE_FRAC = 0.10   # without keep ranges, skip the first/last 10%
 SAMPLE_WORKERS = 4                # capture containers opened in parallel
 
 
+class _OpenCapture:
+    """`with _OpenCapture(path, **kwargs) as cap:` is `with Capture(path,
+    **kwargs) as cap:`, except that a FETCH_ERRORS failure while CLOSING the
+    container is logged instead of raised. By then every frame the block
+    needed has been read; a container that fails to close must not throw
+    those frames away or abort detection. Failures while opening propagate
+    unchanged, and an exception raised inside the block still propagates."""
+
+    def __init__(self, video_path: str, **kwargs):
+        self._video_path = video_path
+        self._capture = Capture(video_path, **kwargs)
+
+    def __enter__(self):
+        return self._capture.__enter__()
+
+    def __exit__(self, *exc_info):
+        try:
+            return self._capture.__exit__(*exc_info)
+        except FETCH_ERRORS as exc:
+            logger.warning("%s: capture failed to close (%s: %s)", self._video_path, type(exc).__name__, exc)
+            return False
+
+
 def to_ocr_view(frame: np.ndarray) -> np.ndarray:
     """The frame as the OCR pass holds it just before masking.
 
@@ -190,7 +213,7 @@ def sample_times(duration: float, time_ranges, n: int, phase: float = 0.5) -> li
 def video_timing(video_path: str) -> tuple[float, float]:
     """(duration, fps) as the OCR pass counts them: frame count / fps from
     Capture. Raises FETCH_ERRORS when the file cannot be opened."""
-    with Capture(video_path) as cap:
+    with _OpenCapture(video_path) as cap:
         frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
     return (frames / fps if fps else 0.0), fps
@@ -230,7 +253,7 @@ def grab_ocr_strips_at(video_path: str, crop_box, times: list[float]) -> list[tu
     if not times:
         return []
     try:
-        with Capture(video_path) as probe:
+        with _OpenCapture(video_path) as probe:
             width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = probe.get(cv2.CAP_PROP_FPS)
@@ -276,11 +299,12 @@ def grab_ocr_strips_at(video_path: str, crop_box, times: list[float]) -> list[tu
         # times; one container per thread (PyAV releases the GIL to decode).
         # Only OPENING the container is guarded here: seek/read failures are
         # handled per frame in read_chunk, and anything else raised there is a
-        # bug to surface, not a capture failure to log away.
+        # bug to surface, not a capture failure to log away. A failure to
+        # CLOSE it is logged by _OpenCapture: the chunk's frames are read.
         with ExitStack() as stack:
             try:
                 cap = stack.enter_context(
-                    Capture(video_path, decode_target_height=decode_height, crop_rect=graph_crop))
+                    _OpenCapture(video_path, decode_target_height=decode_height, crop_rect=graph_crop))
             except FETCH_ERRORS as exc:
                 logger.warning("%s: dropped %d frame(s), capture failed to open (%s: %s)",
                                video_path, len(chunk), type(exc).__name__, exc)
