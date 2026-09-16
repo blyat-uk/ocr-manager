@@ -878,7 +878,7 @@ class PyAVCapture:
             return True
         return False
 
-    # How far before the requested PTS seek_to_pts() retries when a seek
+    # How far before its target a seek (_seek_with_retries) retries when it
     # lands after it, doubling per retry.
     _SEEK_BACKOFF_SECONDS = 1.0
     _SEEK_MAX_RETRIES = 8
@@ -913,35 +913,21 @@ class PyAVCapture:
                   if it were the first one (a warning is logged). After
                   False, read()/grab() fail until the next seek.
         """
-        self._read_started = True
-        time_base = self.stream.time_base
-        target_ts = int(round(pts / time_base))
-        stream_start = self.stream.start_time if self.stream.start_time is not None else 0
-        backoff = max(1, int(round(self._SEEK_BACKOFF_SECONDS / time_base)))
-        seek_ts = max(target_ts, stream_start)
-        for attempt in range(self._SEEK_MAX_RETRIES + 1):
-            self.container.seek(seek_ts, stream=self.stream)
-            self._frame_generator = self.container.decode(video=0)
-            self._pending_frame = None
-            from_stream_start = seek_ts <= stream_start
-
+        def choose(frames, from_stream_start):
             decoded_any = False
-            for frame in self._frame_generator:
-                if frame.pts is None:
-                    continue
-                frame_pts = float(frame.pts * time_base)
+            for frame, frame_pts in frames:
                 if not decoded_any and frame_pts > pts and not from_stream_start:
-                    break  # landed after the target
+                    return self._LANDED_LATE
                 decoded_any = True
                 if frame_pts >= pts:
                     self._park(frame)
                     return True
             if decoded_any or from_stream_start:
-                return self._no_frame()  # end of stream before reaching the target
-            if attempt == self._SEEK_MAX_RETRIES:
-                return self._no_frame(f"seek_to_pts({pts!r})")
-            seek_ts = max(target_ts - backoff, stream_start)
-            backoff *= 2
+                return False  # end of stream before reaching the target
+            return self._LANDED_LATE  # the seek decoded nothing
+
+        return self._seek_with_retries(int(round(pts / self.stream.time_base)), choose,
+                                       f"seek_to_pts({pts!r})")
 
     def seek_to_display_time(self, t):
         """Position the capture so the next read()/grab() returns the frame
@@ -971,10 +957,52 @@ class PyAVCapture:
                   after `t` (a warning is logged). After False, read()/grab()
                   fail until the next seek.
         """
+        limit = t + DISPLAY_TIME_TOLERANCE
+
+        def choose(frames, from_stream_start):
+            on_screen = on_screen_pts = after = None
+            for frame, frame_pts in frames:
+                if frame_pts > limit:
+                    after = frame
+                    break
+                on_screen, on_screen_pts = frame, frame_pts
+            if on_screen is None:
+                if after is not None and from_stream_start:
+                    self._park(after)  # `t` precedes the first frame
+                    return True
+                # Landed after `t`, or decoded nothing (which, from the start
+                # of the stream, means there is nothing to decode).
+                return False if from_stream_start else self._LANDED_LATE
+            if after is None and limit >= on_screen_pts + 1.0 / self._fps:
+                return False  # past the last frame
+            self._park(on_screen, after)
+            return True
+
+        return self._seek_with_retries(math.floor(limit / self.stream.time_base), choose,
+                                       f"seek_to_display_time({t!r})")
+
+    # What a seek's frame chooser returns when the seek landed after its
+    # target (or decoded nothing), so _seek_with_retries seeks from further
+    # back.
+    _LANDED_LATE = object()
+
+    def _seek_with_retries(self, target_ts, choose, description):
+        """The seek loop seek_to_pts() and seek_to_display_time() share.
+
+        Seeks to `target_ts` (in the stream's time base) and hands
+        `choose(frames, from_stream_start)` the decoded frames, as
+        (frame, float(frame.pts * time_base)) pairs, skipping frames without a
+        PTS. `choose` parks the frame it wants and returns True, returns False
+        when there is none, or returns _LANDED_LATE. Then this seeks again from
+        _SEEK_BACKOFF_SECONDS further back, then twice that, and so on. A seek
+        that reached the start of the stream is never retried (`choose` is
+        told, since what it decodes first is the first frame). When all
+        _SEEK_MAX_RETRIES retries still land late, it logs a warning naming
+        `description` and reports no frame. After False, read()/grab() fail
+        until the next seek.
+        """
         self._read_started = True
         time_base = self.stream.time_base
-        limit = t + DISPLAY_TIME_TOLERANCE
-        target_ts = math.floor(limit / time_base)
         stream_start = self.stream.start_time if self.stream.start_time is not None else 0
         backoff = max(1, int(round(self._SEEK_BACKOFF_SECONDS / time_base)))
         seek_ts = max(target_ts, stream_start)
@@ -983,26 +1011,15 @@ class PyAVCapture:
             self._frame_generator = self.container.decode(video=0)
             self._pending_frame = None
             from_stream_start = seek_ts <= stream_start
-
-            on_screen = after = None
-            for frame in self._frame_generator:
-                if frame.pts is None:
-                    continue
-                if float(frame.pts * time_base) > limit:
-                    after = frame
-                    break
-                on_screen = frame
-            if on_screen is None and after is not None and from_stream_start:
-                on_screen, after = after, None  # `t` precedes the first frame
-            if on_screen is not None:
-                if after is None and limit >= float(on_screen.pts * time_base) + 1.0 / self._fps:
-                    return self._no_frame()  # past the last frame
-                self._park(on_screen, after)
+            frames = ((frame, float(frame.pts * time_base))
+                      for frame in self._frame_generator if frame.pts is not None)
+            outcome = choose(frames, from_stream_start)
+            if outcome is True:
                 return True
-            if from_stream_start:
-                return self._no_frame()  # nothing to decode
+            if outcome is False:
+                return self._no_frame()
             if attempt == self._SEEK_MAX_RETRIES:
-                return self._no_frame(f"seek_to_display_time({t!r})")
+                return self._no_frame(description)
             seek_ts = max(target_ts - backoff, stream_start)
             backoff *= 2
 

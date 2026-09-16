@@ -1108,6 +1108,39 @@ def test_seeks_report_no_frame_when_the_retries_run_out(clips, monkeypatch, capl
         assert ok and cap.get_last_pts() == target and np.array_equal(frame, reference[60][1])
 
 
+@pytest.mark.parametrize("seek_name", ["seek_to_pts", "seek_to_display_time"])
+def test_seeks_use_their_last_allowed_retry(clips, monkeypatch, seek_name):
+    """With one retry allowed, a seek that lands late once and then lands
+    before its target still finds the frame."""
+    path = _clip(clips, "zero-start-h264")
+    reference = _decode_reference(path)
+    monkeypatch.setattr(PyAVCapture, "_SEEK_MAX_RETRIES", 1)
+    target = reference[60][0]
+    with PyAVCapture(str(path)) as cap:
+        late = _LateSeekingContainer(cap.container, cap.stream, late_seconds=0.5)
+        cap.container = late
+        assert getattr(cap, seek_name)(target) is True
+        ok, frame = cap.read()
+        assert ok and cap.get_last_pts() == target and np.array_equal(frame, reference[60][1])
+        assert len(late.seeks) == 2, "expected exactly one retry"
+
+
+@pytest.mark.parametrize("seek_name", ["seek_to_pts", "seek_to_display_time"])
+def test_seeks_past_the_end_report_no_frame_without_retrying(clips, caplog, seek_name):
+    """A seek that decodes frames up to the end of the stream without finding
+    one has its answer: no frame, from that one seek, and nothing logged."""
+    path = _clip(clips, "offset-h264")
+    reference = _decode_reference(path)
+    caplog.set_level(logging.WARNING, logger="videocr.pyav_adapter")
+    with PyAVCapture(str(path)) as cap:
+        counting = _LateSeekingContainer(cap.container, cap.stream, late_seconds=0.0)
+        cap.container = counting
+        assert getattr(cap, seek_name)(reference[-1][0] + 1.0) is False
+        assert len(counting.seeks) == 1
+        assert cap.read() == (False, None)
+    assert not caplog.records
+
+
 @pytest.mark.parametrize("clip_id", ["zero-start-h264", "offset-h264"])
 def test_ffmpeg_fallback_seek_to_display_time_reads_the_frame_on_screen(clips, clip_id):
     if not pyav_adapter.FFMPEG_AVAILABLE:
