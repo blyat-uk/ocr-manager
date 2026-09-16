@@ -1379,11 +1379,8 @@ class LabelScanner:
                 group_ocr_results = [[] for _ in cluster]
 
                 for si, sample_pts in enumerate(sample_pts_list):
-                    if int(sample_pts * self.fps) >= self.num_frames:
-                        if progress is not None:
-                            progress.update(1)
-                        continue
-
+                    # Sample times never pass last_pts, a frame phase 1 read,
+                    # so there is no end of stream to check for here.
                     frame = self._read_frame_on_screen(cap, sample_pts)
                     if frame is None:
                         if progress is not None:
@@ -1742,22 +1739,29 @@ class LabelScanner:
         return last_present_pts
 
     def _scan_for_end(self, cap, det_engine, box, discovery_pts, ref_box=None, upper_bound=None):
-        """Scan forward to find where label stops appearing."""
+        """Scan forward to find where label stops appearing.
+
+        Ends at the time bound, after two consecutive absences, or at the
+        first time past the last frame: the end of the stream is where the
+        display-time seek finds no frame, not where int(pts * fps) reaches the
+        frame count, which on a file whose first frame is after time 0 comes
+        up to that offset early. (A seek whose every retry lands late also
+        finds no frame; that is logged, and ends the scan the same way.)
+        """
         step = self.TIMING_SCAN_INTERVAL
         consecutive_absent = 0
         last_present_pts = discovery_pts
 
         pts = discovery_pts + step
-        max_pts = min(self.num_frames / self.fps, discovery_pts + self.TIMING_SCAN_MAX_DURATION)
+        max_pts = discovery_pts + self.TIMING_SCAN_MAX_DURATION
         if upper_bound is not None:
             max_pts = min(max_pts, upper_bound)
 
         while pts <= max_pts:
-            if int(pts * self.fps) >= self.num_frames:
-                break
-
-            frame = self._read_frame_on_screen(cap, pts)
-            if frame is None:
+            if not cap.seek_to_display_time(pts):
+                break  # past the last frame, and so is every later time
+            ret, frame = cap.read()
+            if not ret or frame is None:
                 pts += step
                 continue
 

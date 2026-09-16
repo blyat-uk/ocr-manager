@@ -789,21 +789,23 @@ def _phase4_segments(scanner, reference):
             for s in starts]
 
 
-def _phase4_sample_times(scanner, segment):
+def _phase4_sample_times(scanner, segment, reference):
     """The times phase 4 runs detection at for one segment, in order: the
-    reference box at the midpoint, then the backward and forward scans."""
-    fps, num_frames, step = scanner.fps, scanner.num_frames, scanner.TIMING_SCAN_INTERVAL
+    reference box at the midpoint (if a frame is on screen then), the
+    backward scan, and the forward scan, which ends at its time bound or at
+    the first time past the last frame, whichever comes first."""
+    fps, step = scanner.fps, scanner.TIMING_SCAN_INTERVAL
     start, end = segment["start_pts"], segment["end_pts"]
     times = [(start + end) / 2]
     t, low = start - step, max(0, start - scanner.TIMING_SCAN_MAX_DURATION)
     while t >= low and int(t * fps) >= 0:
         times.append(t)
         t -= step
-    t, high = end + step, min(num_frames / fps, end + scanner.TIMING_SCAN_MAX_DURATION)
-    while t <= high and int(t * fps) < num_frames:
+    t, high = end + step, end + scanner.TIMING_SCAN_MAX_DURATION
+    while t <= high and _on_screen(reference, t, fps) is not None:
         times.append(t)
         t += step
-    return times
+    return [t for t in times if _on_screen(reference, t, fps) is not None]
 
 
 def _check_phase3(scanner, reference, recorder, monkeypatch):
@@ -836,7 +838,7 @@ def _check_phase3(scanner, reference, recorder, monkeypatch):
                 expected, _ = scanner._resize_max_dimension(expected, scanner.RECOGNIZE_HEIGHT)
                 result.check(t, reference, fps, pts, frame, crop, expected)
             want_times = [t for t in _phase3_sample_times(scanner, group)
-                          if int(t * fps) < scanner.num_frames and _on_screen(reference, t, fps) is not None]
+                          if _on_screen(reference, t, fps) is not None]
             if [t for t, _ in got] != want_times:
                 result.missing(f"group {group['first_pts']:.6f}-{group['last_pts']:.6f}: readings at "
                                f"{[t for t, _ in got]}, expected one at each of {want_times}")
@@ -850,8 +852,7 @@ def _check_phase4(scanner, reference, recorder):
     for segment in _phase4_segments(scanner, reference):
         detector = _Phase4Detector(recorder)
         scanner._phase4_find_timing([segment], detector)
-        want_times = [t for t in _phase4_sample_times(scanner, segment)
-                      if _on_screen(reference, t, fps) is not None]
+        want_times = _phase4_sample_times(scanner, segment, reference)
         if len(detector.calls) != len(want_times):
             result.missing(f"segment {segment['start_pts']:.6f}-{segment['end_pts']:.6f}: "
                            f"{len(detector.calls)} detections for {len(want_times)} sample times")
@@ -904,14 +905,11 @@ def test_phase4_reads_the_frame_on_screen_at_each_sample_time(clips, monkeypatch
 
 
 def test_phases_3_and_4_read_the_frame_on_screen_on_the_offset_fixture(offset_video, monkeypatch):
-    """The shared 1.5 s-offset fixture (10 frames).
-
-    Phase 3 analyses none of it: its end-of-stream check compares
-    int(t * fps) with the frame count, and every frame here is at position
-    37 or later of 10. That check is unchanged (it decides whether to sample,
-    not which frame a sample reads), so only phase 4 -- whose backward scans
-    run from inside the clip to before its first frame -- is checked here.
-    """
+    """The shared 1.5 s-offset fixture (10 frames). Every frame here is at
+    position int(PTS * fps) 37 or later of a 10-frame count, so an end-of-stream
+    check against the frame count would skip every phase 3 sample; phase 3
+    must analyse one per group, and phase 4 must scan from before the first
+    frame to past the last."""
     reference = _decode_reference(offset_video)
     scanner = _phase34_scanner(offset_video)
     recorder = _Recorder()
@@ -920,7 +918,7 @@ def test_phases_3_and_4_read_the_frame_on_screen_on_the_offset_fixture(offset_vi
     phase3 = _check_phase3(scanner, reference, recorder, monkeypatch)
     phase4, times = _check_phase4(scanner, reference, recorder)
 
-    assert phase3.checked == 0
+    assert phase3.checked >= len(reference), "phase 3 skipped samples that have a frame on screen"
     assert phase4.checked >= 5 * len(reference)
     assert any(t < reference[0][0] for t in times), "no phase 4 sample before the first frame"
     assert any(reference[0][0] <= t for t in times), "no phase 4 sample inside the clip"
@@ -962,7 +960,7 @@ def _fallback_phase34_run(scanner, reference, recorder, monkeypatch, capture_cls
         segment = {"box": box, "text": "label", "confidence": 1.0, "start_pts": start, "end_pts": start + 0.5}
         detector = _Phase4Detector(recorder)
         scanner._phase4_find_timing([segment], detector)
-        want_times = [t for t in _phase4_sample_times(scanner, segment) if _on_screen(reference, t, fps) is not None]
+        want_times = _phase4_sample_times(scanner, segment, reference)
         if len(detector.calls) != len(want_times):
             phase4.missing(f"segment at {start}: {len(detector.calls)} detections for {len(want_times)} times")
         for t, (got_pts, frame, image) in zip(want_times, detector.calls):
@@ -1280,3 +1278,33 @@ def test_detection_sees_the_shared_frame_read_only_and_a_downscaled_copy_as_it_i
         scanner._apply_label_masks(frame)
         expected += [scanner._crop_box_region(frame[: scanner.dialogue_cutoff_y, :], box)[0] for box in boxes]
     _assert_same_crops(got, expected)
+
+
+@pytest.mark.parametrize("clip_id", ["offset-h264", "video-start-0.021s-mkv"])
+def test_phase4_forward_scan_runs_to_the_last_frame_and_stops_past_it(clips, monkeypatch, clip_id):
+    """A label still on screen at the last frame ends at the last scan time
+    that has a frame, even on a file whose first frame is after time 0 (where
+    int(t * fps) reaches the frame count up to the start offset early). The
+    scan stops at the first time past the last frame instead of seeking on
+    to its time bound."""
+    path = _clip(clips, clip_id)
+    reference = _decode_reference(path)
+    scanner = _phase34_scanner(path)
+    fps, box = scanner.fps, _region_box(scanner)
+    discovery = reference[-1][0] - 1.6
+    step = scanner.TIMING_SCAN_INTERVAL
+    with_frame, t = [], discovery + step
+    while _on_screen(reference, t, fps) is not None:
+        with_frame.append(t)
+        t += step
+    assert len(with_frame) >= 7
+
+    seeks = _Counting(monkeypatch, "seek_to_display_time")
+    detector = _Phase4Detector(_Recorder())
+    detector.recorder.install(monkeypatch, PyAVCapture)
+    with PyAVCapture(str(path)) as cap:
+        end = scanner._scan_for_end(cap, detector, box, discovery, ref_box=box)
+
+    assert end == with_frame[-1]
+    assert len(detector.calls) == len(with_frame)
+    assert seeks.calls == len(with_frame) + 1, "the forward scan went on seeking past the last frame"
