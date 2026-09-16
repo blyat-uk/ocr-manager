@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import time
 
-from . import utils
+from . import engine_registry, utils
 from .models import PredictedFrames, PredictedSubtitle
 
 from .pyav_adapter import Capture, DECODE_TARGET_HEIGHT
@@ -155,7 +155,7 @@ class Video:
         # attached to the tail batch slot when that subtitle ends.
         pending_candidates = []
 
-        ocr = utils.create_ocr_engine(self.lang, self.det_model_dir, self.rec_model_dir, use_gpu)
+        ocr = engine_registry.get_ocr_engine(self.lang, self.det_model_dir, self.rec_model_dir, use_gpu)
 
         ocr_start = utils.get_frame_index(time_start, self.fps) if time_start else 0
         ocr_end = utils.get_frame_index(time_end, self.fps) if time_end else self.num_frames

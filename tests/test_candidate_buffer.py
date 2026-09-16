@@ -6,7 +6,7 @@ stream and a stand-in OCR engine: no media, no GPU, milliseconds.
 import numpy as np
 import pytest
 
-from videocr import video as video_mod
+from videocr import engine_registry, video as video_mod
 from videocr.video import Video
 
 FPS = 25.0
@@ -130,6 +130,12 @@ def _run(monkeypatch, slot_budget=PRODUCTION_SLOT_BUDGET,
     ocr = TaggingOCR()
     monkeypatch.setattr(video_mod.utils, "create_ocr_engine",
                         lambda *a, **k: ocr)
+    # Every call here uses the same (lang, det, rec, gpu) key, but each
+    # needs its OWN fresh TaggingOCR to track just that run's frames -- the
+    # process-wide engine registry would otherwise hand back a stale engine
+    # from an earlier call in this same test session instead of the one
+    # just monkeypatched in above.
+    engine_registry.reset_registry()
 
     v = Video.__new__(Video)
     v.path = "synthetic"

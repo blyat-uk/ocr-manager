@@ -1,4 +1,4 @@
-from . import utils
+from . import engine_registry, utils
 from .video import Video
 from .progress import ProgressTracker
 from .pyav_adapter import assert_reference_backend
@@ -38,7 +38,7 @@ def get_subtitles(
             return ""
         dialogue_ass = v.get_subtitles(sim_threshold)
     else:
-        ocr = utils.create_ocr_engine(lang, det_model_dir, rec_model_dir, use_gpu)
+        ocr = engine_registry.get_ocr_engine(lang, det_model_dir, rec_model_dir, use_gpu)
         dialogue_ass = None
 
     if detect_labels or only_labels:
@@ -54,7 +54,7 @@ def get_subtitles(
             conf_threshold=label_conf_threshold, conf_threshold_min=label_conf_threshold_min, brightness_threshold=brightness_threshold,
             label_mask_crops=label_mask_crops,
         )
-        det_engine = utils.create_detection_engine(det_model_dir, use_gpu)
+        det_engine = engine_registry.get_detection_engine(det_model_dir, use_gpu)
 
         # Get container-level start_time (set during run_ocr, or fetch independently).
         # This is the playback offset; for MKV it's 0, for MP4 it may be non-zero.
