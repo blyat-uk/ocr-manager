@@ -195,6 +195,17 @@ FLAG_MULTIPLE_POSITIONS = "multiple-positions?"     # a second baseline cluster 
                                                      # missing line -- see _baseline_cluster_union())
 FLAG_OUTLIER_DISCARDED = "outlier-discarded?"       # a single hit at a baseline nothing else shared
                                                      # was excluded from the union -- never silently
+FLAG_CANCELLED = "cancelled"                        # cancel_check cut a round short -- composed
+                                                     # on every round it happens to, alongside
+                                                     # whatever that round's own flag was (if any);
+                                                     # never inferred from an absent flag elsewhere
+FLAG_UNKNOWN_REJECTION = "unknown-rejection"        # structural safety net (see detect_crop()'s
+                                                     # post-condition, just before CropResult is
+                                                     # built): box is None but nothing above composed
+                                                     # a flag -- a gap in this function's own flag
+                                                     # coverage, not a real detection outcome. Should
+                                                     # never appear for any KNOWN no-box path; if it
+                                                     # does, a specific flag is missing above it.
 
 
 @dataclass
@@ -1058,8 +1069,21 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         cancel_check=cancel_check,
     )
     sample_pts.extend(used)
+    # Checked (and reused, not re-polled) once per round, right after that
+    # round returns: cancel_check() cutting a round short is a real,
+    # distinct reason a round found little or nothing -- composed
+    # explicitly here (FLAG_CANCELLED) rather than left to be inferred
+    # from an absent flag downstream, which is exactly how round 1's
+    # cancellation went unflagged before this (see task-3 review round 3):
+    # the round-2/round-3 entry gates below skip on `not cancelled`, so a
+    # file cancelled during round 1 with zero hits never triggered
+    # FLAG_SPEECH_PROBES_EXHAUSTED or FLAG_TOP_POSITIONED either, and
+    # nothing else was there to explain the resulting box=None.
+    cancelled = _is_cancelled(cancel_check)
+    if cancelled:
+        flagged = _compose_flag(flagged, FLAG_CANCELLED)
 
-    if raw_hits == 0 and speech_probing_available and not _is_cancelled(cancel_check):
+    if raw_hits == 0 and speech_probing_available and not cancelled:
         uniform_times = _uniform_probe_times(duration_sec)
         polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, uniform_times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
@@ -1068,9 +1092,12 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         )
         sample_pts.extend(used)
         flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
+        cancelled = _is_cancelled(cancel_check)
+        if cancelled:
+            flagged = _compose_flag(flagged, FLAG_CANCELLED)
 
     used_full_frame_retry = False
-    if raw_hits == 0 and not _is_cancelled(cancel_check):
+    if raw_hits == 0 and not cancelled:
         retry_times = _uniform_probe_times(duration_sec) if not sample_pts else sample_pts
         # Reuse the already-attempted timestamps for the full-frame retry
         # rather than probing new ones -- we already know these timestamps
@@ -1085,6 +1112,8 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         sample_pts.extend(used)
         flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
         used_full_frame_retry = True
+        if _is_cancelled(cancel_check):
+            flagged = _compose_flag(flagged, FLAG_CANCELLED)
 
     cutoff_frac = 0.0 if used_full_frame_retry else float(
         (settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)
@@ -1142,6 +1171,26 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
             flagged = _compose_flag(flagged, part)
     if box is not None and 0 < agreed < LOW_AGREEMENT_HITS:
         flagged = _compose_flag(flagged, FLAG_LOW_AGREEMENT)
+
+    # Structural post-condition, not a specific-case fix: every box=None
+    # exit above is expected to have composed its own specific flag by
+    # this point. If one didn't -- because this function grows a new
+    # no-box path later and whoever adds it forgets to flag it, not
+    # because of any case currently known -- this is the last line of
+    # defence against silently returning box=None with no explanation at
+    # all. See test_no_known_scenario_reaches_the_fallback_flag() and
+    # test_safety_net_fallback_flag_fires_for_a_truly_unanticipated_no_box_path()
+    # in tests/test_detect_crop.py: FLAG_UNKNOWN_REJECTION must never
+    # appear for any currently-known scenario.
+    if box is None and flagged is None:
+        logger.warning(
+            "%s: detect_crop() rejected the box with no flag composed -- "
+            "this function's flag coverage is incomplete for whatever path "
+            "just ran; falling back to %r so the result is never silently "
+            "unexplained",
+            video_path, FLAG_UNKNOWN_REJECTION,
+        )
+        flagged = _compose_flag(flagged, FLAG_UNKNOWN_REJECTION)
 
     return CropResult(
         box=box,

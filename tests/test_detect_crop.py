@@ -671,7 +671,7 @@ def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
     assert result.frame_size == (1920, 1080)
 
 
-def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0):
+def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, cancel_check=None):
     """Shared plumbing for the end-to-end box=None/flag tests below: drives
     the real detect_crop() orchestration with vad.probe_times(),
     _probe_dimensions() and _grab_frames_with_times() faked out, and
@@ -701,7 +701,45 @@ def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0):
 
     monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
 
-    return crop.detect_crop("dummy.mp4", duration, FakeEngine())
+    return crop.detect_crop("dummy.mp4", duration, FakeEngine(), cancel_check=cancel_check)
+
+
+def _detect_crop_with_mocked_rounds(monkeypatch, round_outcomes, vad_times=None, duration=60.0,
+                                     cancel_check=None):
+    """Mocks _run_round() itself (not the frame-grab/engine layer), so
+    each of detect_crop()'s up-to-3 sequential round calls can be
+    scripted independently, including side effects -- used for the
+    cancellation-mid-round-2/3 tests below, where exactly WHEN
+    cancellation becomes visible to detect_crop() matters more than
+    _run_round()'s own internal batching (already covered by
+    test_run_round_cancel_check_stops_within_a_couple_of_batches).
+
+    `round_outcomes`: list of zero-arg callables, one per expected
+    _run_round() call, each returning
+    (polys_per_frame, sample_pts, raw_hits, frame_times); may have side
+    effects (e.g. flipping a cancellation flag). Returns (result,
+    number_of_run_round_calls) -- the latter lets a test assert a later
+    round was never reached at all.
+    """
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(
+        crop.vad, "probe_times",
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6): (
+            vad_times if vad_times is not None else [1.0, 2.0, 3.0]
+        ),
+    )
+    calls = {"n": 0}
+
+    def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
+                        settings, known_dims=None, cancel_check=None):
+        idx = calls["n"]
+        calls["n"] += 1
+        assert idx < len(round_outcomes), f"_run_round called more times than scripted ({idx + 1})"
+        return round_outcomes[idx]()
+
+    monkeypatch.setattr(crop, "_run_round", fake_run_round)
+    result = crop.detect_crop("dummy.mp4", duration, object(), cancel_check=cancel_check)
+    return result, calls["n"]
 
 
 def test_confirmed_watermark_sets_static_content_flag_end_to_end(monkeypatch):
@@ -731,6 +769,9 @@ def test_confirmed_watermark_sets_static_content_flag_end_to_end(monkeypatch):
     assert crop.FLAG_STATIC_CONTENT in result.flagged, (
         f"expected {crop.FLAG_STATIC_CONTENT!r} in flagged, got {result.flagged!r}"
     )
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
 
 
 def test_ceiling_exceeded_sets_a_flag_end_to_end(monkeypatch):
@@ -750,6 +791,9 @@ def test_ceiling_exceeded_sets_a_flag_end_to_end(monkeypatch):
     assert crop.FLAG_CEILING_EXCEEDED in result.flagged, (
         f"expected {crop.FLAG_CEILING_EXCEEDED!r} in flagged, got {result.flagged!r}"
     )
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
 
 
 def test_no_hits_anywhere_sets_a_flag_end_to_end(monkeypatch):
@@ -763,6 +807,173 @@ def test_no_hits_anywhere_sets_a_flag_end_to_end(monkeypatch):
 
     assert result.box is None
     assert result.flagged is not None, "exhausting every fallback must never resolve with flagged=None"
+    assert crop.FLAG_SPEECH_PROBES_EXHAUSTED in result.flagged
+    assert crop.FLAG_TOP_POSITIONED in result.flagged
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
+
+
+def test_no_speech_available_and_no_hits_sets_a_flag_end_to_end(monkeypatch):
+    """Fourth box=None exit: vad.probe_times() finds true digital silence
+    (returns []), so detect_crop() falls back to uniform probing
+    immediately (flagged="no-speech") -- and nothing is found there
+    either, so the full-frame retry also runs and also finds nothing."""
+    result = _detect_crop_with_fakes(monkeypatch, [], lambda t: ([], []))
+
+    assert result.box is None
+    assert result.flagged is not None, "no-speech + no hits must never resolve with flagged=None"
+    assert crop.FLAG_NO_SPEECH in result.flagged
+    assert crop.FLAG_TOP_POSITIONED in result.flagged
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
+
+
+def test_cancellation_during_round_1_sets_cancelled_flag_end_to_end(monkeypatch):
+    """Task-3 review round 3, the reported regression: cancel_check()
+    returning True from the very start makes _run_round() break before
+    any batch on round 1, leaving raw_hits==0 -- both the round-2 and
+    round-3 entry gates then evaluate False *because* cancellation is
+    True, so neither FLAG_SPEECH_PROBES_EXHAUSTED nor FLAG_TOP_POSITIONED
+    is ever composed. Before this fix, nothing else explained the
+    resulting box=None: result.flagged came back None. FLAG_CANCELLED
+    exists precisely to name this case explicitly rather than leaving it
+    to be inferred from an absent flag."""
+    result = _detect_crop_with_fakes(
+        monkeypatch, [1.0, 2.0, 3.0], lambda t: ([], []),
+        cancel_check=lambda: True,
+    )
+
+    assert result.box is None
+    assert result.flagged is not None, (
+        "cancellation during round 1 must never resolve with flagged=None"
+    )
+    assert crop.FLAG_CANCELLED in result.flagged, (
+        f"expected {crop.FLAG_CANCELLED!r} in flagged, got {result.flagged!r}"
+    )
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
+
+
+def test_cancellation_during_round_2_sets_cancelled_flag_end_to_end(monkeypatch):
+    """Cancellation taking effect specifically during round 2 (the
+    uniform-probing fallback): round 1 completes normally with zero hits
+    (not cancelled), round 2 starts, and is cut short by cancellation
+    partway through -- round 3 must then be skipped (cancellation, not
+    "found something"), and the result must carry both
+    FLAG_SPEECH_PROBES_EXHAUSTED (round 2 did run) and FLAG_CANCELLED
+    (it didn't finish on its own)."""
+    cancel_state = {"cancelled": False}
+
+    def round_1():
+        return [], [1.0, 2.0, 3.0], 0, [1.0, 2.0, 3.0]
+
+    def round_2():
+        cancel_state["cancelled"] = True  # cancellation happens DURING this round
+        return [], [4.0, 5.0], 0, [4.0, 5.0]
+
+    result, n_calls = _detect_crop_with_mocked_rounds(
+        monkeypatch, [round_1, round_2],
+        cancel_check=lambda: cancel_state["cancelled"],
+    )
+
+    assert n_calls == 2, "round 3 must be skipped once cancellation is visible after round 2"
+    assert result.box is None
+    assert result.flagged is not None
+    assert crop.FLAG_SPEECH_PROBES_EXHAUSTED in result.flagged
+    assert crop.FLAG_CANCELLED in result.flagged, (
+        f"expected {crop.FLAG_CANCELLED!r} in flagged, got {result.flagged!r}"
+    )
+    assert crop.FLAG_TOP_POSITIONED not in result.flagged, "round 3 never ran"
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
+
+
+def test_cancellation_during_round_3_sets_cancelled_flag_end_to_end(monkeypatch):
+    """Cancellation taking effect specifically during round 3 (the
+    full-frame retry): rounds 1 and 2 both complete normally with zero
+    hits (not cancelled), round 3 starts and is cut short -- the result
+    must carry FLAG_SPEECH_PROBES_EXHAUSTED, FLAG_TOP_POSITIONED (round 3
+    did run) AND FLAG_CANCELLED (it didn't finish on its own)."""
+    cancel_state = {"cancelled": False}
+
+    def round_1():
+        return [], [1.0, 2.0, 3.0], 0, [1.0, 2.0, 3.0]
+
+    def round_2():
+        return [], [4.0, 5.0], 0, [4.0, 5.0]
+
+    def round_3():
+        cancel_state["cancelled"] = True  # cancellation happens DURING this round
+        return [], [6.0], 0, [6.0]
+
+    result, n_calls = _detect_crop_with_mocked_rounds(
+        monkeypatch, [round_1, round_2, round_3],
+        cancel_check=lambda: cancel_state["cancelled"],
+    )
+
+    assert n_calls == 3
+    assert result.box is None
+    assert result.flagged is not None
+    assert crop.FLAG_SPEECH_PROBES_EXHAUSTED in result.flagged
+    assert crop.FLAG_TOP_POSITIONED in result.flagged
+    assert crop.FLAG_CANCELLED in result.flagged, (
+        f"expected {crop.FLAG_CANCELLED!r} in flagged, got {result.flagged!r}"
+    )
+    assert crop.FLAG_UNKNOWN_REJECTION not in result.flagged, (
+        "a KNOWN no-box scenario must never reach the generic safety-net fallback"
+    )
+
+
+def test_safety_net_fallback_flag_fires_for_a_truly_unanticipated_no_box_path(monkeypatch, caplog):
+    """Task-3 review round 3, rulings 2 and 4: test the safety net itself,
+    not a specific case. Forces raw_hits > 0 (so none of the fallback-round
+    flags fire) while the internal union/aggregation machinery is
+    monkeypatched to report "nothing found" regardless (so neither
+    FLAG_STATIC_CONTENT nor FLAG_CEILING_EXCEEDED fires either) -- i.e. a
+    box=None outcome that NO currently-known branch accounts for,
+    simulating a future no-box path nobody remembered to flag. The
+    structural post-condition just before CropResult is built must catch
+    this and compose FLAG_UNKNOWN_REJECTION, and log a warning naming the
+    file."""
+    monkeypatch.setattr(crop, "_probe_dimensions", lambda video_path: (1920, 1080))
+    monkeypatch.setattr(
+        crop.vad, "probe_times",
+        lambda video_path, duration_sec, window_frac=(0.4, 0.6): [1.0, 2.0, 3.0],
+    )
+
+    def fake_run_round(video_path, times, det_engine, band_frac, consensus, frame_size,
+                        settings, known_dims=None, cancel_check=None):
+        # raw_hits > 0 so neither fallback round ever runs -- only
+        # _union_extent_detailed()/aggregate_box() decide box/flag from
+        # here, and those are the ones forced to "find nothing" below.
+        return [["something"]], [1.0], 1, [1.0]
+
+    monkeypatch.setattr(crop, "_run_round", fake_run_round)
+    monkeypatch.setattr(
+        crop, "_union_extent_detailed",
+        lambda polys_per_frame, frame_h, cutoff_frac, sample_times=None: (None, [], None, None),
+    )
+    monkeypatch.setattr(
+        crop, "aggregate_box",
+        lambda polys_per_frame, frame_size, band_frac, settings, sample_times=None: None,
+    )
+
+    with caplog.at_level("WARNING"):
+        result = crop.detect_crop("dummy-unflagged-path.mp4", 60.0, object())
+
+    assert result.box is None
+    assert result.flagged is not None
+    assert crop.FLAG_UNKNOWN_REJECTION in result.flagged, (
+        f"expected the safety-net fallback flag, got {result.flagged!r}"
+    )
+    assert any(
+        "dummy-unflagged-path.mp4" in rec.message and rec.levelname == "WARNING"
+        for rec in caplog.records
+    ), "a warning naming the file must be logged when the fallback fires"
 
 
 @pytest.mark.needs_media
