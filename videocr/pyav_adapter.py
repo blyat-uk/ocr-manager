@@ -504,15 +504,28 @@ class PyAVCapture:
         calls it again itself, with the crop now known, before touching
         read()/set(). That rebuilds the graph a second time; harmless,
         since nothing has been pushed through the first one yet.
+
+        Re-configuring (to a different crop, to no crop at all, or to one
+        _plan_crop ends up refusing) never leaves a previous call's crop
+        state behind: everything crop-shaped is reset before (re)planning,
+        below, since _plan_crop only ever *sets* these fields, never
+        clears a stale value left over from an earlier, different request.
         """
-        self._crop_request = crop_rect
-        if not PYAV_AVAILABLE:
-            return  # cv2.VideoCapture fallback: no filter-graph crop support
         if self._read_started:
+            # Rejected -- leave _crop_request exactly as an earlier,
+            # successful call last left it, not as whatever was passed to
+            # this failed one.
             raise RuntimeError(
                 "configure_crop() called after decoding already started; "
                 "it must run before the first read()/set()."
             )
+        self._crop_request = crop_rect
+        if not PYAV_AVAILABLE:
+            return  # cv2.VideoCapture fallback: no filter-graph crop support
+        self._crop_native = None
+        self._crop_scaled_size = None
+        self._crop_slice = None
+        self._crop_graph_active = False
         try:
             # Translate the requested output-space crop into a native-space,
             # aligned, padded decode box (no-op if no crop was requested).

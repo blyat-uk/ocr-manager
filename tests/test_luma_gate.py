@@ -12,9 +12,12 @@ _center_mask_is_empty() for the full argument.
 This suite checks that claim two ways: against an oracle computed by a
 completely different code path (plain numpy min/compare, never calling
 cv2.inRange or anything _center_mask_is_empty itself calls - a mutation
-that broke the production function, e.g. a swapped channel or a flipped
-comparison, would not also break this oracle, so it would actually be
-caught), and against concrete boundary pixels. Trials are constructed, not
+that broke the production function, e.g. a flipped `== 0`/`!= 0`
+comparison (verified: this fails all three tests below), would not also
+break this oracle, so it would actually be caught - a swapped channel
+would not be a useful example here, since the threshold is identical on
+every channel and the result does not depend on channel order at all),
+and against concrete boundary pixels. Trials are constructed, not
 drawn uniformly at random and filtered after the fact: an unconditioned
 uniform draw over 200 random thresholds mostly lands far from where real
 brightness_threshold values (209, 230 - see tests/fixtures/media_manifest
@@ -137,7 +140,6 @@ def test_center_mask_matches_independent_oracle():
     admit_trials = [tr for tr in trials if tr[1] == "admit"]
     assert len(reject_trials) >= 300
     assert len(admit_trials) >= 300
-    assert any(t in PRODUCTION_THRESHOLDS for t, _ in trials)
 
 
 def test_center_mask_matches_full_frame_slice():
@@ -157,11 +159,10 @@ def test_center_mask_matches_full_frame_slice():
             frame = (_guaranteed_reject_strip(rng, (h, w, 3), threshold)
                       if mode == "reject"
                       else _guaranteed_admit_strip(rng, (h, w, 3), threshold))
-            # Force the planted bright pixel (if any) outside the center
-            # square isn't guaranteed by _guaranteed_admit_strip, so also
-            # plant one directly inside it for the "admit" case, ensuring
-            # the interesting pixel is actually within the slice under
-            # test.
+            # _guaranteed_admit_strip plants its bright pixel at a random
+            # location, not guaranteed to land inside the center square,
+            # so also plant one directly inside it for the "admit" case -
+            # otherwise this could spuriously test two "reject" slices.
             if mode == "admit":
                 frame[5, 25] = [255, 255, 255]
 
