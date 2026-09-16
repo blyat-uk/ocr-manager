@@ -5,20 +5,21 @@ core with a 1px anti-aliased 180 rim) on a dark background, bright
 text-free strips for the Laplacian gate, and yellow-text strips for the
 coloured-subtitle failure mode. Fake detection/OCR engines stand in for
 PaddleOCR; the fake OCR engines read the masked image they are handed, so
-nothing here depends on how a batch happens to be ordered.
+nothing here depends on how a batch happens to be ordered. Glyph blocks
+cover the gate's centre square, so a strip trips the real gate exactly while
+its glyph cores survive the mask.
 
-The mirror tests drive the real `videocr.video.Video.run_ocr` (with a fake
-capture, or a real one on encoded clips) and compare what it hands the OCR
-engine against this module's own view of the same frames.
+The OCR-pass mirrors and the frame source are tested in
+tests/test_detect_ocr_view.py.
 """
-import subprocess
+import json
 import time
 
-import cv2
 import numpy as np
 import pytest
 
 from core.detect import brightness as B
+from core.detect import ocr_view as OV
 
 H, W = 54, 1344
 BG = 30
@@ -139,9 +140,9 @@ def test_gate_floor_is_where_empty_strips_stop_tripping_the_laplacian_gate():
     # search for the FIRST quiet threshold would wrongly answer ~1 here.
     assert floor == 241
     for t in (floor, floor + 7, 254):
-        assert not B._gate_fires(B._mask(empties[0], t))
-    assert B._gate_fires(B._mask(empties[0], floor - 1))
-    assert not B._gate_fires(B._mask(empties[0], 1))
+        assert not OV.gate_fires(OV.mask(empties[0], t))
+    assert OV.gate_fires(OV.mask(empties[0], floor - 1))
+    assert not OV.gate_fires(OV.mask(empties[0], 1))
 
 
 def test_gate_floor_needs_only_95_percent_of_empty_strips():
@@ -175,12 +176,13 @@ def _ocr_item(text, conf):
     return {"rec_texts": [text], "rec_scores": [conf], "rec_polys": [poly]}
 
 
-def _probe_strip(identity, n_identities):
+def _probe_strip(identity, n_identities, core=255):
     """A glyph strip that tells a fake OCR engine two things from pixels
     alone: which strip it is (a 255 marker at column `identity` of row -3,
     which survives any mask) and which threshold it was masked at (row -1
-    holds a 1..255 ramp, whose smallest surviving value IS the threshold)."""
-    img = _glyph_strip()
+    holds a 1..255 ramp, whose smallest surviving value IS the threshold).
+    Its glyph cores (default 255) keep the gate firing up to `core`."""
+    img = _glyph_strip(core=(core,) * 3)
     img[-3, :n_identities] = 0
     img[-3, identity] = 255
     img[-1, :255] = np.arange(1, 256, dtype=np.uint8)[:, None]
@@ -191,6 +193,10 @@ def _masked_threshold(img):
     row = img[-1, :255].min(axis=1)
     kept = row[row > 0]
     return int(kept.min()) if kept.size else 256
+
+
+def _identity(img, n):
+    return int(np.argmax(img[-3, :n, 0]))
 
 
 class _ScriptedOCR:
@@ -207,11 +213,29 @@ class _ScriptedOCR:
         self.calls += 1
         out = []
         for img in images:
-            idx = int(np.argmax(img[-3, :len(self.texts), 0]))
+            idx = _identity(img, len(self.texts))
             variant, conf = self.scripts[idx].get(_masked_threshold(img), ("", 0.0))
             base = self.texts[idx]
             text = {"ok": base, "short": base[:-1], "wrong": "口口口口", "junk": "A", "": ""}[variant]
             out.append(_ocr_item(text, conf))
+        return out
+
+
+class _CoreReadingOCR:
+    """Reads each strip's own line whenever at least half its glyph cores
+    survive the mask -- a dim strip stops reading where its cores fade."""
+
+    CORE_PX = N_GLYPHS * (GLYPH_Y1 - GLYPH_Y0 - 2) * (GLYPH_W - 2)
+
+    def __init__(self, n):
+        self.n = n
+
+    def predict(self, images):
+        out = []
+        for img in images:
+            line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
+            readable = np.count_nonzero(line.min(axis=2)) >= self.CORE_PX // 2
+            out.append(_ocr_item(f"字幕第{_identity(img, self.n)}行文本", 0.99) if readable else _ocr_item("", 0.0))
         return out
 
 
@@ -245,13 +269,9 @@ def test_plateau_selection_picks_a_safe_margin_below_the_top_of_the_widest_valid
 
 
 def test_a_short_plateau_picks_its_lowest_verified_threshold():
-    # The right text is still the modal reading (4 of 11), but it only holds
-    # on two consecutive thresholds; four steps below that top is outside it.
     script = {
-        175: ("ok", 0.99), 180: ("junk", 0.9), 185: ("wrong", 0.99),
-        190: ("", 0.0), 195: ("", 0.0), 200: ("", 0.0),
-        205: ("ok", 0.99), 210: ("ok", 0.99),
-        215: ("short", 0.99), 220: ("wrong", 0.99), 225: ("ok", 0.99),
+        200: ("short", 0.99), 205: ("ok", 0.99), 210: ("ok", 0.99),
+        215: ("wrong", 0.9), 220: ("wrong", 0.9),
     }
     value, plateau, _ = B.verify_with_ocr(_probe_strips(), 200, _ScriptedOCR(script, TEXTS))
     assert plateau == (205, 210)
@@ -273,6 +293,21 @@ def test_an_isolated_misreading_does_not_split_the_plateau():
     assert value == 205
 
 
+def test_a_run_bridges_at_most_one_dip():
+    # Failures at 237 AND 247: bridging both would claim 217-252 and pick
+    # 232; one bridge per run gives 217-242.
+    steady = {t: ("ok", 0.99) for t in range(217, 256, 5)}
+    bad_237, bad_247 = dict(steady), dict(steady)
+    bad_237[237] = ("wrong", 0.99)
+    bad_247[247] = ("wrong", 0.99)
+    engine = _ScriptedOCR([bad_237, bad_247, steady, steady], TEXTS)
+
+    value, plateau, _ = B.verify_with_ocr(_probe_strips(), 242, engine)
+
+    assert plateau == (217, 242)
+    assert value == 222
+
+
 def test_a_strip_that_reads_text_at_only_one_threshold_carries_no_evidence():
     # A logo or speck that OCR reads once and never again is not a subtitle:
     # it must not become that strip's "modal text" and then count as lost
@@ -285,6 +320,47 @@ def test_a_strip_that_reads_text_at_only_one_threshold_carries_no_evidence():
 
     assert plateau == (175, 225)
     assert value == 205
+
+
+def test_a_strip_whose_readings_are_scattered_carries_no_evidence():
+    # Read at 175-180 and again at 215-220 with nothing between: not a band a
+    # subtitle's legibility can form, so not evidence about any threshold.
+    steady = {t: ("ok", 0.99) for t in range(175, 230, 5)}
+    scattered = {175: ("ok", 0.99), 180: ("ok", 0.99), 215: ("ok", 0.99), 220: ("ok", 0.99)}
+    engine = _ScriptedOCR([steady, steady, steady, scattered], TEXTS)
+
+    _, plateau, _ = B.verify_with_ocr(_probe_strips(), 200, engine)
+
+    assert plateau == (175, 225)
+
+
+@pytest.mark.parametrize("n_dim", [1, 7])
+def test_dim_lines_readable_only_at_the_lowest_thresholds_keep_the_pick_below_their_limit(n_dim):
+    # Reviewer's scenario: seed 242 (thresholds 217..252), bright strips read
+    # everywhere, a second dimmer style reads only up to 227 -- three
+    # thresholds, empty at five. Those empties are lost lines, not "no
+    # evidence": the pick must stay where the dim lines still read.
+    n = 16
+    strips = [_probe_strip(i, n, core=255 if i >= n_dim else 227) for i in range(n)]
+
+    value, plateau, _ = B.verify_with_ocr(strips, 242, _CoreReadingOCR(n))
+
+    assert plateau == (217, 227)
+    assert value <= 227
+
+
+def test_a_masked_strip_that_does_not_trip_the_gate_reads_as_empty():
+    # The OCR pass never OCRs a frame whose masked centre square stays quiet.
+    # Strip 0's centre holds only one 200-level speck, so from 205 up that
+    # frame is skipped there -- whatever OCR would have read.
+    steady = {t: ("ok", 0.99) for t in range(175, 230, 5)}
+    strips = _probe_strips()
+    strips[0][:, CENTRE_X0:CENTRE_X0 + H] = 0
+    strips[0][27, CENTRE_X0 + 20] = 200
+
+    _, plateau, _ = B.verify_with_ocr(strips, 200, _ScriptedOCR(steady, TEXTS))
+
+    assert plateau == (175, 200)
 
 
 def test_verify_never_scans_thresholds_above_255():
@@ -326,14 +402,20 @@ class _FakeDet:
         return out
 
 
+class _ExplodingDet:
+    def predict(self, images):
+        raise AssertionError("the detection engine must not be used on this path")
+
+
 class _GlyphReadingOCR:
     """Reads the line whenever at least half the glyph cores survive the mask."""
 
     CORE_PX = N_GLYPHS * (GLYPH_Y1 - GLYPH_Y0 - 2) * (GLYPH_W - 2)
 
-    def __init__(self):
+    def __init__(self, conf=0.99):
         self.calls = 0
         self.images = 0
+        self.conf = conf
 
     def predict(self, images):
         self.calls += 1
@@ -342,9 +424,21 @@ class _GlyphReadingOCR:
             self.images += 1
             line = img[GLYPH_Y0:GLYPH_Y1, GLYPH_X0:GLYPH_X0 + N_GLYPHS * GLYPH_PITCH]
             kept = np.count_nonzero(line.min(axis=2))
-            out.append(_ocr_item("你好世界", 0.99) if kept >= self.CORE_PX // 2
+            out.append(_ocr_item("你好世界", self.conf) if kept >= self.CORE_PX // 2
                        else _ocr_item("", 0.0))
         return out
+
+
+class _WindowOCR:
+    """Reads the line only for thresholds in [lo, hi], told apart by the
+    threshold ramp of _probe_strip."""
+
+    def __init__(self, lo, hi):
+        self.lo, self.hi = lo, hi
+
+    def predict(self, images):
+        return [_ocr_item("你好世界", 0.99) if self.lo <= _masked_threshold(img) <= self.hi
+                else _ocr_item("", 0.0) for img in images]
 
 
 class _ExplodingOCR:
@@ -385,6 +479,7 @@ def test_detect_measures_the_gate_floor_on_empty_strips(monkeypatch):
     # and the pick could not clear it.
     assert result.gate_floor == 201
     assert result.flagged is None
+    assert result.auto_applicable
     assert result.seed == 242
     assert result.plateau == (217, 247)
     assert result.value == 227
@@ -406,6 +501,7 @@ def test_a_gate_floor_above_the_pick_is_flagged_not_applied(monkeypatch):
     assert result.plateau == (217, 247)
     assert result.value == 227
     assert result.flagged == "no-clean-threshold"
+    assert result.auto_applicable
 
 
 def test_a_low_scoring_subtitle_still_counts_as_text(monkeypatch):
@@ -424,8 +520,9 @@ def test_detect_samples_24_frames_when_they_hold_enough_text(monkeypatch):
     ocr = _GlyphReadingOCR()
     B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
     assert [n for n, _ in calls] == [24]
-    # 16 text strips x seed 242's thresholds 217..252
-    assert ocr.images == 16 * 8
+    # 16 text strips x the seven of seed 242's thresholds (217..247) whose
+    # masked strips still trip the gate; at 252 nothing survives to OCR.
+    assert ocr.images == 16 * 7
 
 
 def test_too_few_text_strips_top_up_with_interleaved_rounds(monkeypatch):
@@ -448,7 +545,18 @@ def test_top_up_stops_once_there_are_enough_text_strips(monkeypatch):
     ocr = _GlyphReadingOCR()
     B.detect_brightness("v.mp4", CROP, None, _FakeDet(), ocr)
     assert [n for n, _ in calls] == [24, 24]
-    assert ocr.images == 16 * 8
+    assert ocr.images == 16 * 7
+
+
+def test_thin_evidence_after_every_round_is_flagged(monkeypatch):
+    thin = [_glyph_strip()] * 2 + [_ramp_strip(top=200)] * 22   # 6 text strips in 72 frames
+    _fake_source(monkeypatch, rounds=[thin, thin, thin])
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _GlyphReadingOCR())
+
+    assert result.flagged == "thin-evidence?"
+    assert not result.auto_applicable
+    assert result.plateau == (217, 247)
 
 
 def test_yellow_text_is_flagged_rather_than_applied(monkeypatch):
@@ -461,6 +569,7 @@ def test_yellow_text_is_flagged_rather_than_applied(monkeypatch):
     assert result.seed < 150
     assert result.flagged == "coloured-text?"
     assert result.plateau is None
+    assert not result.auto_applicable
 
 
 def test_no_clean_threshold_is_flagged_and_the_pick_is_not_raised(monkeypatch):
@@ -476,6 +585,43 @@ def test_no_clean_threshold_is_flagged_and_the_pick_is_not_raised(monkeypatch):
     assert result.plateau[0] <= result.value <= result.plateau[1]
 
 
+def test_no_empty_strips_means_the_floor_was_not_measured_not_that_clutter_won(monkeypatch):
+    _fake_source(monkeypatch, [_glyph_strip()])
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _GlyphReadingOCR())
+
+    assert result.gate_floor is None
+    assert result.flagged is None
+    assert result.auto_applicable
+
+
+def test_a_plateau_too_narrow_for_the_safety_margin_is_flagged(monkeypatch):
+    # Text reads only at 230-245 (seed 245, thresholds 220..255): the pick
+    # cannot sit 20 below the top without leaving the plateau.
+    text = [_probe_strip(0, 1) for _ in range(16)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _WindowOCR(230, 245))
+
+    assert result.plateau == (230, 245)
+    assert result.value == 230
+    assert result.flagged == "narrow-plateau?"
+    assert not result.auto_applicable
+
+
+def test_detect_flags_a_verification_that_finds_no_plateau(monkeypatch):
+    text = [_glyph_strip() for _ in range(16)]
+    _fake_source(monkeypatch, text + [_ramp_strip(top=200)] * 8)
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _GlyphReadingOCR(conf=0.9))
+
+    assert result.gate_floor == 201
+    assert result.plateau is None
+    assert result.flagged == "no-plateau?"
+    assert result.value == result.seed == 242
+    assert not result.auto_applicable
+
+
 def test_missing_crop_is_flagged_without_touching_the_video(monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("must not sample frames without a crop box")
@@ -484,6 +630,7 @@ def test_missing_crop_is_flagged_without_touching_the_video(monkeypatch):
     result = B.detect_brightness("v.mp4", None, None, _FakeDet(), _ExplodingOCR())
     assert result.flagged == "needs-crop"
     assert result.plateau is None
+    assert not result.auto_applicable
 
 
 def test_no_text_anywhere_is_flagged(monkeypatch):
@@ -491,6 +638,67 @@ def test_no_text_anywhere_is_flagged(monkeypatch):
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR())
     assert result.flagged is not None and "no-text" in result.flagged.split("+")
     assert result.plateau is None
+    assert not result.auto_applicable
+
+
+def test_keep_ranges_that_select_nothing_are_flagged_not_sampled_elsewhere(synthetic_video):
+    # A 0.4 s clip; ranges past its end. Sampling the rest of the file
+    # instead measures text OCR will never run on (Martial Master's opening
+    # lyrics broke at a different threshold than its dialogue).
+    result = B.detect_brightness(str(synthetic_video), (0, 200, 320, 40), [("1:00", "2:00")],
+                                 _ExplodingDet(), _ExplodingOCR())
+    assert result.flagged == "ranges-empty?"
+    assert not result.auto_applicable
+
+
+@pytest.mark.parametrize("cancel_at_poll, rounds_sampled", [(2, 1), (1, 0)])
+def test_cancellation_between_rounds_returns_a_cancelled_result(monkeypatch, cancel_at_poll, rounds_sampled):
+    sparse = [_glyph_strip()] * 6 + [_ramp_strip()] * 18
+    calls = _fake_source(monkeypatch, rounds=[sparse, sparse, sparse])
+    polls = []
+
+    def cancel_check():
+        polls.append(1)
+        return len(polls) >= cancel_at_poll
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(), cancel_check=cancel_check)
+
+    assert len(calls) == rounds_sampled
+    assert result.flagged == "cancelled"
+    assert not result.auto_applicable
+
+
+def test_cancellation_before_verification_skips_the_ocr_batch(monkeypatch):
+    _fake_source(monkeypatch, [_glyph_strip()] * 16 + [_ramp_strip()] * 8)
+    polls = []
+
+    def cancel_check():
+        polls.append(1)
+        return len(polls) >= 2   # poll 1: before the (only) round; poll 2: before OCR
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(), cancel_check=cancel_check)
+
+    assert result.flagged == "cancelled"
+    assert result.seed == 242
+
+
+@pytest.mark.parametrize("flagged, applicable", [
+    (None, True),
+    ("no-clean-threshold", True),
+    ("narrow-plateau?", False),
+    ("no-clean-threshold+narrow-plateau?", False),
+    ("thin-evidence?", False),
+    ("no-plateau?", False),
+    ("coloured-text?", False),
+    ("no-text", False),
+    ("needs-crop", False),
+    ("ranges-empty?", False),
+    ("escalate", False),
+    ("cancelled", False),
+])
+def test_only_clean_or_clutter_only_results_are_auto_applicable(flagged, applicable):
+    result = B.BrightnessResult(227, (217, 247), 242, 201, flagged, [])
+    assert result.auto_applicable is applicable
 
 
 # --------------------------------------------------------------------------
@@ -524,6 +732,17 @@ def test_cheap_path_never_goes_above_the_folder_plateaus_safe_pick(monkeypatch):
     assert result.value == 230
 
 
+def test_cheap_path_never_goes_below_a_narrow_folder_plateau(monkeypatch):
+    dim = _glyph_strip(core=(235,) * 3)   # seed 227
+    _fake_source(monkeypatch, _interleave([dim] * 3, [_ramp_strip()] * 3))
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
+                                 folder_plateau=(220, 235))
+
+    assert result.value == 220          # 235 - 20 = 215 would leave the plateau
+    assert result.flagged == "narrow-plateau?"
+
+
 def test_cheap_path_escalates_when_the_seed_is_outside_the_folder_plateau(monkeypatch):
     calls = _fake_source(monkeypatch, _interleave([_glyph_strip()] * 3, [_ramp_strip()] * 3))
 
@@ -541,274 +760,15 @@ def test_cheap_path_escalates_when_no_text_is_found(monkeypatch):
     assert result.flagged == "escalate"
 
 
-# --------------------------------------------------------------------------
-# Sampling times
-# --------------------------------------------------------------------------
+def test_cheap_path_reports_coloured_text_instead_of_escalating(monkeypatch):
+    yellow = _glyph_strip(core=(0, 250, 250), rim=(0, 180, 180))
+    _fake_source(monkeypatch, _interleave([yellow] * 3, [_ramp_strip()] * 3))
 
-def test_sample_times_skip_the_first_and_last_tenth_without_ranges():
-    times = B.sample_times(1000.0, None, 24)
-    assert len(times) == 24
-    assert all(100.0 <= t <= 900.0 for t in times)
-    assert times == sorted(times)
-    gaps = np.diff(times)
-    assert gaps.min() > 0.8 * (800.0 / 24)
-    assert times[0] < 150 and times[-1] > 850
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
+                                 folder_plateau=(90, 250))
 
-
-def test_sample_times_stay_inside_the_keep_ranges_in_proportion():
-    ranges = [("1:00", "2:00"), ("5:00", "5:30")]
-    times = B.sample_times(600.0, ranges, 24)
-    assert len(times) == 24
-    first = [t for t in times if 60.0 <= t <= 120.0]
-    second = [t for t in times if 300.0 <= t <= 330.0]
-    assert len(first) + len(second) == 24
-    assert len(first) == 16 and len(second) == 8
-
-
-def test_later_sampling_rounds_interleave_with_the_first():
-    first = B.sample_times(1000.0, None, 24)
-    second = B.sample_times(1000.0, None, 24, phase=0.0)
-    third = B.sample_times(1000.0, None, 24, phase=0.25)
-    merged = sorted(first + second + third)
-    assert len(set(merged)) == 72
-    assert all(100.0 <= t <= 900.0 for t in merged)
-    # every second-round time sits between two first-round times
-    for a, b in zip(first, first[1:]):
-        assert sum(a < t < b for t in second) == 1
-
-
-def test_sample_times_open_ended_ranges_run_to_the_file_edges():
-    times = B.sample_times(600.0, [(None, "1:00"), ("9:00", "")], 12)
-    assert all(t <= 60.0 or t >= 540.0 for t in times)
-    assert sum(t <= 60.0 for t in times) == 6
-
-
-# --------------------------------------------------------------------------
-# Mirror of videocr/video.py: downscale, mask and gate, pinned against the
-# real run_ocr with a fake capture (no media, no models).
-# --------------------------------------------------------------------------
-
-class _RecordingOCR:
-    def __init__(self):
-        self.frames = []
-
-    def predict(self, frames):
-        self.frames.extend(f.copy() for f in frames)
-        return [_ocr_item("", 0.0) for _ in frames]
-
-
-def _run_ocr_on_frames(monkeypatch, frames, threshold, crop=None):
-    """Feed `frames` through the real Video.run_ocr and return what it hands
-    the OCR engine."""
-    from videocr import utils
-    from videocr import video as V
-
-    h, w = frames[0].shape[:2]
-
-    class FakeCapture:
-        def __init__(self, path, use_gpu=True, decode_target_height=None, crop_rect=None):
-            self._i = 0
-            self._crop_slice = None
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def get(self, prop):
-            return {
-                cv2.CAP_PROP_FRAME_COUNT: len(frames), cv2.CAP_PROP_FPS: 25.0,
-                cv2.CAP_PROP_FRAME_HEIGHT: h, cv2.CAP_PROP_FRAME_WIDTH: w,
-            }.get(prop, 0)
-
-        def set(self, prop, value):
-            return True
-
-        def read(self):
-            if self._i >= len(frames):
-                return False, None
-            self._i += 1
-            return True, frames[self._i - 1].copy()
-
-        def get_last_pts(self):
-            return (self._i - 1) / 25.0
-
-        def get_stream_start_time(self):
-            return 0.0
-
-    recorder = _RecordingOCR()
-    monkeypatch.setattr(V, "Capture", FakeCapture)
-    monkeypatch.setattr(utils, "create_ocr_engine", lambda *a, **k: recorder)
-    video = V.Video("fake.mp4", None, None)
-    cx, cy, cw, ch = crop if crop else (None, None, None, None)
-    video.run_ocr(False, "ch", "", "", 95, crop is None, threshold, 0, 25, 0, cx, cy, cw, ch)
-    return recorder.frames
-
-
-def _separated(frames):
-    """Two blank frames after each test frame end any tracking state, so a
-    frame reaches OCR exactly when it trips the gate by itself."""
-    blank = np.zeros_like(frames[0])
-    out = []
-    for f in frames:
-        out += [f, blank, blank]
-    return out
-
-
-def _blocky_frame(rng, h, w, block=16):
-    """Grey blocks with per-channel noise: bright blocks survive an area
-    downscale (plain noise would average out and never trip the gate), and
-    the noise makes the min-channel mask cut inside them."""
-    grey = rng.integers(0, 256, (h // block + 1, w // block + 1))
-    img = np.repeat(np.repeat(grey, block, 0), block, 1)[:h, :w]
-    noise = rng.integers(-12, 13, (h, w, 3))
-    return np.clip(img[..., None] + noise, 0, 255).astype(np.uint8)
-
-
-# 1142: int(1142 * (720 / 1142)) is 719 -- the copy must keep run_ocr's float
-# arithmetic, not "fix" it to 720.
-@pytest.mark.parametrize("h, w", [(53, 1344), (720, 900), (721, 900), (1080, 1920), (1142, 700), (2000, 400)])
-def test_ocr_view_and_mask_match_what_run_ocr_hands_the_engine(monkeypatch, h, w):
-    rng = np.random.default_rng(h * 7 + w)
-    frames = [_blocky_frame(rng, h, w) for _ in range(3)]
-    threshold = 200
-
-    seen = _run_ocr_on_frames(monkeypatch, _separated(frames), threshold)
-
-    expected = [B._mask(B._ocr_view(f), threshold) for f in frames]
-    assert all(B._gate_fires(e) for e in expected)
-    assert len(seen) == len(expected)
-    for got, want in zip(seen, expected):
-        assert got.shape == want.shape
-        assert np.array_equal(got, want)
-
-
-def test_gate_fires_at_exactly_the_minimum_variance_like_run_ocr(monkeypatch):
-    # Ten isolated pixels of 27 in the 54x54 centre square give a Laplacian
-    # variance of exactly 145800 / 2916 = 50.0: the OCR gate's ">=" fires.
-    exact = np.zeros((H, W, 3), dtype=np.uint8)
-    nine = np.zeros((H, W, 3), dtype=np.uint8)
-    spots = [(5 + 3 * i, CENTRE_X0 + 5 + 3 * i) for i in range(10)]
-    for k, (r, c) in enumerate(spots):
-        exact[r, c] = 27
-        if k < 9:
-            nine[r, c] = 27
-
-    seen = _run_ocr_on_frames(monkeypatch, _separated([exact, nine]), 20)
-
-    assert B._gate_fires(B._mask(exact, 20))
-    assert not B._gate_fires(B._mask(nine, 20))
-    assert len(seen) == 1 and np.array_equal(seen[0], B._mask(exact, 20))
-
-
-def test_gate_matches_run_ocr_at_the_variance_boundary(monkeypatch):
-    # One bright pixel on black: the centre square's Laplacian variance is
-    # 20*v^2/h^2, which crosses MIN_LAPLACIAN_VARIANCE between v=85 and 86
-    # for h=54. A pixel just outside the centre square must never count.
-    frames = []
-    for v, col in [(85, CENTRE_X0 + 20), (86, CENTRE_X0 + 20), (255, CENTRE_X0 - 3),
-                   (120, CENTRE_X0 + 1), (90, CENTRE_X0 + H + 2)]:
-        f = np.zeros((H, W, 3), dtype=np.uint8)
-        f[27, col] = v
-        frames.append(f)
-
-    seen = _run_ocr_on_frames(monkeypatch, _separated(frames), 80)
-
-    fired = [f for f in frames if B._gate_fires(B._mask(B._ocr_view(f), 80))]
-    assert [int(f.max()) for f in fired] == [86, 120]
-    assert len(seen) == len(fired)
-    for got, want in zip(seen, fired):
-        assert np.array_equal(got, B._mask(B._ocr_view(want), 80))
-
-
-# --------------------------------------------------------------------------
-# Frame source: grab_ocr_strips must return exactly the pixels the OCR pass
-# sees, through the same capture chain (decode downscale, in-graph crop,
-# 10-bit conversion, HDR tone map).
-# --------------------------------------------------------------------------
-
-def _encode(path, size, pix_fmt, codec="libx264", frames=40, gop=15, hdr=False):
-    vf = []
-    if hdr:
-        vf = ["-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
-              "-color_trc", "smpte2084", "-color_primaries", "bt2020", "-colorspace", "bt2020nc"]
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-           "-i", f"testsrc2=size={size}:rate=25:duration={frames / 25}",
-           "-pix_fmt", pix_fmt, "-c:v", codec, "-g", str(gop), "-preset", "ultrafast",
-           *vf, str(path)]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return path
-
-
-def _run_ocr_frames_by_pts(monkeypatch, path, crop, time_start="", time_end=""):
-    """Every frame the real run_ocr hands its OCR engine, keyed by PTS, with
-    the brightness filter off so each decoded frame is handed over as-is."""
-    from videocr import utils
-    from videocr import video as V
-
-    recorder = _RecordingOCR()
-    monkeypatch.setattr(utils, "create_ocr_engine", lambda *a, **k: recorder)
-    video = V.Video(str(path), None, None)
-    x, y, w, h = crop
-    video.run_ocr(False, "ch", time_start, time_end, 95, False, 0, 0, 25, 0, x, y, w, h)
-    assert len(recorder.frames) == len(video.pred_frames)
-    return {round(p.pts_start, 6): f for p, f in zip(video.pred_frames, recorder.frames)}
-
-
-def _assert_strips_match_run_ocr(monkeypatch, path, crop, time_start="", time_end="", picks=6):
-    by_pts = _run_ocr_frames_by_pts(monkeypatch, path, crop, time_start, time_end)
-    pts = sorted(by_pts)
-    chosen = pts[1::max(1, len(pts) // picks)][:picks]
-    strips = B.grab_ocr_strips(str(path), crop, chosen)
-    assert len(strips) == len(chosen)
-    for t, strip in zip(chosen, strips):
-        assert strip.shape == by_pts[t].shape, f"t={t}"
-        assert np.array_equal(strip, by_pts[t]), f"t={t}: strip differs from the OCR pass"
-
-
-@pytest.mark.parametrize("name, size, pix_fmt, hdr, crop", [
-    # no filter graph: decoded as-is, sliced in Python
-    ("sdr8_360p", "640x360", "yuv420p", False, (100, 290, 400, 40)),
-    # PQ tone map in the graph, crop planned inside it
-    ("pq10_720p", "1280x720", "yuv420p10le", True, (100, 640, 1000, 60)),
-    # 4:3 decode downscale: the capture refuses the in-graph crop, Python
-    # slices. The box's far edges scale to x 1575.75 / y 1041.75, which
-    # run_ocr truncates.
-    ("sdr10_1440p", "2560x1440", "yuv420p10le", False, (401, 1300, 1700, 89)),
-])
-def test_grab_ocr_strips_returns_the_pixels_run_ocr_sees(monkeypatch, tmp_path, name, size, pix_fmt, hdr, crop):
-    import av
-    from videocr import pyav_adapter
-
-    path = _encode(tmp_path / f"{name}.mp4", size, pix_fmt, hdr=hdr)
-    container = av.open(str(path))
-    try:
-        trc = int(container.streams.video[0].codec_context.color_trc)
-    finally:
-        container.close()
-    # Otherwise the HDR case would silently exercise the SDR chain.
-    assert (trc == pyav_adapter._TRC_SMPTE2084) == hdr
-    _assert_strips_match_run_ocr(monkeypatch, path, crop)
-
-
-@pytest.mark.parametrize("crop", [
-    (576, 1892, 2688, 108),     # a subtitle band: in-graph crop, no Python downscale
-    (400, 200, 3000, 1600),     # 800 rows after decode downscale: run_ocr shrinks it to 720
-])
-def test_grab_ocr_strips_matches_run_ocr_on_10bit_4k(monkeypatch, tmp_path, crop):
-    path = _encode(tmp_path / "sdr10_4k.mp4", "3840x2160", "yuv420p10le", frames=30)
-    _assert_strips_match_run_ocr(monkeypatch, path, crop)
-
-
-@pytest.mark.needs_media
-@pytest.mark.slow
-def test_grab_ocr_strips_matches_run_ocr_on_the_real_10bit_4k_reference(monkeypatch, reference_media, detector_truth):
-    entry = reference_media.get("xwz")
-    if entry is None:
-        pytest.skip("xwz reference project not present")
-    crop = tuple(detector_truth["xwz"]["files"][entry["video"].name]["crop"])
-    _assert_strips_match_run_ocr(monkeypatch, entry["video"], crop, "5:00", "5:02")
+    assert result.seed < 150
+    assert result.flagged == "coloured-text?"
 
 
 # --------------------------------------------------------------------------
@@ -818,8 +778,9 @@ def test_grab_ocr_strips_matches_run_ocr_on_the_real_10bit_4k_reference(monkeypa
 @pytest.mark.needs_media
 @pytest.mark.slow
 def test_brightness_matches_or_beats_the_hand_tuned_value(reference_media, detector_truth):
-    """Not an equality check: higher within the plateau suppresses clutter,
-    so the automatic pick may legitimately beat the hand-tuned value."""
+    """Not an equality check. An auto-applicable result must sit inside the
+    plateau that contains the hand-tuned value, or above it; a flagged one
+    goes to review and is only reported."""
     from videocr.utils import create_detection_engine, create_ocr_engine, suppress_output
     with suppress_output():
         det = create_detection_engine(None, True)
@@ -833,19 +794,21 @@ def test_brightness_matches_or_beats_the_hand_tuned_value(reference_media, detec
         expected = truth["files"].get(entry["video"].name)
         if not expected:
             continue
-        hand = expected["brightness"]
+        # The keep ranges the pipeline would pass, from the project's own
+        # .ocr.json (read-only); sampling outside them can meet different text.
+        config = json.loads((entry["dir"] / ".ocr.json").read_text())
+        ranges = (config.get("files", {}).get(entry["video"].name) or {}).get("time_ranges") or None
         started = time.perf_counter()
-        result = B.detect_brightness(str(entry["video"]), tuple(expected["crop"]), None, det, ocr)
-        rows.append((key, hand, result, time.perf_counter() - started))
+        result = B.detect_brightness(str(entry["video"]), tuple(expected["crop"]), ranges, det, ocr)
+        rows.append((key, expected["brightness"], result, time.perf_counter() - started))
 
     assert rows, "no reference files resolved"
     for key, hand, r, secs in rows:
         print(f"{key}: hand={hand} chosen={r.value} plateau={r.plateau} seed={r.seed} "
-              f"gate_floor={r.gate_floor} flagged={r.flagged} {secs:.1f}s")
+              f"gate_floor={r.gate_floor} flagged={r.flagged} auto={r.auto_applicable} {secs:.1f}s")
     for key, hand, r, _ in rows:
-        # "no-clean-threshold" is informational (see BrightnessResult); any
-        # other flag means the value must not be auto-applied.
-        assert r.flagged in (None, "no-clean-threshold"), f"{key}: flagged {r.flagged}"
+        if not r.auto_applicable:
+            continue
         in_same_plateau = (r.plateau is not None and r.plateau[0] <= hand <= r.plateau[1]
                            and r.plateau[0] <= r.value <= r.plateau[1])
         assert in_same_plateau or r.value >= hand, (
