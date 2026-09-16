@@ -29,6 +29,38 @@ MIN_CROP_HEIGHT = 150
 # Maximum alternative frames OCR'd for one low-confidence subtitle
 MAX_CANDIDATES = 8
 
+# Ceiling on the alternative-reading frames buffered for one batch, per worker.
+#
+# A candidate is held from the moment the producer offers it until the batch
+# it belongs to has been OCR'd and resolved, so the standing worst case is
+# MAX_CANDIDATES x BATCH_SIZE = 2048 frames on top of the batch's own 256 and
+# the frame queue. At the reference crop geometry (1344x53 BGR, 213,696 bytes
+# a frame) that is ~437 MB; with use_fullframe the candidates are whole
+# 1280x720 pictures (2,764,800 bytes) and it reaches ~5.7 GB -- per worker,
+# and OCRManager runs several workers at once. 256 subtitles each holding a
+# couple of seconds of similar frames is only ~8.5 minutes of dialogue, so
+# this is an ordinary episode, not a pathological one.
+#
+# 512 MiB sits just above the crop-mode worst case, so the mode production
+# actually runs in is never clipped at all (and the golden cases, which OCR
+# two minutes at that geometry, are nowhere near it); use_fullframe is held
+# to ~194 frames instead of 2048.
+MAX_CANDIDATE_BUFFER_BYTES = 512 * 1024**2
+
+
+def _candidate_fits(buffered_bytes: int, frame) -> bool:
+    """Whether one more candidate frame fits in a batch's byte budget.
+
+    A pure function of the running total and the frame itself. That is the
+    whole point: admission must depend only on the frame stream and the
+    configuration, so the buffered set - and therefore the output - is the
+    same on a loaded machine as on an idle one, at any BATCH_SIZE and any
+    worker count. Anything consulting queue depth or elapsed time here would
+    make the OCR result a function of scheduling.
+    """
+    return buffered_bytes + frame.nbytes <= MAX_CANDIDATE_BUFFER_BYTES
+
+
 # Confidence advantage (on the 0-100 scale) a candidate reading must hold over
 # the original before it may replace it *without* agreement from other frames.
 #
@@ -99,6 +131,10 @@ class Video:
         # Candidates for the subtitle currently being tracked by the producer;
         # attached to the tail batch slot when that subtitle ends.
         pending_candidates = []
+        # Bytes of candidate frames currently held for this batch: those
+        # already attached to batch_candidates plus pending_candidates. Reset
+        # with the batch at each flush, when they are all released.
+        batch_candidate_bytes = 0
 
         ocr = utils.create_ocr_engine(self.lang, self.det_model_dir, self.rec_model_dir, use_gpu)
 
@@ -228,7 +264,15 @@ class Video:
                         # Whether it gets OCR'd is decided when the subtitle's
                         # batch is processed, from that subtitle's own
                         # first-reading confidence - never from queue depth.
-                        pending_candidates.append(msg[1])
+                        #
+                        # Admission is bounded by the batch's byte budget and
+                        # evaluated in producer order, so the cap cannot make
+                        # the buffered set depend on consumer timing: the same
+                        # video always drops the same candidates.
+                        candidate = msg[1]
+                        if _candidate_fits(batch_candidate_bytes, candidate):
+                            pending_candidates.append(candidate)
+                            batch_candidate_bytes += candidate.nbytes
                     elif msg_type == "frame":
                         # A new subtitle starts here, so the previous one is
                         # complete: hand its candidates to its batch slot.
@@ -250,6 +294,9 @@ class Video:
                             batch_pts_start = []
                             batch_pts_end = []
                             batch_candidates = []
+                            # Every buffered candidate belonged to the batch
+                            # just resolved, so the budget is free again.
+                            batch_candidate_bytes = 0
 
                         frame, frame_idx, pts = msg[1], msg[2], msg[3]
                         batch_frames.append(frame)
