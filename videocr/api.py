@@ -87,10 +87,16 @@ def save_subtitles_to_file(
         label_min_duration=1.0, label_max_duration=5.0, label_conf_threshold=95, label_conf_threshold_min=75,
         label_mask_crops=None,
         progress_callback=None, subtitle_callback=None, cancel_event=None) -> None:
+    # Produce the text first, create the file second. Opening 'w+' up front
+    # truncates before any work happens, so anything that refuses to run --
+    # the backend guard above, a filter graph that cannot be built -- would
+    # leave a zero-byte .ass next to the video, which reads as "OCR produced
+    # nothing" rather than "OCR did not run".
+    ass = get_subtitles(
+        video_path, lang, time_start, time_end, conf_threshold,
+        sim_threshold, use_fullframe, det_model_dir, rec_model_dir, use_gpu, brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip, crop_x, crop_y, crop_width, crop_height,
+        detect_labels, only_labels, label_min_duration, label_max_duration, label_conf_threshold, label_conf_threshold_min,
+        label_mask_crops,
+        progress_callback=progress_callback, subtitle_callback=subtitle_callback, cancel_event=cancel_event)
     with open(file_path, 'w+', encoding='utf-8') as f:
-        f.write(get_subtitles(
-            video_path, lang, time_start, time_end, conf_threshold,
-            sim_threshold, use_fullframe, det_model_dir, rec_model_dir, use_gpu, brightness_threshold, similar_image_threshold, similar_pixel_threshold, frames_to_skip, crop_x, crop_y, crop_width, crop_height,
-            detect_labels, only_labels, label_min_duration, label_max_duration, label_conf_threshold, label_conf_threshold_min,
-            label_mask_crops,
-            progress_callback=progress_callback, subtitle_callback=subtitle_callback, cancel_event=cancel_event))
+        f.write(ass)

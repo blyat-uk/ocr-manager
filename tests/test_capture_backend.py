@@ -93,3 +93,29 @@ def test_production_entry_point_proceeds_with_escape_hatch(monkeypatch):
 
     with pytest.raises(_NeverReached):
         api.get_subtitles("no-such-video.mkv")
+
+
+def test_refusal_does_not_leave_a_truncated_ass_file(tmp_path, monkeypatch):
+    """save_subtitles_to_file opened 'w+' before doing any work, so anything
+    that refused to run -- the backend guard, an unbuildable filter graph --
+    truncated or created a zero-byte .ass next to the video. An empty file
+    reads as 'OCR produced nothing', not 'OCR did not run'."""
+    from videocr import api
+
+    out = tmp_path / "episode.ass"
+    out.write_text("previous run's output", encoding="utf-8")
+
+    api_module = _stub_video(monkeypatch)
+    monkeypatch.setattr(pyav_adapter, "PYAV_AVAILABLE", False)
+    monkeypatch.setattr(pyav_adapter, "PYAV_IMPORT_ERROR", "ImportError: boom")
+    monkeypatch.delenv(pyav_adapter.ALLOW_FALLBACK_ENV, raising=False)
+
+    with pytest.raises(RuntimeError):
+        api_module.save_subtitles_to_file("no-such-video.mkv", file_path=str(out))
+
+    assert out.read_text(encoding="utf-8") == "previous run's output"
+
+    missing = tmp_path / "fresh.ass"
+    with pytest.raises(RuntimeError):
+        api.save_subtitles_to_file("no-such-video.mkv", file_path=str(missing))
+    assert not missing.exists()
