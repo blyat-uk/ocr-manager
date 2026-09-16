@@ -820,6 +820,17 @@ def grab_frames(video_path: str, times: list[float], band_frac: float = 0.55,
     crossover, see _prefers_persistent_fetch() -- by a pool of persistent
     containers; the frames are identical either way.
 
+    These are NOT the pixels the OCR pass sees, and on some sources not even
+    its frames: a full-width band through crop -> scale -> bgr24 (or the
+    system ffmpeg CLI), where the OCR pass decodes through
+    videocr.pyav_adapter.Capture with its own decode downscale, crop and
+    brightness mask. Measured: identical on Slay the Gods (1080p 8-bit), but
+    87-90% of pixels off by up to 13 levels on XWZ (4K 10-bit) and a
+    different frame on Jinwu Guard (h264 MKV) -- see task-4-report.md. Use
+    core.detect.ocr_view for anything that must match OCR (brightness
+    tuning or previews), and see core/detect/__init__.py for which times
+    re-fetch through which function.
+
     Failed grabs (decode error, timeout, short read, past the end) are
     dropped rather than raising -- a handful of unreadable probe timestamps
     shouldn't fail the whole detection pass -- and logged via the

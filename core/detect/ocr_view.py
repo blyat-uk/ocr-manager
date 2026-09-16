@@ -244,8 +244,13 @@ def grab_ocr_strips_at(video_path: str, crop_box, times: list[float]) -> list[tu
     to 13 levels on XWZ (4K 10-bit) and a different frame altogether on Jinwu
     Guard (h264 MKV). See task-4-report.md.
 
-    `times` are in the OCR pass's own position domain (a time maps to frame
-    index round(t * fps), as `time_start` does). Returns (requested time,
+    `times` map to frame index round(t * fps), which is then sought exactly
+    as the OCR pass seeks its range start (Capture.set(CAP_PROP_POS_FRAMES)).
+    The OCR pass itself TRUNCATES a range start (int(t * fps), see
+    videocr.utils.get_frame_index), so for a time that is not a whole frame
+    this can return the frame after the one the OCR pass would start on.
+    Sampling does not care which of two adjacent frames it gets; a preview of
+    a range boundary would. Returns (requested time,
     strip) pairs in the order of `times`. A frame that cannot be read, seeked
     to or opened (FETCH_ERRORS) is dropped and logged, never raised; a file
     that cannot be opened at all returns [].
