@@ -51,3 +51,6 @@ Thumbs.db
 
 .venv
 .superpowers/
+
+# Fidelity harness output for a failing case, never a golden.
+tests/goldens/*.actual.ass
