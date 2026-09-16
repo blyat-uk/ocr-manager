@@ -24,7 +24,9 @@ def test_assert_reference_backend_raises_when_pyav_unavailable(monkeypatch):
         pyav_adapter.assert_reference_backend()
 
     message = str(exc_info.value)
-    assert "pip install -U --only-binary=:all: av" in message
+    # Venv-qualified: the message must never hand anyone a bare `pip`, and
+    # this file must not contain one either.
+    assert ".venv/bin/pip install -U --only-binary=:all: av" in message
     assert "ImportError: libavdevice.so.62: ..." in message
     assert pyav_adapter.ALLOW_FALLBACK_ENV in message
 

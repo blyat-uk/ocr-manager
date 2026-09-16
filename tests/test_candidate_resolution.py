@@ -134,9 +134,13 @@ def test_each_batch_slot_resolves_against_its_own_subtitle():
 def test_agreement_beats_a_much_more_confident_dissenter():
     """Confidence is certainty, not correctness: the majority reading wins.
 
-    The dissenter's lead here is far beyond CANDIDATE_CONFIDENCE_MARGIN, so
-    only the agreement rule can be what saves the original - exactly the shape
-    that produced the 万 -> 方 regression under highest-confidence-wins.
+    The dissenter leads the original by 9.0 points, just inside the 10.0 of
+    CANDIDATE_CONFIDENCE_MARGIN - so the margin alone would already refuse
+    it. What this locks in is that two agreeing frames beat it regardless:
+    they make the original's text strictly modal, which is the rule that has
+    to hold even for a dissenter whose lead clears the margin. Exactly the
+    shape that produced the 万 -> 方 regression under
+    highest-confidence-wins.
     """
     target = make_target([("光芒万文", 0.900)])
     v = make_video([target])

@@ -3,7 +3,7 @@
 Cross-platform build script for OCR Manager.
 
 Usage:
-    python build.py
+    .venv/bin/python build.py
 
 This script:
 1. Creates a virtual environment

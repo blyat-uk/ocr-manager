@@ -515,10 +515,14 @@ class Video:
             # ...and refuse it outright if it is shorter. Dropping a word
             # raises the mean for free, so on one frame's opinion alone a
             # shorter reading is indistinguishable from a frame that merely
-            # failed to detect the word. The guard is unconditional here:
-            # PredictedFrames already discards every word below
-            # MIN_WORD_CONFIDENCE before assembling `lines`, so a dropped word
-            # the original was *not* confident about cannot occur.
+            # failed to detect the word. The guard is unconditional, with no
+            # carve-out for words the original scored poorly on. It is
+            # tempting to read MIN_WORD_CONFIDENCE as such a carve-out, but
+            # it is a garbage floor (0.5), not a confidence bar: surviving
+            # the filter means a word was not obvious noise, not that the
+            # original was confident about it. Nothing here can tell a
+            # deliberate deletion from a missed detection, so nothing here
+            # gets to make an exception.
             if len(winner.text) < len(target.text):
                 return
         # A strictly modal winner needs no length guard: several independent
