@@ -54,6 +54,9 @@ import numpy as np
 
 from core.config import Config as _Config
 from core.detect import vad
+from core.detect.flags import compose_flag as _compose_flag
+from core.detect.flags import is_cancelled as _is_cancelled
+from core.detect.flags import only_informational
 from videocr.pyav_adapter import _TRC_ARIB_STD_B67, _TRC_SMPTE2084, PyAVCapture, _pyav_has_zscale
 
 logger = logging.getLogger(__name__)
@@ -345,11 +348,7 @@ class CropResult:
         | ceiling-exceeded        | None    | blocking      | Union taller than MAX_CROP_HEIGHT_FRAC; no box. |
         | unknown-rejection       | None    | blocking      | Safety net: no box and no specific flag. |
         """
-        if self.box is None:
-            return False
-        if not self.flagged:
-            return True
-        return all(part in INFORMATIONAL_FLAGS for part in self.flagged.split("+"))
+        return self.box is not None and only_informational(self.flagged, INFORMATIONAL_FLAGS)
 
 
 # --------------------------------------------------------------------------
@@ -1272,19 +1271,6 @@ def _consistent_with_consensus(y_frac: float, h_frac: float,
     return True
 
 
-def _compose_flag(existing: str | None, new: str) -> str:
-    """Combine flag reasons instead of one silently clobbering another --
-    e.g. "speech probes found nothing" AND "had to widen past the bottom
-    band" can both be true of the same result, and both are useful to a
-    reviewer deciding whether to trust the box."""
-    if not existing:
-        return new
-    parts = existing.split("+")
-    if new in parts:
-        return existing
-    return f"{existing}+{new}"
-
-
 def _spread_order(times: list[float]) -> list[float]:
     """Reorder timestamps by greedy farthest-point sampling: the earliest
     entries visited are maximally spread apart, rather than adjacent in
@@ -1537,10 +1523,6 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     extents = _per_frame_extents(polys_per_frame, frame_h, cutoff_frac)
     raw_hits = sum(e is not None for e in extents)
     return polys_per_frame, sample_pts, raw_hits, frame_times
-
-
-def _is_cancelled(cancel_check: Callable[[], bool] | None) -> bool:
-    return cancel_check is not None and cancel_check()
 
 
 def detect_crop(video_path: str, duration_sec: float, det_engine,

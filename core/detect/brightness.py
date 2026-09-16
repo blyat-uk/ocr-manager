@@ -76,6 +76,9 @@ from rapidfuzz.distance import Levenshtein
 
 from core.config import Config as _Config
 from core.detect import ocr_view
+from core.detect.flags import compose_flag as _compose_flag
+from core.detect.flags import is_cancelled as _is_cancelled
+from core.detect.flags import only_informational
 from videocr import utils as _videocr_utils
 from videocr.models import PredictedFrames
 
@@ -154,7 +157,7 @@ MIN_READING_REPEATS = 2
 PICK_BELOW_TOP = 20
 
 # --- BrightnessResult.flagged reasons, composed with "+" (like core.detect.crop).
-# Only FLAG_NO_CLEAN_THRESHOLD on its own leaves a result auto-applicable.
+# Only FLAG_NO_CLEAN_THRESHOLD (INFORMATIONAL_FLAGS) leaves a result auto-applicable.
 FLAG_NO_CLEAN_THRESHOLD = "no-clean-threshold"  # informational: empty frames trip the gate at the pick
 FLAG_NEEDS_CROP = "needs-crop"              # no crop box: nothing measured
 FLAG_RANGES_EMPTY = "ranges-empty?"         # keep ranges select nothing in the file: nothing measured
@@ -166,6 +169,7 @@ FLAG_NARROW_PLATEAU = "narrow-plateau?"     # plateau narrower than PICK_BELOW_T
 FLAG_DIM_TEXT = "dim-text?"                 # a strip's most complete line is not read at the pick, nor nearby
 FLAG_ESCALATE = "escalate"                  # cheap path: seed outside the folder plateau (or no text)
 FLAG_CANCELLED = "cancelled"                # cancel_check fired: result incomplete
+INFORMATIONAL_FLAGS = frozenset({FLAG_NO_CLEAN_THRESHOLD})
 
 # --- Dim-text check
 # Neighbour frames checked around a strip whose line the pick loses, in seconds.
@@ -222,18 +226,7 @@ class BrightnessResult:
         value was not measured, not verified, or not safe: needs-crop,
         ranges-empty?, no-text, thin-evidence?, coloured-text?, no-plateau?,
         narrow-plateau?, dim-text?, escalate, cancelled."""
-        return self.flagged is None or self.flagged == FLAG_NO_CLEAN_THRESHOLD
-
-
-def _compose_flag(existing: str | None, new: str) -> str:
-    if not existing:
-        return new
-    parts = existing.split("+")
-    return existing if new in parts else f"{existing}+{new}"
-
-
-def _is_cancelled(cancel_check: Callable[[], bool] | None) -> bool:
-    return cancel_check is not None and bool(cancel_check())
+        return only_informational(self.flagged, INFORMATIONAL_FLAGS)
 
 
 class _Cancelled(Exception):

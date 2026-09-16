@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from core.detect.ranges.config import MatchConfig, RangesConfig
 from core.detect.ranges.pipeline import (
+    DEFAULT_MIN_SEGMENT_SEC,
     DEFAULT_WORKERS,
     AnalysisCancelled,
     FileEntry,
@@ -23,10 +24,9 @@ from core.detect.ranges.pipeline import (
 
 logger = logging.getLogger(__name__)
 
-# Default minimum repeating-segment length (seconds). Kept importable here
-# (main.py's UI default references this name) even though the value now
-# also lives as core.detect.ranges.pipeline.DEFAULT_MIN_SEGMENT_SEC.
-DEFAULT_MIN_SEGMENT_SEC = 30.0
+# DEFAULT_MIN_SEGMENT_SEC (imported above) stays importable from here too:
+# tools/bench.py reads it as core.audio_analysis.DEFAULT_MIN_SEGMENT_SEC.
+__all__ = ["AudioAnalysisWorker", "DEFAULT_MIN_SEGMENT_SEC"]
 
 
 class AudioAnalysisWorker(QObject):
