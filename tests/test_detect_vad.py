@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -196,3 +198,32 @@ def test_probe_candidates_never_empty_for_nonsilent_audio(samples, label):
 
 def test_probe_candidates_empty_only_for_true_digital_silence():
     assert vad._probe_candidates(_silence(3.0), SR, start=0.0, length=3.0) == []
+
+
+# --- Files without usable audio ---------------------------------------------
+
+
+def test_probe_times_is_empty_for_a_file_with_no_audio_stream(video_only_clip):
+    """No audio stream means nothing to rank, exactly like digital silence:
+    [] sends crop detection to uniform probing with the no-speech flag,
+    instead of an ffmpeg error that skips the file."""
+    assert vad.probe_times(str(video_only_clip), duration_sec=20.0) == []
+
+
+def test_has_audio_stream_tells_video_only_files_from_files_with_audio(
+        video_only_clip, synthetic_audio_video, undecodable_audio_clip):
+    assert vad.has_audio_stream(str(video_only_clip)) is False
+    assert vad.has_audio_stream(str(synthetic_audio_video)) is True
+    assert vad.has_audio_stream(str(undecodable_audio_clip)) is True
+
+
+def test_an_audio_stream_that_cannot_be_decoded_still_raises(undecodable_audio_clip):
+    """Only a MISSING audio stream is a normal outcome. An audio stream that
+    is there but cannot be extracted is a real failure and must surface."""
+    with pytest.raises(subprocess.CalledProcessError):
+        vad.probe_times(str(undecodable_audio_clip), duration_sec=4.0)
+
+
+def test_probing_a_file_that_cannot_be_opened_raises(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError):
+        vad.probe_times(str(tmp_path / "missing.mp4"), duration_sec=20.0)

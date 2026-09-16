@@ -118,6 +118,57 @@ def synthetic_audio_video(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def video_only_clip(tmp_path_factory) -> Path:
+    """20 s, 640x360, 25 fps, NO audio stream. A white bar sits in the
+    bottom band during the first second of every two, so uniform probing
+    over the 40-60% window (8-12 s) hits it on some probes and not others
+    (which keeps it from looking like a static watermark)."""
+    out = tmp_path_factory.mktemp("media") / "video_only.mp4"
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=#202020:size=640x360:rate=25:duration=20",
+        "-vf", "drawbox=x=120:y=300:w=400:h=30:color=white@1.0:t=fill:"
+               "enable='lt(mod(t,2),1)'",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-g", "25", str(out),
+    ])
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+         "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.split() == ["video"], probe.stdout
+    return out
+
+
+@pytest.fixture(scope="session")
+def undecodable_audio_clip(tmp_path_factory) -> Path:
+    """A Matroska file whose audio stream EXISTS but cannot be decoded: a
+    PCM track with its codec ID overwritten by an unknown one of the same
+    length. ffmpeg fails to extract audio from it exactly as it does for a
+    file with no audio stream at all (exit 234), so only probing for the
+    stream tells the two apart."""
+    media = tmp_path_factory.mktemp("media")
+    pcm = media / "pcm.mkv"
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=1000:duration=4",
+        "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-c:a", "pcm_s16le", str(pcm),
+    ])
+    data = pcm.read_bytes()
+    assert data.count(b"A_PCM/INT/LIT") == 1
+    out = media / "undecodable_audio.mkv"
+    out.write_bytes(data.replace(b"A_PCM/INT/LIT", b"A_QQQ/QQQ/QQQ"))
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+         "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.split() == ["video", "audio"], probe.stdout
+    return out
+
+
+@pytest.fixture(scope="session")
 def reference_media() -> dict:
     """Reference projects, or skip the test when they are not present."""
     manifest = json.loads((FIXTURES / "media_manifest.json").read_text())

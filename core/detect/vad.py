@@ -67,6 +67,23 @@ _PEAK_TARGET_SPACING_SEC = 2.5
 _SILENCE_AMPLITUDE_EPS = 1e-6
 
 
+def has_audio_stream(video_path: str) -> bool:
+    """Whether the file has at least one audio stream (decodable or not).
+
+    Raises CalledProcessError when ffprobe cannot read the file at all, so a
+    missing or corrupt file is never mistaken for a silent one. ffmpeg's own
+    exit status cannot make this distinction: extracting audio fails with
+    the same status (234) for a file with no audio stream and for one whose
+    audio stream cannot be decoded.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index", "-of", "csv=p=0", video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+    return bool(result.stdout.strip())
+
+
 def extract_audio_window(video_path: str, start_sec: float, duration_sec: float,
                          sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     """Decode a window of the first audio stream as mono float32 in [-1, 1]."""
@@ -249,7 +266,10 @@ def probe_times(video_path: str, duration_sec: float,
     returns at least one candidate -- worst case "least bad candidate",
     never an empty result that silently loses the speedup this module
     exists to provide. Returns [] only when the window is true digital
-    silence (or degenerate: non-positive duration/window).
+    silence, when the file has no audio stream at all, or when the window
+    is degenerate (non-positive duration/window). An audio stream that
+    exists but cannot be extracted still raises (CalledProcessError), as
+    does a file ffprobe cannot read.
 
     Chronological, never highest-energy-first: long high-energy spans are
     frequently music and action, not dialogue, so the consumer should see
@@ -260,6 +280,8 @@ def probe_times(video_path: str, duration_sec: float,
     start = duration_sec * window_frac[0]
     length = max(0.0, duration_sec * (window_frac[1] - window_frac[0]))
     if length <= 0:
+        return []
+    if not has_audio_stream(video_path):
         return []
 
     samples = extract_audio_window(video_path, start, length)

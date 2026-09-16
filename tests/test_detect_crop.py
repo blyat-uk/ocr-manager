@@ -1704,3 +1704,47 @@ def test_crop_does_not_drift_from_previously_accepted_values(reference_media, de
         )
         if nh > oh:
             print(f"{key}: box grew {oh}px -> {nh}px (expected where two-line subtitles occur)")
+
+
+# --- Files without an audio stream ------------------------------------------
+
+
+class _BrightBoxDetector:
+    """Detection engine stand-in: one polygon around the bright pixels of
+    each frame it is given, scored 1.0; nothing on a dark frame."""
+
+    def __init__(self):
+        self.frames_seen = 0
+
+    def predict(self, frames):
+        results = []
+        for frame in frames:
+            self.frames_seen += 1
+            ys, xs = np.nonzero(frame.max(axis=2) > 128)
+            if len(xs) == 0:
+                results.append({"dt_scores": [], "dt_polys": []})
+            else:
+                results.append({"dt_scores": [1.0],
+                                "dt_polys": [_poly(xs.min(), ys.min(), xs.max(), ys.max())]})
+        return results
+
+
+def test_detect_crop_on_a_video_only_file_probes_uniformly_and_flags_no_speech(video_only_clip):
+    """A file with no audio stream at all gets what spec 7.1 promises files
+    with no speech: uniform probing over the 40-60% window, a box, and the
+    no-speech flag -- not an ffmpeg error that skips the file."""
+    engine = _BrightBoxDetector()
+    result = crop.detect_crop(str(video_only_clip), 20.0, engine)
+
+    assert result.flagged == crop.FLAG_NO_SPEECH
+    assert result.box is not None
+    _, y, _, h = result.box
+    assert y <= 300 and y + h >= 330, f"box {result.box} must contain the bar (y 300-330)"
+    uniform = set(crop._uniform_probe_times(20.0))
+    assert result.sample_pts and set(result.sample_pts) <= uniform
+    assert result.hit_pts and all(int(t) % 2 == 0 for t in result.hit_pts)
+
+
+def test_detect_crop_still_raises_when_the_audio_stream_cannot_be_decoded(undecodable_audio_clip):
+    with pytest.raises(subprocess.CalledProcessError):
+        crop.detect_crop(str(undecodable_audio_clip), 4.0, _BrightBoxDetector())
