@@ -4,7 +4,7 @@
   Phase 1: Detection Scan — sparse sampling at 720p to find frames with text
   Phase 2: Position Grouping — cluster detection boxes spatially across frames
   Phase 3: Crop, Clean, Recognize — dual OCR at regular intervals, detect content changes
-  Phase 4: Timing Refinement — detection scan to find precise start/end
+  Phase 4: Timing Refinement — detection scan to bracket start/end, then find the exact frame inside
 
 Key principles:
   - Trust Paddle — no pixel heuristics, no color analysis, no scene cut detection
@@ -24,12 +24,44 @@ import numpy as np
 from thefuzz import fuzz
 
 from . import utils
-from .pyav_adapter import Capture
+from .pyav_adapter import DISPLAY_TIME_TOLERANCE, Capture
+
+
+@dataclass(frozen=True)
+class _ScanBracket:
+    """Where phase 4's 0.2 s scan left one boundary of a label.
+
+    present: the last sample time, scanning outward from phase 3's reading,
+        at which the label was found; that reading's time if at none.
+    present_pts: PTS of the frame the scan analysed at `present`; None when
+        `present` is the reading's time, which phase 3 read and the scan did not.
+    absent: the first sample time past `present`, scanning outward, at which
+        it was not found; None if the scan stopped without one (at `limit`,
+        or past the last frame). A time whose frame could not be read is not
+        an absence.
+    absent_pts: PTS of the frame analysed at `absent` (None with it).
+    limit: the time the scan could not pass: its duration cap, or the bound
+        from an adjacent segment at the same position.
+    bound: that adjacent segment's bound when it is the limit, else None. It
+        lies strictly between the two segments' readings (_phase4_find_timing).
+    """
+
+    present: float
+    present_pts: float | None
+    absent: float | None
+    absent_pts: float | None
+    limit: float
+    bound: float | None
 
 
 @dataclass
 class LabelResult:
-    """Final label with timing and position."""
+    """Final label with timing and position.
+
+    Phase 4 times a label as the dialogue path times a subtitle
+    (Video.get_subtitles): it starts at the PTS of the first frame it is on
+    and ends at the PTS of the last frame it is on plus one frame (1 / fps).
+    """
 
     start_pts: float
     end_pts: float
@@ -1705,13 +1737,20 @@ class LabelScanner:
         return False
 
     def _scan_for_start(self, cap, det_engine, box, discovery_pts, ref_box=None, lower_bound=None):
-        """Scan backward to find where label starts appearing."""
+        """Scan backward to bracket where the label starts appearing.
+
+        Stops at the time bound or after two consecutive absences. Returns a
+        _ScanBracket, inside which _refine_start finds the exact frame.
+        """
         step = self.TIMING_SCAN_INTERVAL
         consecutive_absent = 0
         last_present_pts = discovery_pts
+        last_present_frame_pts = None
+        first_absent = (None, None)  # (time, frame PTS) of the first absence since last_present_pts
 
         pts = discovery_pts - step
         min_pts = max(0, discovery_pts - self.TIMING_SCAN_MAX_DURATION)
+        bound = lower_bound if lower_bound is not None and lower_bound >= min_pts else None
         if lower_bound is not None:
             min_pts = max(min_pts, lower_bound)
 
@@ -1728,18 +1767,22 @@ class LabelScanner:
             self._apply_label_masks(frame)
             if self._box_detected_at_position(det_engine, frame, box, ref_box):
                 last_present_pts = pts
+                last_present_frame_pts = cap.get_last_pts()
                 consecutive_absent = 0
+                first_absent = (None, None)
             else:
+                if first_absent[0] is None:
+                    first_absent = (pts, cap.get_last_pts())
                 consecutive_absent += 1
                 if consecutive_absent >= 2:  # Require 2 consecutive absences
                     break
 
             pts -= step
 
-        return last_present_pts
+        return _ScanBracket(last_present_pts, last_present_frame_pts, *first_absent, min_pts, bound)
 
     def _scan_for_end(self, cap, det_engine, box, discovery_pts, ref_box=None, upper_bound=None):
-        """Scan forward to find where label stops appearing.
+        """Scan forward to bracket where the label stops appearing.
 
         Ends at the time bound, after two consecutive absences, or at the
         first time past the last frame: the end of the stream is where the
@@ -1748,13 +1791,18 @@ class LabelScanner:
         up to that offset early. A seek whose every retry lands late (logged)
         is not the end: that time is skipped, like an unreadable frame,
         without counting as an absence.
+
+        Returns a _ScanBracket, inside which _refine_end finds the exact frame.
         """
         step = self.TIMING_SCAN_INTERVAL
         consecutive_absent = 0
         last_present_pts = discovery_pts
+        last_present_frame_pts = None
+        first_absent = (None, None)  # (time, frame PTS) of the first absence since last_present_pts
 
         pts = discovery_pts + step
         max_pts = discovery_pts + self.TIMING_SCAN_MAX_DURATION
+        bound = upper_bound if upper_bound is not None and upper_bound <= max_pts else None
         if upper_bound is not None:
             max_pts = min(max_pts, upper_bound)
 
@@ -1773,22 +1821,199 @@ class LabelScanner:
             self._apply_label_masks(frame)
             if self._box_detected_at_position(det_engine, frame, box, ref_box):
                 last_present_pts = pts
+                last_present_frame_pts = cap.get_last_pts()
                 consecutive_absent = 0
+                first_absent = (None, None)
             else:
+                if first_absent[0] is None:
+                    first_absent = (pts, cap.get_last_pts())
                 consecutive_absent += 1
                 if consecutive_absent >= 2:  # Require 2 consecutive absences
                     break
 
             pts += step
 
-        return last_present_pts
+        return _ScanBracket(last_present_pts, last_present_frame_pts, *first_absent, max_pts, bound)
+
+    def _refine_start(self, cap, det_engine, box, ref_box, bracket):
+        """The PTS of the frame the label starts on, found inside the bracket
+        _scan_for_start left.
+
+        Let P be the frame on screen at `bracket.present`, which shows the
+        label. The frames after the frame analysed at `bracket.absent` -- or,
+        if the scan found no absence, the frames at or after `bracket.limit`
+        -- and before P are read in order after one display-time seek, and
+        each is analysed. The start is the earliest of them from which every
+        frame up to P shows the label, or P itself if the frame just before P
+        does not. A frame detection misses can only stop it later: at worst on
+        P, where the scan put it.
+
+        A frame whose PTS is at or after the bound between two segments at the
+        same position belongs to the later one, P included: if P began before
+        this segment's bound, the start is the frame after P, where the
+        earlier segment's end stops (_refine_end). That is the one start
+        outside the bracket: one frame after the frame the scan found the
+        label on, so at most one frame (P's own duration) past `present`, the
+        scan's last present sample -- P is on screen at `present`, so the
+        frame after it begins within P's duration of it. It moves there
+        because P began before the bound, and so belongs to the earlier
+        segment.
+
+        P is only known as the last frame whose PTS is at most `present` (the
+        frame seek_to_display_time finds), so a frame is analysed once the
+        frame after it has been read and is not past `present`. P itself is
+        never analysed again.
+
+        If the bracket's frames cannot be read, the start is P, read from
+        `present` instead; if P cannot be read either, the frame the scan
+        analysed there (see _scan_start).
+        """
+        if bracket.absent is not None:
+            seek_to = bracket.absent
+
+            def in_bracket(pts):
+                return pts > bracket.absent_pts
+        else:
+            seek_to = bracket.limit
+
+            def in_bracket(pts):
+                return pts >= bracket.limit - DISPLAY_TIME_TOLERANCE
+
+        if not cap.seek_to_display_time(seek_to):
+            # Every time but a limit before `present` was sought before, with
+            # the same result; that one can run out of retries.
+            if seek_to == bracket.present or not cap.seek_to_display_time(bracket.present):
+                return self._scan_start(bracket)
+
+        present_limit = bracket.present + DISPLAY_TIME_TOLERANCE
+        run_start = None  # PTS from which every frame analysed so far shows the label
+        held = None       # (pts, frame): the last frame read, not yet known to be before P
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                # End of the stream: the held frame is P if it is still on
+                # screen at `present` by the rule seek_to_display_time applies
+                # to the last frame; if not, P was never read.
+                if held is not None and present_limit < held[0] + 1.0 / self.fps:
+                    return self._start_from(bracket, run_start, held[0], None)
+                return self._scan_start(bracket)
+            pts = cap.get_last_pts()
+            if pts > present_limit:
+                if held is None:
+                    return pts  # `present` precedes the first frame, which is on screen then
+                return self._start_from(bracket, run_start, held[0], pts)
+            if held is not None:
+                held_pts, held_frame = held
+                if not in_bracket(held_pts):
+                    run_start = None
+                else:
+                    # No brightness filter at detection stage
+                    self._apply_label_masks(held_frame)
+                    if self._box_detected_at_position(det_engine, held_frame, box, ref_box):
+                        if run_start is None:
+                            run_start = held_pts
+                    else:
+                        run_start = None
+            held = (pts, frame)
+
+    def _start_from(self, bracket, run_start, p_pts, next_pts):
+        """_refine_start's result once P (at `p_pts`, followed by a frame at
+        `next_pts`, or by the end of the stream if None) has been found."""
+        if run_start is not None:
+            return run_start
+        bound = bracket.bound
+        if bound is not None and p_pts < bound - DISPLAY_TIME_TOLERANCE:
+            # P began before the bound: it is the earlier segment's frame.
+            return next_pts if next_pts is not None else p_pts + 1.0 / self.fps
+        return p_pts
+
+    def _refine_end(self, cap, det_engine, box, ref_box, bracket):
+        """The end time of the label, found inside the bracket _scan_for_end
+        left: the PTS of the last frame it is on plus one frame (1 / fps), as
+        the dialogue path ends a subtitle (Video.get_subtitles).
+
+        Reads P, the frame on screen at `bracket.present` (which shows the
+        label), after one display-time seek, then the frames after it in
+        order, analysing each until one does not show the label. It stops
+        before the frame analysed at `bracket.absent` -- or, if the scan found
+        no absence, before the first frame at or after `bracket.limit` -- and
+        at the end of the stream. So the end never leaves the bracket, and a
+        frame detection misses can only stop it earlier: at worst just after
+        P, where the scan put it.
+
+        A frame whose PTS is at or after the bound between two segments at the
+        same position belongs to the later one, P included: if P begins at
+        this segment's bound (the scan's last sample was on the bound, in the
+        first moment of P), the label is last on the frame before P, and ends
+        where P replaces it, at P's PTS -- where the later segment's start
+        begins (_refine_start).
+
+        If P cannot be read, the end is that of the frame the scan analysed
+        there (see _scan_end).
+        """
+        if bracket.absent is not None:
+            def in_bracket(pts):
+                return pts < bracket.absent_pts
+        else:
+            def in_bracket(pts):
+                return pts < bracket.limit - DISPLAY_TIME_TOLERANCE
+
+        if not cap.seek_to_display_time(bracket.present):
+            return self._scan_end(bracket)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return self._scan_end(bracket)
+
+        last_pts = cap.get_last_pts()
+        bound = bracket.bound
+        if bound is not None and last_pts >= bound - DISPLAY_TIME_TOLERANCE:
+            return last_pts
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            pts = cap.get_last_pts()
+            if not in_bracket(pts):
+                break
+            # No brightness filter at detection stage
+            self._apply_label_masks(frame)
+            if not self._box_detected_at_position(det_engine, frame, box, ref_box):
+                break
+            last_pts = pts
+        return last_pts + 1.0 / self.fps
+
+    @staticmethod
+    def _scan_start(bracket):
+        """A start from the scan alone, when refinement cannot read P: the PTS
+        of the frame the scan analysed at `present`. Unreachable in practice,
+        as that frame was read before with the same deterministic seek -- by
+        the scan, or by phase 3 at its reading, whose frame PTS phase 4 does
+        not have and whose time is then used."""
+        return bracket.present_pts if bracket.present_pts is not None else bracket.present
+
+    def _scan_end(self, bracket):
+        """An end from the scan alone, when refinement cannot read P: the end
+        of the frame the scan analysed at `present` (see _scan_start)."""
+        if bracket.present_pts is not None:
+            return bracket.present_pts + 1.0 / self.fps
+        return bracket.present
 
     def _phase4_find_timing(self, segments, det_engine, progress=None, cancel_event=None):
         """Refine timing for each label segment using detection scanning.
 
         For back-to-back segments at the same position, constrains the timing
         scan so segments don't bleed into each other. Uses the midpoint between
-        adjacent segments as the boundary.
+        adjacent segments as the boundary. A segment's neighbours are among
+        the segments at the same position (overlapping boxes), wherever they
+        are in the list, which phase 3 builds in cluster order, not time
+        order: below it, the one whose readings ended last before its first
+        reading; above it, the one whose readings began first after its last
+        reading. A segment whose readings overlap this one's (it was read
+        while this one was) is not a neighbour: no midpoint could separate the
+        two, and bounding them would cut both short. So a bound always lies
+        strictly between the two segments' readings, and the segments on
+        either side of a gap between readings take their bounds from the same
+        two readings, even when another segment was read inside one of them.
 
         Returns list of LabelResult.
         """
@@ -1815,18 +2040,23 @@ class LabelScanner:
                 # as fallback safety net (size matching is the primary discriminator)
                 lower_bound = None
                 upper_bound = None
-                if li > 0:
-                    prev = segments[li - 1]
-                    if self._boxes_overlap(box, prev["box"]):
-                        lower_bound = (prev["end_pts"] + start_pts) / 2
-                if li < len(segments) - 1:
-                    nxt = segments[li + 1]
-                    if self._boxes_overlap(box, nxt["box"]):
-                        upper_bound = (end_pts + nxt["start_pts"]) / 2
+                same_position = [other for j, other in enumerate(segments)
+                                 if j != li and self._boxes_overlap(box, other["box"])]
+                prev = max((other for other in same_position if other["end_pts"] < start_pts),
+                           key=lambda other: other["end_pts"], default=None)
+                if prev is not None:
+                    lower_bound = (prev["end_pts"] + start_pts) / 2
+                nxt = min((other for other in same_position if other["start_pts"] > end_pts),
+                          key=lambda other: other["start_pts"], default=None)
+                if nxt is not None:
+                    upper_bound = (end_pts + nxt["start_pts"]) / 2
 
-                # Scan backward/forward to find precise boundaries
-                refined_start = self._scan_for_start(cap, det_engine, box, start_pts, ref_box, lower_bound)
-                refined_end = self._scan_for_end(cap, det_engine, box, end_pts, ref_box, upper_bound)
+                # Scan backward/forward 0.2 s at a time to bracket each
+                # boundary, then find its exact frame inside the bracket
+                start_bracket = self._scan_for_start(cap, det_engine, box, start_pts, ref_box, lower_bound)
+                refined_start = self._refine_start(cap, det_engine, box, ref_box, start_bracket)
+                end_bracket = self._scan_for_end(cap, det_engine, box, end_pts, ref_box, upper_bound)
+                refined_end = self._refine_end(cap, det_engine, box, ref_box, end_bracket)
 
                 # Check duration
                 duration = refined_end - refined_start
@@ -1869,43 +2099,68 @@ class LabelScanner:
 
         Requires text similarity for all merges — different text means different labels,
         even at nearby positions (e.g. multi-line disclaimers).
+
+        The label kept (the longer of two duplicates, the earlier on a tie)
+        keeps its text and position, but takes the union of both spans at
+        once, so every later comparison sees the widened span: a label that
+        absorbed one duplicate also absorbs one it only now overlaps, and a
+        label removed later passes everything it absorbed on to the label kept
+        in its place. A widened label may only now overlap a label it was
+        compared with before, so the comparisons are repeated until a round
+        of them removes nothing. Widening only after every decision could
+        leave two survivors overlapping, which _merge_split_labels would then
+        join as one label with the text twice. The labels given are changed
+        in place.
         """
         if len(labels) < 2:
             return labels
 
         to_remove = set()
 
-        for i, label_i in enumerate(labels):
-            if i in to_remove:
-                continue
-
-            for j, label_j in enumerate(labels):
-                if i >= j or j in to_remove:
+        removed_any = True
+        while removed_any:
+            removed_any = False
+            for i, label_i in enumerate(labels):
+                if i in to_remove:
                     continue
 
-                # Check time overlap first
-                overlap_start = max(label_i.start_pts, label_j.start_pts)
-                overlap_end = min(label_i.end_pts, label_j.end_pts)
-                if overlap_end <= overlap_start:
-                    continue
+                for j, label_j in enumerate(labels):
+                    if i >= j or j in to_remove:
+                        continue
 
-                # Must have similar text to be considered duplicates
-                if not self._texts_similar(label_i.text, label_j.text):
-                    continue
+                    # Check time overlap first. Under half a frame is not an
+                    # overlap: labels timed back to back can overlap by float
+                    # noise (an end is a frame's PTS plus 1 / fps), or by under
+                    # a millisecond where frame durations are rounded (23.976
+                    # fps in a millisecond time base).
+                    overlap_start = max(label_i.start_pts, label_j.start_pts)
+                    overlap_end = min(label_i.end_pts, label_j.end_pts)
+                    if overlap_end - overlap_start < 0.5 / self.fps:
+                        continue
 
-                # Check position proximity (within 10% of frame dimensions)
-                dx = abs(label_i.pos_x - label_j.pos_x)
-                dy = abs(label_i.pos_y - label_j.pos_y)
+                    # Must have similar text to be considered duplicates
+                    if not self._texts_similar(label_i.text, label_j.text):
+                        continue
 
-                if dx < self.width * 0.1 and dy < self.height * 0.1:
-                    # Keep the one with longer duration
-                    dur_i = label_i.end_pts - label_i.start_pts
-                    dur_j = label_j.end_pts - label_j.start_pts
-                    if dur_i >= dur_j:
-                        to_remove.add(j)
-                    else:
-                        to_remove.add(i)
-                        break
+                    # Check position proximity (within 10% of frame dimensions)
+                    dx = abs(label_i.pos_x - label_j.pos_x)
+                    dy = abs(label_i.pos_y - label_j.pos_y)
+
+                    if dx < self.width * 0.1 and dy < self.height * 0.1:
+                        # Keep the one with longer duration
+                        dur_i = label_i.end_pts - label_i.start_pts
+                        dur_j = label_j.end_pts - label_j.start_pts
+                        if dur_i >= dur_j:
+                            kept, removed = label_i, label_j
+                            to_remove.add(j)
+                        else:
+                            kept, removed = label_j, label_i
+                            to_remove.add(i)
+                        kept.start_pts = min(kept.start_pts, removed.start_pts)
+                        kept.end_pts = max(kept.end_pts, removed.end_pts)
+                        removed_any = True
+                        if removed is label_i:
+                            break
 
         return [l for i, l in enumerate(labels) if i not in to_remove]
 

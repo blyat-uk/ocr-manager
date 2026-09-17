@@ -659,10 +659,12 @@ def test_scan_serves_phase15_from_phase1_without_opening_the_video_again(clips, 
 #
 # Phase 3 OCRs a cluster every 0.5 s from its first PTS and records each
 # reading under that sample time; phase 4 runs detection 0.2 s apart around
-# each segment and records the label's start and end under those times. Each
+# each segment to bracket the label's start and end between those times. Each
 # must therefore analyse the frame on screen at the time: the last frame
 # whose PTS is at most t (within ON_SCREEN_TOLERANCE), the first frame when t
-# precedes it, and no frame once t is past the last frame's duration.
+# precedes it, and no frame once t is past the last frame's duration. Phase 4
+# then reads the frames inside each bracket in order, which are checked by
+# frame (tests/test_label_boundaries.py pins where the boundaries land).
 #
 # The reference is a plain sequential decode of the clip, independent of any
 # capture seek. Phase 3 is driven with groups as phase 2 hands them over
@@ -745,6 +747,16 @@ class _Mismatches:
                           f"{got_pts if got_pts is None else format(got_pts, '.6f')} "
                           f"(pixels identical: {same_frame}, engine input identical: {same_input})")
 
+    def check_bracket_frame(self, i, reference, got_input, expected_input):
+        """Detection on frame `i`, read inside a boundary's bracket. On the
+        start side a frame is analysed only once the frame after it has been
+        read (LabelScanner._refine_start), so the capture's last read does
+        not name it; the detection input, cut from that frame, does."""
+        self.checked += 1
+        if got_input.shape == expected_input.shape and np.array_equal(got_input, expected_input):
+            return
+        self.lines.append(f"bracket frame {i} (PTS {reference[i][0]:.6f}): the engine input is not cut from it")
+
     def missing(self, message):
         self.lines.append(message)
 
@@ -826,23 +838,61 @@ def _phase4_segments(scanner, reference):
             for s in starts]
 
 
-def _phase4_sample_times(scanner, segment, reference):
-    """The times phase 4 runs detection at for one segment, in order: the
-    reference box at the midpoint (if a frame is on screen then), the
-    backward scan, and the forward scan, which ends at its time bound or at
-    the first time past the last frame, whichever comes first."""
+def _phase4_expected_calls(scanner, segment, reference):
+    """What phase 4 runs detection on for one segment, in order, when every
+    frame shows the label.
+
+    (time, frame on screen then) for the reference box at the midpoint and for
+    each sample of the backward scan and of the forward scan, which ends at its
+    time bound or at the first time past the last frame, whichever comes
+    first; a time with no frame on screen is not analysed. Then, after each
+    scan, (None, frame) for each frame of that boundary's bracket. The label is
+    never absent, so each bracket reaches its scan's time bound: backward, the
+    frames at or after the bound and before the frame on screen at the last
+    sample; forward, the frames after the frame on screen at the last sample
+    (or at the last reading, if no sample had a frame) and before the bound.
+    """
     fps, step = scanner.fps, scanner.TIMING_SCAN_INTERVAL
+    pts = [p for p, _ in reference]
     start, end = segment["start_pts"], segment["end_pts"]
-    times = [(start + end) / 2]
-    t, low = start - step, max(0, start - scanner.TIMING_SCAN_MAX_DURATION)
+    calls = [((start + end) / 2, _on_screen(reference, (start + end) / 2, fps))]
+    t, low, last = start - step, max(0, start - scanner.TIMING_SCAN_MAX_DURATION), start
     while t >= low and int(t * fps) >= 0:
-        times.append(t)
+        calls.append((t, _on_screen(reference, t, fps)))
+        if calls[-1][1] is not None:
+            last = t
         t -= step
-    t, high = end + step, end + scanner.TIMING_SCAN_MAX_DURATION
+    first_shown = _on_screen(reference, last, fps)
+    assert first_shown is not None, "segment whose backward scan finds no frame: not modelled here"
+    calls += [(None, i) for i in range(first_shown) if pts[i] >= low - ON_SCREEN_TOLERANCE]
+    t, high, last = end + step, end + scanner.TIMING_SCAN_MAX_DURATION, end
     while t <= high and _on_screen(reference, t, fps) is not None:
-        times.append(t)
+        calls.append((t, _on_screen(reference, t, fps)))
+        last = t
         t += step
-    return [t for t in times if _on_screen(reference, t, fps) is not None]
+    last_shown = _on_screen(reference, last, fps)
+    if last_shown is not None:
+        calls += [(None, i) for i in range(last_shown + 1, len(pts)) if pts[i] < high - ON_SCREEN_TOLERANCE]
+    return [(t, i) for t, i in calls if i is not None]
+
+
+def _check_phase4_calls(what, result, scanner, reference, segment, detector, box, times_checked=None):
+    want = _phase4_expected_calls(scanner, segment, reference)
+    if len(detector.calls) != len(want):
+        result.missing(f"segment {segment['start_pts']:.6f}-{segment['end_pts']:.6f}: {len(detector.calls)} "
+                       f"detections for {len(want)} {what}")
+    for (t, i), (pts, frame, image) in zip(want, detector.calls):
+        expected = reference[i][1].copy()
+        scanner._apply_label_masks(expected)
+        roi, _, _ = scanner._crop_roi_for_detection(expected[: scanner.dialogue_cutoff_y, :], box)
+        if roi.shape[0] > scanner.SCAN_HEIGHT:
+            roi, _ = scanner._downscale(roi, scanner.SCAN_HEIGHT)
+        if t is None:
+            result.check_bracket_frame(i, reference, image, roi)
+        else:
+            result.check(t, reference, scanner.fps, pts, frame, image, roi)
+            if times_checked is not None:
+                times_checked.append(t)
 
 
 def _check_phase3(scanner, reference, recorder, monkeypatch):
@@ -883,24 +933,13 @@ def _check_phase3(scanner, reference, recorder, monkeypatch):
 
 
 def _check_phase4(scanner, reference, recorder):
-    fps = scanner.fps
     result = _Mismatches("phase 4")
     times_checked = []
     for segment in _phase4_segments(scanner, reference):
         detector = _Phase4Detector(recorder)
         scanner._phase4_find_timing([segment], detector)
-        want_times = _phase4_sample_times(scanner, segment, reference)
-        if len(detector.calls) != len(want_times):
-            result.missing(f"segment {segment['start_pts']:.6f}-{segment['end_pts']:.6f}: "
-                           f"{len(detector.calls)} detections for {len(want_times)} sample times")
-        for t, (pts, frame, image) in zip(want_times, detector.calls):
-            want = reference[_on_screen(reference, t, fps)][1].copy()
-            scanner._apply_label_masks(want)
-            roi, _, _ = scanner._crop_roi_for_detection(want[: scanner.dialogue_cutoff_y, :], segment["box"])
-            if roi.shape[0] > scanner.SCAN_HEIGHT:
-                roi, _ = scanner._downscale(roi, scanner.SCAN_HEIGHT)
-            result.check(t, reference, fps, pts, frame, image, roi)
-            times_checked.append(t)
+        _check_phase4_calls("scan samples and bracket frames", result, scanner, reference, segment, detector,
+                            segment["box"], times_checked)
     return result, times_checked
 
 
@@ -997,14 +1036,7 @@ def _fallback_phase34_run(scanner, reference, recorder, monkeypatch, capture_cls
         segment = {"box": box, "text": "label", "confidence": 1.0, "start_pts": start, "end_pts": start + 0.5}
         detector = _Phase4Detector(recorder)
         scanner._phase4_find_timing([segment], detector)
-        want_times = _phase4_sample_times(scanner, segment, reference)
-        if len(detector.calls) != len(want_times):
-            phase4.missing(f"segment at {start}: {len(detector.calls)} detections for {len(want_times)} times")
-        for t, (got_pts, frame, image) in zip(want_times, detector.calls):
-            want = reference[_on_screen(reference, t, fps)][1].copy()
-            scanner._apply_label_masks(want)
-            roi, _, _ = scanner._crop_roi_for_detection(want[: scanner.dialogue_cutoff_y, :], box)
-            phase4.check(t, reference, fps, got_pts, frame, image, roi)
+        _check_phase4_calls("times and bracket frames", phase4, scanner, reference, segment, detector, box)
     return phase3, phase4
 
 
@@ -1386,7 +1418,7 @@ def test_phase4_forward_scan_runs_to_the_last_frame_and_stops_past_it(clips, mon
     detector = _Phase4Detector(_Recorder())
     detector.recorder.install(monkeypatch, PyAVCapture)
     with PyAVCapture(str(path)) as cap:
-        end = scanner._scan_for_end(cap, detector, box, discovery, ref_box=box)
+        end = scanner._scan_for_end(cap, detector, box, discovery, ref_box=box).present
 
     assert end == with_frame[-1]
     assert len(detector.calls) == len(with_frame)
@@ -1490,7 +1522,7 @@ def _scan_for_end_with(scanner, path, discovery):
 
     box = _region_box(scanner)
     with PyAVCapture(str(path)) as cap:
-        end = scanner._scan_for_end(cap, _Counting(), box, discovery, ref_box=box)
+        end = scanner._scan_for_end(cap, _Counting(), box, discovery, ref_box=box).present
     return end, len(detections)
 
 
