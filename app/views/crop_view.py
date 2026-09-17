@@ -83,6 +83,7 @@ DETECTED_TAG = "dashed grey = the latest detection"
 # widget with a stylesheet gets no focus rectangle from Qt, and the arrows
 # mean different things on the two surfaces (nudge the box / step samples).
 FOCUS_RING_WIDTH = 1.5
+PAGE_MARGIN = 12                  # the page's own padding, all four sides
 # The detector settings "fit to all samples" re-aggregates with; the cutoff is
 # added from the evidence, never from the folder alone (see the module docstring).
 DETECTOR_FIELDS = ("crop_width_fraction", "crop_vertical_padding", "crop_min_height_fraction")
@@ -313,7 +314,21 @@ class CropCanvas(QWidget):
         if width > 0 and height > 0 and (width, height) != self._video:
             self._video = (width, height)
             self._mask_cache = None
+            self._cap_height()
             self.update()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._cap_height()
+
+    def _cap_height(self) -> None:
+        """Never taller than the frame it shows. `heightForWidth` alone only
+        sets the canvas' preferred height -- a Preferred policy still lets a
+        layout with spare height stretch it, and the fit would then centre
+        the frame inside a letterbox instead of the page's own margins
+        taking that height (see `CropTab`'s two stretches). The cap is
+        idempotent: QWidget ignores a maximum it already has."""
+        self.setMaximumHeight(self.heightForWidth(self.width()))
 
     def set_frame(self, frame) -> None:
         """`frame`: a BGR numpy array from `controller.frame`, or None."""
@@ -1362,8 +1377,13 @@ class CropTab:
 
         body = QWidget()
         column = QVBoxLayout(body)
-        column.setContentsMargins(12, 12, 12, 12)
+        column.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
         column.setSpacing(0)
+        # The canvas is exactly as tall as its aspect ratio makes it at the
+        # stage's width, so height the page does not use cannot go into the
+        # frame -- a taller canvas would only letterbox it. The slack is
+        # split above and below instead of piling up under the timeline.
+        column.addStretch(1)
         self.canvas = CropCanvas()
         column.addWidget(self.canvas)
         self.strip = SampleStrip()
@@ -1372,7 +1392,7 @@ class CropTab:
         self.timeline = Timeline(controller, mode="compact")    # ruling B5
         self.timeline.seek_requested.connect(self.select_nearest)
         column.addWidget(self.timeline)
-        column.addStretch(1)                     # the slack goes below, not around the frame
+        column.addStretch(1)                     # ... and the other half, see above the canvas
         outer.addWidget(body, 1)
         QWidget.setTabOrder(self.canvas, self.strip)
 

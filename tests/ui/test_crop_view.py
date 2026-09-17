@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
-from app.views.crop_view import DETECTED_TAG, CropCanvas, CropTab, SampleStrip
+from app.views.crop_view import PAGE_MARGIN, DETECTED_TAG, CropCanvas, CropTab, SampleStrip
 from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
@@ -695,6 +695,23 @@ def test_the_envelope_legend_is_left_out_when_there_is_no_envelope(make_tab):
     assert canvas.overlays()["envelope"] is True        # the toggle is still on
     assert "bottom_right" not in canvas.tags()
     canvas.grab()
+
+
+def test_the_page_centres_its_content_instead_of_leaving_a_void_below(make_tab):
+    """The canvas is as tall as its aspect ratio makes it at the stage's
+    width, so the leftover height cannot go into the frame -- a taller canvas
+    would only letterbox it. It is split above and below instead, which at
+    1440x900 turns ~230 px of flat black under the timeline into margin."""
+    harness = make_tab()
+    tab = harness.tab
+    page = tab.page()
+    page.resize(960, 800)
+    QApplication.processEvents()
+    above = tab.canvas.y()
+    below = page.height() - (tab.timeline.y() + tab.timeline.height())
+    assert above > PAGE_MARGIN                      # not pinned to the top any more
+    assert abs(above - below) <= 3
+    assert tab.canvas.height() == tab.canvas.heightForWidth(tab.canvas.width())
 
 
 def test_the_page_mounts_the_compact_timeline_under_the_stage(make_tab):

@@ -20,6 +20,9 @@ from app.views.crop_view import CropTab
 from app.views.ranges_view import (
     NO_DURATION_TEXT,
     NOTE_TEXT,
+    PAGE_MARGIN,
+    TIMELINE_HEIGHT,
+    TIMELINE_MAX_HEIGHT,
     UNREADABLE_TEXT,
     KeepRow,
     RangesTab,
@@ -213,6 +216,18 @@ def bare(controller):
     """A Timeline of its own, outside any layout: its width is the test's."""
     give_values(controller)
     made = Timeline(controller, mode="edit")
+    made.set_file(NAME)
+    made.resize(800, 68)
+    yield made
+    made.deleteLater()
+
+
+@pytest.fixture
+def bare_compact(controller):
+    """The same, in the read-only compact mode the Crop and Brightness tabs
+    mount under their stages (ruling B5)."""
+    give_values(controller)
+    made = Timeline(controller, mode="compact")
     made.set_file(NAME)
     made.resize(800, 68)
     yield made
@@ -788,3 +803,37 @@ def test_the_tab_follows_the_selected_file(controller):
     assert made.inspector_panel().keep_rows() == []       # no file: nothing to keep
     assert made.header_text() == ""
     assert not made.page().isEnabled()
+
+
+# --------------------------------------------------------------------------
+# Filling the stage
+# --------------------------------------------------------------------------
+
+def test_the_track_grows_into_a_tall_stage_and_the_rest_of_the_page_centres(tab):
+    """At 1440x900 the stage gives this page ~760 px for ~180 px of content,
+    and the remainder was flat black below it. The track -- the thing being
+    edited -- takes what it can use, and what is still left over is split
+    above and below rather than all piled at the bottom."""
+    page, timeline = tab.page(), tab.timeline
+
+    page.resize(880, 200)                       # nothing to spare
+    settle()
+    assert timeline.height() == TIMELINE_HEIGHT
+
+    page.resize(880, 760)                       # the real stage
+    settle()
+    assert timeline.height() == TIMELINE_MAX_HEIGHT
+    assert timeline.height() > TIMELINE_HEIGHT
+    above = timeline.y()
+    below = page.height() - (tab.note.y() + tab.note.height())
+    assert above > 2 * PAGE_MARGIN              # the content is not pinned to the top
+    assert abs(above - below) <= 3              # ... it is centred
+
+
+def test_the_compact_track_keeps_the_mockups_height(bare_compact):
+    """Ruling B5's read-only timeline is a strip under another tab's stage,
+    not the thing being edited: it never grows."""
+    bare_compact.resize(800, 400)
+    settle()
+    assert bare_compact.height() == TIMELINE_HEIGHT
+    assert bare_compact.maximumHeight() == TIMELINE_HEIGHT
