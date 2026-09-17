@@ -386,3 +386,13 @@ def test_stylesheet_restates_the_disabled_look_for_button_variants():
     assert 'QPushButton[variant="ghost"]:disabled' in sheet
     # The disabled rule must come after the variant rule it overrides.
     assert sheet.index('QPushButton[variant="primary"]:disabled') > sheet.index('QPushButton[variant="primary"] {')
+
+
+def test_chip_radius_is_the_qt_adjusted_token():
+    # CSS clamps `.chip`'s 20px to a pill; Qt draws square corners for a radius above half the height.
+    assert tokens.RADIUS_CHIP == 20
+    assert tokens.RADIUS_CHIP_QT == 10
+    sheet = qss.build_stylesheet()
+    chip_rule = sheet[sheet.index("QWidget#Chip {"):]
+    assert f"border-radius: {tokens.RADIUS_CHIP_QT}px;" in chip_rule[:chip_rule.index("}")]
+    assert not hasattr(qss, "CHIP_QT_RADIUS")

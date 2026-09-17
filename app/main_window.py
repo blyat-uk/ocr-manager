@@ -10,9 +10,12 @@ remembered last folder ("project/last_path"), and folders that cannot be
 opened reported in place (the open folder stays open).
 
 Space (mark reviewed / not reviewed) and T (test OCR) are window shortcuts
-for the selected file, so they work from the queue, the stage and the
-inspector; they step aside while a text-editing widget has focus. ↑/↓ stay
-with the queue (plan 3C's crop canvas nudges with the arrows).
+for the selected file. They act while focus is on the queue, a stage page or
+a non-interactive area, and step aside while the focused widget uses keys
+itself (buttons, check boxes, text and number inputs, combo boxes, sliders,
+item views): Space then presses the focused button, and a settings sheet can
+never flip a hidden file's review. ↑/↓ stay with the queue (plan 3C's crop
+canvas nudges with the arrows).
 
 `report_unexpected_error` is where `python -m app`'s excepthook sends an
 exception raised in a slot: the Pipeline log and a dismissible banner.
@@ -31,6 +34,9 @@ from collections.abc import Callable
 from PyQt6.QtCore import QByteArray, Qt
 from PyQt6.QtGui import QAction, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
+    QAbstractButton,
+    QAbstractItemView,
+    QAbstractSlider,
     QAbstractSpinBox,
     QApplication,
     QComboBox,
@@ -44,7 +50,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.controller import ProjectController
+from app.controller import ProjectController, UnsupportedProjectVersion
 from app.logbook import PIPELINE_LOG
 from app.state_text import can_mark_reviewed
 from app.views.activity import ActivityStrip
@@ -61,7 +67,6 @@ from app.views.open_folder import (
 from app.views.queue import QueueView
 from app.views.stage import Stage, StageTab, placeholder_tabs
 from app.views.topbar import APP_NAME, TopBar
-from core.project import UnsupportedProjectVersion
 
 logger = logging.getLogger(__name__)
 
@@ -96,15 +101,14 @@ def dependency_problems() -> list[tuple[str, str]]:
     return problems
 
 
-def is_text_input(widget: QWidget | None) -> bool:
-    """A widget that types text: the Space and T shortcuts step aside for it."""
-    if isinstance(widget, QLineEdit | QAbstractSpinBox):
-        return True
-    if isinstance(widget, QComboBox):
-        return widget.isEditable()
-    if isinstance(widget, QTextEdit | QPlainTextEdit):
-        return not widget.isReadOnly()
-    return False
+KEY_CONSUMERS = (QAbstractButton, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox,
+                 QAbstractSlider, QAbstractItemView)
+
+
+def consumes_keys(widget: QWidget | None) -> bool:
+    """A focused widget that handles Space or letters itself: the Space and T
+    shortcuts step aside for it."""
+    return isinstance(widget, KEY_CONSUMERS)
 
 
 def _open_error_text(path: str, exc: Exception) -> str:
@@ -238,11 +242,11 @@ class MainWindow(QMainWindow):
         self._sync_actions()
 
     def _sync_actions(self, *_args) -> None:
-        """Space and T act on the selected file; neither while a text-editing
-        widget has focus, and Space not while the file is PENDING."""
+        """Space and T act on the selected file; neither while the focused
+        widget consumes keys, and Space not while the file is PENDING."""
         name = self.queue.selected()
         has_file = name is not None and name in self.controller.names()
-        editing = is_text_input(QApplication.focusWidget())
+        editing = consumes_keys(QApplication.focusWidget())
         self.proof_action.setEnabled(has_file and not editing)
         self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
 

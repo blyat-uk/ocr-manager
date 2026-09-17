@@ -10,21 +10,21 @@ chips, and Folder settings / Logs / Start.
   wires what it switches).
 
 Badges change on job "started" events, which emit only `activity_changed`,
-so everything here refreshes on that signal too.
+so everything here refreshes on that signal too. Signals only mark the bar
+dirty; it refreshes once per event-loop turn, so a burst of `file_changed`
+costs one `counts()`.
 """
 from __future__ import annotations
 
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QSizePolicy, QWidget
 
-from app.activity import KIND_LABELS
+from app.views.deferred import Deferred
 from app.widgets.base import Button, Chip, ElidedLabel, SegmentedControl
 
 APP_NAME = "OCR Manager"
-PROOF_KIND = "proof"
-DETECTION_KINDS = frozenset(KIND_LABELS) - {PROOF_KIND}
 
 
 def start_text(count: int) -> str:
@@ -41,8 +41,9 @@ class _ProjectBlock(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        self.name_label = QLabel(APP_NAME)
+        self.name_label = ElidedLabel(APP_NAME)
         self.name_label.setObjectName("ProjectName")
+        self.name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.path_label = ElidedLabel(mode=Qt.TextElideMode.ElideMiddle)
         self.path_label.setObjectName("ProjectPath")
         self.path_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
@@ -108,13 +109,15 @@ class TopBar(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
             layout.addWidget(button)
 
+        self._refresh_later = Deferred(self.refresh, self)
         for signal in (controller.project_opened, controller.project_closed, controller.files_changed,
                        controller.file_changed, controller.activity_changed, controller.folder_changed,
                        controller.run_changed):
-            signal.connect(self.refresh)
+            signal.connect(self._refresh_later.schedule)
         self.refresh()
 
     def refresh(self, *_args) -> None:
+        self._refresh_later.cancel()
         controller = self._controller
         project = controller.project
         is_open = project is not None
@@ -122,10 +125,10 @@ class TopBar(QWidget):
             widget.setVisible(is_open)
         self.run_switch.setVisible(is_open and controller.run_snapshot() is not None)
         if not is_open:
-            self.project_label.setText(APP_NAME)
+            self.project_label.set_full_text(APP_NAME)
             self.path_label.set_full_text("")
             return
-        self.project_label.setText(os.path.basename(project.path) or project.path)
+        self.project_label.set_full_text(os.path.basename(project.path) or project.path)
         self.path_label.set_full_text(f"· {project.path}")
 
         counts = controller.counts()
@@ -133,7 +136,7 @@ class TopBar(QWidget):
         self.needs_chip.set_count(counts["needs_you"])
         self.detecting_chip.set_count(counts["detecting"])
         activity = controller.activity()
-        running = any(kind in DETECTION_KINDS for kind, _file in activity.running)
+        running = any(controller.is_detection_kind(kind) for kind, _file in activity.running)
         self.detecting_chip.set_tone("run" if running else "idle")
 
         ready = len(controller.startable_files())

@@ -14,9 +14,9 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
 
-from app.widgets.base import Button, Dot, MiniProgress
+from app.widgets.base import Button, Dot, ElidedLabel, MiniProgress
 
 RECENT_SHOWN = 2
 AGO_REFRESH_MS = 1000
@@ -61,11 +61,14 @@ class ActivityStrip(QWidget):
         layout.setContentsMargins(14, 6, 14, 6)
         layout.setSpacing(10)
         self.dot = Dot("idle")
-        self.text_label = QLabel("idle")
+        # Long file names elide instead of widening the window.
+        self.text_label = ElidedLabel("idle", Qt.TextElideMode.ElideMiddle)
         self.progress = MiniProgress()
         self.percent_label = QLabel()
-        self.recent_label = QLabel()
+        self.recent_label = ElidedLabel()
         self.recent_label.setObjectName("ActivityRecent")
+        for label in (self.text_label, self.recent_label):
+            label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.pause_button = Button("pause auto-pilot", "ghost", small=True)
         self.pause_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.pause_button.clicked.connect(self._toggle_pause)
@@ -90,13 +93,13 @@ class ActivityStrip(QWidget):
         current = snapshot.current
         if current is None:
             self.dot.set_tone("idle")
-            self.text_label.setText("idle")
+            self.text_label.set_full_text("idle")
             self.progress.hide()
             self.percent_label.hide()
         else:
             kind, file, fraction, message = current
             self.dot.set_tone("run")
-            self.text_label.setText(f"{file} · {message}" if file else message)
+            self.text_label.set_full_text(f"{file} · {message}" if file else message)
             self.progress.show()
             if fraction is None:
                 self.progress.set_indeterminate(True)
@@ -106,7 +109,7 @@ class ActivityStrip(QWidget):
                 self.percent_label.setText(f"{round(fraction * 100)}%")
                 self.percent_label.show()
         text = recent_text(snapshot.recent, time.monotonic())
-        self.recent_label.setText(text)
+        self.recent_label.set_full_text(text)
         self.recent_label.setVisible(bool(text))
         if text:
             if not self._ago_timer.isActive():

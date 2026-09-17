@@ -65,7 +65,10 @@ class FolderPicker(QObject):
         kdialog = shutil.which("kdialog")
         if kdialog:
             self._pick_with_kdialog(kdialog, start_dir)
-            return
+        else:
+            self._pick_with_qt(start_dir)
+
+    def _pick_with_qt(self, start_dir: str) -> None:
         folder = QFileDialog.getExistingDirectory(self._parent_widget, PICKER_CAPTION, start_dir)
         if folder:
             self.chosen.emit(folder)
@@ -75,8 +78,18 @@ class FolderPicker(QObject):
             return
         process = QProcess(self)
         process.finished.connect(lambda code, status: self._on_kdialog_finished(process, code, status))
+        process.errorOccurred.connect(lambda error: self._on_kdialog_error(process, error, start_dir))
         self._process = process
         process.start(program, ["--getexistingdirectory", start_dir])
+
+    def _on_kdialog_error(self, process: QProcess, error, start_dir: str) -> None:
+        """kdialog never started (no "finished" follows): forget it and ask
+        with Qt's dialog instead."""
+        if error != QProcess.ProcessError.FailedToStart or self._process is not process:
+            return
+        self._process = None
+        process.deleteLater()
+        self._pick_with_qt(start_dir)
 
     def _on_kdialog_finished(self, process: QProcess, code: int, status) -> None:
         self._process = None

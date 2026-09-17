@@ -22,11 +22,10 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
-from app.state_text import REVIEW_WAIT_TOOLTIP, can_mark_reviewed, media_text
+from app.state_text import REVIEW_WAIT_TOOLTIP, can_mark_reviewed, is_manual, is_reviewed, media_text
 from app.theme import tokens
 from app.views.inspector_sections import ChangeOffer, DetectedSection, ProofSection, Section
 from app.widgets.base import Button, ElidedLabel
-from core.project.model import ReviewState, Source
 
 SCOPE_TEXT = "◆ THIS EPISODE ONLY"
 REVIEW_TEXT = "✓ Mark reviewed (Space)"
@@ -40,8 +39,7 @@ def _edit_keys(entry) -> dict[str, object]:
 
 
 def _is_manual(entry, kind: str) -> bool:
-    value = entry.crop if kind == "crop" else entry.brightness
-    return value is not None and value.source == Source.MANUAL
+    return is_manual(entry.crop if kind == "crop" else entry.brightness)
 
 
 class Inspector(QWidget):
@@ -187,7 +185,7 @@ class Inspector(QWidget):
         self.file_label.set_full_text(name)
         self.media_label.setText(media_text(entry.media))
         self.detected.set_entry(entry)
-        reviewed = entry.review == ReviewState.REVIEWED
+        reviewed = is_reviewed(entry)
         reviewable = can_mark_reviewed(entry)
         self.review_button.setText(UNREVIEW_TEXT if reviewed else REVIEW_TEXT)
         self.review_button.set_variant("default" if reviewed else "primary")
@@ -221,7 +219,7 @@ class Inspector(QWidget):
         if self._has_file():
             entry = self._controller.entry(self._file)
             if can_mark_reviewed(entry):
-                self._controller.mark_reviewed(self._file, entry.review != ReviewState.REVIEWED)
+                self._controller.mark_reviewed(self._file, not is_reviewed(entry))
 
     def _toggle_skipped(self) -> None:
         if self._has_file():

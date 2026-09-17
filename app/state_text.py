@@ -365,8 +365,22 @@ def field_blocking(entry: FileEntry, field: str) -> bool:
 REVIEW_WAIT_TOOLTIP = "waiting for detections to finish"
 
 
+def is_reviewed(entry: FileEntry) -> bool:
+    return entry.review == ReviewState.REVIEWED
+
+
+def is_pending(entry: FileEntry) -> bool:
+    """Detections for a required value are still outstanding."""
+    return entry.review == ReviewState.PENDING
+
+
+def is_manual(value) -> bool:
+    """A crop, brightness or time ranges value the user set (or pasted)."""
+    return value is not None and value.source == Source.MANUAL
+
+
 def can_mark_reviewed(entry: FileEntry) -> bool:
     """"Mark reviewed" (the button, Space, the queue menu) is offered unless
     the file is still PENDING: its detections have not finished, so there is
     nothing settled to accept yet."""
-    return entry.review != ReviewState.PENDING
+    return not is_pending(entry)

@@ -106,6 +106,9 @@ RADIUS_SEG = 5     # .seg span, .track, .ztile
 RADIUS_BTN = 6     # .btn, .kv, .canvas
 RADIUS_ROW = 7     # .frow
 RADIUS_CHIP = 20   # .chip (pill)
+# What the QSS uses for .chip: CSS clamps 20px to half the height (a pill), but Qt draws square
+# corners when a radius exceeds half the widget, so the ~22 px chip gets half its height instead.
+RADIUS_CHIP_QT = 10
 RADIUS_DOT = 50    # .dot -- CSS 50%; widgets translate this to width/2 px
 
 # --------------------------------------------------------------------------

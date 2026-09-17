@@ -22,11 +22,6 @@ from __future__ import annotations
 
 from app.theme import tokens
 
-# `.chip`'s CSS `border-radius:20px` makes a pill because browsers clamp the
-# radius to half the height. Qt draws no rounding at all when a radius
-# exceeds half the widget, so the ~22 px chip gets half its height instead.
-CHIP_QT_RADIUS = 10
-
 
 def build_stylesheet() -> str:
     """The full QSS for the base widgets in `app/widgets/base.py`. A plain
@@ -106,7 +101,7 @@ QPushButton[toggled="true"] {{
 QWidget#Chip {{
     background-color: {tokens.PANEL2};
     border: 1px solid {tokens.LINE2};
-    border-radius: {CHIP_QT_RADIUS}px;
+    border-radius: {tokens.RADIUS_CHIP_QT}px;
 }}
 QWidget#Chip QLabel {{
     font-size: 11px;

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -53,6 +54,7 @@ SLAY_NAMES = [
 ]
 BOX = (288, 786, 1344, 53)
 WAIT_MS = 5000
+REPO_ROOT = Path(__file__).resolve().parents[2]
 NEWER_VERSION_TEXT = ("This folder was saved by a newer version of OCR Manager (project version 99). "
                       "Update the app to open it.")
 
@@ -68,6 +70,11 @@ def wait_for(predicate, timeout_ms: int = WAIT_MS) -> bool:
             return False
         QTest.qWait(10)
     return True
+
+
+def settle() -> None:
+    """Run the zero-delay refreshes the views coalesce bursts into."""
+    QApplication.processEvents()
 
 
 def entry(name, *, crop=BOX, brightness=209, review=ReviewState.REVIEWED, source=Source.DETECTED,
@@ -160,6 +167,7 @@ def make_window(controller):
 def slay_window(make_window, tmp_project):
     window = make_window()
     window.open_folder(str(tmp_project(fixture="slay")))
+    settle()
     return window
 
 
@@ -170,6 +178,7 @@ def detected_window(make_window, tmp_project):
     folder = write_project(tmp_project(SLAY_NAMES), [entry(name) for name in SLAY_NAMES], labels_enabled=False)
     window = make_window()
     window.open_folder(str(folder))
+    settle()
     return window
 
 
@@ -268,9 +277,11 @@ def test_flagging_a_file_updates_chips_badge_and_start(detected_window, fake_run
     crop = fake_runner.last("crop", name)
     fake_runner.start(crop)
     controller.drain_events()
+    settle()
     assert top.detecting_chip.tone() == "run"              # B7: a detection is running
     fake_runner.finish(crop, crop_result(crop, flagged=FLAG_LOW_AGREEMENT))
     controller.drain_events()
+    settle()
     assert row.badge.text() == "waiting"                   # brightness follows the re-detect, queued
     assert top.detecting_chip.text() == "1 detecting"
     assert top.detecting_chip.tone() == "idle"             # B7: only queued
@@ -278,11 +289,13 @@ def test_flagging_a_file_updates_chips_badge_and_start(detected_window, fake_run
     brightness = fake_runner.last("brightness", name)
     fake_runner.start(brightness)                           # "started" emits only activity_changed
     controller.drain_events()
+    settle()
     assert row.badge.text() == "measuring brightness…"
     assert top.detecting_chip.tone() == "run"
 
     fake_runner.finish(brightness, brightness_result(brightness))
     controller.drain_events()
+    settle()
     assert (row.badge.text(), row.badge.property("badge")) == ("check crop", "warn")
     assert top.reviewed_chip.text() == "4 reviewed"
     assert top.needs_chip.text() == "1 needs you"
@@ -296,19 +309,23 @@ def test_start_is_disabled_without_ready_files_or_extraction(make_window, tmp_pr
                            [entry("a.mkv", review=ReviewState.PROPOSED), entry("b.mkv", review=ReviewState.PROPOSED)])
     window = make_window()
     window.open_folder(str(folder))
+    settle()
     controller, start = window.controller, window.topbar.start_button
     assert start.text() == "▶ Start 2 ready files" and start.isEnabled()
 
     controller.project.folder.dialogue_enabled = False
     controller.project.folder.labels_enabled = False
     controller.folder_changed.emit()
+    settle()
     assert not start.isEnabled()
 
     controller.project.folder.dialogue_enabled = True
     controller.folder_changed.emit()
+    settle()
     assert start.isEnabled()
     controller.set_skipped("a.mkv", True)
     controller.set_skipped("b.mkv", True)
+    settle()
     assert start.text() == "▶ Start 0 ready files"
     assert not start.isEnabled()
 
@@ -331,6 +348,7 @@ def mixed_window(make_window, tmp_project):
     ]
     window = make_window()
     window.open_folder(str(write_project(tmp_project(names), entries)))
+    settle()
     return window
 
 
@@ -350,6 +368,7 @@ def test_queue_filter_counts_and_filtering(mixed_window):
     assert queue.visible_names() == ["a.mkv", "d.mkv"]
 
     mixed_window.controller.mark_reviewed("b.mkv")           # accepted: leaves "Needs you"
+    settle()
     assert queue.filter.labels() == ["All 5", "Needs you 0", "Reviewed 3"]
     assert queue.visible_names() == ["a.mkv", "b.mkv", "d.mkv"]
 
@@ -839,19 +858,32 @@ def test_ctrl_q_closes_and_close_shuts_the_controller_down(controller, fake_runn
 # python -m app
 # --------------------------------------------------------------------------
 
-def test_python_m_app_smoke(qapp, tmp_project):
-    from app.__main__ import main
+def test_python_m_app_smoke(tmp_path):
+    """A real launch in its own process: its theme, settings and hook never
+    touch this test session."""
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=str(tmp_path / "config"))
+    result = subprocess.run([sys.executable, "-m", "app", "--quit-after", "1"], cwd=str(REPO_ROOT), env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert (tmp_path / "config" / "OCRManager" / "OCRTool.conf").exists()     # geometry saved there
 
+
+def test_main_restores_the_excepthook(qapp, monkeypatch):
+    import app.__main__ as entry
+
+    themed = []
+    monkeypatch.setattr(entry, "apply_theme", themed.append)   # keep the session's app unthemed
     hook = sys.excepthook
-    assert main(["--quit-after", "1"]) == 0
-    assert sys.excepthook is hook                      # main() restores the hook it replaced
+    assert entry.main(["--quit-after", "0.2"]) == 0
+    assert themed == [qapp]
+    assert sys.excepthook is hook
 
 
 # --------------------------------------------------------------------------
 # Follow-up: window-level shortcuts, crash guard, pending review button
 # --------------------------------------------------------------------------
 
-def test_space_and_t_work_from_the_stage_and_inspector_but_not_in_editors(make_window, tmp_project):
+def test_space_and_t_act_from_the_queue_and_stage_but_step_aside_for_key_consumers(make_window, tmp_project):
     window = make_window(tabs_factory=lambda controller: [EditorTab("Crop"), EditorTab("Brightness")])
     window.open_folder(str(tmp_project(fixture="slay")))
     controller, name = window.controller, SLAY_NAMES[0]
@@ -861,17 +893,23 @@ def test_space_and_t_work_from_the_stage_and_inspector_but_not_in_editors(make_w
     activate(window)
     tab = window.stage.current_tab()
 
-    tab.surface.setFocus()
+    tab.surface.setFocus()                                     # a stage page
     QTest.keyClick(tab.surface, Qt.Key.Key_Space)
     assert marks.calls == [(name, False)]
     QTest.keyClick(tab.surface, Qt.Key.Key_T)
     assert proofs.calls == [(name,)]
-
-    button = window.inspector.redetect_button                 # Space is the shortcut's, not the button's
-    button.setFocus()
-    QTest.keyClick(button, Qt.Key.Key_Space)
+    window.queue.setFocus()                                    # the queue
+    QTest.keyClick(window.queue, Qt.Key.Key_Space)
     assert marks.calls == [(name, False), (name, True)]
-    assert redetects.calls == []
+
+    button = window.inspector.redetect_button                  # a focused button presses on Space
+    button.setFocus()
+    assert wait_for(lambda: QApplication.focusWidget() is button)
+    assert not window.review_action.isEnabled() and not window.proof_action.isEnabled()
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    QTest.keyClick(button, Qt.Key.Key_T)
+    assert redetects.calls == [(name,)]
+    assert len(marks.calls) == 2 and len(proofs.calls) == 1
 
     for editor in (tab.spin, tab.line):
         editor.setFocus()
@@ -888,19 +926,15 @@ def test_space_and_t_work_from_the_stage_and_inspector_but_not_in_editors(make_w
     assert len(proofs.calls) == 2
 
 
-def test_text_input_detection():
-    from PyQt6.QtWidgets import QComboBox, QPlainTextEdit
+def test_key_consumer_detection():
+    from PyQt6.QtWidgets import QCheckBox, QComboBox, QListWidget, QPlainTextEdit, QSlider, QTextEdit
 
-    from app.main_window import is_text_input
+    from app.main_window import consumes_keys
 
-    editable = QComboBox()
-    editable.setEditable(True)
-    read_only = QPlainTextEdit()
-    read_only.setReadOnly(True)
-    assert is_text_input(QLineEdit()) and is_text_input(QSpinBox()) and is_text_input(editable)
-    assert is_text_input(QPlainTextEdit())
-    assert not is_text_input(QComboBox()) and not is_text_input(read_only)
-    assert not is_text_input(QPushButton()) and not is_text_input(None)
+    for widget in (QPushButton(), QCheckBox(), QLineEdit(), QTextEdit(), QPlainTextEdit(), QSpinBox(),
+                   QComboBox(), QSlider(), QListWidget()):
+        assert consumes_keys(widget), type(widget).__name__
+    assert not consumes_keys(QWidget()) and not consumes_keys(None)
 
 
 def test_an_exception_in_a_slot_is_reported_instead_of_aborting(slay_window, capsys):
@@ -960,3 +994,110 @@ def test_mark_reviewed_is_disabled_while_the_selected_file_is_pending(make_windo
     assert menu_actions(queue.context_menu("a.mkv"))["Mark reviewed"].isEnabled()
     QTest.keyClick(queue, Qt.Key.Key_Space)
     assert marks.calls == [("a.mkv", True)]
+
+
+# --------------------------------------------------------------------------
+# Follow-up 2: detection dot, view imports, refresh coalescing, footer hint,
+# kdialog failing to start, long names in the activity strip
+# --------------------------------------------------------------------------
+
+def test_detecting_dot_ignores_metadata_and_thumbnail_jobs(slay_window, fake_runner):
+    window, controller = slay_window, slay_window.controller
+    thumbnail = fake_runner.last("thumbnail", SLAY_NAMES[0])
+    fake_runner.start(thumbnail)
+    controller.drain_events()
+    settle()
+    assert controller.activity().running == (("thumbnail", SLAY_NAMES[0]),)
+    assert window.topbar.detecting_chip.tone() == "idle"
+    audio = fake_runner.last("audio_profile", SLAY_NAMES[1])
+    fake_runner.start(audio)
+    controller.drain_events()
+    settle()
+    assert window.topbar.detecting_chip.tone() == "run"
+
+
+def test_controller_names_the_detection_kinds(controller):
+    assert controller.DETECTION_KINDS == frozenset({"crop", "brightness", "ranges", "audio_profile"})
+    assert controller.is_detection_kind("audio_profile") and not controller.is_detection_kind("thumbnail")
+
+
+def test_views_import_no_core_modules():
+    import ast
+
+    sources = sorted((REPO_ROOT / "app" / "views").glob("*.py")) + [REPO_ROOT / "app" / "main_window.py"]
+    offenders = []
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules = [node.module] + [f"{node.module}.{alias.name}" for alias in node.names]
+            else:
+                continue
+            for module in modules:
+                if module == "videocr" or module.startswith("videocr.pyav_adapter"):
+                    continue                                # the brief's dependency check
+                if module.split(".")[0] in ("core", "videocr"):
+                    offenders.append(f"{path.name}: {module}")
+    assert offenders == []
+
+
+def test_a_burst_of_file_changes_refreshes_counts_once_per_view(slay_window):
+    controller = slay_window.controller
+    settle()
+    counts = Calls(controller, "counts")
+    startable = Calls(controller, "startable_files")
+    for _ in range(20):
+        for name in SLAY_NAMES:
+            controller.file_changed.emit(name)
+    assert counts.calls == [] and startable.calls == []        # deferred to the event loop
+    settle()
+    assert len(counts.calls) == 2                               # the queue filter and the top bar, once each
+    assert len(startable.calls) == 1                            # the top bar
+    settle()
+    assert len(counts.calls) == 2
+
+
+def test_queue_hint_wraps_instead_of_clipping(slay_window):
+    from PyQt6.QtGui import QTextDocument
+
+    hint = slay_window.queue.hint_label
+    assert hint.wordWrap()
+    document = QTextDocument()
+    document.setHtml(hint.text())
+    assert document.toPlainText().replace("\xa0", " ") == "↑ ↓ move · Space mark reviewed · T test OCR"
+    hint.parentWidget().show()
+    assert wait_for(lambda: hint.height() >= hint.heightForWidth(hint.width()) > 0)
+    hint.parentWidget().hide()
+
+
+def test_kdialog_that_fails_to_start_falls_back_to_the_qt_picker(make_window, tmp_project, tmp_path, monkeypatch):
+    folder = tmp_project(fixture="slay")
+    asked = []
+    monkeypatch.setattr(open_folder_module.shutil, "which", lambda tool: str(tmp_path / "no-such-kdialog"))
+    monkeypatch.setattr(open_folder_module.QFileDialog, "getExistingDirectory",
+                        lambda parent, caption, start: asked.append(start) or str(folder))
+    window = make_window()
+    window.choose_folder()
+    assert wait_for(lambda: window.controller.project is not None)
+    assert window.controller.project.path == str(folder)
+    assert len(asked) == 1
+    window.controller.close_folder()
+    window.choose_folder()                                      # the failed process does not block later picks
+    assert wait_for(lambda: len(asked) == 2)
+
+
+def test_long_file_names_do_not_widen_the_activity_strip(make_window, tmp_project, fake_runner):
+    name = "E" * 100 + ".mkv"
+    window = make_window()
+    window.open_folder(str(tmp_project([name])))
+    submission = fake_runner.last("metadata", name)
+    fake_runner.start(submission)
+    window.controller.drain_events()
+    settle()
+    strip = window.activity_strip
+    assert strip.text_label.full_text() == f"{name} · metadata"
+    assert strip.minimumSizeHint().width() < 400
+    fake_runner.finish(submission, None)
+    window.controller.drain_events()
+    assert strip.minimumSizeHint().width() < 400

@@ -54,6 +54,9 @@ Run
 Saving
     save_project, debounced (500 ms); close_folder and shutdown save at once.
     A project that failed to load is never installed, so never saved.
+
+Views import no core module: UnsupportedProjectVersion (raised by
+open_folder) and DETECTION_KINDS are re-exported here.
 """
 from __future__ import annotations
 
@@ -76,7 +79,7 @@ from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
 from core.jobs import apply as rules
-from core.jobs.autopilot import AUTOPILOT_KINDS, AutoPilot
+from core.jobs.autopilot import AUTOPILOT_KINDS, DETECTION_KINDS, AutoPilot
 from core.jobs.detect_jobs import (
     AudioProfileResult,
     BrightnessJobResult,
@@ -92,6 +95,7 @@ from core.jobs.runner import JobEvent, JobRunner
 from core.project import store
 from core.project.model import FileEntry, FolderSettings, Project, ReviewState
 from core.project.ocr_kwargs import ocr_call_for
+from core.project.store import UnsupportedProjectVersion
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +154,10 @@ def _non_empty_file(path: str) -> bool:
 
 
 class ProjectController(QObject):
+    # Job kinds that are detections (crop, brightness, ranges, audio_profile): what "pause auto-pilot"
+    # holds and what the top bar's "detecting" dot means (ruling B7). Metadata and thumbnails are not.
+    DETECTION_KINDS = DETECTION_KINDS
+
     project_opened = pyqtSignal(str)            # folder path
     project_closed = pyqtSignal()
     files_changed = pyqtSignal()                # entries added/removed/reordered
@@ -295,6 +303,10 @@ class ProjectController(QObject):
     def is_done(self, name: str) -> bool:
         """chi/<output_name(name)> exists and is not empty (the run's stem rule)."""
         return name in self._done
+
+    @staticmethod
+    def is_detection_kind(kind: str) -> bool:
+        return kind in DETECTION_KINDS
 
     def running_detectors(self, name: str) -> set[str]:
         return self._activity.running_kinds(name) & AUTOPILOT_KINDS
@@ -843,7 +855,7 @@ class ProjectController(QObject):
             return
         try:
             store.save_project(project)
-        except store.UnsupportedProjectVersion as exc:
+        except UnsupportedProjectVersion as exc:
             self._save_blocked = True           # someone put a newer project file there: never overwrite it
             self._save_failure(f"Not saving: {exc}")
         except (OSError, TypeError, ValueError) as exc:        # TypeError/ValueError: a value JSON cannot hold

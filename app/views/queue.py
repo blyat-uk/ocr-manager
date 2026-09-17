@@ -23,15 +23,16 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QMenu, QScrollArea, QVBoxLayout, QWidget
 
 from app.run_snapshot import FAILED, QUEUED, RUNNING
-from app.state_text import badge_for, can_mark_reviewed, format_duration
+from app.state_text import badge_for, can_mark_reviewed, format_duration, is_pending, is_reviewed
 from app.theme import tokens
+from app.views.deferred import Deferred
 from app.views.thumbnail import Thumbnail
 from app.widgets.base import Badge, ElidedLabel, SegmentedControl, repolish
-from core.project.model import ReviewState
 
 FILTER_ALL, FILTER_NEEDS_YOU, FILTER_REVIEWED = 0, 1, 2
-HINT_HTML = (f'↑ ↓ move · <b style="color:{tokens.DIM}">Space</b> mark reviewed · '
-             f'<b style="color:{tokens.DIM}">T</b> test OCR')
+# Non-breaking spaces inside each hint, so the 246 px rail wraps between hints, never inside one.
+HINT_HTML = (f'↑&nbsp;↓&nbsp;move · <b style="color:{tokens.DIM}">Space</b>&nbsp;mark&nbsp;reviewed · '
+             f'<b style="color:{tokens.DIM}">T</b>&nbsp;test&nbsp;OCR')
 RUN_BADGE_STATES = frozenset({QUEUED, RUNNING, FAILED})     # a run's transient badges (ruling B10)
 
 
@@ -91,7 +92,7 @@ class QueueRow(QWidget):
         crop = entry.crop
         frame = (media.width, media.height) if media.width > 0 and media.height > 0 else None
         self.thumb.set_state(thumbnail, frame, None if crop is None else (crop.x, crop.y, crop.width, crop.height),
-                             pending=entry.review == ReviewState.PENDING and not entry.skipped,
+                             pending=is_pending(entry) and not entry.skipped,
                              dimmed=entry.skipped)
 
     def mousePressEvent(self, event) -> None:
@@ -113,6 +114,7 @@ class QueueView(QWidget):
         self._controller = controller
         self._rows: dict[str, QueueRow] = {}
         self._selected: str | None = None
+        self._filter_later = Deferred(self._refresh_filter, self)
         self.setObjectName("Queue")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedWidth(tokens.RAIL_WIDTH)
@@ -152,6 +154,7 @@ class QueueView(QWidget):
         self.hint_label = QLabel(HINT_HTML)
         self.hint_label.setObjectName("QueueHint")
         self.hint_label.setTextFormat(Qt.TextFormat.RichText)
+        self.hint_label.setWordWrap(True)                # two lines at 246 px rather than clipped
         layout.addWidget(self.hint_label)
 
         controller.project_opened.connect(self.rebuild)
@@ -199,16 +202,18 @@ class QueueView(QWidget):
             self.select(visible[0] if visible else (names[0] if names else None))
 
     def refresh(self, *_args) -> None:
+        """Every row now; the filter counts and row visibility on the next
+        event-loop turn (coalesced)."""
         if self._controller.project is None:
             return
         for name in self._rows:
             self._refresh_row(name)
-        self._refresh_filter()
+        self._filter_later.schedule()
 
     def _on_file_changed(self, name: str) -> None:
         if name in self._rows and self._controller.project is not None:
             self._refresh_row(name)
-            self._refresh_filter()
+            self._filter_later.schedule()                # a burst of changes counts once
 
     def _refresh_row(self, name: str) -> None:
         controller = self._controller
@@ -225,6 +230,9 @@ class QueueView(QWidget):
         return row.state if row is not None and row.state in RUN_BADGE_STATES else None
 
     def _refresh_filter(self) -> None:
+        self._filter_later.cancel()
+        if self._controller.project is None:
+            return
         counts = self._controller.counts()
         self.filter.set_texts([f"All {len(self._rows)}", f"Needs you {counts['needs_you']}",
                                f"Reviewed {counts['reviewed']}"])
@@ -301,7 +309,7 @@ class QueueView(QWidget):
     def _toggle_reviewed(self, name: str) -> None:
         entry = self._controller.entry(name)
         if can_mark_reviewed(entry):
-            self._controller.mark_reviewed(name, entry.review != ReviewState.REVIEWED)
+            self._controller.mark_reviewed(name, not is_reviewed(entry))
 
     def _toggle_skipped(self, name: str) -> None:
         self._controller.set_skipped(name, not self._controller.entry(name).skipped)
@@ -327,7 +335,7 @@ class QueueView(QWidget):
         add("Test OCR (T)", lambda: self.proof_requested.emit(name))
         add("Open logs", lambda: self.logs_requested.emit(name))
         menu.addSeparator()
-        reviewed = entry.review == ReviewState.REVIEWED
+        reviewed = is_reviewed(entry)
         add("Mark not reviewed" if reviewed else "Mark reviewed", lambda: self._toggle_reviewed(name),
             can_mark_reviewed(entry))
         add("Include file" if entry.skipped else "Skip file", lambda: self._toggle_skipped(name))
