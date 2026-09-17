@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "global": {
+    "brightness": 209,
+    "ocr_parallel": 4,
+    "dialogue_enabled": true,
+    "labels_enabled": false,
+    "time_range": {
+      "start": "23:40",
+      "end": "24:00"
+    }
+  },
+  "videocr": {
+    "ocr_lang": "ch",
+    "conf_threshold": "95",
+    "sim_threshold": "82",
+    "similar_image": "0.3"
+  },
+  "files": {
+    "ZS2_-_11_[1080p]TXHBR.mp4": {
+      "crop": {
+        "x": 288,
+        "y": 786,
+        "width": 1344,
+        "height": 53
+      },
+      "brightness": 209,
+      "time_ranges": [
+        {
+          "start": "02:33",
+          "end": "21:20"
+        }
+      ],
+      "resolution": {
+        "width": 1920,
+        "height": 888
+      },
+      "duration": 1418,
+      "subtitle_position": 4074
+    },
+    "ZS2_-_12_[1080p]TXHBR.mp4": {
+      "crop": {
+        "x": 288,
+        "y": 784,
+        "width": 1344,
+        "height": 55
+      },
+      "brightness": 209,
+      "time_ranges": [
+        {
+          "start": "02:33",
+          "end": "23:05"
+        }
+      ],
+      "resolution": {
+        "width": 1920,
+        "height": 888
+      },
+      "duration": 1628,
+      "subtitle_position": 4082
+    },
+    "ZS2_-_13_[1080p]TXHBR.mp4": {
+      "crop": {
+        "x": 288,
+        "y": 784,
+        "width": 1344,
+        "height": 54
+      },
+      "brightness": 209,
+      "time_ranges": [
+        {
+          "start": "02:33",
+          "end": "21:40"
+        }
+      ],
+      "resolution": {
+        "width": 1920,
+        "height": 888
+      },
+      "duration": 1478,
+      "subtitle_position": 4030
+    },
+    "ZS2_-_14_[1080p]TXHBR.mp4": {
+      "crop": {
+        "x": 288,
+        "y": 780,
+        "width": 1344,
+        "height": 61
+      },
+      "brightness": 209,
+      "time_ranges": [
+        {
+          "start": "02:33",
+          "end": "22:58"
+        }
+      ],
+      "resolution": {
+        "width": 1920,
+        "height": 888
+      },
+      "duration": 1504,
+      "subtitle_position": 4083
+    },
+    "ZS2_-_15_[1080p]TXHBR.mp4": {
+      "crop": {
+        "x": 288,
+        "y": 784,
+        "width": 1344,
+        "height": 54
+      },
+      "brightness": 209,
+      "time_ranges": [
+        {
+          "start": "02:33",
+          "end": "22:33"
+        },
+        {
+          "start": "23:40",
+          "end": "24:00"
+        }
+      ],
+      "resolution": {
+        "width": 1920,
+        "height": 888
+      },
+      "duration": 1516,
+      "subtitle_position": 4039
+    }
+  },
+  "labels": {
+    "label_min_duration": "0.5",
+    "label_max_duration": "5.0",
+    "label_conf_threshold": "95",
+    "label_conf_threshold_min": "80"
+  },
+  "autodetect": {
+    "min_segment_length": "30",
+    "merge_repeating_silences": "false"
+  },
+  "automation": {
+    "crop_width_fraction": "0.70",
+    "crop_vertical_padding": "0",
+    "crop_min_height_fraction": "0.05",
+    "bottom_half_cutoff": "0.50"
+  }
+}
