@@ -24,6 +24,7 @@ video start after a zero container start (Youxia Zhanji), a 1.5 s container
 start, a zero start, HEVC in MP4 (seeks that land after their target) and
 23.976 fps (a 0.2 s step is not a whole number of frames).
 """
+import itertools
 import logging
 import re
 import subprocess
@@ -629,17 +630,25 @@ CORNER_BOX = np.array([[0, 0], [40, 0], [40, 20], [0, 20]], dtype=np.float32)
 def _lost_and_shared(clip, labels, whole):
     """(seconds of `whole` no label covers, frames two labels both claim,
     labels reaching outside `whole`), for the labels at the region box. A
-    label claims a frame whose PTS lies in [start, end), half a frame of
-    float noise allowed."""
+    label claims a frame whose PTS lies in [start, end), and a gap between
+    labels counts as lost only from half a frame on: an end is a frame's PTS
+    plus 1 / fps, which in a millisecond time base can fall a fraction of a
+    millisecond short of the next frame's PTS without leaving that frame
+    unclaimed (the claims below check that)."""
     half = 0.5 / clip.fps
     spans = sorted((l.start_pts, l.end_pts) for l in labels if l.text != "角")
     t, lost = whole[0], 0.0
     for a, b in spans:
-        lost += max(0.0, a - t)
+        if a - t >= half or t == whole[0]:
+            lost += max(0.0, a - t)
         t = max(t, b)
     lost += max(0.0, whole[1] - t)
     claimed = [{i for i, p in enumerate(clip.pts) if a - half <= p < b - half} for a, b in spans]
     shared = sorted({i for x in range(len(claimed)) for y in range(x) for i in claimed[x] & claimed[y]})
+    whole_frames = {i for i, p in enumerate(clip.pts) if whole[0] - half <= p < whole[1] - half}
+    unclaimed = sorted(whole_frames - set().union(*claimed)) if claimed else sorted(whole_frames)
+    if unclaimed:
+        lost = max(lost, len(unclaimed) / clip.fps)
     outside = [(a, b) for a, b in spans if a < whole[0] - 1e-9 or b > whole[1] + 1e-9]
     return lost, shared, outside
 
@@ -660,7 +669,8 @@ def test_same_position_segments_read_at_once_lose_no_span_in_any_list_order(clip
     listed earlier first, later first, and with a segment at another
     position listed between them. With the same text or not, the labels at
     that position cover exactly the label's frames: none is lost, none is
-    claimed twice, and nothing lies outside them. The fast cases run every
+    claimed twice, and nothing lies outside them; with the same text, they
+    come out as one label with that text, once. The fast cases run every
     duplicate shape, and the overlapping ones after one of the two frames."""
     clip = clip_for(clip_id)
     shown = range(5, 96)
@@ -689,11 +699,55 @@ def test_same_position_segments_read_at_once_lose_no_span_in_any_list_order(clip
         for order, segments in _orders(a, b, clip, elsewhere_reading).items():
             labels = _scan_segments(clip.scanner(), segments, _LabelOn(clip, shown, elsewhere_nothing=True))
             lost, shared, outside = _lost_and_shared(clip, labels, whole)
+            texts = [l.text for l in labels if l.text != "角"]
+            if a["text"] == b["text"] and texts != [a["text"]]:
+                failures.append((name, order, "same text did not come out as one label with that text", texts))
             if lost > 1e-9 or shared or outside:
                 failures.append((name, order, round(lost, 3), shared[:3], outside,
                                  [(l.text, round(l.start_pts, 3), round(l.end_pts, 3)) for l in labels]))
     assert len(cases) == (2 if every else 1) * 2 * 4 * 2 * 2 + 9
     assert not failures, f"{len(failures)} of {3 * len(cases)} (case, order, lost s, shared frames, outside, labels): {failures[:6]}"
+
+
+# Three segments at one position, as (first reading frame, last reading
+# frame): one read inside (or across the end of) another's readings, and a
+# third read apart from both, just after, well after, or before them.
+NESTED_SHAPES = {
+    "B inside A, C after": [(15, 45), (25, 30), (60, 80)],
+    "B inside A, C just after": [(15, 45), (25, 30), (50, 80)],
+    "B across the end of A, C after": [(15, 45), (40, 42), (55, 80)],
+    "C before, B inside A": [(40, 80), (55, 60), (10, 25)],
+    "C just before, B inside A": [(40, 80), (55, 60), (10, 35)],
+}
+
+
+@pytest.mark.parametrize("clip_id", _matrix(BOUNDARY_CLIPS + [MS_CLIP], fast={"video-start-0.021s-mkv", MS_CLIP}))
+def test_nested_readings_at_one_position_keep_one_label_per_text_and_lose_no_span(clip_for, clip_id):
+    """Three segments at one position, the label found on every frame 5-95,
+    one segment read while another was, in every list order, through
+    scan(). Each segment is bounded by the segment whose readings ended last
+    before its own began and the one whose readings began first after its
+    own ended, so the bounds the two sides of a gap use agree. Nothing is
+    lost or claimed twice, and with one text there is one label, with that
+    text once."""
+    clip = clip_for(clip_id)
+    shown = range(5, 96)
+    whole = (clip.pts[shown[0]], clip.end_time(shown[-1]))
+    failures, runs = [], 0
+    for name, readings in NESTED_SHAPES.items():
+        for texts in (("第三十七集",) * 3, ("甲甲甲", "乙乙乙", "丙丙丙")):
+            segments = [clip.segment(clip.pts[a], clip.pts[b], t) for (a, b), t in zip(readings, texts)]
+            for order in itertools.permutations(range(3)):
+                runs += 1
+                labels = _scan_segments(clip.scanner(), [segments[i] for i in order], _LabelOn(clip, shown))
+                lost, shared, outside = _lost_and_shared(clip, labels, whole)
+                out = [(l.text, round(l.start_pts, 3), round(l.end_pts, 3)) for l in labels]
+                if texts[0] == texts[1] and [l.text for l in labels] != [texts[0]]:
+                    failures.append((name, order, "not one label with the text once", out))
+                if lost > 1e-9 or shared or outside:
+                    failures.append((name, order, round(lost, 3), shared[:4], outside, out))
+    assert runs == len(NESTED_SHAPES) * 2 * 6
+    assert not failures, f"{len(failures)} failures in {runs} runs (shape, order, ...): {failures[:6]}"
 
 
 def _label(start, end, text="第三十七集", pos_x=160, bbox_x_min=0.0):

@@ -2003,13 +2003,17 @@ class LabelScanner:
 
         For back-to-back segments at the same position, constrains the timing
         scan so segments don't bleed into each other. Uses the midpoint between
-        adjacent segments as the boundary: a segment's neighbours are the
-        segments at the same position (overlapping boxes) just before and just
-        after it in time, wherever they are in the list, which phase 3 builds
-        in cluster order, not time order. A segment whose readings overlap this
-        one's (it was read while this one was) is not a neighbour: no midpoint
-        could separate the two, and bounding them would cut both short. So a
-        bound always lies strictly between the two segments' readings.
+        adjacent segments as the boundary. A segment's neighbours are among
+        the segments at the same position (overlapping boxes), wherever they
+        are in the list, which phase 3 builds in cluster order, not time
+        order: below it, the one whose readings ended last before its first
+        reading; above it, the one whose readings began first after its last
+        reading. A segment whose readings overlap this one's (it was read
+        while this one was) is not a neighbour: no midpoint could separate the
+        two, and bounding them would cut both short. So a bound always lies
+        strictly between the two segments' readings, and the segments on
+        either side of a gap between readings take their bounds from the same
+        two readings, even when another segment was read inside one of them.
 
         Returns list of LabelResult.
         """
@@ -2017,9 +2021,6 @@ class LabelScanner:
             progress.set_phase("label_p4", len(segments))
 
         results = []
-        in_time = sorted(range(len(segments)),
-                         key=lambda i: (segments[i]["start_pts"], segments[i]["end_pts"], i))
-        rank = {i: r for r, i in enumerate(in_time)}
 
         with Capture(self.video_path) as cap:
             for li, seg in enumerate(segments):
@@ -2039,14 +2040,14 @@ class LabelScanner:
                 # as fallback safety net (size matching is the primary discriminator)
                 lower_bound = None
                 upper_bound = None
-                prev = next((segments[j] for j in reversed(in_time[:rank[li]])
-                             if segments[j]["end_pts"] < start_pts
-                             and self._boxes_overlap(box, segments[j]["box"])), None)
+                same_position = [other for j, other in enumerate(segments)
+                                 if j != li and self._boxes_overlap(box, other["box"])]
+                prev = max((other for other in same_position if other["end_pts"] < start_pts),
+                           key=lambda other: other["end_pts"], default=None)
                 if prev is not None:
                     lower_bound = (prev["end_pts"] + start_pts) / 2
-                nxt = next((segments[j] for j in in_time[rank[li] + 1:]
-                            if segments[j]["start_pts"] > end_pts
-                            and self._boxes_overlap(box, segments[j]["box"])), None)
+                nxt = min((other for other in same_position if other["start_pts"] > end_pts),
+                          key=lambda other: other["start_pts"], default=None)
                 if nxt is not None:
                     upper_bound = (end_pts + nxt["start_pts"]) / 2
 
