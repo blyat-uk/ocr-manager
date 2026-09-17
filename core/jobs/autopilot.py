@@ -296,6 +296,7 @@ class AutoPilot:
         self._redetect_superseded: dict[str, int] = {}   # re-detected file -> highest job_id of a
                                                          # non-current crop event since the re-detect
         self._scheduled: set[str] = set()         # files the folder schedule covers (metadata -> everything)
+        self._readded: set[str] = set()           # files added back while jobs for their old entry were outstanding
         self._thumbnail_times: dict[str, float] = {}
         self._ranges_done = False
         self._ranges_files: tuple[str, ...] = ()   # the files of the newest ranges analysis submitted
@@ -314,11 +315,19 @@ class AutoPilot:
 
     def on_files_added(self, names: list[str]) -> None:
         """Schedule the added files (metadata and thumbnails always) and, when
-        autopilot_enabled, their detections and the ranges analysis again."""
+        autopilot_enabled, their detections and the ranges analysis again. A
+        file added back while jobs of its removed entry are still outstanding
+        is scheduled again, as here (without another ranges analysis), when
+        the last outstanding job for it ends; until then it is pending "crop"
+        when it needs one."""
         project = self._project()
         wanted = set(names)
         added = [name for name in project.files if name in wanted]
         for name in added:
+            if self._file_outstanding(name):
+                # Jobs of the removed entry still count, so the checks below
+                # would skip what they cover. Schedule it again once they end.
+                self._readded.add(name)
             self._thumbnail_times.pop(name, None)          # a file that came back has no thumbnail
             self._scan_metadata(project, name)
         if project.folder.autopilot_enabled:
@@ -345,6 +354,7 @@ class AutoPilot:
         if not removed:
             return
         for name in removed:
+            self._readded.discard(name)
             self._crop_chain.discard(name)
             self._deferred_crops.pop(name, None)
             self._drop_redetect(name)
@@ -383,6 +393,7 @@ class AutoPilot:
                 # Remember it, so the key's last crop event can tell whether it
                 # is the re-detect's own job (the newest has the highest job_id).
                 self._redetect_superseded[file] = max(self._redetect_superseded.get(file, 0), event.job_id)
+            self._schedule_readded(self._project(), file)
             return
         project = self._project()
         if kind == "metadata":
@@ -396,6 +407,7 @@ class AutoPilot:
             if event.type != "cancelled":
                 self._ranges_done = True
             self._release_ranges_waits(project)
+        self._schedule_readded(project, file)
         self._settle_tier(project)
 
     def redetect(self, file: str) -> None:
@@ -584,6 +596,23 @@ class AutoPilot:
 
     def _is_outstanding(self, kind: str, file: str) -> bool:
         return self._outstanding.get(f"{kind}:{file}", 0) > 0
+
+    def _file_outstanding(self, name: str) -> bool:
+        """Any submission for the file is outstanding."""
+        return any(file == name for _kind, file in self._identity.values())
+
+    def _schedule_readded(self, project: Project, name: str | None) -> None:
+        """A file added back while jobs for it were outstanding: once the last
+        of them has ended, schedule it as on_files_added would (without
+        another ranges analysis)."""
+        if name not in self._readded or self._file_outstanding(name):
+            return
+        self._readded.discard(name)
+        if name not in project.files:
+            return
+        self._scan_metadata(project, name)
+        self._schedule_file(project, name)
+        self._settle_tier(project)
 
     def _submit(self, job, priority: int) -> None:
         job.priority = int(priority)
@@ -869,12 +898,15 @@ class AutoPilot:
         return name in self._waiting and _brightness_unmeasured(entry)
 
     def _crop_pending(self, project: Project, name: str, entry: FileEntry) -> bool:
-        """A crop detection is outstanding, waits in the auto-fill chain, or
-        will follow outstanding metadata."""
+        """A crop detection is outstanding, waits in the auto-fill chain, will
+        follow outstanding metadata, or will be scheduled for a file added back
+        once its old jobs end."""
         folder = project.folder
         if self._is_outstanding("crop", name):
             return True
         if name in self._crop_chain and _crop_wanted(folder, entry):
+            return True
+        if name in self._readded and self._detects_automatically(folder, name) and _crop_wanted(folder, entry):
             return True
         if not self._is_outstanding("metadata", name):
             return False

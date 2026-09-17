@@ -1716,6 +1716,125 @@ def test_pending_empties_once_the_removed_files_jobs_end(tmp_path):
     assert owner.autopilot.ranges_pending() is False
 
 
+def _readd(owner: Owner, name: str) -> None:
+    """The file comes back: reconcile_files gives it a fresh entry, then on_files_added."""
+    owner.project.files[name] = FileEntry(name=name)
+    owner.project.files = dict(sorted(owner.project.files.items()))
+    owner.autopilot.on_files_added([name])
+    owner.recompute()
+
+
+def _assert_waiting(owner: Owner, name: str) -> None:
+    assert owner.state(name) == ReviewState.PENDING
+    assert "crop" in owner.autopilot.pending()[name]
+
+
+def test_a_file_readded_while_its_metadata_is_outstanding_is_scheduled_when_that_job_ends(tmp_path):
+    owner = Owner(_project(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    (meta_a,) = [s for s in owner.take() if (s.job.kind, s.job.file) == ("metadata", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    _readd(owner, "a.mkv")
+    assert pairs(owner.take()) == [("ranges", None)]            # metadata:a.mkv is still outstanding
+    _assert_waiting(owner, "a.mkv")
+
+    owner.deliver(meta_a, None, type="cancelled")               # the owner cancelled it at removal
+    (meta_again,) = owner.take()
+    assert (meta_again.job.kind, meta_again.job.file) == ("metadata", "a.mkv")
+    _assert_waiting(owner, "a.mkv")
+    owner.deliver(meta_again, metadata_done(meta_again))
+    assert ("crop", "a.mkv") in pairs(owner.take())
+
+
+def test_a_file_readded_while_its_crop_is_outstanding_is_scheduled_when_its_last_job_ends(tmp_path):
+    owner = Owner(_chain_folder(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    opened = owner.take()
+    old_a = [s for s in opened if s.job.file == "a.mkv"]
+    assert sorted(pairs(old_a)) == [("crop", "a.mkv"), ("thumbnail", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    (crop_b,) = owner.take()
+    _readd(owner, "a.mkv")
+    (metadata,) = of_kind(owner.take(), "metadata")
+    owner.deliver(metadata, metadata_done(metadata))
+    side = owner.take()
+    assert sorted(pairs(side)) == [("audio_profile", "a.mkv"), ("thumbnail", "a.mkv")]   # crop:a.mkv outstanding
+    _assert_waiting(owner, "a.mkv")
+
+    for sub in old_a:                                           # the owner cancelled them at removal
+        owner.deliver(sub, None, type="cancelled")
+    assert owner.take() == []                                   # a's new thumbnail and audio are still outstanding
+    _assert_waiting(owner, "a.mkv")
+    finish_side_jobs(owner, side)
+    assert owner.take() == []                                   # a waits in the chain behind b's crop
+    _assert_waiting(owner, "a.mkv")
+    owner.deliver(crop_b, crop_done(crop_b))
+    crops = of_kind(owner.take(), "crop")
+    assert pairs(crops) == [("crop", "a.mkv")] and crops[0].job.hint is None
+
+
+def test_a_readded_file_is_scheduled_when_its_last_job_ends_without_being_current(tmp_path):
+    """The last old job is a brightness job superseded by a request waiting for
+    the ranges (not current); that request is later dropped, so nothing else
+    would ever schedule the file's audio profile."""
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv"], open_ranges=True)
+    del project.files["a.mkv"].evidence["audio"]
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    opened = owner.take()
+    (ranges,) = of_kind(opened, "ranges")
+    owner.deliver(ranges, ranges_done(ranges))
+    (bright_a,) = [s for s in owner.take() if s.job.file == "a.mkv"]
+    old_audio = [s for s in opened if (s.job.kind, s.job.file) == ("audio_profile", "a.mkv")]
+    old_thumbnail = [s for s in opened if (s.job.kind, s.job.file) == ("thumbnail", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    _readd(owner, "a.mkv")
+    added = owner.take()
+    (metadata,) = of_kind(added, "metadata")
+    owner.deliver(metadata, metadata_done(metadata))
+    after_metadata = owner.take()
+    assert of_kind(after_metadata, "audio_profile") == []           # the old audio job is outstanding
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("a.mkv")                           # waits for the new ranges analysis
+    assert of_kind(owner.take(), "brightness") == []
+    for sub in old_audio + old_thumbnail + after_metadata:
+        owner.deliver(sub, None, type="cancelled")
+    assert owner.deliver(bright_a, None, type="cancelled") is False    # the last old job: not current
+    set_manual_brightness(project, "a.mkv", 215)                       # the waiting request will be dropped
+    (again,) = of_kind(added, "ranges")
+    owner.deliver(again, ranges_done(again))
+    submitted = owner.take()
+    assert ("audio_profile", "a.mkv") in pairs(submitted)
+    assert of_kind(submitted, "brightness") == []
+
+
+def test_a_file_readded_once_its_jobs_ended_is_scheduled_at_once(tmp_path):
+    owner = Owner(_project(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    (meta_a,) = [s for s in owner.take() if (s.job.kind, s.job.file) == ("metadata", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    owner.deliver(meta_a, None, type="cancelled")
+    _readd(owner, "a.mkv")
+    submitted = owner.take()
+    assert pairs(submitted) == [("metadata", "a.mkv"), ("ranges", None)]
+    owner.deliver(submitted[0], metadata_done(submitted[0]))
+    owner.take()
+    assert len(of_kind(owner.runner.submissions, "metadata")) == 3      # a, b, and a once more: never twice
+
+
+def test_a_readded_file_removed_again_is_not_scheduled(tmp_path):
+    owner = Owner(_project(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    (meta_a,) = [s for s in owner.take() if (s.job.kind, s.job.file) == ("metadata", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    _readd(owner, "a.mkv")
+    _remove(owner, ["a.mkv"])
+    owner.take()
+    owner.deliver(meta_a, None, type="cancelled")
+    assert of_kind(owner.take(), "metadata") == []
+    assert "a.mkv" not in owner.autopilot.pending()
+
+
 def test_autopilot_module_imports_no_qt():
     code = ("import sys, core.jobs.autopilot; "
             "bad = [m for m in sys.modules if m.split('.')[0] in ('PyQt6', 'PyQt5', 'PySide6')]; "

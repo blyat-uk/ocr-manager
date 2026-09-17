@@ -10,10 +10,13 @@ exactly as AutoPilot's class docstring prescribes, on its own thread:
     -> recompute_all(project, pending=..., ranges_pending=...)
 
 with random user actions (re-detects, hint re-detects, manual edits, marks,
-skips, pause/resume, files added, cancels, files removed) interleaved while
-jobs run. Once nothing is queued, running or undelivered, the folder must be
-at rest: nothing pending or outstanding in AutoPilot, no stale brightness,
-and no file left PENDING.
+skips, pause/resume, files added, files removed and added back under the same
+name, cancels) interleaved while jobs run. Once nothing is queued, running or
+undelivered, the folder must be at rest: nothing pending or outstanding in
+AutoPilot, no stale brightness, and no file left PENDING. A file is FLAGGED at
+rest only for a reason: a hint re-detection disagreed, or the user cancelled
+one of its jobs; otherwise it is PROPOSED or REVIEWED, never stuck without its
+values.
 
 Idle is exact, not timed: the owner counts every job from its "queued" event
 (delivered to the queue before submit returns) to its terminal event, and
@@ -165,6 +168,8 @@ class Owner:
         self.autopilot = AutoPilot(self.runner, lambda: self.project)
         self.live: set[int] = set()          # job ids queued and not yet ended, as drained
         self.problems: list = []
+        self.removed: list[str] = []         # removed names that may be added back
+        self.cancelled: set[str] = set()     # files the user cancelled a job of
 
     def recompute(self) -> None:
         apply.recompute_all(self.project, pending=self.autopilot.pending(),
@@ -192,7 +197,7 @@ class Owner:
         return not self.live and self.events.empty()
 
 
-def _act(owner: Owner, rnd: random.Random, counter, *, cancels: bool) -> None:
+def _act(owner: Owner, rnd: random.Random, counter, *, removals: bool, cancels: bool) -> None:
     project, autopilot, runner = owner.project, owner.autopilot, owner.runner
     names = list(project.files)
     if not names:
@@ -200,8 +205,10 @@ def _act(owner: Owner, rnd: random.Random, counter, *, cancels: bool) -> None:
     name = rnd.choice(names)
     choices = ["redetect", "crop_hint", "brightness_hint", "manual_crop", "manual_brightness", "pause",
                "add", "mark", "skip"]
+    if removals:
+        choices += ["remove", "remove", "readd", "readd", "readd"]
     if cancels:
-        choices += ["cancel", "remove"]
+        choices += ["cancel"]
     action = rnd.choice(choices)
     if action == "redetect":
         autopilot.redetect(name)
@@ -231,14 +238,23 @@ def _act(owner: Owner, rnd: random.Random, counter, *, cancels: bool) -> None:
     elif action == "cancel":
         kind = rnd.choice(["crop", "brightness", "metadata", "audio_profile", "thumbnail", "ranges"])
         runner.cancel("ranges:*" if kind == "ranges" else f"{kind}:{name}")
+        owner.cancelled.add(name)
     elif action == "remove":
         del project.files[name]                                       # reconcile_files removed it
         runner.cancel_where(lambda job, name=name: job.file == name)
         autopilot.on_files_removed([name])
+        owner.removed.append(name)
+    elif action == "readd":
+        if owner.removed:                                             # the same video comes back
+            back = owner.removed.pop(rnd.randrange(len(owner.removed)))
+            project.files[back] = FileEntry(back)                     # reconcile_files: a fresh entry
+            project.files = dict(sorted(project.files.items()))
+            autopilot.on_files_added([back])
     owner.recompute()
 
 
-def simulate(monkeypatch, tmp_path, seed: int, *, actions: int, cancels: bool, hint_shift: bool) -> Owner:
+def simulate(monkeypatch, tmp_path, seed: int, *, actions: int, removals: bool = False, cancels: bool = False,
+             hint_shift: bool = False) -> Owner:
     Fakes(seed, hint_shift).install(monkeypatch)
     rnd = random.Random(seed * 7 + 1)
     names = [f"ep{i:02d}.mp4" for i in range(3 + seed % 5)]
@@ -254,7 +270,7 @@ def simulate(monkeypatch, tmp_path, seed: int, *, actions: int, cancels: bool, h
                                                  owner.runner.running(), owner.autopilot.pending())
             owner.drain_one(0.002)
             if left and rnd.random() < 0.2:
-                _act(owner, rnd, counter, cancels=cancels)
+                _act(owner, rnd, counter, removals=removals, cancels=cancels)
                 left -= 1
                 if not left:
                     owner.autopilot.resume()                           # nothing may stay held at rest
@@ -276,11 +292,15 @@ def assert_at_rest(owner: Owner) -> None:
     for name, entry in project.files.items():
         assert not apply.brightness_is_stale(entry), (name, entry.crop, entry.evidence.get("brightness"))
         assert entry.review != ReviewState.PENDING, (name, entry)
+        if entry.review == ReviewState.FLAGGED:                # only for a reason, never stuck
+            hint_disagreed = any(apply.FLAG_DIFFERS_FROM_HINT in (entry.flags.get(kind) or "")
+                                 for kind in ("crop", "brightness"))
+            assert hint_disagreed or name in owner.cancelled, (name, entry, owner.removed)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_a_folder_left_alone_comes_to_rest_proposed(monkeypatch, tmp_path, seed):
-    owner = simulate(monkeypatch, tmp_path, seed, actions=0, cancels=False, hint_shift=False)
+    owner = simulate(monkeypatch, tmp_path, seed, actions=0)
     assert_at_rest(owner)
     for entry in owner.project.files.values():
         assert entry.review == ReviewState.PROPOSED
@@ -289,15 +309,27 @@ def test_a_folder_left_alone_comes_to_rest_proposed(monkeypatch, tmp_path, seed)
         assert "audio" in entry.evidence and entry.time_ranges is not None
 
 
+def _proposed_or_reviewed(owner: Owner) -> None:
+    for name, entry in owner.project.files.items():            # nothing went missing or got flagged
+        assert entry.review in (ReviewState.PROPOSED, ReviewState.REVIEWED), (name, entry, owner.removed)
+
+
 @pytest.mark.parametrize("seed", [3, 4, 5])
 def test_user_actions_while_jobs_run_leave_the_folder_at_rest(monkeypatch, tmp_path, seed):
-    owner = simulate(monkeypatch, tmp_path, seed, actions=40, cancels=False, hint_shift=False)
+    owner = simulate(monkeypatch, tmp_path, seed, actions=40)
     assert_at_rest(owner)
-    for name, entry in owner.project.files.items():            # nothing went missing or got flagged
-        assert entry.review in (ReviewState.PROPOSED, ReviewState.REVIEWED), (name, entry)
+    _proposed_or_reviewed(owner)
+
+
+# Seed 81 is the re-review's: a file removed and added back while its metadata job was outstanding.
+@pytest.mark.parametrize("seed", [81, 9, 10, 11, 12, 13, 14, 15, 16])
+def test_files_removed_and_added_back_while_jobs_run_come_to_rest(monkeypatch, tmp_path, seed):
+    owner = simulate(monkeypatch, tmp_path, seed, actions=40, removals=True)
+    assert_at_rest(owner)
+    _proposed_or_reviewed(owner)
 
 
 @pytest.mark.parametrize("seed", [6, 7, 8])
 def test_cancels_removals_and_disagreeing_hints_still_leave_the_folder_at_rest(monkeypatch, tmp_path, seed):
-    owner = simulate(monkeypatch, tmp_path, seed, actions=40, cancels=True, hint_shift=True)
+    owner = simulate(monkeypatch, tmp_path, seed, actions=40, removals=True, cancels=True, hint_shift=True)
     assert_at_rest(owner)
