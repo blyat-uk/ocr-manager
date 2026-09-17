@@ -17,16 +17,28 @@ Detection never overrides the user (rulings C1/C2)
 Stale brightness
     A brightness result is dropped entirely (no value, evidence or flag)
     unless the file's crop still has the (x, y, width, height) the result was
-    measured with (BrightnessJobResult.crop_box).
+    measured with (BrightnessJobResult.crop_box). An applied result records
+    that box as evidence["brightness"]["crop_box"]; a detected or hinted
+    brightness whose recorded box is no longer the file's crop (the crop was
+    re-detected or edited since) counts as missing (brightness_is_stale).
+
+Hints
+    "differs-from-hint?" (blocking) is added to the file's flags when a hint
+    re-detection disagrees with its hint: a brightness plateau without the
+    hint value, or a crop box inconsistent with the hint under the crop
+    detector's own consensus rule (core.detect.crop.consistent_with_consensus).
 
 Review
     compute_review_state() is the only place a file's state is derived.
     REVIEWED is the one stored decision: it is set by the user
-    (mark_reviewed, set_manual_*, paste_settings), and it is cleared by an
-    apply that changes a value: a detected or hinted value the file was
-    reviewed with, or an empty field detection fills (the user never saw
-    that value). The user's own values are never changed by detection, so
-    they never clear it.
+    (mark_reviewed, set_manual_*, paste_settings), but it never hides a
+    required value that is missing or stale, nor a blocking flag on a
+    detected or hinted value. An apply clears it when it changes a value (a
+    detected or hinted value the file was reviewed with, a stale brightness,
+    or an empty field detection fills: the user never saw that value) or
+    stores a blocking flag for a required field holding no value or a
+    detected/hinted one. The user's own values are never changed by
+    detection, so they never clear it.
     Flags describe detection results. A blocking flag counts against a file
     only while the field holds a detected or hinted value (or none): a
     detection that was not applied over the user's value is kept as evidence
@@ -62,7 +74,7 @@ from core.project.model import (
     TimeRanges,
 )
 
-FLAG_DIFFERS_FROM_HINT = "differs-from-hint?"   # blocking: a verified plateau that excludes the user's hint value
+FLAG_DIFFERS_FROM_HINT = "differs-from-hint?"   # blocking: a hint re-detection that disagrees with its hint
 
 # Sources detection may overwrite (ruling C2).
 DETECTION_SOURCES = frozenset({Source.DETECTED, Source.HINT})
@@ -97,15 +109,53 @@ def _detection_may_write(value) -> bool:
     return value is None or value.source in DETECTION_SOURCES
 
 
-def _write_detected(entry: FileEntry, field: str, new) -> None:
+def _required(folder: FolderSettings) -> tuple[str, ...]:
+    return DIALOGUE_DETECTORS if folder.dialogue_enabled else ()
+
+
+def _blocking(entry: FileEntry, name: str) -> bool:
+    return not only_informational(entry.flags.get(name) or None, INFORMATIONAL_FLAGS[name])
+
+
+def _is_detected(value) -> bool:
+    return value is not None and value.source in DETECTION_SOURCES
+
+
+def brightness_is_stale(entry: FileEntry) -> bool:
+    """True when the file's brightness is detected or hinted and its evidence
+    records a crop box that is not the file's crop: it was measured on a
+    crop the file no longer has. A brightness without a recorded box (none
+    was applied by apply_brightness) is not judged stale."""
+    if not _is_detected(entry.brightness):
+        return False
+    measured = (entry.evidence.get("brightness") or {}).get("crop_box")
+    if measured is None:
+        return False
+    return entry.crop is None or _value_key(entry.crop) != _crop_tuple(measured)
+
+
+def _counts_as_missing(entry: FileEntry, name: str) -> bool:
+    return getattr(entry, name) is None or (name == "brightness" and brightness_is_stale(entry))
+
+
+def _write_detected(entry: FileEntry, field: str, new, *, old_stale: bool = False) -> None:
     """Write a detected value into a field _detection_may_write() allowed.
-    A REVIEWED file loses its review when the OCR-visible value changes: a
+    A REVIEWED file loses its review when the OCR-visible value changes (a
     detected or hinted value replaced by a different one, or an empty field
-    filled."""
+    filled), or when the value replaced was stale (`old_stale`)."""
     old = getattr(entry, field)
     setattr(entry, field, new)
     if (entry.review == ReviewState.REVIEWED and (old is None or old.source in DETECTION_SOURCES)
-            and _value_key(old) != _value_key(new)):
+            and (old_stale or _value_key(old) != _value_key(new))):
+        entry.review = ReviewState.PENDING
+
+
+def _unreview_on_blocking_flag(project: Project, entry: FileEntry, name: str) -> None:
+    """S4/S5: a blocking flag just stored for a required field that holds no
+    value or a detected/hinted one clears REVIEWED."""
+    value = getattr(entry, name)
+    if (entry.review == ReviewState.REVIEWED and name in _required(project.folder)
+            and (value is None or value.source in DETECTION_SOURCES) and _blocking(entry, name)):
         entry.review = ReviewState.PENDING
 
 
@@ -139,16 +189,30 @@ def apply_crop(project: Project, r: CropJobResult | None) -> None:
         return
     result = r.result
     entry.evidence["crop"] = result.to_evidence()
-    entry.flags["crop"] = result.flagged or ""
+    flag = result.flagged or ""
+    if r.hint is not None and result.box is not None and not _crop_agrees_with_hint(result, r.hint):
+        flag = compose_flag(flag, FLAG_DIFFERS_FROM_HINT)
+    entry.flags["crop"] = flag
 
     written = False
     if _detection_may_write(entry.crop) and result.box is not None and result.auto_applicable:
         source = Source.HINT if r.hint is not None else Source.DETECTED
         _write_detected(entry, "crop", Crop(*_crop_tuple(result.box), source))
         written = True
+    _unreview_on_blocking_flag(project, entry, "crop")
 
     if result.hit_pts and (entry.sample_time is None or written):
         entry.sample_time = float(result.hit_pts[0])
+
+
+def _crop_agrees_with_hint(result, hint: tuple[float, float]) -> bool:
+    """The crop detector's own consensus rule, with the hint as the whole
+    consensus (as CropJob seeds it). A result without a usable frame size
+    cannot be checked and does not agree."""
+    if result.frame_size is None or not result.frame_size[1] or result.frame_size[1] <= 0:
+        return False
+    return _crop.consistent_with_consensus(result.box, result.frame_size,
+                                           [hint] * _crop.CONSENSUS_MIN_ENTRIES)
 
 
 def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
@@ -161,7 +225,8 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
 
     Stale results are dropped entirely: when the file has no crop, or its
     crop is not the box the result was measured with (r.crop_box), nothing
-    about the file changes."""
+    about the file changes. An applied result records r.crop_box in its
+    evidence, which brightness_is_stale() reads."""
     if r is None or detector_cancelled(r.result.flagged):
         return
     entry = project.files.get(r.file)
@@ -170,8 +235,10 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
     if entry.crop is None or r.crop_box is None or _value_key(entry.crop) != _crop_tuple(r.crop_box):
         return
     result = r.result
+    old_stale = brightness_is_stale(entry)
     entry.evidence["brightness"] = {**result.to_evidence(),
-                                    "tiles": {kind: float(t) for kind, t in r.tiles.items()}}
+                                    "tiles": {kind: float(t) for kind, t in r.tiles.items()},
+                                    "crop_box": list(_crop_tuple(r.crop_box))}
     flag = result.flagged or ""
     if r.hint_value is not None:
         plateau = result.plateau
@@ -181,7 +248,8 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
 
     if _detection_may_write(entry.brightness) and result.auto_applicable:
         source = Source.HINT if r.hint_value is not None else Source.DETECTED
-        _write_detected(entry, "brightness", Brightness(int(result.value), source))
+        _write_detected(entry, "brightness", Brightness(int(result.value), source), old_stale=old_stale)
+    _unreview_on_blocking_flag(project, entry, "brightness")
 
 
 def apply_ranges(project: Project, r: RangesJobResult | None) -> None:
@@ -299,26 +367,35 @@ def paste_settings(project: Project, target: str, clip: dict) -> None:
 
 def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
                          detections_pending: set[str], ranges_pending: bool) -> ReviewState:
-    """REVIEWED if the user reviewed it. Otherwise PENDING while a required
-    detector (crop and brightness when dialogue is extracted, none for
-    labels-only) or the folder's ranges analysis is pending. Otherwise
-    FLAGGED when a required value is missing, or when a required value is
-    detected or hinted and its detector's stored flags include a reason that
-    is not informational for that detector ("differs-from-hint?" and unknown
-    reasons block). Flags beside a MANUAL or IMPORTED value do not count.
-    Otherwise PROPOSED."""
-    if entry.review == ReviewState.REVIEWED:
-        return ReviewState.REVIEWED
-    required = DIALOGUE_DETECTORS if folder.dialogue_enabled else ()
-    if ranges_pending or any(name in detections_pending for name in required):
-        return ReviewState.PENDING
+    """The file's review state. Required fields are crop and brightness when
+    dialogue is extracted, none for labels-only. In order:
+
+    1. Each required field, crop first: a missing value (None, or a stale
+       brightness, see brightness_is_stale) makes the file PENDING if that
+       field's detector is pending, else FLAGGED. REVIEWED never hides it.
+    2. REVIEWED if the user reviewed the file, unless a required detected or
+       hinted value carries a blocking flag (see 4): REVIEWED never hides that
+       either.
+    3. PENDING while a required detector is pending for a field holding a
+       detected or hinted value, or while the folder's ranges are pending.
+    4. FLAGGED when a required field's value is detected or hinted and its
+       stored flags include a reason that is not informational for that
+       detector ("differs-from-hint?" and unknown reasons block). Flags beside
+       a MANUAL or IMPORTED value do not count.
+    5. PROPOSED.
+    """
+    required = _required(folder)
     for name in required:
-        value = getattr(entry, name)
-        if value is None:
-            return ReviewState.FLAGGED
-        if (value.source in DETECTION_SOURCES
-                and not only_informational(entry.flags.get(name) or None, INFORMATIONAL_FLAGS[name])):
-            return ReviewState.FLAGGED
+        if _counts_as_missing(entry, name):
+            return ReviewState.PENDING if name in detections_pending else ReviewState.FLAGGED
+    blocked = any(_is_detected(getattr(entry, name)) and _blocking(entry, name) for name in required)
+    if entry.review == ReviewState.REVIEWED and not blocked:
+        return ReviewState.REVIEWED
+    if ranges_pending or any(name in detections_pending and _is_detected(getattr(entry, name))
+                             for name in required):
+        return ReviewState.PENDING
+    if blocked:
+        return ReviewState.FLAGGED
     return ReviewState.PROPOSED
 
 

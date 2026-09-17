@@ -24,10 +24,11 @@ Engines (ruling A1)
 Fidelity
     Detectors get exactly the documented arguments and nothing else.
     ProofOcrJob passes ocr_call_for(entry, folder, project_dir).kwargs
-    unchanged, adding only time_ranges (one 30 s window) and cancel_event,
-    neither of which changes what the OCR pass reads. Its lines are parsed
-    from the ASS text get_subtitles returns, i.e. what a run would write
-    before QA, labels included.
+    unchanged, adding only time_ranges (one 30 s window, whole seconds) and
+    cancel_event, neither of which changes what the OCR pass reads. Its lines
+    are parsed from the ASS text get_subtitles returns after the run's QA pass
+    (core.ass_qafix.process_file on a temporary copy), i.e. what a run would
+    write, labels included.
 
 Cancellation convention: a cancelled job returns None
     A job whose work was cut short by a cancel request returns None. It never
@@ -50,12 +51,14 @@ from __future__ import annotations
 
 import copy
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import cv2
 
+from core import ass_qafix as _qafix
 from core.ass_qafix import ASS_TAG_RE
 from core.detect import audio_profile as _audio_profile
 from core.detect import brightness as _brightness
@@ -139,7 +142,7 @@ class AudioProfileResult:
 @dataclass(frozen=True)
 class ProofResult:
     file: str
-    window: tuple[float, float]                 # seconds; OCR ran on format_mss() of each end
+    window: tuple[float, float]                 # whole seconds OCR ran on (format_mss() of each end)
     lines: list[tuple[float, float, str]]       # (start s, end s, text) of every Dialogue line get_subtitles
                                                 # returned, in document order (see proof_lines)
     seconds: float                              # wall time of the OCR call
@@ -397,6 +400,20 @@ def proof_lines(ass: str) -> list[tuple[float, float, str]]:
     return lines
 
 
+def qa_pass(ass: str) -> str:
+    """`ass` after the run's QA pass (ruling C5): written to a file in a
+    temporary directory (UTF-8, as videocr's save_subtitles_to_file writes
+    it), fixed in place by core.ass_qafix.process_file with its defaults, and
+    read back. The temporary directory is removed."""
+    with tempfile.TemporaryDirectory(prefix="ocr-proof-") as directory:
+        path = os.path.join(directory, "proof.ass")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(ass)
+        _qafix.process_file(path)
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+
 def format_mss(seconds: float) -> str:
     """"M:SS" for a time-range string, truncated to whole seconds (a preview
     window; minutes may exceed 59, which get_frame_index reads correctly)."""
@@ -409,9 +426,11 @@ class ProofOcrJob:
 
     The call (ocr_call_for) and the window are resolved at construction, so
     edits made after the user asked for the proof do not change it. The
-    file's own time ranges are ignored: the window is the only range. Lines
-    are parsed from the ASS text get_subtitles returns (proof_lines), so they
-    are what a run would write before QA, labels-only folders included.
+    file's own time ranges are ignored: the window is the only range, in
+    whole seconds (`window` holds exactly what OCR ran on). Lines are parsed
+    (proof_lines) from the ASS text get_subtitles returns after the run's QA
+    pass (qa_pass), so they are what a run would write, labels-only folders
+    included. `seconds` times the OCR call alone.
     """
 
     kind = "proof"
@@ -421,7 +440,8 @@ class ProofOcrJob:
     def __init__(self, project_dir: str, entry: FileEntry, folder: FolderSettings):
         self.file = entry.name
         self.key = f"{self.kind}:{entry.name}"
-        self.window = proof_window(entry.sample_time, entry.media.duration)
+        start, end = proof_window(entry.sample_time, entry.media.duration)
+        self.window = (float(int(start)), float(int(end)))     # truncated as format_mss() passes them
         self.time_range = (format_mss(self.window[0]), format_mss(self.window[1]))
         self._kwargs = copy.deepcopy(ocr_call_for(entry, folder, project_dir).kwargs)
 
@@ -432,4 +452,4 @@ class ProofOcrJob:
         seconds = time.perf_counter() - started
         if ctx.cancelled():
             return None
-        return ProofResult(self.file, self.window, proof_lines(ass or ""), seconds)
+        return ProofResult(self.file, self.window, proof_lines(qa_pass(ass or "")), seconds)
