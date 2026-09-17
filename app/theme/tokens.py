@@ -51,6 +51,9 @@ KV_WARN_BORDER = "#4a3a1c"    # warn-tinted kv row border
 TAG_BAD_BORDER = "#5b2f34"    # bad-tinted tag / .ztile.bad border
 TAG_BLUE_BORDER = "#2c4666"   # blue-tinted tag border (envelope legend chip)
 WAVEFORM = "#5a6472"          # waveform stroke colour
+THUMB_TOP = "#243044"         # .thumb/.sthumb gradient start: linear-gradient(160deg,#243044,#121820 70%)
+THUMB_BOTTOM = "#121820"      # .thumb/.sthumb gradient end (at 70%)
+THUMB_PENDING = "#161b22"     # a pending (still detecting) queue row's thumbnail background
 SPOTLIGHT = (8, 10, 14, 115)  # rgba(8,10,14,.45) crop-box spotlight dimming
 
 # --------------------------------------------------------------------------
@@ -83,6 +86,8 @@ LETTER_SPACING_INSP_SCOPE_EM = 0.08  # .insp-scope
 # --------------------------------------------------------------------------
 RAIL_WIDTH = 246         # .rail
 INSPECTOR_WIDTH = 322    # .insp
+THUMB_WIDTH = 56         # .thumb
+THUMB_HEIGHT = 32
 
 # --------------------------------------------------------------------------
 # Radii (ui-spec.md §2.4, transcribed from the literal CSS this task's
@@ -93,12 +98,17 @@ INSPECTOR_WIDTH = 322    # .insp
 # `.hf .bar { ... border-radius:2px; ... }`) says 2px for both -- read
 # directly from workbench-hifi.html/tabs-hifi.html, which is what
 # _BarTrack (app/widgets/base.py) actually paints.
+RADIUS_THUMB_BOX = 1   # .thumb i (the crop box drawn on a queue thumbnail)
 RADIUS_XS = 2      # .bar, .mini
+RADIUS_THUMB = 3   # .thumb, .sthumb
 RADIUS_TAG = 4     # .badge, .tag, .pbar
 RADIUS_SEG = 5     # .seg span, .track, .ztile
 RADIUS_BTN = 6     # .btn, .kv, .canvas
 RADIUS_ROW = 7     # .frow
 RADIUS_CHIP = 20   # .chip (pill)
+# What the QSS uses for .chip: CSS clamps 20px to half the height (a pill), but Qt draws square
+# corners when a radius exceeds half the widget, so the ~22 px chip gets half its height instead.
+RADIUS_CHIP_QT = 10
 RADIUS_DOT = 50    # .dot -- CSS 50%; widgets translate this to width/2 px
 
 # --------------------------------------------------------------------------

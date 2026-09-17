@@ -18,7 +18,7 @@ import pytest
 
 from app import state_text
 from core.detect.brightness import BrightnessResult
-from core.detect.crop import CropResult
+from core.detect.crop import FLAG_LOW_AGREEMENT, CropResult
 from core.jobs import apply as apply_mod
 from core.jobs.detect_jobs import BrightnessJobResult, CropJobResult
 from core.project.model import (
@@ -643,3 +643,81 @@ def test_state_text_module_imports_no_qt():
         cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+
+# --------------------------------------------------------------------------
+# Task 3: value texts for the inspector and the placeholder tabs
+# --------------------------------------------------------------------------
+
+def test_crop_and_brightness_texts():
+    from app.state_text import brightness_text, crop_text
+
+    assert crop_text(Crop(288, 784, 1344, 55, Source.IMPORTED)) == "288, 784 · 1344 × 55"
+    assert crop_text(None) == "—"
+    assert brightness_text(Brightness(211, Source.DETECTED)) == "211"
+    assert brightness_text(None) == "—"
+
+
+@pytest.mark.parametrize("ranges, expected", [
+    (None, "whole file"),
+    (TimeRanges([], Source.MANUAL), "whole file"),
+    (TimeRanges([TimeRange("02:33", "23:05")], Source.DETECTED), "2:33 → 23:05"),
+    (TimeRanges([TimeRange(None, "21:20")], Source.IMPORTED), "0:00 → 21:20"),
+    (TimeRanges([TimeRange("1:02:03", None)], Source.MANUAL), "1:02:03 → end"),
+    (TimeRanges([TimeRange("02:33", "21:20"), TimeRange("23:40", "24:00")], Source.IMPORTED),
+     "2:33 → 21:20, 23:40 → 24:00"),
+    (TimeRanges([TimeRange("0:10", "0:20"), TimeRange("0:30", "0:40"), TimeRange("0:50", "1:00")],
+                Source.MANUAL), "0:10 → 0:20, 0:30 → 0:40 +1"),
+    (TimeRanges([TimeRange("soon", "later")], Source.MANUAL), "soon → later"),
+])
+def test_ranges_text(ranges, expected):
+    from app.state_text import ranges_text
+
+    assert ranges_text(ranges) == expected
+
+
+@pytest.mark.parametrize("media, expected", [
+    (Media(1920, 888, 1628.0, 25.0), "1920×888 · 27:08 · 25 fps"),
+    (Media(1920, 1080, 1418.0, 23.976), "1920×1080 · 23:38 · 23.976 fps"),
+    (Media(1920, 888, 1628.0, 0.0), "1920×888 · 27:08"),
+    (Media(0, 0, 0.0, 0.0), ""),
+    (Media(0, 0, 3725.0, 0.0), "1:02:05"),
+])
+def test_media_text_omits_unknown_parts(media, expected):
+    from app.state_text import media_text
+
+    assert media_text(media) == expected
+
+
+def test_clock():
+    from app.state_text import clock
+
+    assert clock(578.4) == "09:38"
+    assert clock(0) == "00:00"
+    assert clock(3725) == "62:05"
+    assert clock(-3) == "00:00"
+
+
+def test_field_blocking_follows_value_source():
+    from app.state_text import field_blocking
+
+    detected = FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.DETECTED), flags={"crop": FLAG_LOW_AGREEMENT})
+    assert field_blocking(detected, "crop")
+    manual = FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.MANUAL), flags={"crop": FLAG_LOW_AGREEMENT})
+    assert not field_blocking(manual, "crop")
+    informational = FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.DETECTED), flags={"crop": "no-speech"})
+    assert not field_blocking(informational, "crop")
+    assert not field_blocking(FileEntry("a.mkv"), "brightness")
+    hinted = FileEntry("a.mkv", brightness=Brightness(200, Source.HINT), flags={"brightness": "differs-from-hint?"})
+    assert field_blocking(hinted, "brightness")
+
+
+@pytest.mark.parametrize("review, expected", [
+    (ReviewState.PENDING, False),
+    (ReviewState.PROPOSED, True),
+    (ReviewState.FLAGGED, True),
+    (ReviewState.REVIEWED, True),
+])
+def test_can_mark_reviewed_waits_for_pending_files(review, expected):
+    assert state_text.can_mark_reviewed(FileEntry("a.mkv", review=review)) is expected
+    assert state_text.REVIEW_WAIT_TOOLTIP == "waiting for detections to finish"
