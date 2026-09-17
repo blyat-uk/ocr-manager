@@ -1402,8 +1402,28 @@ def test_a_pending_required_detector_makes_the_file_pending(folder, pending):
 
 
 @pytest.mark.parametrize("folder", [DIALOGUE, LABELS_ONLY])
-def test_pending_ranges_make_every_file_pending(folder):
-    assert _review(_ready_entry(), folder, ranges_pending=True) == ReviewState.PENDING
+@pytest.mark.parametrize("ranges_source", [None, Source.DETECTED, Source.HINT])
+def test_pending_ranges_make_a_file_whose_ranges_detection_may_write_pending(folder, ranges_source):
+    entry = _ready_entry()
+    if ranges_source is not None:
+        entry.time_ranges = TimeRanges([TimeRange("1:30", "23:00")], ranges_source)
+    assert _review(entry, folder, ranges_pending=True) == ReviewState.PENDING
+
+
+@pytest.mark.parametrize("folder", [DIALOGUE, LABELS_ONLY])
+@pytest.mark.parametrize("ranges", [[], [TimeRange("1:30", "23:00")]])
+@pytest.mark.parametrize("ranges_source", [Source.MANUAL, Source.IMPORTED])
+def test_pending_ranges_do_not_hold_a_file_whose_ranges_are_the_users(folder, ranges, ranges_source):
+    """F5: a ranges analysis can never write MANUAL or IMPORTED ranges, so it
+    does not make such a file wait; the rest of the state is derived as usual."""
+    entry = _ready_entry()
+    entry.time_ranges = TimeRanges(list(ranges), ranges_source)
+    assert _review(entry, folder, ranges_pending=True) == ReviewState.PROPOSED
+    entry.flags["crop"] = "low-agreement"
+    expected = ReviewState.FLAGGED if folder.dialogue_enabled else ReviewState.PROPOSED
+    assert _review(entry, folder, ranges_pending=True) == expected
+    assert _review(entry, folder, pending={"crop"}, ranges_pending=True) == (
+        ReviewState.PENDING if folder.dialogue_enabled else ReviewState.PROPOSED)
 
 
 def test_pending_jobs_that_are_not_required_detectors_do_not_hold_a_file():
