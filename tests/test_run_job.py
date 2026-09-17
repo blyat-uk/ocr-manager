@@ -295,6 +295,33 @@ def test_parallel_must_be_at_least_one(tmp_path, parallel):
         RunJob(str(tmp_path), [], parallel)
 
 
+@pytest.mark.parametrize("names, message", [
+    (["a.mp4", "a.mkv"], "a.mkv and a.mp4 both write chi/a.ass"),
+    (["a.mp4", "b.mp4", "a.mp4"], "a.mp4 and a.mp4 both write chi/a.ass"),
+    (["x.mp4", "a.mp4", "a.mkv", "x.mkv", "a.avi"],
+     "a.avi, a.mkv and a.mp4 both write chi/a.ass; x.mkv and x.mp4 both write chi/x.ass"),
+    (["[1080p] ep.01.mkv", "[1080p] ep.01.mp4"],
+     "[1080p] ep.01.mkv and [1080p] ep.01.mp4 both write chi/[1080p] ep.01.ass"),
+])
+def test_run_files_that_write_the_same_output_are_refused(tmp_path, ocr, names, message):
+    project = tmp_path / "project"
+    project.mkdir()
+    with pytest.raises(ValueError) as raised:
+        RunJob(str(project), [run_file(project, n) for n in names], 2)
+    assert str(raised.value) == message
+    assert list(project.iterdir()) == []
+    assert ocr.calls == []
+
+
+def test_distinct_output_stems_are_accepted(tmp_path, ocr, qa):
+    names = ["a.mp4", "A.mp4", "a.b.mp4", "a .mp4", "ab.mkv"]     # case-sensitive, like the filesystem
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 2)
+    ctx, _ = make_ctx()
+    summary = job.run(ctx)
+    assert summary.succeeded == names
+    assert sorted(os.listdir(tmp_path / "chi")) == sorted(["a.ass", "A.ass", "a.b.ass", "a .ass", "ab.ass"])
+
+
 def test_the_file_list_is_a_snapshot_taken_at_construction(tmp_path, ocr, qa):
     a = run_file(tmp_path, "a.mp4")
     files = [a]

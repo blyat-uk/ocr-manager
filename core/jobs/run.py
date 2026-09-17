@@ -7,6 +7,9 @@ Qt (ruling C8): file workers are plain threads and report through ctx.emit.
 Snapshot
     RunJob deep-copies its RunFiles when it is constructed. Edits the user
     makes to the project during the run do not change a file's call.
+    Construction raises ValueError when two files would write the same
+    output (chi/<stem>.ass, case-sensitive, like the filesystem), e.g. a.mkv
+    and a.mp4, or the same name twice; nothing is created on disk.
 
 Output, per file (ruling C5)
     OCR writes chi/<stem>.ass.partial. core.ass_qafix.process_file runs on
@@ -117,8 +120,10 @@ class RunJob:
         parallel = int(parallel)
         if parallel < 1:
             raise ValueError(f"parallel must be at least 1, got {parallel}")
+        files = list(files)
+        _refuse_shared_outputs(files)
         self.project_dir = project_dir
-        self.files: tuple[RunFile, ...] = tuple(copy.deepcopy(list(files)))
+        self.files: tuple[RunFile, ...] = tuple(copy.deepcopy(files))
         self.parallel = parallel
         # Guards everything below. File workers wait on it while paused, and
         # run() waits on it for them; never held while OCR runs or an event
@@ -241,7 +246,7 @@ class RunJob:
     def _run_file(self, ctx: JobContext, run_file: RunFile,
                   cancel_event: threading.Event) -> tuple[str, str]:
         name = run_file.name
-        final = os.path.join(self.project_dir, "chi", Path(name).stem + ".ass")
+        final = os.path.join(self.project_dir, "chi", _output_name(name))
         partial = final + PARTIAL_SUFFIX
         ctx.emit("run_file_started", file=name)
         lines = 0
@@ -300,6 +305,25 @@ class RunJob:
             if text and not cancel_event.is_set():
                 with open(partial, "w", encoding="utf-8") as f:
                     f.write(text)
+
+
+def _output_name(name: str) -> str:
+    """The file a video's run writes into chi/: <stem>.ass, stem as today's OCRWorker took it."""
+    return Path(name).stem + ".ass"
+
+
+def _refuse_shared_outputs(files: list[RunFile]) -> None:
+    """ValueError naming every group of files that would write the same chi/ output."""
+    by_output: dict[str, list[str]] = {}
+    for run_file in files:
+        by_output.setdefault(_output_name(run_file.name), []).append(run_file.name)
+    collisions = []
+    for output, names in sorted(by_output.items()):
+        if len(names) > 1:
+            names = sorted(names)
+            collisions.append(f"{', '.join(names[:-1])} and {names[-1]} both write chi/{output}")
+    if collisions:
+        raise ValueError("; ".join(collisions))
 
 
 def _progress_reporter(ctx: JobContext, name: str):
