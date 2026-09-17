@@ -613,7 +613,9 @@ def test_ocr_json_holds_no_evidence_and_its_size_does_not_depend_on_it(tmp_path)
     small, large = tmp_path / "small", tmp_path / "large"
     small.mkdir()
     large.mkdir()
-    save_project(_evidence_project(small, NAMES_CJK, evidence=lambda i: {"crop": {"box": [1, 2, 3, 4]}}))
+    # Only the staleness record (value_crop_box) is kept in .ocr.json: the same in both.
+    save_project(_evidence_project(small, NAMES_CJK, evidence=lambda i: {
+        "crop": {"box": [1, 2, 3, 4]}, "brightness": {"value_crop_box": [288, 780, 1344, 61]}}))
     save_project(_evidence_project(large, NAMES_CJK))
 
     config = json.loads((large / ".ocr.json").read_text(encoding="utf-8"))
@@ -726,12 +728,18 @@ def test_a_corrupt_evidence_file_gives_empty_evidence_and_a_warning(tmp_path, ca
     with caplog.at_level(logging.WARNING):
         reloaded = load_project(str(tmp_path))
 
-    assert reloaded.files["a.mkv"].evidence == {}
+    # Empty but for the staleness record, which .ocr.json keeps (see the follow-up tests).
+    record = project.files["a.mkv"].evidence["brightness"]["value_crop_box"]
+    assert reloaded.files["a.mkv"].evidence == {"brightness": {"value_crop_box": record}}
     assert reloaded.files["b.mkv"].evidence == project.files["b.mkv"].evidence
     assert reloaded.files["a.mkv"].crop == project.files["a.mkv"].crop          # values are not a cache
     assert any(r.levelno == logging.WARNING and "a.mkv" in r.getMessage() for r in caplog.records)
 
-    save_project(reloaded)                                         # the corrupt cache file goes away
+    save_project(reloaded)                                         # the corrupt cache file is replaced
+    assert json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
+        {"brightness": {"value_crop_box": record}}
+    reloaded.files["a.mkv"].evidence = {}
+    save_project(reloaded)                                         # and goes away with the evidence
     assert not evidence_path(str(tmp_path), "a.mkv").exists()
 
 
@@ -749,7 +757,9 @@ def test_a_missing_evidence_file_warns_only_when_evidence_was_stored(tmp_path, c
     with caplog.at_level(logging.WARNING):
         reloaded = load_project(str(tmp_path))
 
-    assert all(entry.evidence == {} for entry in reloaded.files.values())
+    record = project.files["a.mkv"].evidence["brightness"]["value_crop_box"]
+    assert reloaded.files["a.mkv"].evidence == {"brightness": {"value_crop_box": record}}   # kept by .ocr.json
+    assert reloaded.files["b.mkv"].evidence == {} and reloaded.files["fresh.mkv"].evidence == {}
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "a.mkv" in warnings[0] and "b.mkv" not in warnings[0] and "fresh.mkv" not in warnings[0]
@@ -816,8 +826,9 @@ def test_a_failed_evidence_write_is_retried_on_the_next_save(tmp_path, monkeypat
         return real(path, text)
 
     monkeypatch.setattr(store, "_atomic_write_text", failing)
-    with pytest.raises(OSError):
-        save_project(project)
+    save_project(project)                                           # a cache failure never aborts the save
+    assert json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))["files"]["a.mkv"]["review"] == "proposed"
+    assert not evidence_path(str(tmp_path), "a.mkv").exists()
     monkeypatch.setattr(store, "_atomic_write_text", real)
     save_project(project)
     assert json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
@@ -857,3 +868,242 @@ def test_saving_forty_files_with_realistic_evidence_is_fast(tmp_path):
           f".ocr.json {config_size / 1e3:.1f} kB, evidence {evidence_size / 1e6:.2f} MB")
     assert config_size < 100_000
     assert unchanged < 1.0                                          # generous: GUI-thread budget, shared machine
+
+
+# --- Follow-up: brightness staleness never depends on the evidence cache -------
+
+
+OLD_CROP = [288, 780, 1344, 60]
+NEW_CROP = (288, 800, 1344, 60)
+
+
+def _stale_project(directory: Path) -> Project:
+    """The user moved the crop after brightness was measured on the old one: stale, FLAGGED."""
+    files = {}
+    for name in ("a.mkv", "b.mkv"):
+        _touch(directory / name)
+        files[name] = FileEntry(
+            name=name, crop=Crop(*NEW_CROP, Source.MANUAL), brightness=Brightness(209, Source.DETECTED),
+            time_ranges=TimeRanges([], Source.MANUAL), media=Media(1920, 1080, 1500.0, 23.976),
+            review=ReviewState.PROPOSED, flags={"crop": "", "brightness": ""},
+            evidence={"brightness": {"crop_box": list(OLD_CROP), "value_crop_box": list(OLD_CROP), "strips": []}})
+    return Project(str(directory), FolderSettings(), files)
+
+
+def _state_after_reload(directory: Path):
+    from core.jobs.apply import brightness_is_stale, recompute_all
+
+    project = load_project(str(directory))
+    recompute_all(project, pending={}, ranges_pending=False)
+    entry = project.files["a.mkv"]
+    return project, entry, brightness_is_stale(entry)
+
+
+def test_the_brightness_staleness_record_is_saved_in_ocr_json(tmp_path):
+    project = _stale_project(tmp_path)
+    project.files["b.mkv"].evidence = {"crop": {"box": [1, 2, 3, 4]}}         # never had a value measured
+    save_project(project)
+    config = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
+    assert config["files"]["a.mkv"]["brightness_crop_box"] == OLD_CROP
+    assert config["files"]["b.mkv"]["brightness_crop_box"] is None
+    assert "evidence" not in config["files"]["a.mkv"]
+    assert to_json(project)["files"]["a.mkv"]["brightness_crop_box"] == OLD_CROP     # with evidence as well
+
+
+def test_a_stale_brightness_stays_stale_when_the_evidence_cache_is_deleted(tmp_path):
+    import shutil
+
+    from core.jobs.apply import recompute_all
+
+    project = _stale_project(tmp_path)
+    recompute_all(project, pending={}, ranges_pending=False)
+    assert project.files["a.mkv"].review == ReviewState.FLAGGED
+    save_project(project)
+    shutil.rmtree(tmp_path / ".ocr-cache")
+
+    reloaded, entry, stale = _state_after_reload(tmp_path)
+
+    assert stale is True
+    assert entry.review == ReviewState.FLAGGED
+    assert entry.evidence == {"brightness": {"value_crop_box": OLD_CROP}}
+
+
+def test_a_stale_brightness_stays_stale_beside_newer_evidence(tmp_path):
+    """.ocr.json says the value was measured on the old crop; the evidence cache
+    was written by a later save whose .ocr.json never landed."""
+    older, newer = tmp_path / "older", tmp_path / "newer"
+    older.mkdir()
+    newer.mkdir()
+    save_project(_stale_project(older))
+    remeasured = _stale_project(newer)
+    for entry in remeasured.files.values():
+        entry.brightness = Brightness(230, Source.DETECTED)
+        entry.evidence["brightness"] = {"crop_box": list(NEW_CROP), "value_crop_box": list(NEW_CROP), "strips": []}
+    save_project(remeasured)
+    for cache in (newer / ".ocr-cache" / "evidence").iterdir():
+        (older / ".ocr-cache" / "evidence" / cache.name).write_bytes(cache.read_bytes())
+
+    reloaded, entry, stale = _state_after_reload(older)
+
+    assert entry.brightness == Brightness(209, Source.DETECTED)
+    assert entry.evidence["brightness"]["value_crop_box"] == OLD_CROP       # .ocr.json wins over the cache
+    assert entry.evidence["brightness"]["crop_box"] == list(NEW_CROP)       # the rest of the evidence is the cache's
+    assert stale is True
+    assert entry.review == ReviewState.FLAGGED
+
+
+def test_a_missing_staleness_record_in_ocr_json_overrides_the_cache(tmp_path):
+    project = _stale_project(tmp_path)
+    for entry in project.files.values():
+        entry.brightness = Brightness(209, Source.MANUAL)
+        entry.evidence["brightness"].pop("value_crop_box")
+    save_project(project)
+    other = tmp_path / "other"
+    other.mkdir()
+    save_project(_stale_project(other))                                        # a cache with a record
+    for cache in (other / ".ocr-cache" / "evidence").iterdir():
+        (tmp_path / ".ocr-cache" / "evidence" / cache.name).write_bytes(cache.read_bytes())
+
+    reloaded = load_project(str(tmp_path))
+
+    assert reloaded.files["a.mkv"].evidence["brightness"]["crop_box"] == OLD_CROP     # the cache was read
+    assert "value_crop_box" not in reloaded.files["a.mkv"].evidence["brightness"]
+
+
+def test_the_staleness_record_round_trips_and_an_unchanged_reload_rewrites_nothing(tmp_path, monkeypatch):
+    project = _stale_project(tmp_path)
+    save_project(project)
+    reloaded = load_project(str(tmp_path))
+    assert reloaded == project
+    assert {n: e.evidence for n, e in reloaded.files.items()} == {n: e.evidence for n, e in project.files.items()}
+    assert from_json(to_json(project), str(tmp_path)) == project
+    assert from_json(to_json(project), str(tmp_path)).files["a.mkv"].evidence == project.files["a.mkv"].evidence
+
+    spy = _WriteSpy(monkeypatch)
+    save_project(reloaded)
+    assert spy.take() == [".ocr.json"]
+
+
+def test_an_old_v2_file_without_the_record_falls_back_to_the_evidence(tmp_path):
+    from core.jobs.apply import recompute_all
+
+    project = _stale_project(tmp_path)
+    save_project(project)
+    config = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
+    for entry in config["files"].values():
+        del entry["brightness_crop_box"]
+    (tmp_path / ".ocr.json").write_text(json.dumps(config), encoding="utf-8")
+
+    _, entry, stale = _state_after_reload(tmp_path)
+    assert entry.evidence["brightness"]["value_crop_box"] == OLD_CROP and stale is True
+
+    inline = tmp_path / "inline"                                               # evidence inline, no record
+    inline.mkdir()
+    old = _stale_project(inline)
+    data = to_json(old)
+    for entry in data["files"].values():
+        del entry["brightness_crop_box"]
+    (inline / ".ocr.json").write_text(json.dumps(data), encoding="utf-8")
+    loaded = load_project(str(inline))
+    recompute_all(loaded, pending={}, ranges_pending=False)
+    assert loaded.files["a.mkv"].evidence == old.files["a.mkv"].evidence
+    assert loaded.files["a.mkv"].review == ReviewState.FLAGGED
+
+
+@pytest.mark.parametrize("record", [[1, 2, 3], "288,780,1344,60", [1, 2, 3, "x"], {"x": 1}, 5, [1, 2, 3, True]])
+def test_a_malformed_staleness_record_takes_the_corrupt_path(tmp_path, record):
+    raw = _write_config(tmp_path, {"version": 2, "folder": {}, "files": {
+        "vid.mkv": {"brightness": {"value": 200, "source": "detected"}, "brightness_crop_box": record}}})
+    _touch(tmp_path / "vid.mkv")
+    project = load_project(str(tmp_path))
+    _assert_corrupt_path_taken(tmp_path, raw, project)
+
+
+# --- Follow-up: file names that are not valid UTF-8 ------------------------------
+
+
+def test_a_file_name_that_is_not_utf8_loads_and_saves(tmp_path, monkeypatch):
+    import hashlib
+    import os
+
+    from core.project.store import evidence_path
+
+    name = os.fsdecode(b"bad\xffname.mkv")                                     # a surrogate-escaped name
+    (tmp_path / name).write_bytes(b"")
+    _touch(tmp_path / "good.mkv")
+
+    project = load_project(str(tmp_path))
+    assert sorted(project.files) == sorted([name, "good.mkv"])
+    project.files[name].evidence = {"crop": {"box": [1, 2, 3, 4], "note": "中文"}}
+    project.files[name].flags = {"crop": ""}
+    save_project(project)
+
+    (tmp_path / ".ocr.json").read_bytes().decode("utf-8")                     # still valid UTF-8
+    assert evidence_path(str(tmp_path), name).name == hashlib.sha256(os.fsencode(name)).hexdigest() + ".json"
+    evidence_path(str(tmp_path), name).read_bytes().decode("utf-8")
+    reloaded = load_project(str(tmp_path))
+    assert reloaded == project
+    assert reloaded.files[name].evidence == project.files[name].evidence
+    spy = _WriteSpy(monkeypatch)
+    save_project(reloaded)
+    assert spy.take() == [".ocr.json"]
+
+
+# --- Follow-up: a cache failure never aborts saving the user's values ------------
+
+
+def test_evidence_that_cannot_be_written_does_not_stop_the_values_being_saved(tmp_path, caplog):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv"])
+    (tmp_path / ".ocr-cache").mkdir()
+    (tmp_path / ".ocr-cache" / "evidence").write_text("not a directory", encoding="utf-8")
+    project.files["a.mkv"].review = ReviewState.REVIEWED
+    project.files["a.mkv"].brightness = Brightness(199, Source.MANUAL)
+
+    with caplog.at_level(logging.WARNING):
+        save_project(project)
+
+    config = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
+    assert config["files"]["a.mkv"]["review"] == "reviewed"
+    assert config["files"]["a.mkv"]["brightness"] == {"value": 199, "source": "manual"}
+    assert any(r.levelno == logging.WARNING and "evidence" in r.getMessage() for r in caplog.records)
+
+    (tmp_path / ".ocr-cache" / "evidence").unlink()
+    save_project(project)                                                    # retried
+    assert evidence_path(str(tmp_path), "a.mkv").exists()
+
+
+def test_an_unwritable_evidence_directory_does_not_stop_the_values_being_saved(tmp_path, caplog, monkeypatch):
+    import os
+
+    from core.project.store import evidence_path
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
+    save_project(project)
+    directory = tmp_path / ".ocr-cache" / "evidence"
+    project.files["a.mkv"].evidence["crop"]["agreed"] = 99                    # changed: must be written
+    del project.files["b.mkv"]                                               # removed: its file must go
+    project.files["a.mkv"].review = ReviewState.FLAGGED
+    directory.chmod(0o555)
+    try:
+        with caplog.at_level(logging.WARNING):
+            save_project(project)
+        config = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
+        assert list(config["files"]) == ["a.mkv"] and config["files"]["a.mkv"]["review"] == "flagged"
+        assert sum(r.levelno == logging.WARNING for r in caplog.records) >= 2      # the write and the delete
+    finally:
+        directory.chmod(0o755)
+    spy = _WriteSpy(monkeypatch)
+    save_project(project)
+    assert spy.take() == sorted([".ocr.json", evidence_path(str(tmp_path), "a.mkv").name])
+    assert not evidence_path(str(tmp_path), "b.mkv").exists()
+
+
+def test_ocr_json_is_written_before_the_evidence(tmp_path, monkeypatch):
+    spy = _WriteSpy(monkeypatch)
+    save_project(_evidence_project(tmp_path, ["a.mkv", "b.mkv"]))
+    assert [path.name for path in spy.paths][0] == ".ocr.json"
+    assert len(spy.paths) == 3

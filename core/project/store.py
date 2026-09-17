@@ -17,32 +17,46 @@ Evidence (spec SS8.3: caches live in `.ocr-cache/`)
     In memory, FileEntry.evidence is the dict core.jobs.apply and AutoPilot
     use. On disk, `.ocr.json` holds no evidence: each file's evidence is its
     own cache file, `<project>/.ocr-cache/evidence/<sha256 hex of the file
-    name, UTF-8>.json` (evidence_path), holding compact UTF-8 JSON
-    {"version": 1, "name": <file name>, "evidence": {...}}. The name is
+    name's bytes, os.fsencode>.json` (evidence_path), holding compact UTF-8
+    JSON {"version": 1, "name": <file name>, "evidence": {...}}. The name is
     hashed, not quoted, so every name gives a short filesystem-safe file
     name; the name inside the file ties it back to its entry.
-    - save_project writes a file's evidence only when its serialised form
-      differs from what was last loaded or saved for it (a digest per file
-      name, kept on the Project: Project.evidence_digests), or when its
-      cache file is gone. A file with empty evidence has no evidence file.
-      Evidence files of files no longer in the project (or whose evidence
-      was emptied) are deleted; other files in the directory are left
-      alone. Evidence is written before `.ocr.json`.
+    - save_project writes `.ocr.json` first, then a file's evidence only
+      when its serialised form differs from what was last loaded or saved
+      for it (a digest per file name, kept on the Project:
+      Project.evidence_digests), or when its cache file is gone. A file with
+      empty evidence has no evidence file. Evidence files of files no longer
+      in the project (or whose evidence was emptied) are deleted; other files
+      in the directory are left alone. The cache never stops the user's
+      values being saved: an evidence write or delete that fails (OSError)
+      is logged, the file's digest stays unset, and the next save retries.
     - load_project reads the evidence file of every entry. A corrupt one
       (not JSON, not an object, another file's name, no evidence object)
       gives empty evidence and a warning; so does a missing one when the
       entry has flags (a detection result was applied, so evidence was
-      stored). It is a cache: values, sources and review never depend on it.
+      stored).
+    - The one piece of evidence the review state depends on is not left to
+      the cache: evidence["brightness"]["value_crop_box"], the crop a
+      detected or hinted brightness value was measured on
+      (core.jobs.apply.brightness_is_stale). Every file entry of `.ocr.json`
+      carries it as "brightness_crop_box" ([x, y, w, h] or null), and on load
+      it is authoritative: it replaces (or, when null, removes) the value
+      the evidence cache or inline evidence holds, creating
+      evidence["brightness"] = {"value_crop_box": ...} when the cache is
+      gone. A v2 file entry without the key (written before it existed)
+      keeps whatever its evidence says. Everything else about a file's
+      values, sources and review is in `.ocr.json` alone.
     - A v2 `.ocr.json` written before evidence moved out (evidence inline in
       each file entry) still loads, and the next save moves the evidence out.
-      An entry's inline evidence wins over its evidence file: both exist only
-      when that save stopped between writing the evidence files and
-      replacing `.ocr.json`, and the inline evidence belongs to the values
-      in the same file.
+      An entry's inline evidence wins over an evidence file: it belongs to
+      the values in the same file.
 
 Writing
     Every file is written atomically: to `<name>.tmp` in the same directory,
-    flushed and fsynced, then os.replace()d onto `<name>`.
+    flushed and fsynced, then os.replace()d onto `<name>`. Everything written
+    is JSON in UTF-8. A file name that is not valid UTF-8 (a lone surrogate
+    from os.fsdecode) is written as its JSON escape (\\udcXX), which reads
+    back as the same name.
 """
 import copy
 import hashlib
@@ -116,6 +130,7 @@ def load_project(project_dir: str) -> Project:
     video_names = list_video_files(project_dir)
 
     project: Project
+    brightness_records: dict[str, list[int] | None] = {}
     if config_path.exists():
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -124,7 +139,7 @@ def load_project(project_dir: str) -> Project:
             version = _config_version(data, config_path)
             try:
                 if version == 2:
-                    project = from_json(data, str(directory))
+                    project, brightness_records = _from_json(data, str(directory))
                 else:
                     project = migrate_v1(data, str(directory), video_names)
             except _CONVERSION_ERRORS as exc:
@@ -145,12 +160,13 @@ def load_project(project_dir: str) -> Project:
 
     reconcile_files(project, video_names)
     _load_evidence(project)
+    _apply_brightness_records(project, brightness_records)
     return project
 
 
 def evidence_path(project_dir: str, name: str) -> Path:
     """The evidence cache file of the video file `name` in `project_dir`."""
-    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(os.fsencode(name)).hexdigest()
     return Path(project_dir) / CACHE_DIRNAME / EVIDENCE_DIRNAME / f"{digest}.json"
 
 
@@ -159,8 +175,47 @@ def _evidence_text(name: str, evidence: dict) -> str:
                       separators=(",", ":"), ensure_ascii=False)
 
 
+def _encode(text: str) -> bytes:
+    """UTF-8 bytes of JSON text; a lone surrogate (a name that is not valid
+    UTF-8) becomes its JSON escape."""
+    return text.encode("utf-8", "backslashreplace")
+
+
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _apply_brightness_records(project: Project, records: dict[str, list[int] | None]) -> None:
+    """Make `.ocr.json`'s brightness_crop_box authoritative over the evidence
+    (see the module docstring). `records` holds only entries that had the key."""
+    for name, box in records.items():
+        entry = project.files.get(name)
+        if entry is None:
+            continue
+        brightness = entry.evidence.get("brightness")
+        if box is not None:
+            if not isinstance(brightness, dict):
+                brightness = entry.evidence["brightness"] = {}
+            brightness["value_crop_box"] = list(box)
+        elif isinstance(brightness, dict) and "value_crop_box" in brightness:
+            del brightness["value_crop_box"]
+            if not brightness:
+                del entry.evidence["brightness"]
+
+
+def _brightness_record(entry: FileEntry) -> list[int] | None:
+    """The entry's evidence["brightness"]["value_crop_box"], as `.ocr.json` stores it."""
+    brightness = entry.evidence.get("brightness")
+    box = brightness.get("value_crop_box") if isinstance(brightness, dict) else None
+    return None if box is None else [int(v) for v in box]
+
+
+def _parse_brightness_record(value) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 4 or any(type(v) is not int for v in value):
+        raise ValueError(f"brightness_crop_box must be null or four integers, not {value!r}")
+    return list(value)
 
 
 def _load_evidence(project: Project) -> None:
@@ -195,32 +250,54 @@ def _load_evidence(project: Project) -> None:
 
 
 def _save_evidence(project: Project) -> None:
-    """Write changed evidence files and delete stale ones (see the module docstring)."""
+    """Write changed evidence files and delete stale ones (see the module
+    docstring). Never raises OSError: failures are logged and retried by the
+    next save."""
     directory = Path(project.path) / CACHE_DIRNAME / EVIDENCE_DIRNAME
     try:
         existing = {item.name for item in os.scandir(directory) if _EVIDENCE_FILE_RE.match(item.name)}
     except FileNotFoundError:
         existing = set()
+    except OSError as exc:
+        logger.warning("Could not list the evidence cache %s (%s)", directory, exc)
+        existing = set()
     digests = project.evidence_digests
     kept: set[str] = set()
+    unwritten: list[str] = []
+    first_error: OSError | None = None
     for name, entry in project.files.items():
         if not entry.evidence:
             continue
         path = evidence_path(project.path, name)
         kept.add(path.name)
         text = _evidence_text(name, entry.evidence)
-        digest = _digest(text.encode("utf-8"))
+        digest = _digest(_encode(text))
         if digests.get(name) == digest and path.name in existing:
             continue
         digests.pop(name, None)                      # unknown until the write succeeds
-        directory.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(path, text)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(path, text)
+        except OSError as exc:
+            unwritten.append(name)
+            first_error = first_error or exc
+            continue
         digests[name] = digest
-    for stale in existing - kept:
+    if unwritten:
+        logger.warning("Could not write the evidence cache of %d file(s) (%s): %s; retried on the next save",
+                       len(unwritten), ", ".join(unwritten), first_error)
+    undeleted: list[str] = []
+    for stale in sorted(existing - kept):
         try:
             os.remove(directory / stale)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            undeleted.append(stale)
+            first_error = exc
+    if undeleted:
+        logger.warning("Could not delete %d stale evidence cache file(s) in %s: %s; retried on the next save",
+                       len(undeleted), directory, first_error)
     for name in [n for n in digests if n not in project.files or not project.files[n].evidence]:
         del digests[name]
 
@@ -246,13 +323,13 @@ def _refuse_unsupported_existing(config_path: Path) -> None:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write `text` (UTF-8) to `path` atomically: `<path>.tmp` in the same
-    directory, flushed and fsynced, then os.replace() onto `path`. The
-    temporary file is removed when anything fails."""
+    """Write JSON `text` (UTF-8, see _encode) to `path` atomically:
+    `<path>.tmp` in the same directory, flushed and fsynced, then os.replace()
+    onto `path`. The temporary file is removed when anything fails."""
     tmp = path.with_name(path.name + ".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        with open(tmp, "wb") as handle:
+            handle.write(_encode(text))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
@@ -276,9 +353,9 @@ def save_project(project: Project) -> None:
             shutil.copy2(config_path, backup_path)
         project.migrated_from_v1 = False
 
-    _save_evidence(project)
     _atomic_write_text(config_path,
                        json.dumps(to_json(project, include_evidence=False), ensure_ascii=False, indent=2))
+    _save_evidence(project)
 
 
 def reconcile_files(project: Project, video_names: list[str]) -> tuple[list[str], list[str]]:
@@ -303,7 +380,8 @@ def reconcile_files(project: Project, video_names: list[str]) -> tuple[list[str]
 def to_json(project: Project, *, include_evidence: bool = True) -> dict:
     """The v2 dict of `project`. `.ocr.json` is written with
     include_evidence=False: its file entries then have no "evidence" key
-    (evidence lives in the evidence cache, see the module docstring)."""
+    (evidence lives in the evidence cache, see the module docstring). Every
+    file entry carries "brightness_crop_box" either way."""
     folder = project.folder
     folder_dict = {
         "dialogue_enabled": folder.dialogue_enabled,
@@ -344,6 +422,7 @@ def to_json(project: Project, *, include_evidence: bool = True) -> dict:
                 "value": entry.brightness.value,
                 "source": entry.brightness.source.value,
             },
+            "brightness_crop_box": _brightness_record(entry),   # authoritative for staleness on load
             "time_ranges": None if entry.time_ranges is None else {
                 "ranges": [{"start": r.start, "end": r.end} for r in entry.time_ranges.ranges],
                 "source": entry.time_ranges.source.value,
@@ -382,7 +461,17 @@ def _object(value, what: str) -> dict:
 def from_json(data: dict, project_dir: str) -> Project:
     """The Project a v2 dict describes. Raises KeyError, TypeError or
     ValueError (load_project's corrupt path) when a required key is missing,
-    an enum value is unknown or a section is not an object."""
+    an enum value is unknown or a section is not an object. A file entry's
+    "brightness_crop_box" is applied over its inline evidence."""
+    project, brightness_records = _from_json(data, project_dir)
+    _apply_brightness_records(project, brightness_records)
+    return project
+
+
+def _from_json(data: dict, project_dir: str) -> tuple[Project, dict[str, list[int] | None]]:
+    """from_json without applying the brightness records: the Project (with
+    only inline evidence) and the brightness_crop_box of every file entry
+    that has the key."""
     defaults = FolderSettings()
     folder_data = _object(data.get("folder"), "folder")
 
@@ -420,9 +509,12 @@ def from_json(data: dict, project_dir: str) -> Project:
     )
 
     files: dict[str, FileEntry] = {}
+    brightness_records: dict[str, list[int] | None] = {}
     for name, fd in _object(data.get("files"), "files").items():
         if not isinstance(fd, dict):
             raise TypeError(f"files[{name!r}] is {type(fd).__name__}, not an object")
+        if "brightness_crop_box" in fd:
+            brightness_records[name] = _parse_brightness_record(fd["brightness_crop_box"])
         crop_d = fd.get("crop")
         crop = None
         if crop_d:
@@ -463,4 +555,4 @@ def from_json(data: dict, project_dir: str) -> Project:
             evidence=copy.deepcopy(fd.get("evidence") or {}),
         )
 
-    return Project(path=project_dir, folder=folder, files=files, migrated_from_v1=False)
+    return Project(path=project_dir, folder=folder, files=files, migrated_from_v1=False), brightness_records
