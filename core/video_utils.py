@@ -1,11 +1,8 @@
-"""Utility functions for video frame extraction."""
+"""Utility functions for video frame extraction (ffprobe/ffmpeg, no Qt)."""
 import json
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
-
-from PyQt6.QtCore import QThread, pyqtSignal
 
 # Cache for HDR metadata to avoid repeated FFprobe calls
 _hdr_cache: dict[str, "HDRMetadata"] = {}
@@ -186,46 +183,3 @@ def seconds_to_timestamp(seconds: int) -> str:
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
-class VideoMetadataScanner(QThread):
-    """Background thread for scanning video file metadata."""
-
-    # Emitted for each file: (filename, width, height, duration_seconds)
-    file_scanned = pyqtSignal(str, int, int, int)
-    # Emitted when all files are scanned: (longest_filename, longest_duration)
-    scan_complete = pyqtSignal(str, int)
-
-    def __init__(self, video_files: list[Path], parent=None):
-        super().__init__(parent)
-        self._video_files = video_files
-        self._stop_requested = False
-
-    def run(self):
-        """Scan all video files for metadata."""
-        longest_file = ""
-        longest_duration = 0
-
-        for video in self._video_files:
-            if self._stop_requested:
-                break
-
-            try:
-                width, height = get_video_resolution(str(video))
-                duration = get_video_duration(str(video))
-
-                self.file_scanned.emit(video.name, width, height, duration)
-
-                if duration > longest_duration:
-                    longest_duration = duration
-                    longest_file = video.name
-            except Exception:
-                # Emit with zeros on failure
-                self.file_scanned.emit(video.name, 0, 0, 0)
-
-        if not self._stop_requested:
-            self.scan_complete.emit(longest_file, longest_duration)
-
-    def stop(self):
-        """Request the scanner to stop."""
-        self._stop_requested = True

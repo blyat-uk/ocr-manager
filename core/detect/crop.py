@@ -9,9 +9,9 @@ growing across consecutive probe batches -- see _run_round()'s
 convergence stop -- instead of walking the whole 40-60% window at a fixed
 step, or stopping once an arbitrary count of probes has agreed.
 
-Two correctness rules this module fixes relative to the old detector
-(`core/subtitle_detector.py`'s `_compute_crop_from_polys`), both pinned by
-tests in `tests/test_detect_crop.py`:
+Two correctness rules this module fixes relative to the v1 app's detector
+(its `core/subtitle_detector.py`'s `_compute_crop_from_polys`, deleted with
+that window), both pinned by tests in `tests/test_detect_crop.py`:
 
 1. Union, not tightest box. The old code kept a running min/max across all
    *accepted* polys but picked the *single* candidate frame with the
@@ -52,20 +52,20 @@ from statistics import median
 import av
 import numpy as np
 
-from core.config import Config as _Config
 from core.detect import vad
 from core.detect.flags import compose_flag as _compose_flag
 from core.detect.flags import is_cancelled as _is_cancelled
 from core.detect.flags import only_informational
+from core.project.model import FolderSettings as _FolderSettings
 from videocr.pyav_adapter import _TRC_ARIB_STD_B67, _TRC_SMPTE2084, PyAVCapture, _pyav_has_zscale
 
 logger = logging.getLogger(__name__)
 
-# --- Geometry defaults, mirroring core/subtitle_detector.py's `automation`
-# settings keys so a settings dict built for the old detector still works
-# here. `CROP_VERTICAL_PADDING` is the one deliberate change: the old
-# default was 0 (no padding); this module's default is 0.3% of frame
-# height, per the brief's rule 2 above.
+# --- Geometry defaults. The keys are the folder settings
+# core.jobs.detect_jobs.crop_settings() passes as `settings`.
+# `CROP_VERTICAL_PADDING` is the one deliberate change from the v1 app: its
+# default was 0 (no padding); this module's default is 0.3% of frame height,
+# per the brief's rule 2 above.
 CROP_WIDTH_FRACTION = 0.70
 CROP_VERTICAL_PADDING = 0.003
 CROP_MIN_HEIGHT_FRACTION = 0.05
@@ -76,18 +76,18 @@ MAX_CROP_HEIGHT_FRAC = 0.25
 DT_SCORE_THRESHOLD = 0.9
 
 def _label_max_duration_default() -> float:
-    """Read core.config.Config's own label_max_duration default rather than
-    hardcoding a twin of it: the label pipeline already encodes "how long a
-    single subtitle can plausibly stay on screen" as this value, and if
-    that assumption ever changes, this module's watermark-vs-repeated-line
-    boundary (below) should track it automatically instead of silently
-    diverging. core/config.py has no Qt imports, so this import doesn't
+    """Read core.project.model.FolderSettings' own label_max_duration default
+    rather than hardcoding a twin of it: the label pipeline already encodes
+    "how long a single subtitle can plausibly stay on screen" as this value,
+    and if that assumption ever changes, this module's watermark-vs-repeated-
+    line boundary (below) should track it automatically instead of silently
+    diverging. core/project/ has no Qt imports, so this import doesn't
     violate core/detect/'s Qt-free convention.
     """
-    for f in _dataclass_fields(_Config):
+    for f in _dataclass_fields(_FolderSettings):
         if f.name == "label_max_duration":
             return float(f.default)
-    return 5.0  # matches Config's own fallback, in case the field is ever renamed
+    return 5.0  # matches FolderSettings' own value, in case the field is ever renamed
 
 
 # Watermark rejection: a box present in every sampled frame, to within this
@@ -1250,10 +1250,10 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     `frame_size`: (width, height) of the coordinate space the polygons are in.
     `band_frac`: fraction of frame height below which a poly's center must
     sit to be accepted -- overridable via settings['bottom_half_cutoff'].
-    `settings`: optional dict mirroring core/subtitle_detector.py's
-    `automation` keys (crop_width_fraction, crop_vertical_padding,
-    crop_min_height_fraction, bottom_half_cutoff). None means the defaults
-    at the top of this module.
+    `settings`: optional dict of the folder settings
+    core.jobs.detect_jobs.crop_settings() passes (crop_width_fraction,
+    crop_vertical_padding, crop_min_height_fraction, bottom_half_cutoff).
+    None means the defaults at the top of this module.
     `sample_times`: optional, one timestamp per entry of `polys_per_frame`
     (same length, same order) -- lets the watermark check require real
     temporal spread among the contributing samples instead of only extent
@@ -1436,7 +1436,7 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     batch -- so at most one already-in-flight batch (already-dispatched
     ffmpeg grabs + one det_engine.predict() call) still completes after
     cancellation is requested, not an unbounded number of them. A caller
-    driving this from a background thread (see core/subtitle_detector.py)
+    driving this from a background thread (core.jobs.detect_jobs.CropJob)
     can therefore expect cancellation to take effect within roughly one
     batch, not only once the whole candidate list or MAX_PROBES_PER_ROUND
     is exhausted.
@@ -1721,8 +1721,8 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     there, the result is just "cancelled", with nothing probed), between
     probe batches (see _run_round()) AND between the fallback rounds
     below, so a caller driving several files from a background thread
-    (core/subtitle_detector.py) can make Cancel take effect within roughly
-    one batch of one file, not only between whole files.
+    (core.jobs.detect_jobs.CropJob) can make Cancel take effect within
+    roughly one batch of one file, not only between whole files.
 
     Orchestration: vad.probe_times() picks candidate timestamps ranked by
     likelihood of carrying dialogue -> they are fetched in batches (one-shot

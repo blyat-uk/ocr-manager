@@ -74,7 +74,7 @@ class FileEntry:
 @dataclass
 class FolderSettings:
     dialogue_enabled: bool = True
-    labels_enabled: bool = True   # matches old core.config.Config default (True) / old checked-by-default UI checkbox
+    labels_enabled: bool = True   # matches the v1 Config default (True) / its checked-by-default UI checkbox
     ocr_lang: str = "ch"
     conf_threshold: int = 95
     sim_threshold: int = 82

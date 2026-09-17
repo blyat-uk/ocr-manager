@@ -6,7 +6,7 @@ Pinned here (rulings C5/C6, task-9-brief.md):
   core.ass_qafix.process_file on it, then os.replace()s it onto chi/<stem>.ass.
   A stopped or failed file deletes only its .partial: an existing
   chi/<stem>.ass is never deleted or modified except by that replace.
-- Today's OCRWorker call shape. No range or one range goes through
+- The old OCRWorker call shape. No range or one range goes through
   save_subtitles_to_file(time_start=, time_end=); several go through
   get_subtitles(time_ranges=) and the text is written only if there is some
   and the file was not stopped.
@@ -17,7 +17,9 @@ Pinned here (rulings C5/C6, task-9-brief.md):
 
 videocr.api and core.ass_qafix.process_file are fakes in the fast tests. The
 slow test runs real OCR on two fidelity cases and compares the run's output
-with today's OCRWorker flow and with the goldens.
+with the old OCRWorker flow -- transcribed into _todays_worker_output below,
+because core/ocr_worker.py itself was deleted in plan 3B Task 6 -- and with
+the goldens.
 """
 from __future__ import annotations
 
@@ -427,7 +429,7 @@ def test_lines_counts_dialogue_lines_of_the_final_file(tmp_path, ocr, qa):
 
 
 # --------------------------------------------------------------------------
-# Call shape (today's OCRWorker._run_ocr)
+# Call shape (the old OCRWorker._run_ocr)
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("ranges, start, end", [
@@ -1200,29 +1202,73 @@ FIDELITY_CASES = {                     # case -> pinned golden digest prefix (as
 
 
 def _todays_worker_output(ref_dir: Path, name: str, case) -> bytes:
-    """chi/<stem>.ass as the current OCRWorker flow writes it: its _run_ocr, run
-    synchronously on this thread (save_subtitles_to_file / get_subtitles, then
-    process_file, then the move into chi/), with the case as its Config/FileConfig."""
-    from PyQt6.QtCore import Qt
+    """chi/<stem>.ass as the old `core/ocr_worker.py` flow wrote it.
 
-    from core.config import Config, FileConfig
-    from core.ocr_worker import OCRWorker
+    That module was deleted in plan 3B Task 6, so its call sequence lives here
+    instead, transcribed from `OCRWorker._run_ocr` and run synchronously on
+    this thread in `ref_dir`, a tmp dir of its own:
 
-    config = Config(labels_enabled=case.detect_labels)
-    file_config = FileConfig(
-        filename=name,
-        crop_x=case.crop[0], crop_y=case.crop[1], crop_width=case.crop[2], crop_height=case.crop[3],
-        brightness=case.brightness,
-        time_ranges=[tuple(r) for r in case.time_ranges],
+      - the OCR output goes NEXT TO THE VIDEO, `<video dir>/<stem>.ass`;
+      - no range or one range -> `videocr.api.save_subtitles_to_file(**kwargs,
+        file_path=, time_start=, time_end=, progress_callback=,
+        subtitle_callback=, cancel_event=)`;
+      - several ranges -> `videocr.api.get_subtitles(**kwargs, time_ranges=,
+        <same three>)`, and the returned text is written (UTF-8) only if there
+        is some and the cancel event is not set;
+      - then `core.ass_qafix.process_file` on that file, then
+        `shutil.move` into `<video dir>/chi/<stem>.ass`.
+
+    `kwargs` come from `core.project.ocr_kwargs.ocr_call_for`, as they did
+    when this reference still built a `Config`/`FileConfig` for `OCRWorker`:
+    `tests/test_ocr_kwargs.py` pins that resolution literally, this test pins
+    what the call sequence around it produces.
+    """
+    entry = FileEntry(
+        name,
+        crop=Crop(*case.crop, Source.MANUAL),
+        brightness=Brightness(case.brightness, Source.MANUAL),
+        time_ranges=TimeRanges([TimeRange(s, e) for s, e in case.time_ranges], Source.MANUAL),
     )
-    worker = OCRWorker(ref_dir / name, ref_dir / "chi", config, file_config)
-    succeeded: list[bool] = []
-    output: list[str] = []
-    worker.finished.connect(lambda _file, ok: succeeded.append(ok), type=Qt.ConnectionType.DirectConnection)
-    worker.raw_output.connect(lambda _file, text: output.append(text), type=Qt.ConnectionType.DirectConnection)
-    worker._run_ocr()
-    assert succeeded == [True], "".join(output)
-    return (ref_dir / "chi" / f"{stem(name)}.ass").read_bytes()
+    call = ocr_call_for(entry, FolderSettings(labels_enabled=case.detect_labels), str(ref_dir))
+    kwargs, time_ranges = dict(call.kwargs), list(call.time_ranges)
+    ass_source = ref_dir / f"{stem(name)}.ass"
+    cancel_event = threading.Event()
+
+    def progress_callback(_phase, _percent):
+        pass
+
+    def subtitle_callback(_start, _end, _text):
+        pass
+
+    # api.* are still the real functions here: the caller monkeypatches them
+    # only after this reference has produced its output.
+    if len(time_ranges) <= 1:
+        api.save_subtitles_to_file(
+            **kwargs,
+            file_path=str(ass_source),
+            time_start=time_ranges[0][0] if time_ranges else "0:00",
+            time_end=time_ranges[0][1] if time_ranges else "",
+            progress_callback=progress_callback,
+            subtitle_callback=subtitle_callback,
+            cancel_event=cancel_event,
+        )
+    else:
+        result = api.get_subtitles(
+            **kwargs,
+            time_ranges=time_ranges,
+            progress_callback=progress_callback,
+            subtitle_callback=subtitle_callback,
+            cancel_event=cancel_event,
+        )
+        if result and not cancel_event.is_set():
+            with open(ass_source, "w", encoding="utf-8") as f:
+                f.write(result)
+
+    assert ass_source.exists(), f"{name}: the reference flow produced no .ass"
+    REAL_PROCESS_FILE(str(ass_source))
+    destination = ref_dir / "chi" / f"{stem(name)}.ass"
+    shutil.move(str(ass_source), str(destination))
+    return destination.read_bytes()
 
 
 @pytest.mark.slow
@@ -1289,7 +1335,7 @@ def test_run_output_is_byte_identical_to_todays_worker_flow_and_matches_the_gold
     assert summary.succeeded == [names[case.name] for case in cases], summary
     assert sorted(os.listdir(run_dir / "chi")) == sorted(f"{stem(n)}.ass" for n in names.values())
 
-    # Which branch of today's call shape each file took.
+    # Which branch of the old call shape each file took.
     def calls_for(name):
         video = str(run_dir / name)
         top = [(fn, kw) for fn, args, kw in calls if kw.get("video_path") == video]
@@ -1312,7 +1358,7 @@ def test_run_output_is_byte_identical_to_todays_worker_flow_and_matches_the_gold
     for case in cases:
         name = names[case.name]
         produced = final_of(run_dir, name).read_bytes()
-        assert produced == expected[case.name], f"{case.name}: run output differs from today's OCRWorker flow"
+        assert produced == expected[case.name], f"{case.name}: run output differs from the old OCRWorker flow"
         golden = digest((GOLDEN_DIR / f"{case.name}.ass").read_text(encoding="utf-8"))
         assert golden.startswith(FIDELITY_CASES[case.name]), case.name
         got = digest(pre_qa[f"{stem(name)}.ass.partial"])

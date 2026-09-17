@@ -2,6 +2,7 @@
 
 This package is the only Qt layer of the revamp: everything under
 `core/` (`core/project/`, `core/jobs/`, `core/detect/`) stays Qt-free
-(ruling C8). The old window under `widgets/` and `main.py` keeps working
-until plan 3B's parity task lands (ruling C10).
+(ruling C8). `python -m app` and `main.py` both start it; the v1 window,
+its widgets and its config code were deleted with plan 3B's Task 6
+(ruling C10).
 """

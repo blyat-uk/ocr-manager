@@ -112,8 +112,9 @@ _CONVERSION_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexErro
 
 
 def list_video_files(project_dir: str) -> list[str]:
-    """Sorted video file names in `project_dir` -- same rule as
-    core.pipeline.get_video_files (glob on VIDEO_EXTENSIONS, case-sensitive).
+    """Sorted video file names in `project_dir` -- same rule as the v1 app's
+    core/pipeline.py get_video_files (glob on VIDEO_EXTENSIONS,
+    case-sensitive).
     """
     directory = Path(project_dir)
     names = [
