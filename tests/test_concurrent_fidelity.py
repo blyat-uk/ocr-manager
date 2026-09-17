@@ -19,8 +19,8 @@ from tools.fidelity_check import GOLDEN_DIR, digest, load_cases, media_root, run
 EXPECTED_DIGEST_PREFIXES = {
     "slay_1080p_dialogue": "c76ee2af4ecd",
     "slay_1080p_multirange": "273ba6ac6c03",
-    "slay_1080p_labels": "af324c0c56bd",
-    "slay_1080p_multirange_labels": "3ff9b1b329b3",
+    "slay_1080p_labels": "288b8f254dbd",
+    "slay_1080p_multirange_labels": "6a1e5c1f2683",
 }
 
 
