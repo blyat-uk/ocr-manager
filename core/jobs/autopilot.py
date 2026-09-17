@@ -12,12 +12,17 @@ Order (ruling C1: fill missing values only; re-detects ignore sources)
        evidence) and crop (no crop, folder not labels-only). Auto-fill crops
        run as a chain, one at a time in name order: the next is submitted when
        the previous one's terminal event arrives (after the owner applied it),
-       so each is seeded with every result before it (below). The GPU lane
-       runs one job at a time anyway, and brightness (2) still queues behind
-       the next crop (3). Files waiting in the chain are pending "crop";
+       so each is seeded with every result before it (below). The chain costs
+       no throughput (the GPU lane runs one job at a time), but it does not
+       keep brightness behind crops: the GPU worker starts whatever is queued
+       as soon as a crop's terminal event is sent, while the next chained crop
+       is submitted only when the owner drains that event, so brightness jobs
+       and chained crops interleave. Files waiting in the chain are pending
+       "crop";
     3. once the crop is known: brightness (missing or stale, dialogue on), in
-       two tiers (below). An applied crop result that moves sample_time
-       re-runs the thumbnail there;
+       two tiers (below), and only once the folder's ranges are settled
+       (below). An applied crop result that moves sample_time re-runs the
+       thumbnail there;
     4. ranges once per session for the whole folder, when it has >= 2 files
        and some file's ranges are still open to detection (None, DETECTED or
        HINT). on_files_added resubmits it.
@@ -35,6 +40,19 @@ Crop consensus (crop_consensus)
     redetect() is not part of the chain: it is submitted at once, with the
     pool as it stands. Hint re-detects use the hint consensus (CropJob).
 
+Brightness waits for ranges
+    detect_brightness samples inside the file's keep ranges, so no brightness
+    job is submitted while ranges_pending() (a ranges analysis is queued or
+    running): auto-fill, full tier and cheap, escalation, on_crop_changed,
+    redetect's brightness step and the brightness hint re-detect alike. Each
+    request waits (the newest per file) and is submitted when the analysis
+    ends (finished, failed or cancelled), with the file's time_ranges as they
+    are then; a waiting auto-pilot request whose value no longer needs
+    measuring (the user set it) is dropped, explicit re-detects are not.
+    When no analysis runs (one file, every file's ranges the user's, or
+    auto-pilot off) nothing waits. Waiting files are pending "brightness". A
+    later change of ranges does not re-measure brightness.
+
 Two-tier brightness
     The first folder.brightness_full_detect_files files in name order that
     need detection this session form the full tier and run full detection.
@@ -51,17 +69,25 @@ Two-tier brightness
     place. When no file can take it and the tier is empty (the setting fell
     to 0), waiting files run full. With brightness_full_detect_files <= 0
     every file runs full. Waiting files count as pending (they are not
-    flagged while they wait).
+    flagged while they wait). While dialogue is off the tier is left as it
+    is (nothing is dropped, promoted or closed), so switching dialogue off
+    and on again cannot close it on a partial plateau.
 
 Superseded jobs
     Submissions are counted per key: +1 on submit, -1 on the terminal event
     for that key. The runner delivers exactly one terminal event per
-    submission, same-key ones in submission order, so a terminal event is
-    current iff no newer submission for its key is outstanding. This does not
-    depend on "queued" events having been drained. pending() reports a kind
-    for a file while any submission for that key is outstanding. Every job of
-    an AUTOPILOT_KINDS kind must be submitted through AutoPilot; events for
-    keys it never submitted (proof, run) are current and otherwise ignored.
+    submission, so a terminal event is current iff it ends the last
+    outstanding submission for its key. Same-key terminal events normally
+    arrive in submission order, and then that is the newest job. They do not
+    when a newer job is removed from the queue (cancel, cancel_where,
+    shutdown) while an older one with the same key runs: the newer job's
+    "cancelled" (result None, nothing to apply) arrives first and is not
+    current, and the older job's terminal event, which ends the key's work,
+    is current and drives what follows. This does not depend on "queued"
+    events having been drained. pending() reports a kind for a file while any
+    submission for that key is outstanding. Every job of an AUTOPILOT_KINDS
+    kind must be submitted through AutoPilot; events for keys it never
+    submitted (proof, run) are current and otherwise ignored.
 
 autopilot_enabled
     Gates the detections AutoPilot starts on its own (crop, brightness,
@@ -94,6 +120,7 @@ from core.jobs.runner import Job, JobEvent, JobRunner, Lane
 from core.project.model import FileEntry, FolderSettings, Project, Source
 
 AUTOPILOT_KINDS = frozenset({"metadata", "thumbnail", "crop", "brightness", "ranges", "audio_profile"})
+DETECTION_KINDS = frozenset({"crop", "brightness", "ranges", "audio_profile"})   # what pause() holds
 TERMINAL_EVENTS = frozenset({"finished", "failed", "cancelled"})
 PRIORITY = {"metadata": 5, "crop": 3, "brightness": 2, "thumbnail": 1, "audio_profile": 1, "ranges": 0}
 REDETECT_BOOST = 10
@@ -105,8 +132,14 @@ Plateau = tuple[int, int]
 
 
 def is_autopilot_job(job: Job) -> bool:
-    """The `only` predicate pause() holds: jobs of the kinds AutoPilot owns."""
+    """A job of a kind AutoPilot owns (and must be submitted through it)."""
     return getattr(job, "kind", None) in AUTOPILOT_KINDS
+
+
+def is_detection_job(job: Job) -> bool:
+    """The `only` predicate pause() holds: detection jobs. Metadata and
+    thumbnails are never held (ruling C6 holds detection jobs)."""
+    return getattr(job, "kind", None) in DETECTION_KINDS
 
 
 CONSENSUS_SOURCES = frozenset({Source.IMPORTED, Source.MANUAL})   # plus unflagged DETECTED crops
@@ -153,6 +186,12 @@ def _time_ranges(entry: FileEntry) -> list[tuple[str | None, str | None]] | None
     return [(r.start, r.end) for r in entry.time_ranges.ranges]
 
 
+def _crop_wanted(folder: FolderSettings, entry: FileEntry) -> bool:
+    """An auto-fill crop is wanted: the file has none and the folder is not
+    labels-only."""
+    return entry.crop is None and not folder.labels_only
+
+
 def _brightness_missing(entry: FileEntry) -> bool:
     """None, or a detected/hinted value measured on another crop."""
     return entry.brightness is None or brightness_is_stale(entry)
@@ -172,11 +211,12 @@ def _brightness_unmeasured(entry: FileEntry) -> bool:
 
 @dataclass(frozen=True)
 class _BrightnessRequest:
-    """The newest brightness submission for a file."""
+    """A brightness job for a file, submitted or waiting for the ranges."""
     box: Box
     plateau: Plateau | None        # None: full detection
     hint_value: int | None
     priority: int
+    explicit: bool = False         # a user request (re-detect, hint): runs whatever the value's source
 
 
 @dataclass(frozen=True)
@@ -212,9 +252,10 @@ class AutoPilot:
     result is harmless: on_job_event already did the same, and a brightness
     job already measuring the file's current box is not submitted again.
 
-    pause()/resume() hold and release queued AUTOPILOT_KINDS jobs on the GPU
-    and CPU lanes (running jobs finish, ruling C6). JobRunner.resume() clears
-    every hold on a lane, so resume() also releases holds others placed there.
+    pause()/resume() hold and release queued DETECTION_KINDS jobs on the GPU
+    and CPU lanes (running jobs finish, ruling C6); metadata and thumbnails
+    are never held. JobRunner.resume() clears every hold on a lane, so
+    resume() also releases holds others placed there.
     """
 
     def __init__(self, runner: JobRunner, project_getter: Callable[[], Project]):
@@ -222,7 +263,8 @@ class AutoPilot:
         self._project_getter = project_getter
         self._outstanding: dict[str, int] = {}                    # key -> submissions without a terminal event
         self._identity: dict[str, tuple[str, str | None]] = {}    # key -> (kind, file), while outstanding
-        self._brightness_requests: dict[str, _BrightnessRequest] = {}
+        self._brightness_requests: dict[str, _BrightnessRequest] = {}   # the newest submitted, per file
+        self._ranges_waits: dict[str, _BrightnessRequest] = {}          # brightness waiting for ranges
         self._deferred_crops: dict[str, _CropRequest] = {}
         self._crop_chain: set[str] = set()        # files waiting for their auto-fill crop
         self._crop_active: str | None = None      # the file whose auto-fill crop is outstanding
@@ -247,13 +289,13 @@ class AutoPilot:
         """Schedule the added files (metadata and thumbnails always) and, when
         autopilot_enabled, their detections and the ranges analysis again."""
         project = self._project()
+        if project.folder.autopilot_enabled:
+            self._schedule_ranges(project, force=True)      # first: brightness waits for it
         added = set(names)
         for name in project.files:
             if name in added:
                 self._thumbnail_times.pop(name, None)      # a file that came back has no thumbnail
                 self._schedule_file(project, name)
-        if project.folder.autopilot_enabled:
-            self._schedule_ranges(project, force=True)
         self._settle_tier(project)
 
     def on_job_event(self, event: JobEvent) -> None:
@@ -278,8 +320,10 @@ class AutoPilot:
             self._advance_crop_chain(project)
         elif kind == "brightness":
             self._after_brightness_event(project, file, event)
-        elif kind == "ranges" and event.type != "cancelled":
-            self._ranges_done = True
+        elif kind == "ranges":
+            if event.type != "cancelled":
+                self._ranges_done = True
+            self._release_ranges_waits(project)
         self._settle_tier(project)
 
     def redetect(self, file: str) -> None:
@@ -322,7 +366,7 @@ class AutoPilot:
         for name, entry in project.files.items():
             if name != source_file and entry.crop is not None:
                 self._submit_brightness(project, name, _crop_box(entry), plateau=None, hint_value=value,
-                                        priority=PRIORITY["brightness"] + REDETECT_BOOST)
+                                        priority=PRIORITY["brightness"] + REDETECT_BOOST, explicit=True)
         self._settle_tier(project)
 
     def on_crop_changed(self, file: str) -> None:
@@ -337,18 +381,20 @@ class AutoPilot:
         """Submit what the new settings newly require: the folder schedule when
         auto-pilot was just turned on; crop and brightness for files missing
         them when extraction starts needing them. Call after
-        core.jobs.apply.apply_folder_change(project, old, new)."""
+        core.jobs.apply.apply_folder_change(project, old, new). The full tier is
+        settled whatever changed (it is left alone while dialogue is off)."""
         project = self._project()
-        if not new.autopilot_enabled:
-            return
-        if not old.autopilot_enabled:
+        if new.autopilot_enabled and not old.autopilot_enabled:
             self._schedule_folder(project)
-            return
-        if not ((old.labels_only and not new.labels_only) or (new.dialogue_enabled and not old.dialogue_enabled)):
-            return
+        elif new.autopilot_enabled and (
+                (old.labels_only and not new.labels_only) or (new.dialogue_enabled and not old.dialogue_enabled)):
+            self._schedule_newly_required(project, new)
+        self._settle_tier(project)
+
+    def _schedule_newly_required(self, project: Project, new: FolderSettings) -> None:
         for name, entry in project.files.items():
             self._scheduled.add(name)
-            needs_crop = entry.crop is None and not new.labels_only
+            needs_crop = _crop_wanted(new, entry)
             if entry.media.duration <= 0:
                 if needs_crop and not self._is_outstanding("metadata", name):
                     self._submit(MetadataJob(project.path, name), PRIORITY["metadata"])
@@ -357,17 +403,17 @@ class AutoPilot:
             if new.dialogue_enabled and _brightness_missing(entry):
                 self._want_brightness(project, name)
         self._advance_crop_chain(project)
-        self._settle_tier(project)
 
     # --- pause ------------------------------------------------------------------
 
     def pause(self) -> None:
-        """Hold queued auto-pilot jobs on the GPU and CPU lanes."""
+        """Hold queued detection jobs (DETECTION_KINDS) on the GPU and CPU
+        lanes; metadata and thumbnails keep running."""
         if self._paused:
             return
         self._paused = True
         for lane in (Lane.GPU, Lane.CPU):
-            self._runner.pause(lane, only=is_autopilot_job)
+            self._runner.pause(lane, only=is_detection_job)
 
     def resume(self) -> None:
         if not self._paused:
@@ -395,10 +441,9 @@ class AutoPilot:
             if crop_pending:
                 kinds.add("crop")
             if folder.dialogue_enabled and "brightness" not in kinds:
-                after_crop = crop_pending and (name in self._redetect or _brightness_missing(entry))
-                waiting = (name in self._waiting and _brightness_unmeasured(entry)
-                           and (entry.crop is not None or crop_pending))
-                if after_crop or waiting:
+                after_crop = crop_pending and self._brightness_follows_crop(name, entry)
+                for_tier = self._waits_for_tier(name, entry) and (entry.crop is not None or crop_pending)
+                if after_crop or for_tier or self._waits_for_ranges(name, entry):
                     kinds.add("brightness")
             if kinds:
                 pending[name] = kinds
@@ -408,9 +453,10 @@ class AutoPilot:
         return self._outstanding.get(RANGES_KEY, 0) > 0
 
     def is_current(self, event: JobEvent) -> bool:
-        """False when a newer submission with the event's key is outstanding.
-        Call before on_job_event for the same event. True for keys AutoPilot
-        never submitted."""
+        """True when the event ends the last outstanding submission for its
+        key (see "Superseded jobs"): False while another one, normally a newer
+        one, is outstanding. Call before on_job_event for the same event. True
+        for keys AutoPilot never submitted."""
         return self._outstanding.get(event.key, 0) <= 1
 
     # --- scheduling -------------------------------------------------------------
@@ -438,10 +484,10 @@ class AutoPilot:
             raise
 
     def _schedule_folder(self, project: Project) -> None:
+        if project.folder.autopilot_enabled:
+            self._schedule_ranges(project, force=False)     # first: brightness waits for it
         for name in list(project.files):
             self._schedule_file(project, name)
-        if project.folder.autopilot_enabled:
-            self._schedule_ranges(project, force=False)
         self._settle_tier(project)
 
     def _schedule_file(self, project: Project, name: str) -> None:
@@ -462,9 +508,9 @@ class AutoPilot:
         entry = project.files[name]
         folder = project.folder
         self._submit_thumbnail(project, name)
-        if not folder.autopilot_enabled:
+        if not self._detects_automatically(folder, name):
             return
-        if crop and entry.crop is None and not folder.labels_only and not self._is_outstanding("crop", name):
+        if crop and _crop_wanted(folder, entry) and not self._is_outstanding("crop", name):
             self._crop_chain.add(name)
             self._advance_crop_chain(project)
         if "audio" not in entry.evidence and not self._is_outstanding("audio_profile", name):
@@ -509,7 +555,7 @@ class AutoPilot:
         for name in [n for n in project.files if n in self._crop_chain]:
             self._crop_chain.discard(name)
             entry = project.files[name]
-            if (entry.crop is None and not project.folder.labels_only and entry.media.duration > 0
+            if (_crop_wanted(project.folder, entry) and entry.media.duration > 0
                     and not self._is_outstanding("crop", name)):
                 self._submit_crop(project, name)
                 self._crop_active = name
@@ -530,13 +576,40 @@ class AutoPilot:
         self._thumbnail_times[name] = time
 
     def _submit_brightness(self, project: Project, name: str, box: Box, *, plateau: Plateau | None,
-                           hint_value: int | None, priority: int) -> None:
+                           hint_value: int | None, priority: int, explicit: bool = False) -> None:
+        """Every brightness job goes through here: submitted now, or, while a
+        ranges analysis is pending, kept (replacing an earlier wait) until it
+        ends, so the job samples the file's keep ranges."""
+        request = _BrightnessRequest(box, plateau, hint_value, priority, explicit)
+        if self.ranges_pending():
+            self._ranges_waits[name] = request
+            return
+        self._ranges_waits.pop(name, None)
         entry = project.files[name]
         self._submit(BrightnessJob(project.path, name, box, _time_ranges(entry), project.folder,
                                    folder_plateau=plateau, hint_value=hint_value), priority)
-        self._brightness_requests[name] = _BrightnessRequest(box, plateau, hint_value, priority)
+        self._brightness_requests[name] = request
 
-    def _outstanding_brightness(self, name: str) -> _BrightnessRequest | None:
+    def _release_ranges_waits(self, project: Project) -> None:
+        """The ranges analysis ended: submit the brightness requests that waited,
+        in name order, on the file's crop and ranges as they are now."""
+        if self.ranges_pending():
+            return
+        for name in [n for n in project.files if n in self._ranges_waits]:
+            entry = project.files[name]
+            if not project.folder.dialogue_enabled or not self._waits_for_ranges(name, entry):
+                continue
+            request = self._ranges_waits.pop(name)
+            self._submit_brightness(project, name, _crop_box(entry), plateau=request.plateau,
+                                    hint_value=request.hint_value, priority=request.priority,
+                                    explicit=request.explicit)
+        self._ranges_waits.clear()
+
+    def _brightness_request(self, name: str) -> _BrightnessRequest | None:
+        """The file's newest brightness request: waiting for ranges, else outstanding."""
+        waiting = self._ranges_waits.get(name)
+        if waiting is not None:
+            return waiting
         return self._brightness_requests.get(name) if self._is_outstanding("brightness", name) else None
 
     def _want_brightness(self, project: Project, name: str) -> None:
@@ -547,19 +620,18 @@ class AutoPilot:
         if entry is None or not folder.dialogue_enabled:
             return
         plateau = None
-        if name in self._tier:
-            pass
-        elif not self._tier_closed and folder.brightness_full_detect_files > 0:
-            if len(self._tier) >= folder.brightness_full_detect_files:
-                self._waiting.add(name)
-                return
-            self._tier[name] = _UNRESOLVED
-        elif self._tier_closed:
-            plateau = self._folder_plateau
+        if name not in self._tier:
+            if not self._tier_closed and folder.brightness_full_detect_files > 0:
+                if len(self._tier) >= folder.brightness_full_detect_files:
+                    self._waiting.add(name)
+                    return
+                self._tier[name] = _UNRESOLVED
+            elif self._tier_closed:
+                plateau = self._folder_plateau
         if entry.crop is None:
             return
         box = _crop_box(entry)
-        request = self._outstanding_brightness(name)
+        request = self._brightness_request(name)
         if request is not None and request.box == box:
             return
         self._submit_brightness(project, name, box, plateau=plateau, hint_value=None,
@@ -573,19 +645,14 @@ class AutoPilot:
         entry = project.files.get(name)
         if entry is None or not project.folder.dialogue_enabled or entry.crop is None:
             return
+        if not (_brightness_unmeasured(entry) if unrecorded else _brightness_missing(entry)):
+            return
         box = _crop_box(entry)
-        brightness = entry.brightness
-        if brightness is not None:
-            if brightness.source not in DETECTION_SOURCES:
-                return
-            measured = (entry.evidence.get("brightness") or {}).get("value_crop_box")
-            if (measured is None and not unrecorded) or (measured is not None and _box(measured) == box):
-                return
-        request = self._outstanding_brightness(name)
+        request = self._brightness_request(name)
         if request is not None:
             if request.box != box:
-                self._submit_brightness(project, name, box, plateau=request.plateau,
-                                        hint_value=request.hint_value, priority=request.priority)
+                self._submit_brightness(project, name, box, plateau=request.plateau, hint_value=request.hint_value,
+                                        priority=request.priority, explicit=request.explicit)
             return
         self._want_brightness(project, name)
 
@@ -607,13 +674,14 @@ class AutoPilot:
         if entry is None:
             self._redetect.discard(name)
             return
-        if name in self._redetect:
-            self._redetect.discard(name)
-            if project.folder.dialogue_enabled and entry.crop is not None:
+        if (project.folder.dialogue_enabled and entry.crop is not None
+                and self._brightness_follows_crop(name, entry)):
+            if name in self._redetect:
                 self._submit_brightness(project, name, _crop_box(entry), plateau=None, hint_value=None,
-                                        priority=PRIORITY["brightness"] + REDETECT_BOOST)
-        else:
-            self._remeasure_brightness(project, name, unrecorded=False)
+                                        priority=PRIORITY["brightness"] + REDETECT_BOOST, explicit=True)
+            else:
+                self._remeasure_brightness(project, name, unrecorded=False)
+        self._redetect.discard(name)
         if (name in self._thumbnail_times and entry.sample_time is not None
                 and float(entry.sample_time) != self._thumbnail_times[name]):
             self._submit_thumbnail(project, name)
@@ -638,7 +706,29 @@ class AutoPilot:
             plateau = result.result.plateau
             self._tier[name] = None if plateau is None else (int(plateau[0]), int(plateau[1]))
 
-    # --- the full tier ----------------------------------------------------------
+    # --- conditions shared by the scheduler and pending() -----------------------
+
+    def _detects_automatically(self, folder: FolderSettings, name: str) -> bool:
+        """The folder schedule covers the file and auto-pilot is on: its missing
+        values are detected once its duration is known."""
+        return name in self._scheduled and folder.autopilot_enabled
+
+    def _brightness_follows_crop(self, name: str, entry: FileEntry) -> bool:
+        """A crop event for the file (with a crop known) is followed by a
+        brightness job: its re-detect's step, or a value missing or stale."""
+        return name in self._redetect or _brightness_missing(entry)
+
+    def _waits_for_ranges(self, name: str, entry: FileEntry) -> bool:
+        """A brightness request for the file waits for the ranges analysis and
+        will be submitted when it ends: an explicit one always, an auto-pilot
+        one while the value still needs measuring."""
+        request = self._ranges_waits.get(name)
+        return (request is not None and entry.crop is not None
+                and (request.explicit or _brightness_unmeasured(entry)))
+
+    def _waits_for_tier(self, name: str, entry: FileEntry) -> bool:
+        """The file waits for the full tier to close and still needs measuring."""
+        return name in self._waiting and _brightness_unmeasured(entry)
 
     def _crop_pending(self, project: Project, name: str, entry: FileEntry) -> bool:
         """A crop detection is outstanding, waits in the auto-fill chain, or
@@ -646,19 +736,21 @@ class AutoPilot:
         folder = project.folder
         if self._is_outstanding("crop", name):
             return True
-        if name in self._crop_chain and entry.crop is None and not folder.labels_only:
+        if name in self._crop_chain and _crop_wanted(folder, entry):
             return True
         if not self._is_outstanding("metadata", name):
             return False
         return name in self._deferred_crops or (
-            name in self._scheduled and folder.autopilot_enabled and entry.crop is None and not folder.labels_only)
+            self._detects_automatically(folder, name) and _crop_wanted(folder, entry))
+
+    # --- the full tier ----------------------------------------------------------
 
     def _member_alive(self, project: Project, name: str) -> bool:
         """A tier file that may still report a full-run plateau."""
         entry = project.files.get(name)
-        if entry is None or not project.folder.dialogue_enabled:
+        if entry is None:
             return False
-        if self._is_outstanding("brightness", name):
+        if self._brightness_request(name) is not None:        # submitted, or waiting for ranges
             return True
         if not _brightness_unmeasured(entry):
             return False
@@ -668,8 +760,8 @@ class AutoPilot:
         """Drop tier files that can no longer be measured, fill their places
         from the waiting files, and close the tier once every file in it has
         reported: then the folder plateau is fixed and waiting files are
-        released."""
-        if self._tier_closed:
+        released. Nothing happens while dialogue is off."""
+        if self._tier_closed or not project.folder.dialogue_enabled:
             return
         limit = project.folder.brightness_full_detect_files
         self._waiting.intersection_update(project.files)
@@ -681,9 +773,10 @@ class AutoPilot:
             for name in [n for n in project.files if n in self._waiting]:
                 if len(self._tier) >= limit:
                     break
-                self._waiting.discard(name)
                 entry = project.files[name]
-                if project.folder.dialogue_enabled and _brightness_unmeasured(entry):
+                wanted = self._waits_for_tier(name, entry)
+                self._waiting.discard(name)
+                if wanted:
                     self._want_brightness(project, name)
                     promoted = True
             if not promoted:
@@ -696,8 +789,8 @@ class AutoPilot:
         self._tier_closed = True
         self._folder_plateau = intersect_plateaus(self._tier.values())
         for name in [n for n in project.files if n in self._waiting]:
-            self._waiting.discard(name)
             entry = project.files[name]
-            if project.folder.dialogue_enabled and _brightness_unmeasured(entry):
+            if self._waits_for_tier(name, entry):
+                self._waiting.discard(name)
                 self._want_brightness(project, name)
         self._waiting.clear()
