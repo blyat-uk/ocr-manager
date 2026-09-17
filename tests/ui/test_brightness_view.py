@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from app.controller import ProjectController
 from app.views.brightness_view import (
@@ -842,6 +842,20 @@ def test_pinned_times_are_per_file_and_survive_a_file_switch(loaded, controller)
     loaded.set_file(NAME)
     settle()
     assert loaded.pinned_times() == [123.0]
+
+
+def test_the_zoom_and_toggle_controls_live_in_the_stage_head(loaded):
+    """Ruling B3 puts each tab's own controls in the stage head, where the
+    Crop tab puts its envelope/masked/grid row too; `Stage` mounts whatever
+    `toolbar()` returns. The page itself carries none of them."""
+    bar = loaded.toolbar()
+    assert isinstance(bar, QWidget)
+    owned = [*loaded.zoom_buttons, loaded.lost_button, loaded.mask_button]
+    for button in owned:
+        assert button.parentWidget() is bar
+    assert not any(button.parentWidget() is loaded.page() for button in owned)
+    assert [button.text() for button in loaded.zoom_buttons] == ["fit", "100%", "300%", "600%"]
+    assert bar.findChildren(QLabel)[0].text() == "zoom"
 
 
 def test_the_tab_leaves_room_for_the_compact_timeline(loaded):

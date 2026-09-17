@@ -35,9 +35,10 @@ Evidence is disposable
     and "not verified on this file".
 
 Layout (ruling B4 moves `tabs-hifi`'s 230 px side panel into the one
-persistent inspector, so the stage keeps the full width):
+persistent inspector, so the stage keeps the full width). The zoom presets
+and the two toggles are `toolbar()`, which the Stage mounts in the stage
+head (ruling B3); the page below it is:
 
-    toolbar        zoom presets and the two toggles
     ContextStrip   the whole strip, 26 px, with the draggable amber window
     tiles          3-column grid of ZoomTile, then the dashed PinTile
     ThresholdCurve the two curves, the plateau band and both markers
@@ -821,10 +822,11 @@ class BrightnessTab:
         column.setContentsMargins(12, 10, 12, 12)
         column.setSpacing(10)
 
-        toolbar = QHBoxLayout()
+        self._toolbar = QWidget()
+        self._toolbar.setObjectName("BrightnessToolbar")
+        toolbar = QHBoxLayout(self._toolbar)
         toolbar.setContentsMargins(0, 0, 0, 0)
         toolbar.setSpacing(4)
-        toolbar.addStretch(1)
         zoom_label = QLabel(ZOOM_LABEL)
         zoom_label.setObjectName("Note")
         toolbar.addWidget(zoom_label)
@@ -844,7 +846,6 @@ class BrightnessTab:
         self.mask_button.clicked.connect(self.toggle_masked)
         toolbar.addWidget(self.lost_button)
         toolbar.addWidget(self.mask_button)
-        column.addLayout(toolbar)
 
         self.context = ContextStrip()
         self.context.panned.connect(self._on_panned)
@@ -881,6 +882,12 @@ class BrightnessTab:
 
     def inspector_panel(self) -> QWidget:
         return self.panel
+
+    def toolbar(self) -> QWidget:
+        """The zoom presets and the two toggles, which the Stage mounts in
+        the stage head (ruling B3) beside the tab buttons -- the same place
+        the Crop tab puts envelope / masked / grid."""
+        return self._toolbar
 
     def set_file(self, name: str | None) -> None:
         self._file = name
