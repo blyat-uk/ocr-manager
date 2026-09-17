@@ -214,6 +214,18 @@ IDENTITY_CASES = {
         lambda t: ([1.0, 0.89, 0.9, 0.97],
                    [_poly(400 + _jitter(t), 980, 1500, 1030), _poly(300, 880, 1600, 930),
                     _poly(600, 1035, 900, 1060), _poly(100, 200, 400, 260)])),
+    # Boundaries: a polygon centred exactly on the cutoff row (594 at 1080p)
+    # is in band; a padded box of 264 px sits between 24% and 25% of 1080;
+    # a second-batch frame 13 px lower moves the union by more than 1% but
+    # less than CONVERGENCE_VERTICAL_TOLERANCE_FRAC (1.5%) of frame height.
+    "text-centred-on-the-cutoff": lambda mp: _detect_crop_with_fakes(
+        mp, VAD_TIMES, lambda t: ([1.0, 1.0], [_one_line(t)[1][0], _poly(700, 574, 900, 614)])),
+    "just-under-the-height-ceiling": lambda mp: _detect_crop_with_fakes(
+        mp, VAD_TIMES, lambda t: ([1.0], [_poly(400 + _jitter(t), 770, 1500, 1028)])),
+    "union-drift-inside-convergence-tolerance": lambda mp: _detect_crop_with_fakes(
+        mp, VAD_TIMES,
+        lambda t: ([1.0], [_poly(400 + _jitter(t), 980, 1500, 1043)]) if t == crop._spread_order(VAD_TIMES)[5]
+        else _one_line(t)),
     "consensus": lambda mp: _detect_crop_with_fakes(
         mp, VAD_TIMES, _one_line, consensus=[(977 / 1080, 56 / 1080)] * 3),
     "settings": lambda mp: _detect_crop_with_fakes(
@@ -252,3 +264,212 @@ def test_pre_existing_crop_result_fields_match_the_recording_from_before_evidenc
     expected = json.loads(IDENTITY_FIXTURE.read_text())["cases"][name]
     result = IDENTITY_CASES[name](monkeypatch)
     assert _canonical(_pre_existing_fields(result)) == _canonical(expected)
+
+
+# --- CropResult.samples ------------------------------------------------------
+
+FULL_FRAME_GEOMETRY = (1920, 1080) + crop._crop_geometry(1920, 1080, 1.0, crop.TARGET_HEIGHT)
+
+
+def _box_in_full_frame(rect, geometry):
+    """(x, y, w, h) full-frame pixels of a rectangle given in a grab's
+    coordinates, rounded like CropResult.envelope."""
+    _w, _h, crop_w, crop_h, crop_x, crop_y, out_w, out_h = geometry
+    sx, sy = crop_w / out_w, crop_h / out_h
+    x0, y0 = rect[0] * sx + crop_x, rect[1] * sy + crop_y
+    x1, y1 = rect[2] * sx + crop_x, rect[3] * sy + crop_y
+    return (round(x0), round(y0), round(x1 - x0), round(y1 - y0))
+
+
+def _xywh(x0, y0, x1, y1):
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def test_samples_carry_each_probed_frames_boxes_whether_it_was_kept_and_its_text_rows(monkeypatch):
+    """One sample per probed frame, in sample_pts order: the frame's accepted
+    in-band boxes (score >= DT_SCORE_THRESHOLD, centre below the cutoff)
+    sorted by (y, x), whether it contributed to the kept union, and how many
+    text rows those boxes form."""
+    two_line, same_row, empty, outlier, filtered = crop._spread_order(VAD_TIMES)[:crop.PROBE_BATCH_SIZE]
+    content = {
+        # two rows, listed bottom row first: samples sort by (y, x)
+        two_line: ([1.0, 1.0], [(400, 980, 1500, 1030), (450, 920, 1450, 970)]),
+        # two boxes on one row, the right one listed first and slightly lower
+        same_row: ([1.0, 1.0], [(950, 985, 1500, 1032), (400, 980, 900, 1030)]),
+        empty: ([], []),
+        # its own baseline far above the subtitle's: left out of the union
+        outlier: ([1.0], [(500, 700, 1400, 740)]),
+        # score 0.89 is rejected, 0.9 accepted, and text above the cutoff is out of band
+        filtered: ([0.89, 1.0, 0.97, 0.9],
+                   [(300, 880, 1600, 930), (430, 980, 1470, 1030), (100, 200, 400, 260), (1600, 990, 1700, 1025)]),
+    }
+
+    def predict_fn(t):
+        if t in content:
+            scores, rects = content[t]
+            return scores, [_poly(*r) for r in rects]
+        j = _jitter(t)
+        return [1.0], [_poly(400 + j, 980, 1500 - j, 1030)]
+
+    result = _detect_crop_with_fakes(monkeypatch, VAD_TIMES, predict_fn)
+
+    assert result.box is not None and crop.FLAG_OUTLIER_DISCARDED in result.flagged
+    assert set(content) <= set(result.sample_pts)
+    expected = {
+        two_line: crop.CropSample(time=two_line, boxes=(_xywh(450, 920, 1450, 970), _xywh(400, 980, 1500, 1030)),
+                                  kept=True, lines=2),
+        same_row: crop.CropSample(time=same_row, boxes=(_xywh(400, 980, 900, 1030), _xywh(950, 985, 1500, 1032)),
+                                  kept=True, lines=1),
+        empty: crop.CropSample(time=empty, boxes=(), kept=False, lines=0),
+        outlier: crop.CropSample(time=outlier, boxes=(_xywh(500, 700, 1400, 740),), kept=False, lines=1),
+        filtered: crop.CropSample(time=filtered, boxes=(_xywh(430, 980, 1470, 1030), _xywh(1600, 990, 1700, 1025)),
+                                  kept=True, lines=1),
+    }
+    for t in result.sample_pts:
+        if t not in expected:
+            j = _jitter(t)
+            expected[t] = crop.CropSample(time=t, boxes=(_xywh(400 + j, 980, 1500 - j, 1030),), kept=True, lines=1)
+    assert result.samples == [expected[t] for t in result.sample_pts]
+    # No time was probed twice here, so kept is exactly hit_pts membership.
+    assert [s.kept for s in result.samples] == [s.time in result.hit_pts for s in result.samples]
+
+
+def test_sample_boxes_are_full_frame_pixels_not_the_grabbed_bands(monkeypatch):
+    """Detection runs on the bottom band, cropped and downscaled; the boxes
+    are reported in the source frame's native pixels, like `box`."""
+    def rect(t):
+        j = _jitter(t)
+        return (200 + j, 400, 1200 - j, 441)
+
+    result = _detect_crop_with_fakes(monkeypatch, VAD_TIMES, lambda t: ([1.0], [_poly(*rect(t))]),
+                                     real_geometry=True)
+
+    assert result.box is not None and result.samples
+    for sample in result.samples:
+        assert sample.boxes == (_box_in_full_frame(rect(sample.time), BAND_GEOMETRY),)
+        assert sample.kept and sample.lines == 1
+
+
+def test_a_time_the_full_frame_retry_probes_again_is_kept_only_where_it_contributed(monkeypatch):
+    """The full-frame retry re-probes times the bottom-band rounds already
+    probed, so sample_pts lists those times twice. Only the retry's frame
+    contributed; the band round's frame at the same time had nothing in band
+    and is not kept, even though its time is in hit_pts."""
+    def rect(t):
+        return (300 + _jitter(t), 3, 700, 22)   # top of the frame, in grab coordinates
+
+    result = _detect_crop_with_fakes(monkeypatch, [1.0, 2.0, 3.0], lambda t: ([1.0], [_poly(*rect(t))]),
+                                     real_geometry=True)
+
+    assert result.box is not None and crop.FLAG_TOP_POSITIONED in result.flagged
+    band_rounds = 3 + len(crop._uniform_probe_times(60.0))
+    assert len(result.sample_pts) > band_rounds
+    for sample in result.samples[:band_rounds]:
+        assert sample.boxes == () and not sample.kept and sample.lines == 0
+    for sample in result.samples[band_rounds:]:
+        assert sample.boxes == (_box_in_full_frame(rect(sample.time), FULL_FRAME_GEOMETRY),)
+        assert sample.kept
+    assert any(s.time in result.hit_pts for s in result.samples[:band_rounds])
+    assert sorted(s.time for s in result.samples if s.kept) == result.hit_pts
+
+
+def test_a_probe_the_engine_left_unanswered_gets_no_boxes_rather_than_the_next_frames():
+    """_run_round() records a sample for every fetched frame but analyses
+    only the frames the engine returned a result for, so an engine answering
+    [1, 2] of a batch [1, 2, 3] and [4] of [4, 5] leaves frame_times
+    [1, 2, 4]. Each analysed frame stays with its own sample."""
+    line, upper = _poly(400, 980, 1500, 1030), _poly(400, 900, 1500, 950)
+    rounds = [([1.0, 2.0, 3.0, 4.0, 5.0], [[line], [line], [upper]], [1.0, 2.0, 4.0], False)]
+
+    samples = crop._crop_samples(rounds, 1080, crop.BOTTOM_HALF_CUTOFF, kept_idx=[0, 2])
+
+    assert samples == [
+        crop.CropSample(time=1.0, boxes=(_xywh(400, 980, 1500, 1030),), kept=True, lines=1),
+        crop.CropSample(time=2.0, boxes=(_xywh(400, 980, 1500, 1030),), kept=False, lines=1),
+        crop.CropSample(time=3.0, boxes=(), kept=False, lines=0),
+        crop.CropSample(time=4.0, boxes=(_xywh(400, 900, 1500, 950),), kept=True, lines=1),
+        crop.CropSample(time=5.0, boxes=(), kept=False, lines=0),
+    ]
+
+
+@pytest.mark.parametrize("name", sorted(IDENTITY_CASES))
+def test_samples_line_up_with_sample_pts_hit_pts_and_the_envelope(monkeypatch, name):
+    result = IDENTITY_CASES[name](monkeypatch)
+
+    assert [s.time for s in result.samples] == result.sample_pts
+    kept = [s for s in result.samples if s.kept]
+    assert sorted(s.time for s in kept) == result.hit_pts
+    assert len(kept) == result.agreed
+    for s in result.samples:
+        assert all(type(v) is int for box in s.boxes for v in box)
+        assert list(s.boxes) == sorted(s.boxes, key=lambda b: (b[1], b[0]))
+        assert (s.lines == 0) if not s.boxes else (1 <= s.lines <= len(s.boxes))
+    if not kept:
+        assert result.envelope is None
+        return
+    assert all(s.boxes for s in kept)
+    # The kept boxes rebuild the envelope, to within their own rounding.
+    boxes = [b for s in kept for b in s.boxes]
+    union = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+             max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes))
+    ex, ey, ew, eh = result.envelope
+    for got, want in zip(union, (ex, ey, ex + ew, ey + eh)):
+        assert abs(got - want) <= 1, (union, result.envelope)
+
+
+@pytest.mark.parametrize("boxes,rows", [
+    ([], 0),
+    ([(0, 100, 50, 40)], 1),
+    ([(0, 100, 50, 40), (60, 100, 50, 40)], 1),                 # side by side
+    ([(0, 920, 1000, 50), (0, 980, 1100, 50)], 2),              # a two-line subtitle
+    ([(0, 0, 10, 40), (20, 20, 10, 60)], 1),                    # overlap 20 = half the smaller height
+    ([(0, 0, 10, 40), (20, 21, 10, 60)], 2),                    # overlap 19: just under half
+    ([(0, 0, 10, 40), (0, 20, 10, 40), (0, 40, 10, 40)], 1),    # chained through the middle box
+    ([(0, 0, 10, 40), (0, 15, 10, 40), (0, 100, 10, 40)], 2),   # one row of two, one alone
+    ([(0, 0, 10, 40), (0, 30, 10, 40)], 2),                     # overlap 10: a quarter
+])
+def test_text_rows_join_boxes_overlapping_vertically_by_at_least_half_the_smaller_height(boxes, rows):
+    assert crop._count_text_rows(tuple(boxes)) == rows
+
+
+def test_to_evidence_is_json_serialisable_and_carries_every_sample(monkeypatch):
+    result = _detect_crop_with_fakes(monkeypatch, VAD_TIMES, _one_or_two_lines)
+    evidence = result.to_evidence()
+
+    assert json.loads(json.dumps(evidence)) == evidence
+    assert set(evidence) == {"box", "envelope", "agreed", "probes_used", "flagged", "hit_pts",
+                             "frame_size", "samples"}
+    assert evidence["box"] == list(result.box)
+    assert evidence["envelope"] == list(result.envelope)
+    assert evidence["frame_size"] == list(result.frame_size)
+    assert (evidence["agreed"], evidence["probes_used"], evidence["flagged"], evidence["hit_pts"]) == (
+        result.agreed, result.probes_used, result.flagged, result.hit_pts)
+    assert evidence["samples"] == [
+        {"time": s.time, "boxes": [list(b) for b in s.boxes], "kept": s.kept, "lines": s.lines}
+        for s in result.samples
+    ]
+    assert any(len(s["boxes"]) == 2 for s in evidence["samples"])
+
+
+def test_to_evidence_of_a_result_without_a_box_is_json_serialisable(monkeypatch):
+    result = _detect_crop_with_fakes(monkeypatch, VAD_TIMES, _one_line, cancel_check=lambda: True)
+    evidence = result.to_evidence()
+
+    assert json.loads(json.dumps(evidence)) == evidence
+    assert evidence["box"] is None and evidence["envelope"] is None and evidence["samples"] == []
+
+
+def test_to_evidence_converts_numpy_scalars():
+    import numpy as np
+
+    result = crop.CropResult(
+        box=tuple(np.int64(v) for v in (288, 977, 1344, 56)), sample_pts=[np.float32(1.5)],
+        envelope=tuple(np.int32(v) for v in (400, 980, 1100, 50)), agreed=np.int64(1), probes_used=1,
+        hit_pts=[np.float32(1.5)], frame_size=(np.int64(1920), np.int64(1080)),
+        samples=[crop.CropSample(time=np.float32(1.5), boxes=((np.int64(400), 980, 1100, 50),),
+                                 kept=np.bool_(True), lines=np.int64(1))],
+    )
+    evidence = result.to_evidence()
+
+    assert json.loads(json.dumps(evidence)) == evidence
+    assert evidence["samples"] == [{"time": 1.5, "boxes": [[400, 980, 1100, 50]], "kept": True, "lines": 1}]

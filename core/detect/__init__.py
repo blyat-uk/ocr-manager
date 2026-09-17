@@ -11,7 +11,7 @@ a result without review.
 
 | producer | times it records | re-fetch with | semantics |
 |---|---|---|---|
-| crop.detect_crop | CropResult.sample_pts, hit_pts: the REQUESTED probe times | crop.grab_frames(video, times) (either fetch path) | first frame at or after the time rounded to whole ms, container-relative (crop._seek_seconds). May precede the frame's own PTS by up to one frame; never re-fetch with the PTS. |
+| crop.detect_crop | CropResult.sample_pts, hit_pts, samples[i].time: the REQUESTED probe times (samples[i].boxes are full-frame native pixels, not grab_frames' band coordinates) | crop.grab_frames(video, times) (either fetch path) | first frame at or after the time rounded to whole ms, container-relative (crop._seek_seconds). May precede the frame's own PTS by up to one frame; never re-fetch with the PTS. |
 | OCR pass (videocr.video.Video.run_ocr) | ASS times from each frame's PTS minus the container start | range starts/ends are "MM:SS" strings: videocr.utils.get_frame_index truncates int(t * fps), then Capture.set(CAP_PROP_POS_FRAMES) | index -> first frame whose round(PTS * fps) reaches it |
 | ocr_view.grab_ocr_strips_at (brightness sampling and neighbours) | the times it was given | ocr_view.grab_ocr_strips_at(video, crop_box, times) | index round(t * fps) (rounds, where the OCR pass truncates), then the same Capture.set as the OCR pass; pixels identical to what the OCR pass masks |
 | label scanner phase 1 | PTS from Capture.get_last_pts() | Capture.seek_to_pts(pts) | first frame whose PTS is at or after it: exactly that frame |
