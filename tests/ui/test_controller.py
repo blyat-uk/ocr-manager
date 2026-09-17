@@ -45,6 +45,7 @@ from core.jobs.detect_jobs import (
 )
 from core.jobs.run import RunFile, RunJob, RunSummary
 from core.jobs.runner import JobRunner, Lane
+from core.jobs.view_jobs import FramesResult, StripsResult
 from core.project import (
     Brightness,
     Crop,
@@ -1413,3 +1414,293 @@ def test_append_log_records_text_under_a_key(make_controller, tmp_project):
     controller.append_log("Pipeline", "Unexpected error:\nTraceback ...")
     assert "Traceback ..." in controller.log_text("Pipeline")
     assert logs.calls and logs.calls[-1][0] == "Pipeline"
+
+
+# --------------------------------------------------------------------------
+# Frames and strips for the review views (plan 3C Task 1)
+# --------------------------------------------------------------------------
+
+def _frames_controller(make_controller, tmp_project, names=("ep01.mkv", "ep02.mkv")):
+    names = list(names)
+    folder = tmp_project(names, config=manual_config(names, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    return controller, folder
+
+
+def _frame(value: int, size: int = 8) -> np.ndarray:
+    return np.full((size, size, 3), value, dtype=np.uint8)
+
+
+def test_request_frames_submits_one_job_for_the_times_that_are_missing(
+        make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0])
+    controller.request_frames("ep01.mkv", [10.0, 20.0])          # still in flight: no second job
+
+    jobs = [s.job for s in fake_runner.of_kind("frames", "ep01.mkv")]
+    assert len(jobs) == 1
+    assert jobs[0].times == (10.0, 20.0)
+    assert jobs[0].lane is Lane.CPU
+
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"),
+                       FramesResult("ep01.mkv", {10.0: _frame(10), 20.0: _frame(20)}))
+    controller.drain_events()
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0, 30.0])    # only 30.0 is missing now
+    jobs = [s.job for s in fake_runner.of_kind("frames", "ep01.mkv")]
+    assert len(jobs) == 2 and jobs[1].times == (30.0,)
+
+
+def test_a_finished_frame_job_fills_the_cache_and_announces_each_frame(
+        make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    ready = Spy(controller.frame_ready)
+    image = _frame(42)
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0])
+    assert controller.frame("ep01.mkv", 10.0) is None
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"),
+                       FramesResult("ep01.mkv", {10.0: image}))   # 20.0 could not be grabbed
+    controller.drain_events()
+
+    assert controller.frame("ep01.mkv", 10.0) is image
+    assert controller.frame("ep01.mkv", 20.0) is None
+    assert ready.calls == [("ep01.mkv", 10.0)]
+
+
+def test_a_frame_job_that_fails_is_not_asked_for_again(make_controller, fake_runner, tmp_project):
+    """A failure marks every time it was asked for: one attempt per session,
+    not one per repaint."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"), None,
+                       event_type="failed", message="decode error", error="Traceback")
+    controller.drain_events()
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0])
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 1
+    assert controller.frame("ep01.mkv", 10.0) is None
+    assert "decode error" in controller.log_text("Pipeline")
+
+
+def test_a_time_that_could_not_be_grabbed_is_not_asked_for_again(make_controller, fake_runner, tmp_project):
+    """A finished job marks only the times missing from its result."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    ready = Spy(controller.frame_ready)
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"),
+                       FramesResult("ep01.mkv", {10.0: _frame(1)}))       # 20.0 could not be read
+    controller.drain_events()
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0])                   # a repaint asks again
+    controller.request_frames("ep01.mkv", [20.0])
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 1
+    assert controller.frame("ep01.mkv", 20.0) is None                     # the view draws its placeholder
+    assert ready.calls == [("ep01.mkv", 10.0)]
+
+    controller.request_frames("ep01.mkv", [30.0])                         # a time never tried still goes
+    assert [s.job.times for s in fake_runner.of_kind("frames", "ep01.mkv")] == [(10.0, 20.0), (30.0,)]
+
+
+def test_a_strip_that_could_not_be_grabbed_is_tried_again_for_a_new_crop_box(
+        make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+    fake_runner.finish(fake_runner.last("strips", "ep01.mkv"), StripsResult("ep01.mkv", BOX, {}))
+    controller.drain_events()
+
+    controller.request_strips("ep01.mkv", BOX, [10.0])                    # same box: already tried
+    assert len(fake_runner.of_kind("strips", "ep01.mkv")) == 1
+
+    controller.request_strips("ep01.mkv", OTHER_BOX, [10.0])              # another box: a new question
+    assert [s.job.crop_box for s in fake_runner.of_kind("strips", "ep01.mkv")] == [BOX, OTHER_BOX]
+
+
+def test_a_file_that_comes_back_is_tried_again(make_controller, fake_runner, tmp_project):
+    """clear_file drops the markers with the frames: a re-added file is not
+    stuck with the verdicts of the one that vanished."""
+    controller, folder = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"),
+                       FramesResult("ep01.mkv", {}), event_type="failed", message="decode error")
+    controller.drain_events()
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 1
+
+    (folder / "ep01.mkv").unlink()
+    assert wait_for(lambda: "ep01.mkv" not in controller.names(), WAIT_MS)
+    (folder / "ep01.mkv").write_bytes(b"placeholder video")
+    assert wait_for(lambda: "ep01.mkv" in controller.names(), WAIT_MS)
+
+    controller.request_frames("ep01.mkv", [10.0])
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 2
+
+
+def test_a_cancelled_frame_job_lets_a_later_request_try_again(make_controller, fake_runner, tmp_project):
+    """Cancellation is not "unavailable": nothing was learned about the time."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_frames("ep01.mkv", [10.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"), None, event_type="cancelled")
+    controller.drain_events()
+
+    controller.request_frames("ep01.mkv", [10.0])
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 2
+
+
+def test_a_cancelled_strip_job_lets_a_later_request_try_again(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+    fake_runner.finish(fake_runner.last("strips", "ep01.mkv"), None, event_type="cancelled")
+    controller.drain_events()
+
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+    assert len(fake_runner.of_kind("strips", "ep01.mkv")) == 2
+
+
+def test_request_strips_keys_the_cache_by_crop_box(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    ready = Spy(controller.strips_ready)
+    strip = _frame(7)
+
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])            # in flight: no second job
+    controller.request_strips("ep01.mkv", OTHER_BOX, [10.0])      # another box is another request
+
+    jobs = [s.job for s in fake_runner.of_kind("strips", "ep01.mkv")]
+    assert [(job.crop_box, job.times) for job in jobs] == [(BOX, (10.0,)), (OTHER_BOX, (10.0,))]
+
+    fake_runner.finish(fake_runner.of_kind("strips", "ep01.mkv")[0],
+                       StripsResult("ep01.mkv", BOX, {10.0: strip}))
+    controller.drain_events()
+
+    assert controller.strip("ep01.mkv", BOX, 10.0) is strip
+    assert controller.strip("ep01.mkv", OTHER_BOX, 10.0) is None
+    assert ready.calls == [("ep01.mkv",)]
+
+
+def test_changing_the_crop_drops_the_files_strips(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+    controller.request_strips("ep02.mkv", BOX, [10.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"), FramesResult("ep01.mkv", {10.0: _frame(1)}))
+    fake_runner.finish(fake_runner.last("strips", "ep01.mkv"), StripsResult("ep01.mkv", BOX, {10.0: _frame(2)}))
+    fake_runner.finish(fake_runner.last("strips", "ep02.mkv"), StripsResult("ep02.mkv", BOX, {10.0: _frame(3)}))
+    controller.drain_events()
+
+    controller.set_crop("ep01.mkv", OTHER_BOX)
+
+    assert controller.strip("ep01.mkv", BOX, 10.0) is None        # measured on a box that is gone
+    assert controller.strip("ep02.mkv", BOX, 10.0) is not None
+    assert controller.frame("ep01.mkv", 10.0) is not None         # frames do not depend on the crop
+
+
+def test_a_removed_file_loses_its_frames(make_controller, fake_runner, tmp_project):
+    controller, folder = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"), FramesResult("ep01.mkv", {10.0: _frame(1)}))
+    fake_runner.finish(fake_runner.last("strips", "ep01.mkv"), StripsResult("ep01.mkv", BOX, {10.0: _frame(2)}))
+    controller.drain_events()
+
+    (folder / "ep01.mkv").unlink()
+    assert wait_for(lambda: "ep01.mkv" not in controller.names(), WAIT_MS)
+
+    assert controller.frame("ep01.mkv", 10.0) is None
+    assert controller.strip("ep01.mkv", BOX, 10.0) is None
+
+
+def test_a_frame_of_a_removed_file_is_never_cached(make_controller, fake_runner, tmp_project):
+    controller, folder = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    submission = fake_runner.last("frames", "ep01.mkv")
+
+    (folder / "ep01.mkv").unlink()
+    assert wait_for(lambda: "ep01.mkv" not in controller.names(), WAIT_MS)
+    fake_runner.finish(submission, FramesResult("ep01.mkv", {10.0: _frame(1)}))
+    controller.drain_events()
+
+    assert controller.frame("ep01.mkv", 10.0) is None
+
+
+def test_closing_the_folder_forgets_every_frame(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"), FramesResult("ep01.mkv", {10.0: _frame(1)}))
+    controller.drain_events()
+
+    controller.close_folder()
+
+    assert controller.frame("ep01.mkv", 10.0) is None
+
+
+def test_frames_and_strips_are_not_activity(make_controller, fake_runner, tmp_project):
+    """A view repainting must not push the detectors out of the activity
+    strip (or its five-deep "recent" list)."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.drain_events()
+    before = controller.activity()
+    changed = Spy(controller.activity_changed)
+
+    controller.request_frames("ep01.mkv", [10.0])
+    submission = fake_runner.last("frames", "ep01.mkv")
+    fake_runner.start(submission)
+    controller.drain_events()
+    assert controller.activity() == before
+
+    fake_runner.finish(submission, FramesResult("ep01.mkv", {10.0: _frame(1)}))
+    controller.drain_events()
+    assert controller.activity() == before
+    assert changed.calls == []
+
+
+def test_a_frame_the_cache_evicted_is_not_taken_for_unreadable(make_controller, fake_runner, tmp_project):
+    """"Unavailable" means the grab failed, never "the LRU dropped it": the
+    times that could not be read come from the result, not from what is still
+    in the cache when the last frame of the batch has been stored."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller._frames.max_bytes = 100                        # two of these frames fit, not three
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0, 30.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"),
+                       FramesResult("ep01.mkv", {time: _frame(int(time), size=4) for time in (10.0, 20.0, 30.0)}))
+    controller.drain_events()
+    assert controller.frame("ep01.mkv", 10.0) is None         # evicted, not unreadable
+    assert controller.frame("ep01.mkv", 30.0) is not None
+
+    controller.request_frames("ep01.mkv", [10.0])
+    assert [s.job.times for s in fake_runner.of_kind("frames", "ep01.mkv")] == [(10.0, 20.0, 30.0), (10.0,)]
+
+
+def test_requesting_frames_without_an_open_folder_does_nothing(make_controller, fake_runner, tmp_project):
+    """Views ask from paintEvent: a repaint between close_folder() and the
+    view hearing about it must not raise."""
+    controller = make_controller()
+    controller.request_frames("ep01.mkv", [10.0])             # no folder has ever been open
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+
+    controller.open_folder(str(tmp_project(["ep01.mkv"], config=manual_config(["ep01.mkv"]))))
+    controller.close_folder()
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+
+    controller.shutdown(timeout=0.5)
+    controller.request_frames("ep01.mkv", [10.0])             # and on the way out
+
+    assert fake_runner.of_kind("frames") == [] and fake_runner.of_kind("strips") == []
+    assert controller.frame("ep01.mkv", 10.0) is None
+    assert controller.strip("ep01.mkv", BOX, 10.0) is None
+
+
+def test_requesting_frames_for_an_unknown_file_is_refused(make_controller, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    with pytest.raises(KeyError):
+        controller.request_frames("nope.mkv", [10.0])
+    with pytest.raises(KeyError):
+        controller.request_strips("nope.mkv", BOX, [10.0])
