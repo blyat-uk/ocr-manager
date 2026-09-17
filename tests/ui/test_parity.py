@@ -390,7 +390,9 @@ def test_no_module_imports_the_removed_ones():
     offenders = []
     for path in sorted(REPO_ROOT.rglob("*.py")):
         relative = path.relative_to(REPO_ROOT)
-        if set(relative.parts) & {".venv", ".worktrees", "build", "dist"}:
+        # Skip everything that is not this project's source: virtualenvs,
+        # worktrees, build output and any other dot-directory.
+        if any(part.startswith(".") for part in relative.parts) or set(relative.parts) & {"build", "dist"}:
             continue
         if relative.as_posix() == "tests/test_ocr_kwargs.py":
             continue            # its skip guard imports them on purpose, inside try/except ImportError
