@@ -5,8 +5,10 @@ then files in name order -- appended live from `controller.log_appended`.
 Each section shows at most `LOG_LIMIT` characters (~500 KB), dropping the
 oldest text first, as the controller's log book keeps it. A run start (or a
 folder change) restarts the logs: `logs_cleared` rebuilds the sections from
-`controller.log_keys()`. `show_key(key)` expands a section and scrolls to it
-("Open logs" on a queue row).
+`controller.log_keys()`, keeping which sections were open and where the
+window was scrolled -- a run start must not collapse the log the user is
+reading. `show_key(key)` expands a section and scrolls to it ("Open logs" on
+a queue row).
 """
 from __future__ import annotations
 
@@ -14,13 +16,13 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
-from app.logbook import DETECTIONS_LOG, LOG_LIMIT, PIPELINE_LOG
+from app.logbook import FIRST_KEYS, LOG_LIMIT
 
 LOGS_TITLE = "Logs"
 LOGS_SIZE = (700, 500)
 BODY_MIN_HEIGHT, BODY_MAX_HEIGHT = 120, 300
 SCROLL_SETTLE_MS = 250          # how long show_key waits for the layout to make room before giving up
-_FIRST = {PIPELINE_LOG: 0, DETECTIONS_LOG: 1}
+_FIRST = {key: index for index, key in enumerate(FIRST_KEYS)}     # "Pipeline", then "Detections"
 
 
 def key_order(key: str) -> tuple[int, str]:
@@ -115,6 +117,7 @@ class LogsWindow(QWidget):
         self._controller = controller
         self._sections: dict[str, LogSection] = {}
         self._scroll_target: str | None = None
+        self._pending_position: int | None = None       # scroll position to restore after a reload
         self.setObjectName("LogsWindow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setWindowTitle(LOGS_TITLE)
@@ -162,13 +165,22 @@ class LogsWindow(QWidget):
     # --- commands ---------------------------------------------------------------------------
 
     def reload(self) -> None:
-        """Rebuild every section from the controller's logs."""
+        """Rebuild every section from the controller's logs, keeping the
+        sections that were open open and the scroll position."""
+        expanded = {key: section.is_expanded() for key, section in self._sections.items()}
+        position = self.scroll_area.verticalScrollBar().value()
         for section in self._sections.values():
             self._layout.removeWidget(section)
             section.deleteLater()
         self._sections = {}
         for key in self._controller.log_keys():
-            self._section_for(key).set_text(self._controller.log_text(key))
+            section = self._section_for(key)
+            section.set_text(self._controller.log_text(key))
+            section.set_expanded(expanded.get(key, False))
+        if position:
+            self._pending_position = position
+            self._settle_timer.start()
+            self._scroll_timer.start()
 
     def show_key(self, key: str) -> None:
         """Expand `key`'s section (an empty one when it has no log yet) and
@@ -196,20 +208,26 @@ class LogsWindow(QWidget):
         self._section_for(key).append(text)
 
     def _scroll_to_target(self) -> None:
-        """Put the target section at the top, as far as the list scrolls. The
-        list may not have grown yet: then each range change tries again,
-        until SCROLL_SETTLE_MS after show_key."""
-        section = self._sections.get(self._scroll_target) if self._scroll_target is not None else None
-        if section is None:
-            self._forget_target()
-            return
+        """Put the target section at the top (or restore the position a
+        reload had), as far as the list scrolls. The list may not have grown
+        yet: then each range change tries again, until SCROLL_SETTLE_MS."""
         bar = self.scroll_area.verticalScrollBar()
-        bar.setValue(min(section.y(), bar.maximum()))
+        if self._scroll_target is not None:
+            section = self._sections.get(self._scroll_target)
+            if section is None:
+                self._forget_target()
+                return
+            bar.setValue(min(section.y(), bar.maximum()))
+        elif self._pending_position is not None:
+            bar.setValue(min(self._pending_position, bar.maximum()))
+            if bar.maximum() >= self._pending_position:
+                self._pending_position = None
 
     def _on_range_changed(self, _minimum: int, _maximum: int) -> None:
-        if self._scroll_target is not None:
+        if self._scroll_target is not None or self._pending_position is not None:
             self._scroll_to_target()
 
     def _forget_target(self) -> None:
         self._scroll_target = None
+        self._pending_position = None
         self._settle_timer.stop()

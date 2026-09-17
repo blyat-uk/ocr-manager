@@ -478,6 +478,9 @@ QWidget#RunRow, QWidget#RunHeader {{
     background: transparent;
     border-bottom: 1px solid {tokens.LINE};
 }}
+QWidget#RunRow[last="true"] {{
+    border-bottom: none;
+}}
 QLabel#RunHeaderCell {{
     color: {tokens.DIM2};
     font-size: {tokens.FONT_SIZE_SCOPE}px;

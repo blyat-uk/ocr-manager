@@ -9,15 +9,16 @@ while the review queue stays.
   running and full when done; "{n} lines".
 - Footer: "GPU {p}%" from `nvidia-smi`, run through an async QProcess every
   2 s only while this view is visible and a run is active, hidden when the
-  query fails; and one raise offer (`raise_offer`) with a ghost
-  "raise to {m}" button that calls `update_folder(ocr_parallel=m)`, which
-  reaches the running job (RunJob.set_parallel):
-    - "{k} workers idle →", m = the folder's parallel, when the run has
-      worker slots it is not using while files wait (`idle_workers`, B13);
-    - otherwise "{q} files queued ·", m = parallel + 2 capped at
-      MAX_PARALLEL, while files wait and the folder is below that cap -- the
-      case that actually comes up, since the run job fills a free worker at
-      once (B13 as amended).
+  query fails; and one hint about the files still waiting (`raise_offer`):
+    - "{k} workers idle" -- text only, since the run already has every
+      worker its parallel allows and there is nothing to raise to -- when it
+      leaves worker slots unused while files wait (`idle_workers`, B13);
+    - otherwise "{q} files queued ·" with a ghost "raise to {m}" button,
+      m = parallel + 2 capped at MAX_PARALLEL, while files wait and the
+      folder is below that cap. This is the case that actually comes up,
+      since the run job fills a free worker at once (B13 as amended). The
+      button calls `update_folder(ocr_parallel=m)`, which reaches the
+      running job (RunJob.set_parallel).
 - Right panel (300 px) "LIVE · {file}": the recognised lines of the followed
   file ("MM:SS text"), by default the most recently started file; "follow ▾"
   picks another. Then the note that reviewing goes on meanwhile.
@@ -66,7 +67,7 @@ RAISE_TOOLTIP = ("Run up to {m} files at once. Files already running carry on; t
                  "that have not started yet.")
 MAX_PARALLEL = 8                            # the folder settings sheet's upper bound for "parallel files"
 PARALLEL_STEP = 2                           # how much "raise to" offers above the folder's parallel
-IDLE_HINT = "{count} {noun} idle →"
+IDLE_HINT = "{count} {noun} idle"
 QUEUED_HINT = "{count} {noun} queued ·"
 RAISE_TEXT = "raise to {m}"
 
@@ -92,14 +93,16 @@ def lines_text(count: int) -> str:
     return f"{count} line" if count == 1 else f"{count} lines"
 
 
-def raise_offer(snapshot, parallel: int) -> tuple[str, int] | None:
-    """The footer's raise offer: (hint text, the parallel to offer), or None
-    when there is nothing to offer (see this module's docstring)."""
+def raise_offer(snapshot, parallel: int) -> tuple[str, int | None] | None:
+    """The footer's hint about the files still waiting: (text, the parallel
+    to offer), the parallel None when the line is text only because there is
+    nothing to raise to. None at all when there is nothing to say (see this
+    module's docstring)."""
     if snapshot is None or snapshot.finished or snapshot.paused or snapshot.stopping:
         return None
     idle = idle_workers(snapshot, parallel)
     if idle > 0:
-        return IDLE_HINT.format(count=idle, noun="worker" if idle == 1 else "workers"), parallel
+        return IDLE_HINT.format(count=idle, noun="worker" if idle == 1 else "workers"), None
     queued = snapshot.count(QUEUED)
     if queued > 0 and parallel < MAX_PARALLEL:
         return (QUEUED_HINT.format(count=queued, noun="file" if queued == 1 else "files"),
@@ -207,6 +210,8 @@ class GpuMeter(QObject):
         process.deleteLater()
 
     def _set(self, value: int | None) -> None:
+        if value == self._value:
+            return                          # every poll otherwise repaints the footer for nothing
         self._value = value
         self.changed.emit(value)
 
@@ -277,6 +282,7 @@ class RunRow(QWidget):
         self._shown: RunFileRow | None = None
         self.setObjectName("RunRow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setProperty("last", False)
         self.name_label = ElidedLabel(name)
         self.name_label.setObjectName("RunFile")
 
@@ -300,6 +306,12 @@ class RunRow(QWidget):
         self.result_label.setObjectName("RunResult")
         _fill_grid(self, [self.name_label, phase, bar, self.result_label])
         self.update_from(RunFileRow(name))
+
+    def set_last(self, last: bool) -> None:
+        """The last row of the table draws no bottom border (ui-spec §3.10)."""
+        if self.property("last") != last:
+            self.setProperty("last", last)
+            repolish(self)
 
     def phase_tone(self) -> str:
         return self.phase_label.property("tone")
@@ -405,7 +417,7 @@ class RunView(QWidget):
         self._rows: dict[str, RunRow] = {}
         self._pinned: str | None = None          # the file chosen with "follow ▾"; None follows the newest
         self._followed: str | None = None
-        self._raise_to = 0
+        self._raise_to: int | None = None        # what "raise to" offers; None when there is no button
         self.setObjectName("RunView")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
@@ -521,10 +533,12 @@ class RunView(QWidget):
         return [line.text() for line in self._feed_lines()]
 
     def hint_text(self) -> str:
-        """The footer's raise offer as one line ("3 files queued · raise to
-        6"); "" when there is none."""
+        """The footer's hint as one line ("3 files queued · raise to 6", or
+        "2 workers idle" when there is no button); "" when there is none."""
         if self.hint_label.isHidden():
             return ""
+        if self.raise_button.isHidden():
+            return self.hint_label.text()
         return f"{self.hint_label.text()} {self.raise_button.text()}"
 
     # --- refreshing ---------------------------------------------------------------------
@@ -547,8 +561,9 @@ class RunView(QWidget):
             self._rows_scroll.remove_row(row)
             row.deleteLater()
         self._rows = {}
-        for name in names:
+        for index, name in enumerate(names):
             row = RunRow(name, self._rows_scroll.content)
+            row.set_last(index == len(names) - 1)        # ui-spec §3.10: the last row has no bottom border
             self._rows[name] = row
             self._rows_scroll.add_row(row)
 
@@ -572,18 +587,19 @@ class RunView(QWidget):
             self.gpu_label.setText(f"GPU {gpu}%")
         project = controller.project
         offer = raise_offer(snapshot, project.folder.ocr_parallel) if project is not None else None
+        hint, self._raise_to = offer if offer is not None else ("", None)
         self.hint_label.setVisible(offer is not None)
-        self.raise_button.setVisible(offer is not None)
+        self.raise_button.setVisible(self._raise_to is not None)
         if offer is not None:
-            hint, self._raise_to = offer
             self.hint_label.setText(hint)
+        if self._raise_to is not None:
             self.raise_button.setText(RAISE_TEXT.format(m=self._raise_to))
             self.raise_button.setToolTip(RAISE_TOOLTIP.format(m=self._raise_to))
         self.gpu_separator.setVisible(gpu is not None and offer is not None)
         self.footer.setVisible(gpu is not None or offer is not None)
 
     def _raise_parallel(self) -> None:
-        if self._raise_to > 0 and self._controller.project is not None:
+        if self._raise_to is not None and self._controller.project is not None:
             self._controller.update_folder(ocr_parallel=self._raise_to)
 
     # --- GPU ------------------------------------------------------------------------------

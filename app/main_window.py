@@ -94,6 +94,7 @@ MODE_REVIEW, MODE_RUN = 0, 1
 OVERWRITE_TITLE = "Replace existing subtitles?"
 OVERWRITE_TEXT = ("{n} file(s) already have subtitles in chi/. Re-run and replace them when their new output "
                   "is ready?")
+NOTHING_TO_RUN = "Nothing to run — the files you picked already have subtitles."
 
 
 def dependency_problems() -> list[tuple[str, str]]:
@@ -320,6 +321,8 @@ class MainWindow(QMainWindow):
             if reply != answers.Yes:
                 names = [name for name in names if name not in set(replace)]
         if not names:
+            if replace:                                  # every file was declined: say so instead of nothing
+                self.topbar.show_start_error(NOTHING_TO_RUN)
             return
         try:
             controller.start_run(names)

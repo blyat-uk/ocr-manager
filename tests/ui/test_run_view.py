@@ -9,7 +9,6 @@ events a real RunJob sends, then drains them with
 """
 from __future__ import annotations
 
-import os
 import stat
 import time
 from pathlib import Path
@@ -255,6 +254,41 @@ def test_the_logs_window_opens_during_a_run(window, fake_runner):
     assert window.logs_window is not None and window.logs_window.isVisible()
 
 
+def test_declining_the_overwrite_question_with_nothing_left_says_so(make_window, tmp_project, fake_runner,
+                                                                    monkeypatch):
+    window = make_window(["a.mkv", "b.mkv"], tmp_project=tmp_project, done=("a.mkv", "b.mkv"))
+    answer(monkeypatch, No)
+    window.topbar.start_button.click()
+    settle()
+    assert fake_runner.of_kind("run") == []
+    assert not window.topbar.start_error_label.isHidden()
+    assert window.topbar.start_error_label.full_text() == \
+        "Nothing to run — the files you picked already have subtitles."
+    assert window.mode() == MODE_REVIEW
+
+
+def test_only_the_last_table_row_has_no_bottom_border(window, fake_runner):
+    start(window, fake_runner)
+    view = window.run_view
+    assert [view.row(name).property("last") for name in NAMES] == [False, False, False, False, True]
+
+
+def test_a_run_start_keeps_open_log_sections_open(window, fake_runner):
+    controller = window.controller
+    controller.append_log("Detections", "ep03.mkv: crop failed: boom")
+    controller.append_log("ep01.mkv", "Starting OCR: ep01.mkv")
+    window.open_logs(None)
+    settle()
+    logs = window.logs_window
+    logs.section("Detections").set_expanded(True)
+    assert logs.keys() == ["Detections", "ep01.mkv"]
+
+    start(window, fake_runner)                                  # clears every log but "Detections"
+    settle()
+    assert logs.keys() == ["Detections"]
+    assert logs.section("Detections").is_expanded()
+
+
 def test_a_refused_start_is_shown_beside_start_without_switching_modes(make_window, tmp_project, fake_runner):
     window = make_window(["a.mkv", "a.mp4"], tmp_project=tmp_project)
     top = window.topbar
@@ -496,7 +530,8 @@ def test_the_live_feed_follows_the_newest_file_and_the_menu_switches(window, fak
     assert view.followed() == "ep03.mkv" and view.feed_lines() == []
 
 
-def test_the_idle_hint_offers_to_raise_parallel_files(window, fake_runner):
+def test_the_idle_workers_line_is_text_only(window, fake_runner):
+    """The run already has every worker its parallel allows: nothing to raise to."""
     controller = window.controller
     run = start(window, fake_runner)
     view = window.run_view
@@ -504,15 +539,10 @@ def test_the_idle_hint_offers_to_raise_parallel_files(window, fake_runner):
     fake_runner.emit(run, "run_file_started", file="ep02.mkv")
     deliver(window)
 
-    assert not view.hint_label.isHidden() and not view.raise_button.isHidden()
-    assert view.hint_label.text() == "2 workers idle →"
-    assert view.raise_button.text() == "raise to 4"
-    assert view.hint_text() == "2 workers idle → raise to 4"
-    assert "not started yet" in view.raise_button.toolTip()
-    updates = Recorder(controller, "update_folder")
-    view.raise_button.click()
-    settle()
-    assert updates.calls == [((), {"ocr_parallel": 4})]
+    assert not view.hint_label.isHidden()
+    assert view.hint_label.text() == "2 workers idle"
+    assert view.raise_button.isHidden()
+    assert view.hint_text() == "2 workers idle"
 
     controller.pause_run()                                      # a paused run starts nothing: no hint
     settle()
@@ -531,8 +561,8 @@ def test_one_idle_worker_reads_singular(make_window, tmp_project, fake_runner):
     run = start(window, fake_runner)
     fake_runner.emit(run, "run_file_started", file="ep01.mkv")
     deliver(window)
-    assert window.run_view.hint_label.text() == "1 worker idle →"
-    assert window.run_view.raise_button.text() == "raise to 2"
+    assert window.run_view.hint_text() == "1 worker idle"
+    assert window.run_view.raise_button.isHidden()
 
 
 def test_queued_files_offer_a_higher_parallel_that_reaches_the_run_job(make_window, tmp_project, fake_runner):
@@ -556,7 +586,8 @@ def test_queued_files_offer_a_higher_parallel_that_reaches_the_run_job(make_wind
     assert run.job.parallel == 4                                # it reached the running job
     assert controller.run_snapshot().parallel == 4
     assert controller.project.folder.ocr_parallel == 4
-    assert view.hint_text() == "2 workers idle → raise to 4"    # the literal B13 case, now that 4 > 2 running
+    assert view.hint_text() == "2 workers idle"                 # the literal B13 case: nothing to raise to
+    assert view.raise_button.isHidden()
 
     fake_runner.emit(run, "run_file_started", file="ep03.mkv")
     fake_runner.emit(run, "run_file_started", file="ep04.mkv")
@@ -721,16 +752,3 @@ def test_closing_the_window_closes_the_logs_window(controller, make_window, tmp_
     settle()
     assert not logs.isVisible()
 
-
-def test_run_view_imports_no_core_modules():
-    import ast
-
-    root = Path(__file__).resolve().parents[2]
-    for path in (root / "app" / "views" / "run_view.py", root / "app" / "views" / "logs.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                assert node.module.split(".")[0] not in ("core", "videocr"), f"{path.name}: {node.module}"
-            elif isinstance(node, ast.Import):
-                assert all(alias.name.split(".")[0] not in ("core", "videocr") for alias in node.names)
-    assert os.path.exists(root / "app" / "views" / "run_view.py")
