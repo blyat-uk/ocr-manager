@@ -33,7 +33,7 @@ a result without review.
 |---|---|---|
 | crop.detect_crop | cancel_check callable, polled during audio extraction (every 0.1 s), between probe batches and between rounds | a CropResult, not an exception: flagged gains "cancelled", and `box` is whatever the evidence so far gives -- possibly clipped, possibly None. auto_applicable is False. |
 | brightness.detect_brightness | cancel_check callable, polled before each sampling round, before OCR verification, and before each OCR batch / neighbour grab of the dim-text check | a BrightnessResult with flagged == "cancelled", value DEFAULT_BRIGHTNESS (nothing measured), plateau None, curve [], strips [], clutter_curve []. auto_applicable is False. |
-| ranges.pipeline.analyse | cancel callable, polled between files and between phases | raises ranges.pipeline.AnalysisCancelled (no partial result). core/audio_analysis.py turns it into finished({}). |
+| ranges.pipeline.analyse | cancel callable, polled between files and between phases | raises ranges.pipeline.AnalysisCancelled (no partial result). core.jobs.detect_jobs.RangesJob turns it into a None result. |
 
 (c) Flags and auto_applicable. Both detectors join reasons with "+"
     (`flagged` is None when clean) and expose `auto_applicable`: True only
@@ -45,15 +45,16 @@ a result without review.
 |---|---|---|
 | crop (CropResult; per-flag reasons in its auto_applicable docstring) | no-speech, speech-probes-exhausted | top-positioned?, low-agreement, static-content?, multiple-positions?, outlier-discarded?, cancelled; and, always without a box, static-content, ceiling-exceeded, unknown-rejection. A result without a box is never auto-applicable. |
 | brightness (BrightnessResult) | no-clean-threshold | needs-crop, ranges-empty?, no-text, thin-evidence?, coloured-text?, no-plateau?, narrow-plateau?, dim-text?, escalate (cheap path: re-run full detection), cancelled |
-| ranges | no flags. A file absent from analyse()'s result has no keep ranges (no repeated segment, or no gap of MIN_GAP_SEC): OCR it whole | nothing is flagged; decode errors (e.g. no audio stream) raise, and core/audio_analysis.py reports them through error() |
+| ranges | no flags. A file absent from analyse()'s result has no keep ranges (no repeated segment, or no gap of MIN_GAP_SEC): OCR it whole | nothing is flagged; decode errors (e.g. no audio stream) raise, and core.jobs.detect_jobs.RangesJob lets them fail the job |
 
-(d) Values detectors take from core.config.Config's DEFAULTS, not from the
+(d) Values detectors take from core.project.model.FolderSettings' DEFAULTS
+    (brightness's fallback from core.project.ocr_kwargs), not from the
     user's settings. Threading a user value through would touch several
     internal call sites in each case, so they are listed here instead.
 
 | detector | value | used for | effect of a user setting that differs |
 |---|---|---|---|
-| crop | Config.label_max_duration (5.0 s) | WATERMARK_MIN_SPAN_SEC = it + 1.0 s: the span identical extents must cover before a box is rejected as a watermark (static-content) rather than kept as static-content? | a user who raised label_max_duration still gets the 6 s watermark span |
-| brightness | Config.ocr_lang ("ch") | _reading() joins OCR words the way the OCR pass does for that language (no spaces for "ch") | for another OCR language, readings are joined without spaces, so modal agreement compares differently joined text than that OCR pass emits |
-| brightness | Config.brightness (230) | DEFAULT_BRIGHTNESS: the value reported when nothing was measured | none: such results are flagged and never auto-applicable |
+| crop | FolderSettings.label_max_duration (5.0 s) | WATERMARK_MIN_SPAN_SEC = it + 1.0 s: the span identical extents must cover before a box is rejected as a watermark (static-content) rather than kept as static-content? | a user who raised label_max_duration still gets the 6 s watermark span |
+| brightness | FolderSettings.ocr_lang ("ch") | _reading() joins OCR words the way the OCR pass does for that language (no spaces for "ch") | for another OCR language, readings are joined without spaces, so modal agreement compares differently joined text than that OCR pass emits |
+| brightness | ocr_kwargs.DEFAULT_BRIGHTNESS (230) | DEFAULT_BRIGHTNESS: the value reported when nothing was measured | none: such results are flagged and never auto-applicable |
 """

@@ -220,7 +220,7 @@ class ThumbnailJob:
 
 
 class RangesJob:
-    """Folder-wide keep-range analysis, configured exactly as the old app's
+    """Folder-wide keep-range analysis, configured exactly as the v1 app's
     core/audio_analysis.py configured it, with its fingerprint cache."""
 
     kind = "ranges"

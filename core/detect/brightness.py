@@ -84,31 +84,34 @@ import cv2
 import numpy as np
 from rapidfuzz.distance import Levenshtein
 
-from core.config import Config as _Config
 from core.detect import ocr_view
 from core.detect.flags import compose_flag as _compose_flag
 from core.detect.flags import is_cancelled as _is_cancelled
 from core.detect.flags import only_informational
+from core.project.model import FolderSettings as _FolderSettings
+from core.project.ocr_kwargs import DEFAULT_BRIGHTNESS as _DEFAULT_BRIGHTNESS
 from videocr import utils as _videocr_utils
 from videocr.models import PredictedFrames
 
 logger = logging.getLogger(__name__)
 
 
-def _config_default(name: str, fallback):
-    """core.config.Config's own default for `name`, so this module follows the
-    app's defaults instead of keeping twins of them."""
-    for f in _dataclass_fields(_Config):
+def _folder_default(name: str, fallback):
+    """core.project.model.FolderSettings' own default for `name`, so this
+    module follows the app's defaults instead of keeping twins of them."""
+    for f in _dataclass_fields(_FolderSettings):
         if f.name == name:
             return f.default
     return fallback
 
 
 # Value reported when nothing could be measured (no crop, no text, cancelled).
-# Such results are always flagged and never auto-applicable.
-DEFAULT_BRIGHTNESS = int(_config_default("brightness", 230))
+# Such results are always flagged and never auto-applicable. It is the value
+# core/project/ocr_kwargs.py falls back to for a file with no brightness, so
+# the two can never drift apart.
+DEFAULT_BRIGHTNESS = int(_DEFAULT_BRIGHTNESS)
 # Language the OCR pass joins words for (no spaces for 'ch').
-OCR_LANG = _config_default("ocr_lang", "ch")
+OCR_LANG = _folder_default("ocr_lang", "ch")
 
 # --- Sampling
 FULL_SAMPLE_FRAMES = 24

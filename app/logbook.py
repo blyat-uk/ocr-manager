@@ -1,4 +1,4 @@
-"""Log text per key, as today's core/log_store.py kept it: appended text, the
+"""Log text per key, as the v1 app's core/log_store.py kept it: appended text, the
 oldest text dropped past LOG_LIMIT characters per key. Keys: "Pipeline" (the
 run and the controller), "Detections" (failed detection and proof jobs: they
 are not retried, so this is their only record and a run start keeps it) and

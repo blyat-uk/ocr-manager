@@ -61,21 +61,25 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BOX = (288, 786, 1344, 53)
 Yes, No = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
 
-# Modules the old window lived in. They are gone (plan 3B Task 6, ruling C10)
-# and nothing may import them again.
-REMOVED_MODULES = [
+# Source files the old window lived in. They are gone (plan 3B Task 6,
+# ruling C10) and nothing may import them again.
+REMOVED_FILES = [
     "widgets",
-    "theme",
-    "core.pipeline",
-    "core.ocr_manager",
-    "core.ocr_worker",
-    "core.subtitle_detector",
-    "core.audio_analysis",
-    "core.config",
-    "core.config_saver",
-    "core.log_store",
-    "qt_material",
+    "theme.py",
+    "core/pipeline.py",
+    "core/ocr_manager.py",
+    "core/ocr_worker.py",
+    "core/subtitle_detector.py",
+    "core/audio_analysis.py",
+    "core/config.py",
+    "core/config_saver.py",
+    "core/log_store.py",
 ]
+REMOVED_MODULES = [name.removesuffix(".py").replace("/", ".") for name in REMOVED_FILES if name.endswith(".py")]
+# Dependencies only the old window needed (rulings C9/C10). They may still sit
+# in a developer's virtualenv, so what is pinned is that the project no longer
+# asks for them.
+REMOVED_REQUIREMENTS = ["qt-material", "qtawesome"]
 
 # §11 row -> the tests that keep it. "file::test" is looked up in that file;
 # a bare name is a test in this file.
@@ -343,13 +347,23 @@ def test_the_old_window_and_its_dead_support_code_are_gone():
     dead widgets and the dead config code are deleted."""
     import importlib.util
 
-    still_there = [name for name in REMOVED_MODULES if importlib.util.find_spec(name) is not None]
-    assert still_there == []
+    assert [name for name in REMOVED_FILES if (REPO_ROOT / name).exists()] == []
+    assert [name for name in REMOVED_MODULES if importlib.util.find_spec(name) is not None] == []
 
     source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
     assert "from app.__main__ import main" in source
     assert "multiprocessing.freeze_support()" in source
     assert "QMainWindow" not in source
+
+
+def test_the_old_windows_own_dependencies_are_no_longer_required():
+    """Ruling C9: the new window does not use qt-material, and nothing needs
+    qtawesome any more."""
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    for name in REMOVED_REQUIREMENTS:
+        assert name not in requirements, name
+        assert name not in pyproject, name
 
 
 def test_main_py_launches_the_new_window(tmp_path):
@@ -375,9 +389,11 @@ def test_no_module_imports_the_removed_ones():
                "core.audio_analysis", "core.config_saver", "core.log_store", "qt_material", "qtawesome")
     offenders = []
     for path in sorted(REPO_ROOT.rglob("*.py")):
-        parts = set(path.relative_to(REPO_ROOT).parts)
-        if parts & {".venv", ".worktrees", "build", "dist"}:
+        relative = path.relative_to(REPO_ROOT)
+        if set(relative.parts) & {".venv", ".worktrees", "build", "dist"}:
             continue
+        if relative.as_posix() == "tests/test_ocr_kwargs.py":
+            continue            # its skip guard imports them on purpose, inside try/except ImportError
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
