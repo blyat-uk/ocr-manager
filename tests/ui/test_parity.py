@@ -80,6 +80,20 @@ REMOVED_MODULES = [name.removesuffix(".py").replace("/", ".") for name in REMOVE
 # in a developer's virtualenv, so what is pinned is that the project no longer
 # asks for them.
 REMOVED_REQUIREMENTS = ["qt-material", "qtawesome"]
+# Import roots nothing may name again: the removed modules, the removed
+# top-level `widgets` package, and the dependencies only the old window used.
+# `app.widgets` / `app.theme` are the NEW window's own packages and are not
+# these (see imports_a_removed_module: a root matches only as a whole path or
+# as the parent of one).
+REMOVED_IMPORT_ROOTS = [*REMOVED_MODULES, "widgets", "qt_material", "qtawesome"]
+
+
+def imports_a_removed_module(module: str) -> bool:
+    """True when the dotted `module` IS one of REMOVED_IMPORT_ROOTS or lives
+    under one. Whole-path matching, so `import widgets` and
+    `from widgets import x` are caught as well as `import widgets.file_table`,
+    and `app.widgets.base` is not."""
+    return any(module == root or module.startswith(root + ".") for root in REMOVED_IMPORT_ROOTS)
 
 # §11 row -> the tests that keep it. "file::test" is looked up in that file;
 # a bare name is a test in this file.
@@ -396,11 +410,21 @@ def test_main_py_and_python_m_app_both_describe_themselves(tmp_path):
     assert usage(["-m", "app"]).startswith("usage: python -m app")
 
 
+def test_the_removed_module_matcher_matches_whole_paths():
+    """A bare `import widgets` must be caught, and the new window's own
+    `app.widgets` must not (an earlier version matched the prefix "widgets."
+    and missed the bare form)."""
+    for caught in ("widgets", "widgets.file_table", "theme", "core.config", "core.config.Config",
+                   "core.ocr_worker", "qt_material", "qtawesome"):
+        assert imports_a_removed_module(caught), caught
+    for allowed in ("app", "app.widgets", "app.widgets.base", "app.theme", "app.theme.tokens",
+                    "core", "core.project", "core.jobs.run", "widgetsmith", "themes"):
+        assert not imports_a_removed_module(allowed), allowed
+
+
 def test_no_module_imports_the_removed_ones():
     """The cut-over's grep, as a test: no source file outside .venv may name
     a removed module again."""
-    needles = ("widgets.", "core.pipeline", "core.ocr_manager", "core.ocr_worker", "core.subtitle_detector",
-               "core.audio_analysis", "core.config_saver", "core.log_store", "qt_material", "qtawesome")
     offenders = []
     for path in sorted(REPO_ROOT.rglob("*.py")):
         relative = path.relative_to(REPO_ROOT)
@@ -418,11 +442,7 @@ def test_no_module_imports_the_removed_ones():
                 modules = [node.module]
             else:
                 continue
-            for module in modules:
-                if module.startswith("app."):
-                    continue                            # app.widgets is the new window's own package
-                if module in ("core.config", "theme") or any(module.startswith(n) for n in needles):
-                    offenders.append(f"{path.relative_to(REPO_ROOT)}: {module}")
+            offenders += [f"{relative}: {module}" for module in modules if imports_a_removed_module(module)]
     assert offenders == []
 
 
