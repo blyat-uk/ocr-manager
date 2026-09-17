@@ -3,9 +3,16 @@
 
 - `DetectedSection`: "DETECTED" -- Crop, Brightness and OCR window rows with
   confidence bars (`state_text` captions); a click on a row asks for its tab.
-- `ProofSection`: "PROOF · REAL OCR OF 30 S" -- "running…" while the proof
-  runs, then up to three "MM:SS text" lines and "{n} lines · took {s} s".
-- `ChangeOffer`: "IF YOU CHANGE SOMETHING HERE" -- the hint re-detect offer.
+  Its note carries the series-median brightness sentence.
+- `ProofSection`: "PROOF · REAL OCR OF 30 S" (ruling C4) -- "running on
+  MM:SS-MM:SS…" while the proof runs, then up to PROOF_LINES_SHOWN "MM:SS
+  text" lines ("show all" reveals the rest), and "{n} lines · took {s} s".
+  A result whose settings have since changed keeps its lines and says so.
+- `ChangeOffer`: "IF YOU CHANGE SOMETHING HERE" -- the hint re-detect offer
+  (ruling C3), one button per kind the user edited in this session.
+
+These widgets hold no state about which file they describe and never call
+the controller: `Inspector` decides what to show and when.
 """
 from __future__ import annotations
 
@@ -24,9 +31,30 @@ from app.state_text import (
 )
 from app.widgets.base import Button, ConfBar, KvRow, SectionHeader, repolish
 
-PROOF_LINES_SHOWN = 3
+PROOF_LINES_SHOWN = 6             # more recognised lines than this hide behind "show all"
 PULSE_MS = 1400
 PULSE_LOW_OPACITY = 0.35
+
+VALUES_NOTE = "Values belong to this file."
+SHOW_ALL_TEXT = "show all"
+STALE_TEXT = "settings changed — run again"
+NO_LINES_TEXT = "No subtitles recognised in this window — check crop and brightness."
+RUNNING_TEXT = "running on {window}…"
+RUNNING_UNKNOWN_TEXT = "running…"            # defensive: run_proof refuses an unknown duration
+HINT_TEXT = "↻ re-detect the other {count} using this {what} as a hint"
+HINT_WRAP_AT = " using "                     # see hint_text()
+REDETECTING_TEXT = "re-detecting {count} files…"
+HINT_KINDS = ("crop", "brightness")          # the two kinds ruling C3 offers, in inspector order
+
+
+def hint_text(count: int, what: str, *, wrapped: bool = False) -> str:
+    """ui-spec §3.7's hint button label. `wrapped` breaks it over two lines,
+    which is how it is shown: one line of it is wider than the whole 322 px
+    inspector, and the mockup's `.btn` (inline-flex, no `white-space`) wraps
+    the same way inside the column. A QPushButton renders the newline but
+    never inserts one itself."""
+    text = HINT_TEXT.format(count=count, what=what)
+    return text.replace(HINT_WRAP_AT, "\nusing ", 1) if wrapped else text
 
 
 def small_button(text: str, variant: str = "default") -> Button:
@@ -89,7 +117,8 @@ class DetectedSection(Section):
         self.crop_row, self.crop_conf = self._add_row("Crop")
         self.brightness_row, self.brightness_conf = self._add_row("Brightness")
         self.window_row, self.window_conf = self._add_row("OCR window")
-        self.body.addWidget(note_label("Values belong to this file."))
+        self.note_label = note_label(VALUES_NOTE)
+        self.body.addWidget(self.note_label)
 
     def _add_row(self, key: str) -> tuple[DetectedRow, ConfBar]:
         row = DetectedRow(key)
@@ -100,7 +129,11 @@ class DetectedSection(Section):
         self.body.addWidget(conf)
         return row, conf
 
-    def set_entry(self, entry) -> None:
+    def set_entry(self, entry, median_note: str = "") -> None:
+        """`median_note`: the series-median sentence (`state_text.
+        series_median_note`), appended to the section's note; "" leaves the
+        note at its first sentence."""
+        self.note_label.setText(" ".join(part for part in (VALUES_NOTE, median_note) if part))
         for field, row, conf, value, caption in (
                 ("crop", self.crop_row, self.crop_conf, crop_text(entry.crop), crop_caption),
                 ("brightness", self.brightness_row, self.brightness_conf, brightness_text(entry.brightness),
@@ -151,6 +184,13 @@ class _OcrLine(QWidget):
 
 
 class ProofSection(Section):
+    """"Proof · real OCR of 30 s" (ruling C4). Four presentations, each set by
+    the Inspector from the controller's proof state: nothing yet, running,
+    a result (fresh or stale), and a refusal ("Can't run yet: ...").
+
+    The "T run" button is disabled exactly while that file's proof runs, and
+    so is the T key that shares its command (ruling 5)."""
+
     run_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -159,7 +199,7 @@ class ProofSection(Section):
         self.run_button.clicked.connect(self.run_requested)
         self.body.addWidget(SectionHeader("Proof · real OCR of 30 s", trailing=self.run_button))
         self.body.addSpacing(8)
-        self.status_label = note_label("running…")
+        self.status_label = note_label(RUNNING_UNKNOWN_TEXT)
         self.body.addWidget(self.status_label)
         self._pulse_effect = QGraphicsOpacityEffect(self.status_label)
         self.status_label.setGraphicsEffect(self._pulse_effect)
@@ -171,55 +211,95 @@ class ProofSection(Section):
         self._pulse.setEasingCurve(QEasingCurve.Type.InOutSine)
         self._pulse.setLoopCount(-1)
         self._lines: list[_OcrLine] = []
-        for _ in range(PROOF_LINES_SHOWN):
-            line = _OcrLine()
-            self._lines.append(line)
-            self.body.addWidget(line)
+        self._lines_box = QVBoxLayout()
+        self._lines_box.setContentsMargins(0, 0, 0, 0)
+        self._lines_box.setSpacing(0)
+        self.body.addLayout(self._lines_box)
+        self.show_all_button = small_button(SHOW_ALL_TEXT, "ghost")
+        self.show_all_button.clicked.connect(self._show_all)
+        self.body.addSpacing(4)
+        self.body.addWidget(self.show_all_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.body.addSpacing(6)
         self.note_label = note_label()
         self.body.addWidget(self.note_label)
+        self._result = None
+        self._expanded = False
         self.show_nothing()
 
+    # --- the four presentations ------------------------------------------------
+
     def show_nothing(self) -> None:
-        self._set_running(False)
-        self._show_lines([])
+        """No proof has run for this file yet (or none is remembered)."""
+        self._reset()
         self._set_note("")
 
-    def show_running(self) -> None:
-        self._show_lines([])
+    def show_running(self, window_text: str | None) -> None:
+        """`window_text`: "09:38–10:08", the window OCR runs on."""
+        self._reset()
         self._set_note("")
-        self._set_running(True)
+        self.run_button.setEnabled(False)
+        self.status_label.setText(RUNNING_TEXT.format(window=window_text) if window_text
+                                  else RUNNING_UNKNOWN_TEXT)
+        self.status_label.show()
+        self._pulse.start()
 
-    def show_result(self, result) -> None:
-        self._set_running(False)
-        self._show_lines(result.lines[:PROOF_LINES_SHOWN])
-        count = len(result.lines)
-        self._set_note(f"{count} {'line' if count == 1 else 'lines'} · took {result.seconds:.1f} s")
+    def show_result(self, result, *, stale: bool = False) -> None:
+        """`stale`: the file's crop, brightness or time ranges changed since
+        this proof ran, so its lines describe settings the file no longer
+        has. They stay on screen -- they are still the last thing real OCR
+        saw -- under a note asking for another run."""
+        collapse = result is not self._result
+        self._reset()
+        if collapse:
+            self._expanded = False
+        self._result = result
+        self._show_lines(result.lines)
+        if stale:
+            self._set_note(STALE_TEXT)
+        elif not result.lines:
+            self._set_note(NO_LINES_TEXT, "warn")
+        else:
+            count = len(result.lines)
+            self._set_note(f"{count} {'line' if count == 1 else 'lines'} · took {result.seconds:.1f} s")
 
     def show_error(self, message: str) -> None:
-        self._set_running(False)
-        self._show_lines([])
+        """The proof could not be asked for at all (an unknown duration)."""
+        self.show_nothing()
         self._set_note(message, "warn")
 
     def texts(self) -> list[str]:
         return [line.text() for line in self._lines if not line.isHidden()]
 
-    def _set_running(self, running: bool) -> None:
-        self.status_label.setVisible(running)
-        if running:
-            self._pulse.start()
-        else:
-            self._pulse.stop()
-            self._pulse_effect.setOpacity(1.0)
+    # --- internals -----------------------------------------------------------------
+
+    def _reset(self) -> None:
+        self._result = None
+        self._pulse.stop()
+        self._pulse_effect.setOpacity(1.0)
+        self.status_label.hide()
+        self.run_button.setEnabled(True)
+        self._show_lines([])
+
+    def _show_all(self) -> None:
+        self._expanded = True
+        if self._result is not None:
+            self._show_lines(self._result.lines)
 
     def _show_lines(self, lines) -> None:
+        shown = lines if self._expanded else lines[:PROOF_LINES_SHOWN]
+        while len(self._lines) < len(shown):
+            line = _OcrLine()
+            line.hide()
+            self._lines.append(line)
+            self._lines_box.addWidget(line)
         for index, widget in enumerate(self._lines):
-            if index < len(lines):
-                start, _end, text = lines[index]
+            if index < len(shown):
+                start, _end, text = shown[index]
                 widget.set_line(start, text)
                 widget.show()
             else:
                 widget.hide()
+        self.show_all_button.setVisible(len(shown) < len(lines))
 
     def _set_note(self, text: str, tone: str = "") -> None:
         self.note_label.setText(text)
@@ -230,11 +310,13 @@ class ProofSection(Section):
 
 
 class ChangeOffer(Section):
-    """Shown after a manual crop or brightness edit (see Inspector)."""
+    """Shown after a manual crop or brightness edit (see Inspector), one
+    button per edited kind (ruling C3). A queued hint re-detect replaces the
+    offer text with "re-detecting N files…" until those jobs end."""
 
     NOTE = "Corrections are never copied verbatim to other episodes. Instead the app offers:"
 
-    hint_requested = pyqtSignal()
+    hint_requested = pyqtSignal(str)             # "crop" | "brightness"
     dismissed = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -244,14 +326,41 @@ class ChangeOffer(Section):
         self.note_label = note_label(self.NOTE)
         self.body.addWidget(self.note_label)
         self.body.addSpacing(7)
-        self.hint_button = small_button("")
-        self.hint_button.clicked.connect(self.hint_requested)
-        self.this_file_only_button = small_button("apply to this file only", "ghost")
-        self.this_file_only_button.clicked.connect(self.dismissed)
-        for button in (self.hint_button, self.this_file_only_button):
+        self.hint_buttons: dict[str, Button] = {}
+        for what in HINT_KINDS:
+            button = small_button(hint_text(0, what, wrapped=True))
+            button.clicked.connect(lambda _checked=False, kind=what: self.hint_requested.emit(kind))
+            self.hint_buttons[what] = button
             self.body.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
             self.body.addSpacing(6)
+        self.this_file_only_button = small_button("apply to this file only", "ghost")
+        self.this_file_only_button.clicked.connect(self.dismissed)
+        self.body.addWidget(self.this_file_only_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.body.addSpacing(6)
+        self.status_label = note_label()
+        self.body.addWidget(self.status_label)
 
-    def set_targets(self, count: int) -> None:
-        self.hint_button.setText(f"↻ re-detect the other {count} using this as a hint")
-        self.hint_button.setEnabled(count > 0)
+    def set_targets(self, counts: dict[str, int]) -> None:
+        """`counts`: the kinds to offer, mapped to how many other files the
+        re-detect would submit (`controller.hint_targets`). A kind that is
+        missing is not offered; a count of 0 is offered but disabled, so the
+        user can see there is nothing else to re-detect."""
+        for what, button in self.hint_buttons.items():
+            count = counts.get(what)
+            button.setVisible(count is not None)
+            button.setText(hint_text(count or 0, what, wrapped=True))
+            button.setEnabled(bool(count))
+        offering = bool(counts)
+        self.note_label.setVisible(offering)
+        self.this_file_only_button.setVisible(offering)
+
+    def set_redetecting(self, count: int) -> None:
+        """`count` files are being re-detected with this file's value as a
+        hint; 0 clears the line."""
+        self.status_label.setText(REDETECTING_TEXT.format(count=count) if count else "")
+        self.status_label.setVisible(bool(count))
+
+    def is_empty(self) -> bool:
+        """Nothing to offer and nothing running: the section has no reason to
+        be on screen."""
+        return self.status_label.isHidden() and all(button.isHidden() for button in self.hint_buttons.values())

@@ -315,6 +315,11 @@ class ProjectController(QObject):
     def running_detectors(self, name: str) -> set[str]:
         return self._activity.running_kinds(name) & AUTOPILOT_KINDS
 
+    def outstanding_detectors(self, name: str) -> set[str]:
+        """running_detectors() plus the file's queued detections: whether a
+        re-detect of `name` is still to come. Changes with activity_changed."""
+        return self._activity.outstanding_kinds(name) & AUTOPILOT_KINDS
+
     def thumbnail(self, name: str) -> QImage | None:
         return self._thumbnails.get(name)
 
