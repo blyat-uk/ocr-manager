@@ -454,6 +454,7 @@ def field_blocking(entry: FileEntry, field: str) -> bool:
 # --------------------------------------------------------------------------
 
 REVIEW_WAIT_TOOLTIP = "waiting for detections to finish"
+REVIEW_MISSING_TOOLTIP = "set a {what} first"
 
 
 def is_reviewed(entry: FileEntry) -> bool:
@@ -470,11 +471,40 @@ def is_manual(value) -> bool:
     return value is not None and value.source == Source.MANUAL
 
 
+def missing_required_values(entry: FileEntry) -> list[str]:
+    """Which of crop/brightness the file has not got a usable value for, in
+    B10's order -- `core.jobs.apply.counts_as_missing`, the same predicate
+    that decides REVIEWED is not stored (compute_review_state's first rung
+    outranks the stored mark).
+
+    Only a PENDING or FLAGGED file can be missing one, which is how this
+    reads the folder's requirements without being handed the folder: a
+    labels-only folder requires neither value, so compute_review_state never
+    sends its files to those two states over a missing one, and a PROPOSED or
+    REVIEWED file has everything its folder asks for by construction."""
+    if entry.review not in (ReviewState.PENDING, ReviewState.FLAGGED):
+        return []
+    return [name for name in _apply.DIALOGUE_DETECTORS if _apply.counts_as_missing(entry, name)]
+
+
 def can_mark_reviewed(entry: FileEntry) -> bool:
     """"Mark reviewed" (the button, Space, the queue menu) is offered unless
-    the file is still PENDING: its detections have not finished, so there is
-    nothing settled to accept yet."""
-    return not is_pending(entry)
+    the file is still PENDING -- its detections have not finished, so there is
+    nothing settled to accept yet -- or a required value is missing or stale,
+    which core/jobs/apply.py refuses to store REVIEWED over: offering it then
+    would leave the file exactly as it was, with nothing said."""
+    return not is_pending(entry) and not missing_required_values(entry)
+
+
+def mark_reviewed_tooltip(entry: FileEntry) -> str:
+    """Why "Mark reviewed" is not offered, in the voice of the rest of the
+    review copy; "" when it is."""
+    if is_pending(entry):
+        return REVIEW_WAIT_TOOLTIP
+    missing = missing_required_values(entry)
+    if not missing:
+        return ""
+    return REVIEW_MISSING_TOOLTIP.format(what=" and ".join(_FIELD_LABEL[name] for name in missing))
 
 
 # --------------------------------------------------------------------------

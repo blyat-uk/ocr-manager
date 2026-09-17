@@ -712,6 +712,12 @@ def test_field_blocking_follows_value_source():
     assert field_blocking(hinted, "brightness")
 
 
+def _reviewable(review) -> FileEntry:
+    """A file with both required values, in `review`."""
+    return FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.DETECTED),
+                     brightness=Brightness(200, Source.DETECTED), review=review)
+
+
 @pytest.mark.parametrize("review, expected", [
     (ReviewState.PENDING, False),
     (ReviewState.PROPOSED, True),
@@ -719,5 +725,64 @@ def test_field_blocking_follows_value_source():
     (ReviewState.REVIEWED, True),
 ])
 def test_can_mark_reviewed_waits_for_pending_files(review, expected):
-    assert state_text.can_mark_reviewed(FileEntry("a.mkv", review=review)) is expected
+    assert state_text.can_mark_reviewed(_reviewable(review)) is expected
     assert state_text.REVIEW_WAIT_TOOLTIP == "waiting for detections to finish"
+
+
+@pytest.mark.parametrize("entry, missing", [
+    (FileEntry("a.mkv", brightness=Brightness(200, Source.DETECTED), review=ReviewState.FLAGGED), ["crop"]),
+    (FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.DETECTED), review=ReviewState.FLAGGED), ["brightness"]),
+    (FileEntry("a.mkv", review=ReviewState.FLAGGED), ["crop", "brightness"]),
+])
+def test_mark_reviewed_is_refused_while_a_required_value_is_missing(entry, missing):
+    """core/jobs/apply.py will not store REVIEWED while one of these is
+    missing, so the button must not offer it (and must say why)."""
+    assert state_text.missing_required_values(entry) == missing
+    assert state_text.can_mark_reviewed(entry) is False
+    assert state_text.mark_reviewed_tooltip(entry) == state_text.REVIEW_MISSING_TOOLTIP.format(
+        what=" and ".join({"crop": "crop", "brightness": "brightness"}[name] for name in missing))
+
+
+def test_mark_reviewed_is_refused_while_the_brightness_is_stale():
+    entry = FileEntry("a.mkv", crop=Crop(9, 9, 9, 9, Source.MANUAL),
+                      brightness=Brightness(200, Source.DETECTED), review=ReviewState.FLAGGED,
+                      evidence={"brightness": {"value_crop_box": [1, 2, 3, 4]}})
+    assert apply_mod.brightness_is_stale(entry)
+    assert state_text.missing_required_values(entry) == ["brightness"]
+    assert state_text.can_mark_reviewed(entry) is False
+
+
+def test_a_labels_only_file_with_no_crop_can_still_be_reviewed():
+    """A labels-only folder requires neither value, so its files are never
+    FLAGGED for a missing one -- which is how this reads the requirement
+    without being handed the folder."""
+    entry = FileEntry("a.mkv", review=ReviewState.PROPOSED)
+    assert state_text.missing_required_values(entry) == []
+    assert state_text.can_mark_reviewed(entry) is True
+    assert state_text.mark_reviewed_tooltip(entry) == ""
+
+
+@pytest.mark.parametrize("entry", [
+    FileEntry("a.mkv", review=ReviewState.FLAGGED),
+    FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.DETECTED), review=ReviewState.FLAGGED),
+    FileEntry("a.mkv", brightness=Brightness(200, Source.DETECTED), review=ReviewState.FLAGGED),
+    FileEntry("a.mkv", crop=Crop(9, 9, 9, 9, Source.MANUAL), brightness=Brightness(200, Source.DETECTED),
+              review=ReviewState.FLAGGED, evidence={"brightness": {"value_crop_box": [1, 2, 3, 4]}}),
+    FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.DETECTED), brightness=Brightness(200, Source.DETECTED),
+              review=ReviewState.FLAGGED, flags={"crop": FLAG_LOW_AGREEMENT}),
+    FileEntry("a.mkv", crop=Crop(1, 2, 3, 4, Source.MANUAL), brightness=Brightness(200, Source.MANUAL),
+              review=ReviewState.PROPOSED),
+])
+def test_can_mark_reviewed_agrees_with_what_the_apply_rules_will_store(entry):
+    """Through the real rules: the button is offered exactly when pressing it
+    would leave the file REVIEWED."""
+    project = _project(entry)
+    offered = state_text.can_mark_reviewed(entry)
+    apply_mod.mark_reviewed(project, entry.name)
+    apply_mod.recompute_all(project, pending={}, ranges_pending=False)
+    assert (entry.review == ReviewState.REVIEWED) is offered
+
+
+def test_mark_reviewed_tooltip_names_the_wait_while_pending():
+    assert state_text.mark_reviewed_tooltip(_reviewable(ReviewState.PENDING)) == state_text.REVIEW_WAIT_TOOLTIP
+    assert state_text.mark_reviewed_tooltip(_reviewable(ReviewState.FLAGGED)) == ""
