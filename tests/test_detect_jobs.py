@@ -48,8 +48,10 @@ from core.jobs.apply import (
     apply_audio_profile,
     apply_brightness,
     apply_crop,
+    apply_folder_change,
     apply_metadata,
     apply_ranges,
+    brightness_is_stale,
     compute_review_state,
     copy_settings,
     mark_reviewed,
@@ -432,7 +434,10 @@ def test_apply_brightness_writes_only_over_an_empty_detected_or_hinted_value(pri
         assert entry.brightness == Brightness(NEW_BRIGHTNESS, Source.DETECTED)
     else:
         assert entry.brightness == Brightness(OTHER_BRIGHTNESS, prior_source)
-    assert entry.evidence["brightness"] == {**r.result.to_evidence(), "tiles": r.tiles, "crop_box": list(NEW_BOX)}
+    expected_evidence = {**r.result.to_evidence(), "tiles": r.tiles, "crop_box": list(NEW_BOX)}
+    if overwritten:                                     # the box the stored value was measured on
+        expected_evidence["value_crop_box"] = list(NEW_BOX)
+    assert entry.evidence["brightness"] == expected_evidence
     assert entry.evidence["brightness"]["tiles"]      # the fixture strips give tiles
     assert entry.flags["brightness"] == ""
 
@@ -887,7 +892,35 @@ def test_mark_reviewed_does_not_accept_a_stale_brightness():
     apply_crop(project, _crop_job_result(box=OLD_BOX))                     # brightness measured on NEW_BOX
     mark_reviewed(project, "a.mp4")
     assert entry.brightness.source == Source.DETECTED
+    assert entry.review == ReviewState.FLAGGED                             # stored: the computed state
     assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+@pytest.mark.parametrize("unstale", ["set_manual_crop", "paste"])
+@pytest.mark.parametrize("recompute_between", [False, True])
+def test_restoring_the_crop_after_marking_does_not_review_a_flagged_brightness(unstale, recompute_between):
+    """repro_c: the brightness was stale (not accepted) when the file was marked;
+    putting the crop back un-stales it, and its blocking flag must still count."""
+    project, entry = _flagged_brightness_project()
+    apply_crop(project, _crop_job_result(box=OLD_BOX))
+    recompute_all(project, pending={}, ranges_pending=False)
+    mark_reviewed(project, "a.mp4")
+    assert entry.review != ReviewState.REVIEWED
+    if recompute_between:
+        recompute_all(project, pending={}, ranges_pending=False)
+
+    if unstale == "set_manual_crop":
+        set_manual_crop(project, "a.mp4", NEW_BOX)
+    else:
+        paste_settings(project, "a.mp4", {"crop": NEW_BOX, "brightness": None, "time_ranges": None})
+
+    assert not brightness_is_stale(entry)
+    assert entry.brightness == Brightness(NEW_BRIGHTNESS, Source.DETECTED)
+    assert entry.review == ReviewState.FLAGGED
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+    mark_reviewed(project, "a.mp4")                                        # now it can be accepted
+    assert entry.brightness.source == Source.MANUAL
+    assert _state(project, "a.mp4") == ReviewState.REVIEWED
 
 
 def test_unmarking_does_not_revert_accepted_values():
@@ -913,29 +946,139 @@ def test_unmarking_converts_nothing():
     lambda project: set_manual_time_ranges(project, "a.mp4", [("01:00", None)]),
     lambda project: paste_settings(project, "a.mp4", {"crop": NEW_BOX, "time_ranges": None}),
 ])
-def test_an_edit_leaves_review_alone_while_another_required_field_is_flagged(edit):
+@pytest.mark.parametrize("stored", [ReviewState.FLAGGED, ReviewState.PROPOSED, ReviewState.REVIEWED])
+def test_an_edit_stores_the_computed_state_while_another_required_field_is_flagged(edit, stored):
     project, entry = _flagged_brightness_project()
-    recompute_all(project, pending={}, ranges_pending=False)
-    assert entry.review == ReviewState.FLAGGED
+    entry.review = stored               # REVIEWED here is built by hand: the API never stores it beside the flag
 
     edit(project)
 
-    assert entry.review == ReviewState.FLAGGED                             # left unchanged, not REVIEWED
+    assert entry.review == ReviewState.FLAGGED                             # the computed state, never REVIEWED
     assert entry.brightness.source == Source.DETECTED
     assert _state(project, "a.mp4") == ReviewState.FLAGGED
     mark_reviewed(project, "a.mp4")                                        # the user accepts the brightness
     assert _state(project, "a.mp4") == ReviewState.REVIEWED
 
 
-def test_set_manual_brightness_leaves_review_alone_while_the_crop_is_flagged():
+@pytest.mark.parametrize("stored", [ReviewState.PROPOSED, ReviewState.REVIEWED])
+def test_set_manual_brightness_stores_the_computed_state_while_the_crop_is_flagged(stored):
     project = _project()
     entry = project.files["a.mp4"]
     _complete(entry)
     apply_crop(project, _crop_job_result(box=OLD_BOX, flagged="low-agreement"))
-    entry.review = ReviewState.PROPOSED
+    entry.review = stored
     set_manual_brightness(project, "a.mp4", 205)
-    assert entry.review == ReviewState.PROPOSED
+    assert entry.review == ReviewState.FLAGGED
     assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+def test_mark_reviewed_stores_reviewed_when_a_stale_brightness_carries_no_blocking_flag():
+    project = _project()
+    entry = project.files["a.mp4"]
+    apply_crop(project, _crop_job_result())
+    apply_brightness(project, _brightness_job_result())
+    apply_crop(project, _crop_job_result(box=OLD_BOX))
+    mark_reviewed(project, "a.mp4")
+    assert entry.review == ReviewState.REVIEWED                            # nothing flagged is left
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED                 # step 1: stale still counts
+
+
+# --- folder mode switch ---------------------------------------------------------------------------
+
+LABELS_ONLY_FOLDER = FolderSettings(dialogue_enabled=False, labels_enabled=True)
+DIALOGUE_FOLDER = FolderSettings(dialogue_enabled=True, labels_enabled=True)
+
+
+def _switch(project, new):
+    old = project.folder
+    project.folder = new
+    apply_folder_change(project, old, new)
+
+
+def test_repro_folder_switching_back_to_dialogue_does_not_keep_a_flagged_file_reviewed():
+    project, entry = _flagged_brightness_project()
+    _switch(project, FolderSettings(dialogue_enabled=False, labels_enabled=True))
+    mark_reviewed(project, "a.mp4")
+    recompute_all(project, pending={}, ranges_pending=False)
+    assert entry.brightness.source == Source.DETECTED                      # not required: not accepted
+    assert entry.review == ReviewState.REVIEWED
+
+    _switch(project, FolderSettings(dialogue_enabled=True, labels_enabled=True))
+
+    assert entry.review == ReviewState.FLAGGED
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+def _labels_only_reviewed(setup):
+    project = _project(folder=LABELS_ONLY_FOLDER)
+    entry = project.files["a.mp4"]
+    setup(project, entry)
+    entry.review = ReviewState.REVIEWED
+    return project, entry
+
+
+def _missing_crop(project, entry):
+    entry.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+
+
+def _stale_brightness(project, entry):
+    entry.crop = Crop(*OLD_BOX, Source.MANUAL)
+    entry.brightness = Brightness(NEW_BRIGHTNESS, Source.DETECTED)
+    entry.evidence["brightness"] = {"crop_box": list(NEW_BOX), "value_crop_box": list(NEW_BOX)}
+
+
+def _flagged_detected_crop(project, entry):
+    entry.crop = Crop(*NEW_BOX, Source.DETECTED)
+    entry.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    entry.flags["crop"] = "low-agreement"
+
+
+@pytest.mark.parametrize("setup", [_missing_crop, _stale_brightness, _flagged_detected_crop])
+def test_switching_to_dialogue_un_reviews_a_file_whose_new_required_values_are_not_ready(setup):
+    project, entry = _labels_only_reviewed(setup)
+    values = (entry.crop, entry.brightness)
+    _switch(project, DIALOGUE_FOLDER)
+    assert entry.review == ReviewState.FLAGGED
+    assert (entry.crop, entry.brightness) == values                         # nothing accepted or changed
+
+
+@pytest.mark.parametrize("sources", [(Source.DETECTED, Source.DETECTED), (Source.MANUAL, Source.IMPORTED)])
+def test_switching_to_dialogue_keeps_a_reviewed_file_whose_values_are_ready(sources):
+    def ready(project, entry):
+        entry.crop = Crop(*NEW_BOX, sources[0])
+        entry.brightness = Brightness(NEW_BRIGHTNESS, sources[1])
+        entry.flags = {"crop": "no-speech", "brightness": "escalate" if sources[1] != Source.DETECTED else ""}
+    project, entry = _labels_only_reviewed(ready)
+    _switch(project, DIALOGUE_FOLDER)
+    assert entry.review == ReviewState.REVIEWED
+
+
+def test_switching_to_dialogue_leaves_files_that_are_not_reviewed_alone():
+    project = _project(folder=LABELS_ONLY_FOLDER)
+    for entry, stored in zip(project.files.values(), (ReviewState.PROPOSED, ReviewState.PENDING, ReviewState.FLAGGED)):
+        entry.review = stored
+    before = to_json(project)
+    _switch(project, DIALOGUE_FOLDER)
+    assert to_json(project)["files"] == before["files"]
+
+
+@pytest.mark.parametrize("old, new", [
+    (DIALOGUE_FOLDER, LABELS_ONLY_FOLDER),                                           # nothing newly required
+    (DIALOGUE_FOLDER, FolderSettings(dialogue_enabled=True, labels_enabled=False)),  # same required set
+    (LABELS_ONLY_FOLDER, FolderSettings(dialogue_enabled=False, labels_enabled=True, ocr_lang="en")),
+])
+def test_a_folder_change_that_does_not_add_required_fields_changes_no_file(old, new):
+    project = _project(folder=old)
+    a, b, c = project.files.values()
+    _missing_crop(project, a)
+    a.review = ReviewState.REVIEWED
+    _flagged_detected_crop(project, b)
+    b.review = ReviewState.FLAGGED
+    c.review = ReviewState.PROPOSED
+    before = to_json(project)["files"]
+    project.folder = new
+    apply_folder_change(project, old, new)
+    assert to_json(project)["files"] == before
 
 
 @pytest.mark.parametrize("edit", [
@@ -984,7 +1127,8 @@ def test_a_reviewed_file_with_a_flag_beside_the_users_value_stays_reviewed(sourc
 def test_a_detected_brightness_measured_on_another_crop_counts_as_missing(measured_on, expected, source):
     entry = _ready_entry()
     entry.brightness.source = source
-    entry.evidence = {"brightness": {"value": NEW_BRIGHTNESS, "crop_box": list(measured_on)}}
+    entry.evidence = {"brightness": {"value": NEW_BRIGHTNESS, "crop_box": list(NEW_BOX),
+                                     "value_crop_box": list(measured_on)}}
     assert _review(entry) == expected
     entry.review = ReviewState.REVIEWED
     stale = expected == ReviewState.FLAGGED
@@ -996,12 +1140,13 @@ def test_a_detected_brightness_measured_on_another_crop_counts_as_missing(measur
 def test_the_users_brightness_is_never_stale(source):
     entry = _ready_entry()
     entry.brightness.source = source
-    entry.evidence = {"brightness": {"crop_box": list(OLD_BOX)}}
+    entry.evidence = {"brightness": {"crop_box": list(OLD_BOX), "value_crop_box": list(OLD_BOX)}}
     assert _review(entry) == ReviewState.PROPOSED
 
 
-@pytest.mark.parametrize("evidence", [{}, {"brightness": {"value": NEW_BRIGHTNESS}}])
-def test_a_detected_brightness_without_a_recorded_crop_is_not_judged_stale(evidence):
+@pytest.mark.parametrize("evidence", [{}, {"brightness": {"value": NEW_BRIGHTNESS}},
+                                      {"brightness": {"crop_box": list(OLD_BOX)}}])   # the latest result's box only
+def test_a_detected_brightness_without_a_recorded_value_crop_is_not_judged_stale(evidence):
     entry = _ready_entry()
     entry.evidence = evidence
     assert _review(entry) == ReviewState.PROPOSED
@@ -1025,6 +1170,42 @@ def test_s7_a_re_detected_crop_makes_the_brightness_stale_until_it_is_measured_a
 
     apply_brightness(project, _brightness_job_result(crop_box=OLD_BOX))
     assert _state(project, "a.mp4") == ReviewState.PROPOSED
+
+
+def test_an_unapplied_brightness_result_does_not_hide_that_the_value_is_stale():
+    """repro_s6s7: re-measuring on the new crop fails; the stored value is still
+    the one measured on the old crop."""
+    project = _project()
+    entry = project.files["a.mp4"]
+    apply_crop(project, _crop_job_result())
+    apply_brightness(project, _brightness_job_result())                       # 209 measured on NEW_BOX
+    apply_crop(project, _crop_job_result(box=OLD_BOX))
+    assert brightness_is_stale(entry)
+
+    apply_brightness(project, _brightness_job_result(value=230, plateau=None, flagged="no-plateau?",
+                                                     crop_box=OLD_BOX))       # not applied
+    assert entry.brightness == Brightness(NEW_BRIGHTNESS, Source.DETECTED)
+    assert entry.evidence["brightness"]["crop_box"] == list(OLD_BOX)          # the latest result
+    assert entry.evidence["brightness"]["value_crop_box"] == list(NEW_BOX)    # the stored value
+    assert brightness_is_stale(entry)
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+    mark_reviewed(project, "a.mp4")
+    assert entry.brightness.source == Source.DETECTED                          # not accepted
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+def test_a_written_brightness_records_its_crop_and_an_unapplied_one_keeps_it():
+    project = _project()
+    entry = project.files["a.mp4"]
+    apply_crop(project, _crop_job_result())
+    apply_brightness(project, _brightness_job_result(value=240, plateau=None, flagged="escalate"))
+    assert "value_crop_box" not in entry.evidence["brightness"]               # no value was written
+    apply_brightness(project, _brightness_job_result())
+    assert entry.evidence["brightness"]["value_crop_box"] == list(NEW_BOX)
+    apply_brightness(project, _brightness_job_result(value=240, plateau=None, flagged="escalate"))
+    assert entry.evidence["brightness"]["value_crop_box"] == list(NEW_BOX)
+    assert entry.evidence["brightness"]["flagged"] == "escalate"
 
 
 def test_a_fresh_brightness_over_a_stale_one_un_reviews_even_with_the_same_value():

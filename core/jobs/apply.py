@@ -18,9 +18,13 @@ Stale brightness
     A brightness result is dropped entirely (no value, evidence or flag)
     unless the file's crop still has the (x, y, width, height) the result was
     measured with (BrightnessJobResult.crop_box). An applied result records
-    that box as evidence["brightness"]["crop_box"]; a detected or hinted
-    brightness whose recorded box is no longer the file's crop (the crop was
-    re-detected or edited since) counts as missing (brightness_is_stale).
+    that box as evidence["brightness"]["crop_box"] (the latest result's
+    crop). When it also writes the value, the box goes into
+    evidence["brightness"]["value_crop_box"] (the crop the stored value was
+    measured on), which later unapplied results carry over unchanged. A
+    detected or hinted brightness whose value_crop_box is no longer the
+    file's crop (the crop was re-detected or edited since) counts as missing
+    (brightness_is_stale). MANUAL and IMPORTED brightness is never stale.
 
 Hints
     "differs-from-hint?" (blocking) is added to the file's flags when a hint
@@ -35,11 +39,15 @@ Review
     required detected or hinted value either, by construction:
     - mark_reviewed(True) is explicit acceptance: every required detected or
       hinted value carrying a blocking flag becomes MANUAL (detection never
-      overwrites it again; its evidence and flag stay stored), then REVIEWED.
-    - set_manual_* and paste_settings write MANUAL values and set REVIEWED
+      overwrites it again; its evidence and flag stay stored), except a stale
+      brightness. It then stores REVIEWED, or, when a flagged detected or
+      hinted value is left (a stale one), the computed state.
+    - set_manual_* and paste_settings write MANUAL values and store REVIEWED
       only when no required field still holds a detected or hinted value with
-      a blocking flag; otherwise they leave the review state unchanged (the
-      file stays FLAGGED until the user accepts or edits that field).
+      a blocking flag; otherwise they store the computed state (the file stays
+      FLAGGED until the user accepts or edits that field).
+    - apply_folder_change un-reviews files whose newly required values are
+      missing, stale or flagged when the folder starts extracting dialogue.
     - An apply clears REVIEWED when it changes a value (a detected or hinted
       value the file was reviewed with, a stale brightness, or an empty field
       detection fills: the user never saw that value) or stores a blocking
@@ -131,13 +139,14 @@ def _is_detected(value) -> bool:
 
 
 def brightness_is_stale(entry: FileEntry) -> bool:
-    """True when the file's brightness is detected or hinted and its evidence
-    records a crop box that is not the file's crop: it was measured on a
-    crop the file no longer has. A brightness without a recorded box (none
-    was applied by apply_brightness) is not judged stale."""
+    """True when the file's brightness is detected or hinted and the crop its
+    value was measured on (evidence["brightness"]["value_crop_box"]) is not
+    the file's crop. A brightness without that record (its value was not
+    written by apply_brightness) is not judged stale; the latest result's
+    crop_box says nothing about the stored value and is not consulted."""
     if not _is_detected(entry.brightness):
         return False
-    measured = (entry.evidence.get("brightness") or {}).get("crop_box")
+    measured = (entry.evidence.get("brightness") or {}).get("value_crop_box")
     if measured is None:
         return False
     return entry.crop is None or _value_key(entry.crop) != _crop_tuple(measured)
@@ -245,9 +254,13 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
         return
     result = r.result
     old_stale = brightness_is_stale(entry)
-    entry.evidence["brightness"] = {**result.to_evidence(),
-                                    "tiles": {kind: float(t) for kind, t in r.tiles.items()},
-                                    "crop_box": list(_crop_tuple(r.crop_box))}
+    previous = entry.evidence.get("brightness") or {}
+    evidence = {**result.to_evidence(),
+                "tiles": {kind: float(t) for kind, t in r.tiles.items()},
+                "crop_box": list(_crop_tuple(r.crop_box))}
+    if previous.get("value_crop_box") is not None:          # the stored value's crop, until a value is written
+        evidence["value_crop_box"] = list(previous["value_crop_box"])
+    entry.evidence["brightness"] = evidence
     flag = result.flagged or ""
     if r.hint_value is not None:
         plateau = result.plateau
@@ -258,6 +271,7 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
     if _detection_may_write(entry.brightness) and result.auto_applicable:
         source = Source.HINT if r.hint_value is not None else Source.DETECTED
         _write_detected(entry, "brightness", Brightness(int(result.value), source), old_stale=old_stale)
+        evidence["value_crop_box"] = list(_crop_tuple(r.crop_box))
     _unreview_on_blocking_flag(project, entry, "brightness")
 
 
@@ -307,17 +321,31 @@ def apply_audio_profile(project: Project, r: AudioProfileResult | None) -> None:
 # User edits
 # --------------------------------------------------------------------------
 
-def _flagged_detected_fields(project: Project, entry: FileEntry) -> list[str]:
-    """Required fields holding a detected or hinted value with a blocking flag."""
-    return [name for name in _required(project.folder)
+def _flagged_detected_fields(folder: FolderSettings, entry: FileEntry) -> list[str]:
+    """Required fields holding a detected or hinted value with a blocking flag
+    (stale or not)."""
+    return [name for name in _required(folder)
             if _is_detected(getattr(entry, name)) and _blocking(entry, name)]
 
 
-def _review_after_edit(project: Project, entry: FileEntry) -> None:
-    """An edit reviews the file only when no required field is left holding a
-    flagged detected or hinted value; otherwise the state is left as it was."""
-    if not _flagged_detected_fields(project, entry):
+def _store_computed_state(folder: FolderSettings, entry: FileEntry) -> None:
+    """Replace the stored state with the derived one, never REVIEWED (no
+    pending information here: recompute_all refines PENDING)."""
+    entry.review = ReviewState.PENDING
+    entry.review = compute_review_state(entry, folder, detections_pending=set(), ranges_pending=False)
+
+
+def _review_unless_flagged(folder: FolderSettings, entry: FileEntry) -> None:
+    """Store REVIEWED when no required field holds a flagged detected or
+    hinted value; otherwise store the computed state."""
+    if _flagged_detected_fields(folder, entry):
+        _store_computed_state(folder, entry)
+    else:
         entry.review = ReviewState.REVIEWED
+
+
+def _review_after_edit(project: Project, entry: FileEntry) -> None:
+    _review_unless_flagged(project.folder, entry)
 
 
 def set_manual_crop(project: Project, file: str, box: tuple[int, int, int, int]) -> None:
@@ -353,17 +381,21 @@ def mark_reviewed(project: Project, file: str, reviewed: bool = True) -> None:
     overwrites the value the user accepted; its evidence and flag strings
     stay stored. A stale brightness (measured on another crop) is not
     accepted: it counts as missing, and the file stays FLAGGED or PENDING
-    until it is measured again or edited. Clearing the mark reverts nothing."""
+    until it is measured again or edited. REVIEWED is stored only when no
+    required field is left holding a flagged detected or hinted value (a
+    stale flagged brightness is); otherwise the computed state is stored, so
+    restoring the crop later cannot turn the unaccepted value into a
+    reviewed one. Clearing the mark reverts nothing."""
     entry = project.files[file]
     if not reviewed:
         if entry.review == ReviewState.REVIEWED:
             entry.review = ReviewState.PENDING
         return
-    for name in _flagged_detected_fields(project, entry):
+    for name in _flagged_detected_fields(project.folder, entry):
         if not _counts_as_missing(entry, name):
             value = getattr(entry, name)
             setattr(entry, name, replace(value, source=Source.MANUAL))
-    entry.review = ReviewState.REVIEWED
+    _review_unless_flagged(project.folder, entry)
 
 
 def set_skipped(project: Project, file: str, skipped: bool) -> None:
@@ -386,9 +418,9 @@ def copy_settings(project: Project, source: str) -> dict:
 
 def paste_settings(project: Project, target: str, clip: dict) -> None:
     """Apply every value the clip has (key present and not None) to `target`
-    as MANUAL, then mark the target REVIEWED unless a required field it did
-    not replace still holds a flagged detected or hinted value. A clip with
-    nothing in it changes nothing."""
+    as MANUAL, then store REVIEWED, or the computed state when a required
+    field it did not replace still holds a flagged detected or hinted value.
+    A clip with nothing in it changes nothing."""
     entry = project.files[target]
     pasted = False
     if clip.get("crop") is not None:
@@ -403,6 +435,25 @@ def paste_settings(project: Project, target: str, clip: dict) -> None:
         pasted = True
     if pasted:
         _review_after_edit(project, entry)
+
+
+def apply_folder_change(project: Project, old: FolderSettings, new: FolderSettings) -> None:
+    """After the folder's settings change from `old` to `new`: when fields
+    become required (the folder starts extracting dialogue), every REVIEWED
+    file whose newly required value is missing, stale, or a detected/hinted
+    value with a blocking flag stores the computed state (under `new`)
+    instead: it was reviewed while those values did not matter. Nothing is
+    accepted or changed otherwise, and a change that adds no required field
+    (including dialogue -> labels-only) changes no file."""
+    newly_required = [name for name in _required(new) if name not in _required(old)]
+    if not newly_required:
+        return
+    for entry in project.files.values():
+        if entry.review != ReviewState.REVIEWED:
+            continue
+        if any(_counts_as_missing(entry, name) or (_is_detected(getattr(entry, name)) and _blocking(entry, name))
+               for name in newly_required):
+            _store_computed_state(new, entry)
 
 
 # --------------------------------------------------------------------------
