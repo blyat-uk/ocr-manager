@@ -5,6 +5,7 @@ tests/fixtures/ocr_json_v1/{slay,dragon}.json, copied verbatim from
 /mnt/FAST/work (never modified; see task-1-brief.md Step 1).
 """
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -148,21 +149,23 @@ def test_migrate_dragon_detection_batch_size_not_present_anywhere_in_to_json():
     assert "detection_batch_size" not in json.dumps(payload)
 
 
-def test_migrate_dragon_automation_values_not_exactly_old_defaults_carry_over_as_float():
+def test_migrate_dragon_automation_values_map_numerically_despite_different_literal():
     """Dragon's automation strings are "0.0"/"0.5", not the literal
-    "0"/"0.50" the old app actually wrote as defaults (see slay.json), so
-    ruling A5's exact-string default mapping does not fire here -- they
-    carry over unchanged as floats. This is a real-fixture case beyond
-    what the brief's example list spells out.
+    "0"/"0.50" slay.json uses -- but ruling A5 (amended) compares
+    numerically, not as an exact string, because "0.0"/"0.5" are the same
+    old-app default re-serialised, just with a different literal. So they
+    DO map to the new measured defaults, same as slay.json. This is a
+    real-fixture case beyond what the brief's original example list
+    spelled out (the amendment exists specifically because of it).
     """
     data = _load_fixture("dragon.json")
     project = migrate_v1(data, "/tmp/dragon", DRAGON_NAMES)
     folder = project.folder
 
-    assert folder.crop_width_fraction == 0.7
-    assert folder.crop_vertical_padding == 0.0
-    assert folder.crop_min_height_fraction == 0.05
-    assert folder.bottom_half_cutoff == 0.5
+    assert folder.crop_width_fraction == 0.7           # no default-mapping rule; carries over
+    assert folder.crop_vertical_padding == 0.003        # "0.0" -> numerically 0 -> new default
+    assert folder.crop_min_height_fraction == 0.05      # no default-mapping rule; carries over
+    assert folder.bottom_half_cutoff == 0.55             # "0.5" -> numerically 0.50 -> new default
 
 
 # --- Synthetic edge cases -------------------------------------------------
@@ -262,6 +265,54 @@ def test_migrate_automation_preserves_nondefault_values():
     project = migrate_v1(data, "/tmp/proj", [])
     assert project.folder.crop_vertical_padding == 0.01
     assert project.folder.bottom_half_cutoff == 0.60
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0", 0.003),      # old literal default
+        ("0.0", 0.003),    # same default, re-serialised (Dragon's actual shape)
+        ("0.01", 0.01),    # non-default, preserved
+    ],
+)
+def test_migrate_crop_vertical_padding_numeric_mapping(raw, expected):
+    data = {"automation": {"crop_vertical_padding": raw}, "files": {}}
+    project = migrate_v1(data, "/tmp/proj", [])
+    assert project.folder.crop_vertical_padding == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0.5", 0.55),     # old default, re-serialised (Dragon's actual shape)
+        ("0.50", 0.55),    # old literal default
+        ("0.60", 0.60),    # non-default, preserved
+    ],
+)
+def test_migrate_bottom_half_cutoff_numeric_mapping(raw, expected):
+    data = {"automation": {"bottom_half_cutoff": raw}, "files": {}}
+    project = migrate_v1(data, "/tmp/proj", [])
+    assert project.folder.bottom_half_cutoff == expected
+
+
+def test_migrate_automation_unparseable_value_falls_back_to_default_and_logs_warning(caplog):
+    data = {
+        "automation": {
+            "crop_vertical_padding": "not-a-number",
+            "bottom_half_cutoff": "also-not-a-number",
+        },
+        "files": {},
+    }
+    defaults = FolderSettings()
+
+    with caplog.at_level(logging.WARNING):
+        project = migrate_v1(data, "/tmp/proj", [])
+
+    assert project.folder.crop_vertical_padding == defaults.crop_vertical_padding
+    assert project.folder.bottom_half_cutoff == defaults.bottom_half_cutoff
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("crop_vertical_padding" in m for m in warnings)
+    assert any("bottom_half_cutoff" in m for m in warnings)
 
 
 def test_migrate_review_reviewed_when_labels_only_and_brightness_set_without_crop():

@@ -8,6 +8,8 @@ Project` with typed `FolderSettings` and per-file `FileEntry` values,
 per the migration rules in task-1-brief.md and ruling A5/C1
 (docs/superpowers/specs/2026-09-17-stage3-rulings.md).
 """
+import logging
+
 from core.project.model import (
     Brightness,
     Crop,
@@ -20,6 +22,8 @@ from core.project.model import (
     TimeRange,
     TimeRanges,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _to_int(value, default: int) -> int:
@@ -54,25 +58,44 @@ def _to_bool(value, default: bool) -> bool:
 
 
 def _map_crop_vertical_padding(raw, default: float) -> float:
-    # Ruling A5: the old app's default was the literal string "0"; map
-    # exactly that string to the new measured default, and carry any
-    # other value over as a float (e.g. an explicit "0.0" is NOT the
-    # same literal and is preserved, not remapped).
+    # Ruling A5 (amended): compare the v1 value numerically, not as an
+    # exact string -- the old app's default was 0, however it happened to
+    # be serialised ("0", "0.0", ...), so any of those map to the new
+    # measured default. Any other parseable value carries over as a
+    # float; an unparseable value falls back to the FolderSettings
+    # default (and is logged, since that's user data we couldn't read).
     if raw is None:
         return default
-    if raw == "0":
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Unparseable automation.crop_vertical_padding %r -- using default %s",
+            raw, default,
+        )
+        return default
+    if numeric == 0.0:
         return 0.003
-    return _to_float(raw, default)
+    return numeric
 
 
 def _map_bottom_half_cutoff(raw, default: float) -> float:
-    # Same rule as above: old default literal "0.50" -> new default;
-    # any other value (including "0.5") carries over as a float.
+    # Same rule as above: the old default was 0.50 however serialised
+    # ("0.5", "0.50", ...) -> new measured default; any other parseable
+    # value carries over as a float; unparseable -> default, logged.
     if raw is None:
         return default
-    if raw == "0.50":
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Unparseable automation.bottom_half_cutoff %r -- using default %s",
+            raw, default,
+        )
+        return default
+    if numeric == 0.50:
         return 0.55
-    return _to_float(raw, default)
+    return numeric
 
 
 def _migrate_folder(data: dict) -> FolderSettings:
