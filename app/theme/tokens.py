@@ -55,6 +55,16 @@ THUMB_TOP = "#243044"         # .thumb/.sthumb gradient start: linear-gradient(1
 THUMB_BOTTOM = "#121820"      # .thumb/.sthumb gradient end (at 70%)
 THUMB_PENDING = "#161b22"     # a pending (still detecting) queue row's thumbnail background
 SPOTLIGHT = (8, 10, 14, 115)  # rgba(8,10,14,.45) crop-box spotlight dimming
+CANVAS_TOP = "#2b3d52"        # .canvas radial-gradient(120% 90% at 30% 25%, #2b3d52 0%, #16202c 55%, #0a0e14 100%)
+CANVAS_MID = "#16202c"
+CANVAS_BOTTOM = "#0a0e14"
+CANVAS_MID_STOP = 0.55        # the gradient's middle stop
+ENVELOPE_ALPHA = 0.9          # .envelope border: 1px dashed rgba(106,169,255,.9) (tabs-hifi's crop tab)
+SAMPLE_BAR_ALPHA = 0.75       # .sthumb i: the white "a line was found here" bar, rgba(255,255,255,.75)
+# `.hf .tag` background: rgba(10,12,16,.82). ui-spec §2.1's second list does not carry it (it lists the
+# tag BORDER colours only), so it is transcribed from the literal CSS of both hi-fi files, as the radii
+# below are.
+TAG_BG = (10, 12, 16, 209)
 
 # --------------------------------------------------------------------------
 # Typography (ui-spec.md §2.2)
