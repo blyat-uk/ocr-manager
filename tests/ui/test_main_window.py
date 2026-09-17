@@ -313,20 +313,24 @@ def test_start_is_disabled_without_ready_files_or_extraction(make_window, tmp_pr
     controller, start = window.controller, window.topbar.start_button
     assert start.text() == "▶ Start 2 ready files" and start.isEnabled()
 
-    controller.project.folder.dialogue_enabled = False
-    controller.project.folder.labels_enabled = False
-    controller.folder_changed.emit()
-    settle()
-    assert not start.isEnabled()
-
-    controller.project.folder.dialogue_enabled = True
-    controller.folder_changed.emit()
+    controller.update_folder(labels_enabled=False)
     settle()
     assert start.isEnabled()
+    with pytest.raises(ValueError, match="At least one of dialogue or labels must be on."):
+        controller.update_folder(dialogue_enabled=False)          # both off is refused, Start stays usable
+    settle()
+    assert start.isEnabled() and controller.project.folder.dialogue_enabled
     controller.set_skipped("a.mkv", True)
     controller.set_skipped("b.mkv", True)
     settle()
     assert start.text() == "▶ Start 0 ready files"
+    assert not start.isEnabled()
+
+    both_off = write_project(tmp_project(["c.mkv"]), [entry("c.mkv", review=ReviewState.PROPOSED)],
+                             dialogue_enabled=False, labels_enabled=False)   # e.g. a hand-edited .ocr.json
+    window.open_folder(str(both_off))
+    settle()
+    assert start.text() == "▶ Start 1 ready file"
     assert not start.isEnabled()
 
 

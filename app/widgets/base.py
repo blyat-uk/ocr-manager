@@ -8,9 +8,9 @@ actual views; nothing here knows about `core.project`/`core.jobs`.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
+from PyQt6.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PyQt6.QtWidgets import QAbstractButton, QBoxLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
 from app.theme import tokens
 
@@ -224,16 +224,24 @@ class SegmentedControl(QWidget):
     "Needs you 1" / "Reviewed 3". Clicking a segment makes it current and
     emits `current_changed(index)`. `set_current()` is the programmatic
     counterpart (syncing the control from a model) and does NOT emit, so a
-    caller driving both directions cannot create a feedback loop."""
+    caller driving both directions cannot create a feedback loop.
+
+    `orientation=Qt.Orientation.Vertical` stacks the segments as a left
+    aligned list with a 2 px gap (the Folder settings nav, workbench-hifi
+    figure 3: `.seg` with `flex-direction:column; gap:2px`)."""
 
     current_changed = pyqtSignal(int)
 
-    def __init__(self, items: list[str], parent: QWidget | None = None):
+    def __init__(self, items: list[str], parent: QWidget | None = None, *,
+                 orientation: Qt.Orientation = Qt.Orientation.Horizontal):
         super().__init__(parent)
         self.setObjectName("SegmentedControl")
-        self._layout = QHBoxLayout(self)
+        vertical = orientation == Qt.Orientation.Vertical
+        self.setProperty("orientation", "vertical" if vertical else "horizontal")
+        direction = QBoxLayout.Direction.TopToBottom if vertical else QBoxLayout.Direction.LeftToRight
+        self._layout = QBoxLayout(direction, self)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(4)
+        self._layout.setSpacing(2 if vertical else 4)
         self._buttons: list[QPushButton] = []
         self._current = 0
         self.set_labels(items)
@@ -283,6 +291,16 @@ class SegmentedControl(QWidget):
 
     def current(self) -> int:
         return self._current
+
+    def item(self, index: int) -> QPushButton:
+        return self._buttons[index]
+
+    def set_item_visible(self, index: int, visible: bool) -> None:
+        """Hide or show one segment; indices do not shift."""
+        self._buttons[index].setVisible(visible)
+
+    def is_item_visible(self, index: int) -> bool:
+        return not self._buttons[index].isHidden()
 
     def _refresh(self) -> None:
         for index, button in enumerate(self._buttons):
@@ -476,3 +494,79 @@ class ElidedLabel(QLabel):
         text = self._full if width <= 0 else self.fontMetrics().elidedText(self._full, self._mode, width)
         if text != super().text():
             super().setText(text)
+
+
+class Toggle(QAbstractButton):
+    """An on/off switch for a boolean setting (the Folder settings sheet):
+    the word "on" (`--ok`) or "off" (`--dim2`), as workbench-hifi figure 3
+    prints a kv row's value, beside a small painted switch. No figure draws
+    the switch itself, so it takes the same two tones -- an ok knob on the
+    good badge fill when on, a dim knob on the default badge fill when off --
+    and an accent outline while focused.
+
+    A checkable QAbstractButton: a click or Space flips it and emits
+    `clicked(checked)`; `setChecked()` (syncing from a model) emits no
+    `clicked`."""
+
+    TRACK_WIDTH = 24
+    TRACK_HEIGHT = 14
+    KNOB = 8
+    GAP = 7
+
+    def __init__(self, checked: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Toggle")
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        font = self.font()
+        font.setPixelSize(round(tokens.FONT_SIZE_BODY))
+        self.setFont(font)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.toggled.connect(lambda _on: self.update())
+
+    def state_text(self) -> str:
+        return "on" if self.isChecked() else "off"
+
+    def sizeHint(self) -> QSize:
+        text = self.fontMetrics().horizontalAdvance("off")
+        return QSize(text + self.GAP + self.TRACK_WIDTH + 2, max(self.TRACK_HEIGHT + 4, self.fontMetrics().height()))
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def paintEvent(self, event) -> None:
+        on = self.isChecked()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        track = QRectF(rect.width() - self.TRACK_WIDTH - 1.5, (rect.height() - self.TRACK_HEIGHT) / 2,
+                       self.TRACK_WIDTH, self.TRACK_HEIGHT)
+
+        painter.setPen(QColor(tokens.OK if on else tokens.DIM2))
+        painter.setFont(self.font())
+        text_rect = QRectF(0, 0, track.left() - self.GAP, rect.height())
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                         self.state_text())
+
+        border = tokens.ACC if self.hasFocus() else (tokens.OK if on else tokens.LINE2)
+        painter.setPen(QPen(QColor(border), 1))
+        painter.setBrush(QColor(tokens.BADGE_GOOD_BG if on else tokens.BADGE_BG))
+        radius = self.TRACK_HEIGHT / 2
+        painter.drawRoundedRect(track, radius, radius)
+
+        inset = (self.TRACK_HEIGHT - self.KNOB) / 2
+        knob_x = track.right() - inset - self.KNOB if on else track.left() + inset
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(tokens.OK if on else tokens.DIM2))
+        painter.drawEllipse(QRectF(knob_x, track.top() + inset, self.KNOB, self.KNOB))
+        painter.end()
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.update()
