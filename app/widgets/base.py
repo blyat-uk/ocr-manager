@@ -8,9 +8,9 @@ actual views; nothing here knows about `core.project`/`core.jobs`.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
 from app.theme import tokens
 
@@ -30,7 +30,7 @@ _BAR_TONE_COLOR = {
 }
 
 
-def _repolish(widget: QWidget) -> None:
+def repolish(widget: QWidget) -> None:
     """Force Qt to re-evaluate `widget`'s QSS after a dynamic property
     changed at runtime: `setProperty()` alone does not repaint the new
     rule, Qt only re-polishes on show/style change."""
@@ -38,6 +38,9 @@ def _repolish(widget: QWidget) -> None:
     style.unpolish(widget)
     style.polish(widget)
     widget.update()
+
+
+_repolish = repolish
 
 
 class Button(QPushButton):
@@ -116,6 +119,13 @@ class Chip(QWidget):
     def set_tone(self, dot: str) -> None:
         self._dot.set_tone(dot)
 
+    def text(self) -> str:
+        """The chip as read aloud: "3 reviewed"."""
+        return f"{self._count_label.text()} {self._label.text()}"
+
+    def tone(self) -> str:
+        return self._dot.property("tone")
+
 
 class Badge(QLabel):
     """`.badge` / `.badge.w` / `.badge.g` -- the review-queue state pill
@@ -159,11 +169,20 @@ class KvRow(QWidget):
         layout.addWidget(self._value_label)
         self.set_value(value, tone)
 
-    def set_value(self, value: str, tone: str | None = None) -> None:
+    def value(self) -> str:
+        return self._value_label.text()
+
+    def value_tone(self) -> str:
+        return self._value_label.property("tone")
+
+    def set_value(self, value: str, tone: str | None = None, *, tint_border: bool = True) -> None:
+        """`tint_border=False` colours only the value, as the inspector's
+        Detected rows do (workbench-hifi figure 1: a warn "211" in a plain
+        row)."""
         self._value_label.setText(value)
         tone_prop = tone or ""
         self._value_label.setProperty("tone", tone_prop)
-        self.setProperty("tone", tone_prop)
+        self.setProperty("tone", tone_prop if tint_border else "")
         _repolish(self._value_label)
         _repolish(self)
 
@@ -219,6 +238,19 @@ class SegmentedControl(QWidget):
         self._current = 0
         self.set_labels(items)
 
+    def labels(self) -> list[str]:
+        return [button.text() for button in self._buttons]
+
+    def set_texts(self, items: list[str]) -> None:
+        """Rename the segments in place (same count), keeping the buttons and
+        the current segment; a different count falls back to set_labels()."""
+        if len(items) != len(self._buttons):
+            self.set_labels(items)
+            return
+        for button, label in zip(self._buttons, items, strict=True):
+            if button.text() != label:
+                button.setText(label)
+
     def set_labels(self, items: list[str]) -> None:
         for button in self._buttons:
             self._layout.removeWidget(button)
@@ -261,18 +293,22 @@ class SegmentedControl(QWidget):
 class _BarTrack(QWidget):
     """Shared fixed-size painted track behind `ConfBar`/`MiniProgress`: a
     rounded `TRACK_BG` background (`.bar` / `.mini`) with a solid fill rect
-    clipped to `fraction` of the width (`.bar u` / `.mini u`). Not part of
-    Task 1's public widget list -- a fraction-of-width fill cannot be
-    expressed in static QSS, so both bars paint themselves directly."""
+    clipped to `fraction` of the width (`.bar u` / `.mini u`), or, as a
+    moving segment, from `offset` for `fraction` of the width (an
+    indeterminate bar). Not part of Task 1's public widget list -- a
+    fraction-of-width fill cannot be expressed in static QSS, so both bars
+    paint themselves directly."""
 
     def __init__(self, width: int, height: int, fill: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.setFixedSize(width, height)
         self._fraction = 0.0
+        self._offset = 0.0
         self._fill = fill
 
-    def set_value(self, fraction: float, fill: str) -> None:
+    def set_value(self, fraction: float, fill: str, offset: float = 0.0) -> None:
         self._fraction = max(0.0, min(1.0, fraction))
+        self._offset = offset
         self._fill = fill
         self.update()
 
@@ -289,7 +325,8 @@ class _BarTrack(QWidget):
         if self._fraction > 0:
             painter.setClipPath(path)
             painter.setBrush(QColor(self._fill))
-            painter.drawRect(0, 0, round(rect.width() * self._fraction), self.height())
+            width = rect.width()
+            painter.drawRect(QRectF(width * self._offset, 0, width * self._fraction, rect.height()))
         painter.end()
 
 
@@ -314,6 +351,9 @@ class ConfBar(QWidget):
         layout.addWidget(self._caption, 1)
         self.set_value(fraction, tone, caption)
 
+    def caption(self) -> str:
+        return self._caption.text()
+
     def set_value(self, fraction: float, tone: str = "ok", caption: str = "") -> None:
         self.setProperty("tone", tone)
         self._track.set_value(fraction, _BAR_TONE_COLOR.get(tone, tokens.OK))
@@ -322,7 +362,16 @@ class ConfBar(QWidget):
 
 
 class MiniProgress(QWidget):
-    """`.mini` -- a 90x4px, always-blue progress bar (the activity strip)."""
+    """`.mini` -- a 90x4px, always-blue progress bar (the activity strip).
+
+    `set_indeterminate(True)` animates a segment sliding along the track, for
+    a job that reports no progress fraction; `set_value()` returns the bar to
+    a plain fraction. The animation timer runs only while the bar is
+    indeterminate and shown."""
+
+    SEGMENT = 0.3                  # the sliding segment's share of the track
+    FRAME_MS = 40
+    STEP = 0.025                   # track widths per frame
 
     def __init__(self, fraction: float = 0.0, parent: QWidget | None = None):
         super().__init__(parent)
@@ -332,7 +381,98 @@ class MiniProgress(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self._track = _BarTrack(tokens.MINI_WIDTH, tokens.MINI_HEIGHT, tokens.BLUE)
         layout.addWidget(self._track)
+        self._indeterminate = False
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.FRAME_MS)
+        self._timer.timeout.connect(self._advance)
         self.set_value(fraction)
 
     def set_value(self, fraction: float) -> None:
+        self._indeterminate = False
+        self._timer.stop()
         self._track.set_value(fraction, tokens.BLUE)
+
+    def set_indeterminate(self, on: bool = True) -> None:
+        if not on:
+            self.set_value(0.0)
+            return
+        if not self._indeterminate:
+            self._indeterminate = True
+            self._phase = 0.0
+            self._paint_segment()
+        self._sync_timer()
+
+    def is_indeterminate(self) -> bool:
+        return self._indeterminate
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_timer()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()
+
+    def _sync_timer(self) -> None:
+        if self._indeterminate and self.isVisible():
+            self._timer.start()
+        else:
+            self._timer.stop()
+
+    def _advance(self) -> None:
+        self._phase = (self._phase + self.STEP) % (1.0 + self.SEGMENT)
+        self._paint_segment()
+
+    def _paint_segment(self) -> None:
+        start = self._phase - self.SEGMENT
+        left, right = max(0.0, start), min(1.0, self._phase)
+        self._track.set_value(max(0.0, right - left), tokens.BLUE, offset=left)
+
+
+class ElidedLabel(QLabel):
+    """A single-line label that elides its text to fit its width (a long
+    file name or path), keeping the full text in `full_text()` and its
+    tooltip. `mode`: Qt.TextElideMode (right by default)."""
+
+    def __init__(self, text: str = "", mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full = ""
+        self._mode = mode
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.set_full_text(text)
+
+    def full_text(self) -> str:
+        return self._full
+
+    def set_full_text(self, text: str) -> None:
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        margins = self.contentsMargins()
+        hint.setWidth(self.fontMetrics().horizontalAdvance(self._full) + margins.left() + margins.right()
+                      + 2 * self.margin() + 1)
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        width = self.contentsRect().width()
+        text = self._full if width <= 0 else self.fontMetrics().elidedText(self._full, self._mode, width)
+        if text != super().text():
+            super().setText(text)

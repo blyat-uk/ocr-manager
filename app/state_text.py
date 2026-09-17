@@ -280,3 +280,79 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+# --------------------------------------------------------------------------
+# Value texts (plan 3B Task 3: the inspector's Detected rows and header, the
+# placeholder tabs)
+# --------------------------------------------------------------------------
+
+_NO_VALUE = "—"
+_RANGES_SHOWN = 2          # more keep ranges than this read "first, second +N"
+
+
+def crop_text(crop) -> str:
+    """"288, 784 · 1344 × 55" (x, y · width × height), or "—"."""
+    if crop is None:
+        return _NO_VALUE
+    return f"{crop.x}, {crop.y} · {crop.width} × {crop.height}"
+
+
+def brightness_text(brightness) -> str:
+    return _NO_VALUE if brightness is None else str(brightness.value)
+
+
+def _time_text(value: str | None, missing: str) -> str:
+    """A stored "MM:SS" / "H:MM:SS" as format_duration writes it ("02:33"
+    reads "2:33"); text that is not a time is shown as stored."""
+    if value is None:
+        return missing
+    try:
+        parts = [int(part) for part in value.split(":")]
+    except ValueError:
+        return value
+    if not 2 <= len(parts) <= 3 or any(part < 0 for part in parts):
+        return value
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return format_duration(seconds)
+
+
+def ranges_text(time_ranges) -> str:
+    """"2:33 → 23:05" per keep range; "whole file" for None or an empty list
+    (a manual "use whole file" is stored as an empty MANUAL list)."""
+    if time_ranges is None or not time_ranges.ranges:
+        return "whole file"
+    spans = [f"{_time_text(r.start, '0:00')} → {_time_text(r.end, 'end')}" for r in time_ranges.ranges]
+    if len(spans) > _RANGES_SHOWN:
+        return ", ".join(spans[:_RANGES_SHOWN]) + f" +{len(spans) - _RANGES_SHOWN}"
+    return ", ".join(spans)
+
+
+def media_text(media) -> str:
+    """"1920×888 · 27:08 · 25 fps"; unknown (zero) parts are left out."""
+    parts = []
+    if media.width > 0 and media.height > 0:
+        parts.append(f"{media.width}×{media.height}")
+    if media.duration > 0:
+        parts.append(format_duration(media.duration))
+    if media.fps > 0:
+        parts.append(f"{media.fps:g} fps")
+    return " · ".join(parts)
+
+
+def clock(seconds: float) -> str:
+    """"MM:SS" (minutes are not wrapped into hours): a proof line's time."""
+    total = max(0, int(seconds))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+_FIELD_VALUE = {"crop": "crop", "brightness": "brightness", "ranges": "time_ranges"}
+
+
+def field_blocking(entry: FileEntry, field: str) -> bool:
+    """Whether `entry.flags[field]` holds a blocking flag on a DETECTED/HINT
+    value -- the `blocking=` argument of the captions above. `field`: "crop" |
+    "brightness" | "ranges"."""
+    return _flag_blocks_detected_value(entry, field, getattr(entry, _FIELD_VALUE[field]))

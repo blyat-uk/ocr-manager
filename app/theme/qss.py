@@ -22,6 +22,11 @@ from __future__ import annotations
 
 from app.theme import tokens
 
+# `.chip`'s CSS `border-radius:20px` makes a pill because browsers clamp the
+# radius to half the height. Qt draws no rounding at all when a radius
+# exceeds half the widget, so the ~22 px chip gets half its height instead.
+CHIP_QT_RADIUS = 10
+
 
 def build_stylesheet() -> str:
     """The full QSS for the base widgets in `app/widgets/base.py`. A plain
@@ -90,7 +95,7 @@ QPushButton[toggled="true"] {{
 QWidget#Chip {{
     background-color: {tokens.PANEL2};
     border: 1px solid {tokens.LINE2};
-    border-radius: {tokens.RADIUS_CHIP}px;
+    border-radius: {CHIP_QT_RADIUS}px;
 }}
 QWidget#Chip QLabel {{
     font-size: 11px;
@@ -190,6 +195,256 @@ QPushButton#SegmentItem[on="true"] {{
     background-color: {tokens.PANEL2};
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE2};
+}}
+""".strip("\n") + "\n" + _views_stylesheet()
+
+
+def _views_stylesheet() -> str:
+    """The window's views (plan 3B Task 3, `app/views/`), matched by object
+    name: top bar, review queue, stage head, inspector, activity strip,
+    banners and the open-folder empty state (workbench-hifi.html figure 1)."""
+    return f"""
+/* == Views (plan 3B Task 3) =========================================== */
+QLabel {{
+    background: transparent;
+}}
+
+/* -- Panels: top bar, rail, inspector, activity strip ------------------ */
+QWidget#TopBar {{
+    background-color: {tokens.PANEL};
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QWidget#ActivityStrip {{
+    background-color: {tokens.PANEL};
+    border-top: 1px solid {tokens.LINE};
+}}
+QWidget#Queue {{
+    background-color: {tokens.PANEL};
+    border-right: 1px solid {tokens.LINE};
+}}
+QWidget#Inspector {{
+    background-color: {tokens.PANEL};
+    border-left: 1px solid {tokens.LINE};
+}}
+QWidget#QueueList, QWidget#InspectorContent,
+QScrollArea#QueueScroll, QScrollArea#InspectorScroll,
+QScrollArea#QueueScroll > QWidget#qt_scrollarea_viewport,
+QScrollArea#InspectorScroll > QWidget#qt_scrollarea_viewport {{
+    background-color: {tokens.PANEL};
+    border: none;
+}}
+
+/* -- Scroll bars and menus --------------------------------------------- */
+QScrollBar:vertical {{
+    background: transparent;
+    width: 8px;
+    margin: 2px 1px;
+}}
+QScrollBar::handle:vertical {{
+    background-color: {tokens.LINE2};
+    border-radius: 3px;
+    min-height: 24px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: transparent;
+}}
+QMenu {{
+    background-color: {tokens.PANEL2};
+    border: 1px solid {tokens.LINE2};
+    border-radius: {tokens.RADIUS_BTN}px;
+    color: {tokens.TXT};
+    font-size: {tokens.FONT_SIZE_BODY}px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 5px 14px;
+    border-radius: {tokens.RADIUS_TAG}px;
+}}
+QMenu::item:selected {{
+    background-color: {tokens.ROW_SELECTED};
+}}
+QMenu::item:disabled {{
+    color: {tokens.DIM2};
+}}
+QMenu::separator {{
+    height: 1px;
+    background-color: {tokens.LINE};
+    margin: 4px 6px;
+}}
+
+/* -- Top bar (.topbar / .proj / .path) --------------------------------- */
+QWidget#ChipBar {{
+    background: transparent;
+}}
+QLabel#ProjectName {{
+    font-size: {tokens.FONT_SIZE_PROJ}px;
+    font-weight: {tokens.FONT_WEIGHT_PROJ};
+    color: {tokens.TXT};
+}}
+QLabel#ProjectPath {{
+    font-size: 11px;
+    color: {tokens.DIM2};
+}}
+
+/* -- Banners (dependency warnings, open/save errors) ------------------- */
+QWidget#Banner {{
+    background-color: {tokens.BADGE_WARN_BG};
+    border-bottom: 1px solid {tokens.KV_WARN_BORDER};
+}}
+QWidget#Banner[tone="bad"] {{
+    background-color: {tokens.PANEL2};
+    border-bottom: 1px solid {tokens.TAG_BAD_BORDER};
+}}
+QLabel#BannerTitle {{
+    color: {tokens.WARN};
+    font-weight: {tokens.FONT_WEIGHT_PROJ};
+    font-size: {tokens.FONT_SIZE_BODY}px;
+}}
+QWidget#Banner[tone="bad"] QLabel#BannerTitle {{
+    color: {tokens.BAD};
+}}
+QLabel#BannerText {{
+    color: {tokens.TXT};
+    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+}}
+
+/* -- Review queue (.rail-head / .frow / .fname / .fsub) ---------------- */
+QWidget#QueueHead {{
+    background-color: {tokens.PANEL};
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QWidget#QueueRow {{
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: {tokens.RADIUS_ROW}px;
+}}
+QWidget#QueueRow[selected="false"]:hover {{
+    background-color: {tokens.ROW_HOVER};
+}}
+QWidget#QueueRow[selected="true"] {{
+    background-color: {tokens.ROW_SELECTED};
+    border-color: {tokens.ACC_DIM};
+}}
+QLabel#QueueName {{
+    font-size: {tokens.FONT_SIZE_BODY}px;
+    font-weight: {tokens.FONT_WEIGHT_FNAME};
+    color: {tokens.TXT};
+}}
+QWidget#QueueRow[skipped="true"] QLabel#QueueName {{
+    color: {tokens.DIM2};
+}}
+QLabel#QueueSub {{
+    font-size: {tokens.FONT_SIZE_SM}px;
+    color: {tokens.DIM2};
+}}
+QLabel#QueueHint {{
+    background-color: {tokens.PANEL};
+    border-top: 1px solid {tokens.LINE};
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_SM}px;
+    padding: 9px 11px;
+}}
+
+/* -- Stage (.stage-head / .tab / .tab.on) ------------------------------ */
+QWidget#Stage, QStackedWidget#StagePages {{
+    background-color: {tokens.BG};
+}}
+QWidget#StageHead {{
+    background-color: {tokens.BG};
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QPushButton#StageTab {{
+    font-size: {tokens.FONT_SIZE_BODY}px;
+    padding: 5px 11px;
+    color: {tokens.DIM};
+    background: transparent;
+    border: 1px solid transparent;
+    border-top-left-radius: {tokens.RADIUS_BTN}px;
+    border-top-right-radius: {tokens.RADIUS_BTN}px;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}}
+QPushButton#StageTab:hover {{
+    color: {tokens.TXT};
+}}
+QPushButton#StageTab[on="true"] {{
+    color: {tokens.TXT};
+    background-color: {tokens.PANEL2};
+    border: 1px solid {tokens.LINE2};
+    border-bottom-color: {tokens.PANEL2};
+}}
+
+/* -- Inspector (.insp-head / .sec / .note / .ocrline / .footer) -------- */
+QWidget#InspectorSection {{
+    background-color: {tokens.PANEL};
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QWidget#InspectorFooter {{
+    background-color: {tokens.PANEL};
+    border-top: 1px solid {tokens.LINE};
+}}
+QLabel#InspectorScope {{
+    color: {tokens.ACC};
+    font-size: {tokens.FONT_SIZE_SCOPE}px;
+}}
+QLabel#InspectorFile {{
+    color: {tokens.TXT};
+    font-size: {tokens.FONT_SIZE_MD}px;
+    font-weight: {tokens.FONT_WEIGHT_PROJ};
+}}
+QLabel#InspectorSub {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+}}
+QLabel#Note {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_SM}px;
+}}
+QLabel#Note[tone="warn"] {{
+    color: {tokens.WARN};
+}}
+QWidget#OcrLine {{
+    background: transparent;
+    border-bottom: 1px dashed {tokens.LINE};
+}}
+QLabel#OcrTime {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_SM}px;
+}}
+QLabel#OcrText {{
+    color: {tokens.TXT};
+    font-size: 11px;
+}}
+
+/* -- Activity strip (.activity) ---------------------------------------- */
+QWidget#ActivityStrip QLabel {{
+    color: {tokens.DIM};
+    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+}}
+QWidget#ActivityStrip QLabel#ActivityRecent {{
+    color: {tokens.DIM2};
+}}
+
+/* -- Placeholder tab pages --------------------------------------------- */
+QWidget#PlaceholderPage {{
+    background-color: {tokens.BG};
+}}
+
+/* -- Open-folder empty state ------------------------------------------- */
+QWidget#OpenFolder {{
+    background-color: {tokens.BG};
+}}
+QLabel#OpenTitle {{
+    color: {tokens.TXT};
+    font-size: {tokens.FONT_SIZE_PROJ}px;
+    font-weight: {tokens.FONT_WEIGHT_PROJ};
+}}
+QLabel#OpenError {{
+    color: {tokens.BAD};
+    font-size: {tokens.FONT_SIZE_BTN_SM}px;
 }}
 """.strip("\n")
 

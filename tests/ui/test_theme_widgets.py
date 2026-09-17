@@ -61,6 +61,9 @@ COLOUR_TOKENS = [
     ("TAG_BAD_BORDER", "#5b2f34"),
     ("TAG_BLUE_BORDER", "#2c4666"),
     ("WAVEFORM", "#5a6472"),
+    ("THUMB_TOP", "#243044"),
+    ("THUMB_BOTTOM", "#121820"),
+    ("THUMB_PENDING", "#161b22"),
 ]
 
 
@@ -311,3 +314,67 @@ def test_segmented_control_set_labels_replaces_segments(qapp):
     seg.set_labels(["X", "Y", "Z"])
     assert len(seg._buttons) == 3
     assert [b.text() for b in seg._buttons] == ["X", "Y", "Z"]
+
+
+# --------------------------------------------------------------------------
+# Task 3 additions: read accessors, set_texts, indeterminate MiniProgress,
+# ElidedLabel
+# --------------------------------------------------------------------------
+
+def test_read_accessors(qapp):
+    chip = Chip(dot="warn", count=1, label="needs you")
+    assert chip.text() == "1 needs you" and chip.tone() == "warn"
+    assert KvRow("Crop", "288, 784 · 1344 × 55").value() == "288, 784 · 1344 × 55"
+    row = KvRow("Brightness", "211")
+    row.set_value("211", "warn", tint_border=False)
+    assert (row.value_tone(), row.property("tone")) == ("warn", "")
+    assert ConfBar(0.5, caption="12 of 12 samples agree").caption() == "12 of 12 samples agree"
+    assert SegmentedControl(["All 5", "Needs you 1"]).labels() == ["All 5", "Needs you 1"]
+
+
+def test_segmented_control_set_texts_keeps_buttons_and_current(qapp):
+    seg = SegmentedControl(["All 5", "Needs you 1", "Reviewed 3"])
+    seg.set_current(2)
+    buttons = list(seg._buttons)
+    seg.set_texts(["All 5", "Needs you 0", "Reviewed 4"])
+    assert seg._buttons == buttons
+    assert seg.labels() == ["All 5", "Needs you 0", "Reviewed 4"]
+    assert seg.current() == 2
+    seg.set_texts(["A", "B"])                       # another count: rebuilt
+    assert seg.labels() == ["A", "B"]
+
+
+def test_mini_progress_indeterminate_animates_only_while_shown(qapp):
+    mini = MiniProgress()
+    mini.set_indeterminate(True)
+    assert mini.is_indeterminate()
+    assert not mini._timer.isActive()               # not shown yet
+    mini.show()
+    assert mini._timer.isActive()
+    before = (mini._track._offset, mini._track._fraction)
+    mini._advance()
+    mini._advance()
+    assert (mini._track._offset, mini._track._fraction) != before
+    mini.hide()
+    assert not mini._timer.isActive()
+    mini.show()
+    mini.set_value(0.4)
+    assert not mini.is_indeterminate() and not mini._timer.isActive()
+    assert mini._track._fraction == pytest.approx(0.4) and mini._track._offset == 0.0
+    mini.close()
+
+
+def test_elided_label_keeps_the_full_text(qapp):
+    from app.widgets.base import ElidedLabel
+
+    label = ElidedLabel("ZS2_-_12_[1080p]TXHBR.mp4 with a very long tail that cannot fit")
+    label.resize(60, 20)
+    label.show()                                    # resize events reach a shown widget
+    assert label.full_text() == "ZS2_-_12_[1080p]TXHBR.mp4 with a very long tail that cannot fit"
+    assert label.toolTip() == label.full_text()
+    assert label.text() != label.full_text() and label.text().endswith("…")
+    label.resize(2000, 20)
+    assert label.text() == label.full_text()
+    assert label.sizeHint().width() >= label.fontMetrics().horizontalAdvance(label.full_text())
+    assert label.minimumSizeHint().width() == 0
+    label.close()
