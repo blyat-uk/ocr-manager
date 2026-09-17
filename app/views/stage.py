@@ -1,5 +1,5 @@
-"""The centre stage (`.stage`, ui-spec §3.3): a tab bar and the active
-tab's page.
+"""The centre stage (`.stage`, ui-spec §3.3): a tab bar, the active tab's
+per-tab toolbar beside it, and the active tab's page.
 
 Tabs are pluggable (`StageTab`): plan 3C supplies the real Crop, Brightness
 and Time ranges views; until then `placeholder_tabs` shows each tab's values
@@ -7,6 +7,13 @@ as key/value rows. The stage knows nothing about any particular tab: it
 forwards the selected file, calls `refresh()` when the model changes and
 reports tab switches, which the inspector follows to show the active tab's
 panel (ruling B4).
+
+`toolbar()` is optional. Ruling B3 puts each tab's own controls
+right-aligned in the stage head (`.stage-head`), so a tab that has some
+returns one widget holding them and the stage mounts it there, swapping it
+on every tab change. A tab that returns None -- or, for a tab written before
+this existed, one with no `toolbar` attribute at all -- leaves the head with
+nothing but its tab buttons.
 """
 from __future__ import annotations
 
@@ -26,6 +33,8 @@ class StageTab(Protocol):
     def page(self) -> QWidget: ...               # centre stage content
 
     def inspector_panel(self) -> QWidget: ...    # the active-tab section shown in the inspector (ruling B4)
+
+    def toolbar(self) -> QWidget | None: ...     # the per-tab stage-head toolbar (ruling B3); None for no toolbar
 
     def set_file(self, name: str | None) -> None: ...
 
@@ -66,6 +75,9 @@ class Stage(QWidget):
             head_layout.addWidget(button)
             self._buttons.append(button)
         head_layout.addStretch(1)
+        self._head = head
+        self._head_layout = head_layout
+        self._toolbars: list[QWidget] = []
         layout.addWidget(head)
 
         self._pages = QStackedWidget()
@@ -73,6 +85,8 @@ class Stage(QWidget):
         for tab in self._tabs:
             self._pages.addWidget(tab.page())
         layout.addWidget(self._pages, 1)
+
+        self._show_toolbar(self._current)
 
         controller.file_changed.connect(self._on_file_changed)
         controller.files_changed.connect(self._refresh_tabs)
@@ -83,6 +97,26 @@ class Stage(QWidget):
 
     def tab_buttons(self) -> list[QPushButton]:
         return list(self._buttons)
+
+    def head(self) -> QWidget:
+        return self._head
+
+    def current_toolbar(self) -> QWidget | None:
+        """The toolbar mounted in the head right now, or None."""
+        return next((bar for bar in self._toolbars if not bar.isHidden()), None)
+
+    def _show_toolbar(self, index: int) -> None:
+        """Mount the tab's toolbar in the head, hiding the previous one.
+
+        `getattr`: `toolbar` is optional, so a tab that predates it (or a
+        test's stand-in) simply has none."""
+        factory = getattr(self._tabs[index], "toolbar", None)
+        bar = factory() if callable(factory) else None
+        if bar is not None and bar not in self._toolbars:
+            self._toolbars.append(bar)
+            self._head_layout.addWidget(bar)
+        for other in self._toolbars:
+            other.setVisible(other is bar)
 
     def page_host(self) -> QStackedWidget:
         return self._pages
@@ -107,6 +141,7 @@ class Stage(QWidget):
         for position, button in enumerate(self._buttons):
             button.setProperty("on", position == index)
             repolish(button)
+        self._show_toolbar(index)
         self.tab_changed.emit(index)
 
     def set_file(self, name: str | None) -> None:
@@ -200,6 +235,9 @@ class PlaceholderTab:
 
     def inspector_panel(self) -> QWidget:
         return self._panel
+
+    def toolbar(self) -> QWidget | None:
+        return None                              # a placeholder tab has no controls of its own
 
     def current_file(self) -> str | None:
         return self._file

@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import QApplication
 
 from app.main_window import MainWindow
 from app.theme.qss import apply_theme
+from app.views.tabs import evidence_tabs
 
 
 def _program_name() -> str:
@@ -67,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     args, qt_args = _parse(sys.argv[1:] if argv is None else list(argv))
     app = QApplication.instance() or QApplication([sys.argv[0], *qt_args])
     apply_theme(app)
-    window = MainWindow()
+    window = MainWindow(tabs_factory=evidence_tabs)
     window.show()
     if args.folder:
         window.open_folder(args.folder)
