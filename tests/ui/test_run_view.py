@@ -224,12 +224,35 @@ def test_only_done_files_can_be_re_run_and_no_starts_nothing(make_window, tmp_pr
     window = make_window(["a.mkv", "b.mkv"], tmp_project=tmp_project, done=("a.mkv", "b.mkv"))
     asked = answer(monkeypatch, No)
     button = window.topbar.start_button
-    assert button.text() == "▶ Start 0 ready files" and button.isEnabled()
+    assert button.text() == "▶ Re-run 2 done files" and button.isEnabled()
     button.click()
     settle()
     assert asked and asked[0][2] == OVERWRITE_TEXT.format(n=2)
     assert fake_runner.of_kind("run") == []
     assert window.mode() == MODE_REVIEW and window.topbar.run_switch.isHidden()
+
+
+def test_start_says_re_run_for_one_done_file_and_stays_disabled_with_nothing_to_run(make_window, tmp_project):
+    window = make_window(["a.mkv", "b.mkv"], tmp_project=tmp_project, done=("a.mkv",))
+    button = window.topbar.start_button
+    assert button.text() == "▶ Start 1 ready file" and button.isEnabled()
+
+    window.controller.set_skipped("b.mkv", True)
+    settle()
+    assert button.text() == "▶ Re-run 1 done file" and button.isEnabled()
+
+    window.controller.set_skipped("a.mkv", True)                # nothing ready, nothing to re-run
+    settle()
+    assert button.text() == "▶ Start 0 ready files" and not button.isEnabled()
+
+
+def test_the_logs_window_opens_during_a_run(window, fake_runner):
+    start(window, fake_runner)
+    top = window.topbar
+    assert not top.logs_button.isHidden() and top.settings_button.isHidden()
+    top.logs_button.click()
+    settle()
+    assert window.logs_window is not None and window.logs_window.isVisible()
 
 
 def test_a_refused_start_is_shown_beside_start_without_switching_modes(make_window, tmp_project, fake_runner):
@@ -265,8 +288,9 @@ def test_the_run_switch_appears_and_toggles_the_centre_and_right_area(window, fa
     assert top.run_switch.labels() == ["Review", "Run"] and top.run_switch.current() == MODE_RUN
     assert window.modes.currentWidget() is window.run_view
     assert window.queue.parentWidget() is window.workbench and window.run_view.parentWidget() is window.modes
-    for hidden in (top.settings_button, top.logs_button, top.start_button, top._chips):
+    for hidden in (top.settings_button, top.start_button, top._chips):
         assert hidden.isHidden()
+    assert not top.logs_button.isHidden()                       # logs stay reachable during a run
     assert not top.pause_button.isHidden() and not top.stop_button.isHidden()
     assert top.pause_button.text() == "⏸ pause" and top.stop_button.text() == "■ stop"
 
@@ -280,7 +304,7 @@ def test_the_run_switch_appears_and_toggles_the_centre_and_right_area(window, fa
     fake_runner.finish(run, RunSummary(["ep01.mkv"], {}, NAMES[1:], 5.0))
     deliver(window)
     for shown in (top.settings_button, top.logs_button, top.start_button, top._chips):
-        assert not shown.isHidden()
+        assert not shown.isHidden()                             # the top bar is back to itself
     assert top.pause_button.isHidden() and top.stop_button.isHidden()
     assert not top.run_switch.isHidden()                        # the switch stays until another folder opens
     assert window.mode() == MODE_RUN
@@ -480,9 +504,10 @@ def test_the_idle_hint_offers_to_raise_parallel_files(window, fake_runner):
     fake_runner.emit(run, "run_file_started", file="ep02.mkv")
     deliver(window)
 
-    assert not view.idle_label.isHidden() and not view.raise_button.isHidden()
-    assert view.idle_label.text() == "2 workers idle →"
+    assert not view.hint_label.isHidden() and not view.raise_button.isHidden()
+    assert view.hint_label.text() == "2 workers idle →"
     assert view.raise_button.text() == "raise to 4"
+    assert view.hint_text() == "2 workers idle → raise to 4"
     assert "not started yet" in view.raise_button.toolTip()
     updates = Recorder(controller, "update_folder")
     view.raise_button.click()
@@ -491,13 +516,14 @@ def test_the_idle_hint_offers_to_raise_parallel_files(window, fake_runner):
 
     controller.pause_run()                                      # a paused run starts nothing: no hint
     settle()
-    assert view.idle_label.isHidden() and view.raise_button.isHidden()
+    assert view.hint_label.isHidden() and view.raise_button.isHidden()
+    assert view.hint_text() == ""
     controller.resume_run()
     for name in NAMES[2:]:
         fake_runner.emit(run, "run_file_started", file=name)
     fake_runner.emit(run, "run_file_finished", file="ep01.mkv", result={"ok": True, "lines": 1, "error": ""})
     deliver(window)
-    assert view.idle_label.isHidden()                          # nothing queued: nothing to raise for
+    assert view.hint_label.isHidden()                           # nothing queued: nothing to raise for
 
 
 def test_one_idle_worker_reads_singular(make_window, tmp_project, fake_runner):
@@ -505,8 +531,47 @@ def test_one_idle_worker_reads_singular(make_window, tmp_project, fake_runner):
     run = start(window, fake_runner)
     fake_runner.emit(run, "run_file_started", file="ep01.mkv")
     deliver(window)
-    assert window.run_view.idle_label.text() == "1 worker idle →"
+    assert window.run_view.hint_label.text() == "1 worker idle →"
     assert window.run_view.raise_button.text() == "raise to 2"
+
+
+def test_queued_files_offer_a_higher_parallel_that_reaches_the_run_job(make_window, tmp_project, fake_runner):
+    """Every worker is busy and files wait: the offer is parallel + 2 (B13 as amended)."""
+    window = make_window(tmp_project=tmp_project, ocr_parallel=2)
+    controller, view = window.controller, window.run_view
+    run = start(window, fake_runner)
+    fake_runner.emit(run, "run_file_started", file="ep01.mkv")
+    fake_runner.emit(run, "run_file_started", file="ep02.mkv")
+    deliver(window)
+
+    assert view.hint_label.text() == "3 files queued ·"
+    assert view.raise_button.text() == "raise to 4"
+    assert view.hint_text() == "3 files queued · raise to 4"
+    assert "not started yet" in view.raise_button.toolTip()
+    updates = Recorder(controller, "update_folder")
+    view.raise_button.click()
+    deliver(window)
+
+    assert updates.calls == [((), {"ocr_parallel": 4})]
+    assert run.job.parallel == 4                                # it reached the running job
+    assert controller.run_snapshot().parallel == 4
+    assert controller.project.folder.ocr_parallel == 4
+    assert view.hint_text() == "2 workers idle → raise to 4"    # the literal B13 case, now that 4 > 2 running
+
+    fake_runner.emit(run, "run_file_started", file="ep03.mkv")
+    fake_runner.emit(run, "run_file_started", file="ep04.mkv")
+    deliver(window)
+    assert view.hint_text() == "1 file queued · raise to 6"     # singular, and two above the folder's 4
+
+
+def test_no_queued_hint_at_the_parallel_cap(make_window, tmp_project, fake_runner):
+    names = [f"ep{index:02d}.mkv" for index in range(1, 11)]
+    window = make_window(names, tmp_project=tmp_project, ocr_parallel=8)
+    run = start(window, fake_runner)
+    for name in names[:8]:
+        fake_runner.emit(run, "run_file_started", file=name)
+    deliver(window)
+    assert window.run_view.hint_label.isHidden() and window.run_view.hint_text() == ""
 
 
 def test_parse_gpu_utilisation():

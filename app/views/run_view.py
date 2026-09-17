@@ -9,8 +9,15 @@ while the review queue stays.
   running and full when done; "{n} lines".
 - Footer: "GPU {p}%" from `nvidia-smi`, run through an async QProcess every
   2 s only while this view is visible and a run is active, hidden when the
-  query fails; "{k} workers idle →" + "raise to {m}" (`idle_workers`), which
-  calls `update_folder(ocr_parallel=m)`.
+  query fails; and one raise offer (`raise_offer`) with a ghost
+  "raise to {m}" button that calls `update_folder(ocr_parallel=m)`, which
+  reaches the running job (RunJob.set_parallel):
+    - "{k} workers idle →", m = the folder's parallel, when the run has
+      worker slots it is not using while files wait (`idle_workers`, B13);
+    - otherwise "{q} files queued ·", m = parallel + 2 capped at
+      MAX_PARALLEL, while files wait and the folder is below that cap -- the
+      case that actually comes up, since the run job fills a free worker at
+      once (B13 as amended).
 - Right panel (300 px) "LIVE · {file}": the recognised lines of the followed
   file ("MM:SS text"), by default the most recently started file; "follow ▾"
   picks another. Then the note that reviewing goes on meanwhile.
@@ -57,6 +64,11 @@ LIVE_NOTE = ("You can keep reviewing other episodes while this runs — nothing 
              "files that haven't started yet.")
 RAISE_TOOLTIP = ("Run up to {m} files at once. Files already running carry on; the new limit applies to files "
                  "that have not started yet.")
+MAX_PARALLEL = 8                            # the folder settings sheet's upper bound for "parallel files"
+PARALLEL_STEP = 2                           # how much "raise to" offers above the folder's parallel
+IDLE_HINT = "{count} {noun} idle →"
+QUEUED_HINT = "{count} {noun} queued ·"
+RAISE_TEXT = "raise to {m}"
 
 _PROGRESS_COLOURS = {"run": tokens.BLUE, "done": tokens.ACC, "bad": tokens.BAD, "dim": tokens.DIM2}
 
@@ -78,6 +90,21 @@ def feed_time(seconds: float) -> str:
 
 def lines_text(count: int) -> str:
     return f"{count} line" if count == 1 else f"{count} lines"
+
+
+def raise_offer(snapshot, parallel: int) -> tuple[str, int] | None:
+    """The footer's raise offer: (hint text, the parallel to offer), or None
+    when there is nothing to offer (see this module's docstring)."""
+    if snapshot is None or snapshot.finished or snapshot.paused or snapshot.stopping:
+        return None
+    idle = idle_workers(snapshot, parallel)
+    if idle > 0:
+        return IDLE_HINT.format(count=idle, noun="worker" if idle == 1 else "workers"), parallel
+    queued = snapshot.count(QUEUED)
+    if queued > 0 and parallel < MAX_PARALLEL:
+        return (QUEUED_HINT.format(count=queued, noun="file" if queued == 1 else "files"),
+                min(MAX_PARALLEL, parallel + PARALLEL_STEP))
+    return None
 
 
 def parse_gpu_utilisation(output: str) -> int | None:
@@ -428,11 +455,11 @@ class RunView(QWidget):
         footer.setSpacing(6)
         self.gpu_label = QLabel()
         self.gpu_separator = QLabel("·")
-        self.idle_label = QLabel()
-        self.raise_button = Button("raise to 0", "ghost", small=True)
+        self.hint_label = QLabel()
+        self.raise_button = Button(RAISE_TEXT.format(m=0), "ghost", small=True)
         self.raise_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.raise_button.clicked.connect(self._raise_parallel)
-        for widget in (self.gpu_label, self.gpu_separator, self.idle_label, self.raise_button):
+        for widget in (self.gpu_label, self.gpu_separator, self.hint_label, self.raise_button):
             footer.addWidget(widget)
         footer.addStretch(1)
         column.addWidget(self.footer)
@@ -493,6 +520,13 @@ class RunView(QWidget):
     def feed_lines(self) -> list[str]:
         return [line.text() for line in self._feed_lines()]
 
+    def hint_text(self) -> str:
+        """The footer's raise offer as one line ("3 files queued · raise to
+        6"); "" when there is none."""
+        if self.hint_label.isHidden():
+            return ""
+        return f"{self.hint_label.text()} {self.raise_button.text()}"
+
     # --- refreshing ---------------------------------------------------------------------
 
     def refresh(self, *_args) -> None:
@@ -537,17 +571,16 @@ class RunView(QWidget):
         if gpu is not None:
             self.gpu_label.setText(f"GPU {gpu}%")
         project = controller.project
-        parallel = project.folder.ocr_parallel if project is not None else 0
-        idle = idle_workers(snapshot, parallel) if snapshot is not None and project is not None else 0
-        self.idle_label.setVisible(idle > 0)
-        self.raise_button.setVisible(idle > 0)
-        if idle > 0:
-            self._raise_to = parallel
-            self.idle_label.setText(f"{idle} {'worker' if idle == 1 else 'workers'} idle →")
-            self.raise_button.setText(f"raise to {parallel}")
-            self.raise_button.setToolTip(RAISE_TOOLTIP.format(m=parallel))
-        self.gpu_separator.setVisible(gpu is not None and idle > 0)
-        self.footer.setVisible(gpu is not None or idle > 0)
+        offer = raise_offer(snapshot, project.folder.ocr_parallel) if project is not None else None
+        self.hint_label.setVisible(offer is not None)
+        self.raise_button.setVisible(offer is not None)
+        if offer is not None:
+            hint, self._raise_to = offer
+            self.hint_label.setText(hint)
+            self.raise_button.setText(RAISE_TEXT.format(m=self._raise_to))
+            self.raise_button.setToolTip(RAISE_TOOLTIP.format(m=self._raise_to))
+        self.gpu_separator.setVisible(gpu is not None and offer is not None)
+        self.footer.setVisible(gpu is not None or offer is not None)
 
     def _raise_parallel(self) -> None:
         if self._raise_to > 0 and self._controller.project is not None:

@@ -4,16 +4,19 @@ chips, and Folder settings / Logs / Start.
 - Chips follow `controller.counts()`, which agrees with the row badges
   (ruling B10). The "detecting" dot is blue while any detection job runs and
   grey when detections are only queued or held (ruling B7).
-- "▶ Start N ready files" counts `controller.startable_files()` (ruling B6)
-  and is disabled when both extraction toggles are off or nothing can run
-  (no ready file and no done file to re-run). A start the controller refuses
-  is shown beside it (`show_start_error`).
+- "▶ Start N ready files" counts `controller.startable_files()` (ruling B6).
+  With no ready file but done ones to re-run it reads "▶ Re-run N done
+  files" (the overwrite question follows); with neither it stays
+  "▶ Start 0 ready files", disabled, as it is when both extraction toggles
+  are off. A start the controller refuses is shown beside it
+  (`show_start_error`).
 - The "Review · Run" switch shows while a run exists, until another folder
   opens (ruling B12); the window switches the centre and right area.
-- During a run (plan 3B Task 5, B12/B13) the chips and Folder settings /
-  Logs / Start give way to the run status in place of the path
-  (`run_status_text`, refreshed every second) and "⏸ pause" / "▶ resume"
-  and "■ stop"; both are disabled once a stop was asked for.
+- During a run (plan 3B Task 5, B12/B13) the chips, Folder settings and
+  Start give way to the run status in place of the path (`run_status_text`,
+  refreshed every second) and "⏸ pause" / "▶ resume" and "■ stop"; both are
+  disabled once a stop was asked for. "⤓ Logs" stays: the logs are
+  read-only and reachable at any time.
 
 Badges change on job "started" events, which emit only `activity_changed`,
 so everything here refreshes on that signal too. Signals only mark the bar
@@ -39,6 +42,11 @@ STATUS_REFRESH_MS = 1000
 
 def start_text(count: int) -> str:
     return f"▶ Start {count} ready {'file' if count == 1 else 'files'}"
+
+
+def rerun_text(count: int) -> str:
+    """The Start button when only files that already have output can run."""
+    return f"▶ Re-run {count} done {'file' if count == 1 else 'files'}"
 
 
 class _ProjectBlock(QWidget):
@@ -172,8 +180,9 @@ class TopBar(QWidget):
         is_open = project is not None
         snapshot = controller.run_snapshot() if is_open else None
         run_active = snapshot is not None and not snapshot.finished
-        for widget in (self._chips, self.settings_button, self.logs_button, self.start_button):
+        for widget in (self._chips, self.settings_button, self.start_button):
             widget.setVisible(is_open and not run_active)
+        self.logs_button.setVisible(is_open)                 # logs stay reachable during a run
         for widget in (self.pause_button, self.stop_button):
             widget.setVisible(run_active)
         if run_active:
@@ -204,8 +213,9 @@ class TopBar(QWidget):
         running = any(controller.is_detection_kind(kind) for kind, _file in activity.running)
         self.detecting_chip.set_tone("run" if running else "idle")
 
-        ready = len(controller.startable_files())
-        runnable = ready > 0 or bool(controller.startable_files(include_done=True))    # done files re-run
+        # One call: startable_files() is this list without the done files (its include_done rule).
+        startable = controller.startable_files(include_done=True)         # done files can be re-run
+        ready = sum(1 for name in startable if not controller.is_done(name))
         folder = project.folder
-        self.start_button.setText(start_text(ready))
-        self.start_button.setEnabled(runnable and (folder.dialogue_enabled or folder.labels_enabled))
+        self.start_button.setText(start_text(ready) if ready or not startable else rerun_text(len(startable)))
+        self.start_button.setEnabled(bool(startable) and (folder.dialogue_enabled or folder.labels_enabled))
