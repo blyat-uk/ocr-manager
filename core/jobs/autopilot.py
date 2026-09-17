@@ -51,7 +51,9 @@ Brightness waits for ranges
     measuring (the user set it) is dropped, explicit re-detects are not.
     When no analysis runs (one file, every file's ranges the user's, or
     auto-pilot off) nothing waits. Waiting files are pending "brightness". A
-    later change of ranges does not re-measure brightness.
+    later change of ranges does not re-measure brightness. A waiting request
+    is the newest for its file: it supersedes brightness jobs already
+    outstanding for it (see "Superseded jobs").
 
 Two-tier brightness
     The first folder.brightness_full_detect_files files in name order that
@@ -83,7 +85,11 @@ Superseded jobs
     shutdown) while an older one with the same key runs: the newer job's
     "cancelled" (result None, nothing to apply) arrives first and is not
     current, and the older job's terminal event, which ends the key's work,
-    is current and drives what follows. This does not depend on "queued"
+    is current and drives what follows. A brightness request waiting for the
+    ranges counts as a newer outstanding submission: while one waits, older
+    brightness events for that file are not current. A non-current event
+    releases its own count and changes nothing else (no escalation, no
+    resubmission, no tier or chain change). This does not depend on "queued"
     events having been drained. pending() reports a kind for a file while any
     submission for that key is outstanding. Every job of an AUTOPILOT_KINDS
     kind must be submitted through AutoPilot; events for keys it never
@@ -269,6 +275,8 @@ class AutoPilot:
         self._crop_chain: set[str] = set()        # files waiting for their auto-fill crop
         self._crop_active: str | None = None      # the file whose auto-fill crop is outstanding
         self._redetect: set[str] = set()          # files whose crop re-detect is followed by brightness
+        self._redetect_superseded: dict[str, int] = {}   # re-detected file -> highest job_id of a
+                                                         # non-current crop event since the re-detect
         self._scheduled: set[str] = set()         # files the folder schedule covers (metadata -> everything)
         self._thumbnail_times: dict[str, float] = {}
         self._ranges_done = False
@@ -289,34 +297,45 @@ class AutoPilot:
         """Schedule the added files (metadata and thumbnails always) and, when
         autopilot_enabled, their detections and the ranges analysis again."""
         project = self._project()
+        wanted = set(names)
+        added = [name for name in project.files if name in wanted]
+        for name in added:
+            self._thumbnail_times.pop(name, None)          # a file that came back has no thumbnail
+            self._scan_metadata(project, name)
         if project.folder.autopilot_enabled:
-            self._schedule_ranges(project, force=True)      # first: brightness waits for it
-        added = set(names)
-        for name in project.files:
-            if name in added:
-                self._thumbnail_times.pop(name, None)      # a file that came back has no thumbnail
-                self._schedule_file(project, name)
+            self._schedule_ranges(project, force=True)      # before any brightness: it waits for ranges
+        for name in added:
+            self._schedule_file(project, name)
         self._settle_tier(project)
 
     def on_job_event(self, event: JobEvent) -> None:
         """Consume a terminal event of a job AutoPilot submitted and, when it is
-        the newest for its key, submit what it unblocks. Call after applying
-        the result (see the class docstring). Other events are ignored."""
+        current (is_current), submit what it unblocks. A non-current event only
+        releases its own submission. Call after applying the result (see the
+        class docstring). Other events are ignored."""
         if event.type not in TERMINAL_EVENTS:
             return
         count = self._outstanding.get(event.key, 0)
         if count <= 0:
             return
+        current = self.is_current(event)
+        kind, file = self._identity[event.key]
         if count > 1:
             self._outstanding[event.key] = count - 1
+        else:
+            del self._outstanding[event.key]
+            del self._identity[event.key]
+        if not current:
+            if kind == "crop" and file in self._redetect:
+                # Remember it, so the key's last crop event can tell whether it
+                # is the re-detect's own job (the newest has the highest job_id).
+                self._redetect_superseded[file] = max(self._redetect_superseded.get(file, 0), event.job_id)
             return
-        del self._outstanding[event.key]
-        kind, file = self._identity.pop(event.key)
         project = self._project()
         if kind == "metadata":
             self._after_metadata_event(project, file)
         elif kind == "crop":
-            self._after_crop_event(project, file)
+            self._after_crop_event(project, file, event)
             self._advance_crop_chain(project)
         elif kind == "brightness":
             self._after_brightness_event(project, file, event)
@@ -329,11 +348,15 @@ class AutoPilot:
     def redetect(self, file: str) -> None:
         """User "re-detect": crop, then full brightness, for one file, whatever
         its values' sources (results still obey the apply rules). Metadata
-        first when the duration is unknown. Respects the extraction toggles."""
+        first when the duration is unknown. Respects the extraction toggles.
+        The brightness step follows only the re-detect's own crop job, and only
+        when it finishes: a crop job cancelled, failed or superseded (a later
+        crop hint, or an older same-key job that ends last) drops it."""
         project = self._project()
         if file not in project.files or project.folder.labels_only:
             return
         self._redetect.add(file)
+        self._redetect_superseded.pop(file, None)
         self._crop_chain.discard(file)                     # this detection replaces the auto-fill one
         self._submit_crop(project, file, boost=True)
         self._settle_tier(project)
@@ -352,6 +375,7 @@ class AutoPilot:
         for name in project.files:
             if name != source_file:
                 self._crop_chain.discard(name)
+                self._drop_redetect(name)                  # this crop job supersedes a re-detect's
                 self._submit_crop(project, name, hint=hint, boost=True)
         self._settle_tier(project)
 
@@ -457,7 +481,15 @@ class AutoPilot:
         key (see "Superseded jobs"): False while another one, normally a newer
         one, is outstanding. Call before on_job_event for the same event. True
         for keys AutoPilot never submitted."""
-        return self._outstanding.get(event.key, 0) <= 1
+        count = self._outstanding.get(event.key, 0)
+        if count > 1:
+            return False
+        return count == 0 or not self._request_waits(event.key)
+
+    def _request_waits(self, key: str) -> bool:
+        """A brightness request newer than every submission for `key` waits for the ranges."""
+        kind, file = self._identity.get(key, (None, None))
+        return kind == "brightness" and file in self._ranges_waits
 
     # --- scheduling -------------------------------------------------------------
 
@@ -484,19 +516,28 @@ class AutoPilot:
             raise
 
     def _schedule_folder(self, project: Project) -> None:
+        """Metadata first (a CPU worker may start whatever is queued at once,
+        and the ranges analysis has the lowest priority), then the ranges
+        analysis (before any brightness: it waits for ranges), then each
+        file's jobs."""
+        for name in list(project.files):
+            self._scan_metadata(project, name)
         if project.folder.autopilot_enabled:
-            self._schedule_ranges(project, force=False)     # first: brightness waits for it
+            self._schedule_ranges(project, force=False)
         for name in list(project.files):
             self._schedule_file(project, name)
         self._settle_tier(project)
+
+    def _scan_metadata(self, project: Project, name: str) -> None:
+        if project.files[name].media.duration <= 0 and not self._is_outstanding("metadata", name):
+            self._submit(MetadataJob(project.path, name), PRIORITY["metadata"])
 
     def _schedule_file(self, project: Project, name: str) -> None:
         self._scheduled.add(name)
         entry = project.files[name]
         folder = project.folder
         if entry.media.duration <= 0:
-            if not self._is_outstanding("metadata", name):
-                self._submit(MetadataJob(project.path, name), PRIORITY["metadata"])
+            self._scan_metadata(project, name)
             if folder.autopilot_enabled and folder.dialogue_enabled and _brightness_missing(entry):
                 self._want_brightness(project, name)     # takes its place in the tier, in name order
             return
@@ -662,17 +703,22 @@ class AutoPilot:
         request = self._deferred_crops.pop(name, None)
         entry = project.files.get(name)
         if entry is None or entry.media.duration <= 0:
-            self._redetect.discard(name)
+            self._drop_redetect(name)
             return
         if name in self._scheduled:
             self._after_metadata(project, name, crop=request is None)
         if request is not None:
             self._submit_crop(project, name, hint=request.hint, boost=request.boost)
 
-    def _after_crop_event(self, project: Project, name: str) -> None:
+    def _after_crop_event(self, project: Project, name: str, event: JobEvent) -> None:
         entry = project.files.get(name)
+        # The re-detect's brightness step needs its own crop job, finished: this
+        # event ends the key's last submission, and no superseded event of the
+        # key since the re-detect had a higher job_id (a newer job, cancelled).
+        if not (event.type == "finished" and event.job_id >= self._redetect_superseded.get(name, 0)):
+            self._drop_redetect(name)
         if entry is None:
-            self._redetect.discard(name)
+            self._drop_redetect(name)
             return
         if (project.folder.dialogue_enabled and entry.crop is not None
                 and self._brightness_follows_crop(name, entry)):
@@ -681,7 +727,7 @@ class AutoPilot:
                                         priority=PRIORITY["brightness"] + REDETECT_BOOST, explicit=True)
             else:
                 self._remeasure_brightness(project, name, unrecorded=False)
-        self._redetect.discard(name)
+        self._drop_redetect(name)
         if (name in self._thumbnail_times and entry.sample_time is not None
                 and float(entry.sample_time) != self._thumbnail_times[name]):
             self._submit_thumbnail(project, name)
@@ -695,6 +741,7 @@ class AutoPilot:
         if FLAG_ESCALATE in (result.result.flagged or "").split("+"):
             brightness = entry.brightness
             if (project.folder.dialogue_enabled and entry.crop is not None
+                    and name not in self._ranges_waits              # never replaces a waiting request
                     and (brightness is None or brightness.source in DETECTION_SOURCES)):
                 priority = request.priority if request is not None else PRIORITY["brightness"]
                 self._submit_brightness(project, name, _crop_box(entry), plateau=None, hint_value=None,
@@ -705,6 +752,10 @@ class AutoPilot:
                 and _box(result.crop_box) == _crop_box(entry)):
             plateau = result.result.plateau
             self._tier[name] = None if plateau is None else (int(plateau[0]), int(plateau[1]))
+
+    def _drop_redetect(self, name: str) -> None:
+        self._redetect.discard(name)
+        self._redetect_superseded.pop(name, None)
 
     # --- conditions shared by the scheduler and pending() -----------------------
 

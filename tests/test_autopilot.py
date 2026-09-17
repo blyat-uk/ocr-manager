@@ -243,13 +243,13 @@ def test_open_on_a_fresh_folder_submits_every_detection_in_dependency_order(tmp_
     owner.recompute()
 
     opened = owner.take()
-    assert pairs(opened) == [("ranges", None)] + [("metadata", name) for name in names]
-    assert [s.job.priority for s in opened] == [0] + [5] * 5
-    ranges = opened[0]
+    assert pairs(opened) == [("metadata", name) for name in names] + [("ranges", None)]
+    assert [s.job.priority for s in opened] == [5] * 5 + [0]
+    ranges = opened[-1]
     assert list(ranges.job.files) == names
     assert {owner.state(name) for name in names} == {ReviewState.PENDING}
 
-    for sub in opened[1:]:
+    for sub in opened[:-1]:
         owner.deliver(sub, metadata_done(sub))
     after_metadata = owner.take()
     assert sorted(pairs(after_metadata)) == sorted(
@@ -387,10 +387,10 @@ def test_a_labels_only_folder_gets_no_crop_or_brightness(tmp_path):
     owner = Owner(_project(tmp_path, names, FolderSettings(dialogue_enabled=False, labels_enabled=True)))
     owner.autopilot.on_open()
     opened = owner.take()
-    assert pairs(opened) == [("ranges", None), ("metadata", "a.mkv"), ("metadata", "b.mkv")]
+    assert pairs(opened) == [("metadata", "a.mkv"), ("metadata", "b.mkv"), ("ranges", None)]
     assert owner.autopilot.pending() == {"a.mkv": {"metadata"}, "b.mkv": {"metadata"}}
 
-    for sub in opened[1:]:
+    for sub in opened[:-1]:
         owner.deliver(sub, metadata_done(sub))
     after = owner.take()
     assert sorted(pairs(after)) == sorted(
@@ -400,7 +400,7 @@ def test_a_labels_only_folder_gets_no_crop_or_brightness(tmp_path):
     owner.autopilot.on_crop_changed("a.mkv")
     assert owner.take() == []
     finish_side_jobs(owner, after)
-    owner.deliver(opened[0], ranges_done(opened[0]))
+    owner.deliver(opened[-1], ranges_done(opened[-1]))
     assert {owner.state(name) for name in names} == {ReviewState.PROPOSED}
 
 
@@ -416,6 +416,23 @@ def _ready_folder(tmp_path, names, folder: FolderSettings | None = None, *, open
         if not open_ranges:
             entry.time_ranges = TimeRanges([], Source.MANUAL)
     return project
+
+
+def test_open_and_added_files_submit_metadata_then_ranges_then_file_jobs(tmp_path):
+    project = _project(tmp_path, ["a.mkv", "b.mkv", "c.mkv"])
+    _media(project.files["b.mkv"]).evidence["audio"] = {}
+    project.files["b.mkv"].sample_time = 50.0
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    assert pairs(owner.take()) == [("metadata", "a.mkv"), ("metadata", "c.mkv"), ("ranges", None),
+                                   ("thumbnail", "b.mkv"), ("crop", "b.mkv")]
+
+    project.files["d.mkv"] = FileEntry(name="d.mkv")
+    project.files["e.mkv"] = _media(FileEntry(name="e.mkv"))
+    project.files["e.mkv"].evidence["audio"] = {}
+    project.files["e.mkv"].sample_time = 60.0
+    owner.autopilot.on_files_added(["d.mkv", "e.mkv"])
+    assert pairs(owner.take()) == [("metadata", "d.mkv"), ("ranges", None), ("thumbnail", "e.mkv")]
 
 
 def test_opening_twice_submits_nothing_new(tmp_path):
@@ -703,6 +720,85 @@ def test_a_file_waiting_for_the_tier_is_not_measured_once_the_user_sets_its_valu
     assert pairs(of_kind(owner.take(), "brightness")) == [("brightness", "c.mkv")]
 
 
+def _cheap_jobs_then_new_ranges(tmp_path):
+    """Three files with the tier closed on a: b and c have cheap brightness jobs
+    outstanding when a file is added and a new ranges analysis starts."""
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], FolderSettings(brightness_full_detect_files=1))
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (full,) = of_kind(owner.take(), "brightness")
+    owner.deliver(full, brightness_done(full, value=205, plateau=(190, 225)))
+    cheap = {s.job.file: s for s in of_kind(owner.take(), "brightness")}
+    assert sorted(cheap) == ["b.mkv", "c.mkv"]
+    project.files["d.mkv"] = FileEntry(name="d.mkv")
+    owner.autopilot.on_files_added(["d.mkv"])
+    (ranges,) = of_kind(owner.take(), "ranges")
+    return project, owner, cheap, ranges
+
+
+def test_a_brightness_hint_waiting_for_ranges_supersedes_older_jobs(tmp_path):
+    project, owner, cheap, ranges = _cheap_jobs_then_new_ranges(tmp_path)
+    owner.autopilot.redetect_others_with_brightness_hint("a.mkv")
+    assert of_kind(owner.take(), "brightness") == []
+
+    old_b, old_c = cheap["b.mkv"], cheap["c.mkv"]
+    assert owner.deliver(old_b, brightness_done(old_b, value=250, plateau=None, flagged=FLAG_ESCALATE)) is False
+    assert owner.deliver(old_c, brightness_done(old_c, value=200, plateau=(190, 225))) is False
+    assert owner.take() == []                                  # no escalation replaces the waiting hint
+    assert project.files["b.mkv"].brightness is None and "brightness" not in project.files["b.mkv"].evidence
+    assert project.files["c.mkv"].brightness is None           # the older result is not applied
+    assert all("brightness" in owner.autopilot.pending()[name] for name in ("b.mkv", "c.mkv"))
+
+    set_manual_brightness(project, "c.mkv", 230)               # an explicit request still runs
+    owner.deliver(ranges, ranges_done(ranges))
+    released = {s.job.file: s.job for s in of_kind(owner.take(), "brightness")}
+    assert sorted(released) == ["b.mkv", "c.mkv"]
+    for job in released.values():
+        assert (job.hint_value, job.priority, job.folder_plateau) == (205, 12, None)
+
+
+def test_a_tier_job_superseded_by_a_waiting_request_does_not_set_the_folder_plateau(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "z.mkv"], FolderSettings(brightness_full_detect_files=1))
+    project.files["z.mkv"].brightness = Brightness(215, Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (full_a,) = of_kind(owner.take(), "brightness")
+    assert full_a.job.file == "a.mkv"                          # b waits for the tier
+    project.files["d.mkv"] = FileEntry(name="d.mkv")
+    project.files = dict(sorted(project.files.items()))
+    owner.autopilot.on_files_added(["d.mkv"])
+    added = owner.take()
+    (ranges,), (metadata_d,) = of_kind(added, "ranges"), of_kind(added, "metadata")
+    owner.autopilot.redetect_others_with_brightness_hint("z.mkv")   # a and b wait for the ranges
+
+    assert owner.deliver(full_a, brightness_done(full_a, plateau=(190, 230))) is False
+    owner.deliver(metadata_d, metadata_done(metadata_d))
+    (crop_d,) = of_kind(owner.take(), "crop")
+    owner.deliver(crop_d, crop_done(crop_d))
+    owner.deliver(ranges, ranges_done(ranges))
+    released = of_kind(owner.take(), "brightness")
+    assert sorted(s.job.file for s in released) == ["a.mkv", "b.mkv"]   # d still waits for the tier
+    assert all(s.job.hint_value == 215 for s in released)
+
+
+@pytest.mark.parametrize("old_flag", [FLAG_ESCALATE, None])
+def test_a_redetect_waiting_for_ranges_is_not_downgraded_or_dropped_by_an_older_job(tmp_path, old_flag):
+    project, owner, cheap, ranges = _cheap_jobs_then_new_ranges(tmp_path)
+    owner.autopilot.redetect("b.mkv")
+    (crop,) = of_kind(owner.take(), "crop")
+    owner.deliver(crop, crop_done(crop))                       # its brightness step waits for ranges
+    assert of_kind(owner.take(), "brightness") == []
+
+    old = cheap["b.mkv"]
+    result = brightness_done(old, value=200, plateau=None if old_flag else (190, 225), flagged=old_flag)
+    assert owner.deliver(old, result) is False
+    assert owner.take() == []
+    assert project.files["b.mkv"].brightness is None
+    owner.deliver(ranges, ranges_done(ranges))
+    (released,) = [s.job for s in of_kind(owner.take(), "brightness") if s.job.file == "b.mkv"]
+    assert (released.priority, released.hint_value, released.folder_plateau) == (12, None, None)
+
+
 @pytest.mark.parametrize("with_hint", [False, True])
 def test_brightness_asked_for_while_ranges_run_waits_for_them(tmp_path, with_hint):
     project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], open_ranges=True)
@@ -754,16 +850,16 @@ def test_added_files_get_their_jobs_and_ranges_again(tmp_path):
     owner.project.files["c.mkv"] = FileEntry(name="c.mkv")
     owner.autopilot.on_files_added(["c.mkv"])
     added = owner.take()
-    assert pairs(added) == [("ranges", None), ("metadata", "c.mkv")]
-    assert list(added[0].job.files) == ["a.mkv", "b.mkv", "c.mkv"]
+    assert pairs(added) == [("metadata", "c.mkv"), ("ranges", None)]
+    assert list(added[1].job.files) == ["a.mkv", "b.mkv", "c.mkv"]
 
     owner.project.files["d.mkv"] = FileEntry(name="d.mkv")
     owner.autopilot.on_files_added(["d.mkv"])          # the queued analysis is replaced
     again = owner.take()
-    assert pairs(again) == [("ranges", None), ("metadata", "d.mkv")]
-    assert owner.deliver(added[0], None, type="cancelled") is False
+    assert pairs(again) == [("metadata", "d.mkv"), ("ranges", None)]
+    assert owner.deliver(added[1], None, type="cancelled") is False
     assert owner.autopilot.ranges_pending() is True
-    assert owner.deliver(again[0], ranges_done(again[0])) is True
+    assert owner.deliver(again[1], ranges_done(again[1])) is True
     assert owner.autopilot.ranges_pending() is False
 
 
@@ -1002,7 +1098,7 @@ def test_pending_tracks_queued_running_and_finished_jobs(tmp_path):
     assert autopilot.pending() == {name: {"metadata", "crop", "brightness"} for name in ("a.mkv", "b.mkv")}
     assert autopilot.ranges_pending() is True
 
-    ranges, metadata_a, metadata_b = opened
+    metadata_a, metadata_b, ranges = opened
     owner.deliver(metadata_a, metadata_done(metadata_a))
     assert autopilot.pending()["a.mkv"] == {"crop", "thumbnail", "audio_profile", "brightness"}
     owner.deliver(metadata_b, type="failed")
@@ -1087,6 +1183,56 @@ def test_a_newer_job_cancelled_while_an_older_one_runs_leaves_the_older_one_curr
     after = owner.take()
     assert pairs(of_kind(after, "crop")) == [("crop", "b.mkv")]          # the chain moves on
     assert "crop" not in owner.autopilot.pending().get("a.mkv", set())
+
+
+def test_a_redetect_cancelled_while_the_older_crop_runs_has_no_brightness_step(tmp_path):
+    names = ["a.mkv", "b.mkv", "c.mkv", "d.mkv"]
+    project = _project(tmp_path, names, FolderSettings(brightness_full_detect_files=1))
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.sample_time = 300.0
+        entry.time_ranges = TimeRanges([], Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (crop,) = of_kind(owner.take(), "crop")
+    for _ in ("a.mkv", "b.mkv"):
+        owner.deliver(crop, crop_done(crop))
+        (crop,) = of_kind(owner.take(), "crop")
+    older = crop                                               # c's auto-fill crop, running
+    assert older.job.file == "c.mkv"
+    owner.autopilot.redetect("c.mkv")
+    (newer,) = owner.take()
+    assert owner.deliver(newer, None, type="cancelled") is False
+    assert owner.deliver(older, crop_done(older)) is True
+    after = owner.take()
+    assert pairs(after) == [("crop", "d.mkv")]                 # no priority-12 brightness for c
+    assert "brightness" in owner.autopilot.pending()["c.mkv"]  # c waits for the full tier as usual
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+def test_a_redetect_whose_crop_job_does_not_finish_has_no_brightness_step(tmp_path, outcome):
+    project = _ready_folder(tmp_path, ["a.mkv"])
+    project.files["a.mkv"].brightness = Brightness(209, Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.redetect("a.mkv")
+    (crop,) = owner.take()
+    owner.deliver(crop, type=outcome)
+    assert owner.take() == []
+    assert owner.autopilot.pending() == {}
+
+
+def test_a_crop_hint_after_a_redetect_replaces_its_brightness_step(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv"])
+    for entry in project.files.values():
+        entry.brightness = Brightness(209, Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.redetect("a.mkv")
+    (redetect,) = owner.take()
+    owner.autopilot.redetect_others_with_crop_hint("b.mkv")
+    (hinted,) = owner.take()
+    assert owner.deliver(redetect, crop_done(redetect)) is False
+    assert owner.deliver(hinted, crop_done(hinted)) is True
+    assert owner.take() == []                                  # the user's brightness stays; no step
 
 
 def test_events_autopilot_did_not_submit_are_current_and_ignored(tmp_path):
