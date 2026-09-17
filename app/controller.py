@@ -71,6 +71,7 @@ from app.activity import TERMINAL_EVENTS, ActivitySnapshot, ActivityTracker
 from app.folder_watch import OUTPUT_DIR, FolderWatch
 from app.logbook import PIPELINE_LOG, LogBook
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
+from app.state_text import badge_for
 from core.jobs import apply as rules
 from core.jobs.autopilot import AUTOPILOT_KINDS, AutoPilot
 from core.jobs.detect_jobs import (
@@ -93,6 +94,11 @@ logger = logging.getLogger(__name__)
 
 BOTH_OFF_MESSAGE = "At least one of dialogue or labels must be on."
 READY_STATES = frozenset({ReviewState.PROPOSED, ReviewState.REVIEWED})
+BADGE_SKIPPED, BADGE_DONE = "skipped", "done"          # app.state_text.badge_for's texts for those rows
+# The chip a row counts under, once its badge is neither "skipped" nor "done":
+# "reviewed", a "check ..." badge (FLAGGED) or a pending badge. PROPOSED ("ready") has no chip.
+_BADGE_BUCKETS = {ReviewState.REVIEWED: "reviewed", ReviewState.FLAGGED: "needs_you",
+                  ReviewState.PENDING: "detecting"}
 MAX_EVENTS_PER_DRAIN = 2000
 MAX_DRAINS_AT_CLOSE = 50                 # close/shutdown apply what arrived, without chasing a busy runner forever
 NOTIFY_TIMEOUT_SECONDS = 10
@@ -292,17 +298,25 @@ class ProjectController(QObject):
         return self._activity.snapshot(paused=self._user_paused, held=self._user_paused or self._run_active)
 
     def counts(self) -> dict[str, int]:
+        """Chip counts that agree with the row badges (ruling B10):
+        "reviewed" (badge "reviewed"), "needs_you" (a "check ..." badge),
+        "detecting" (a pending badge: "finding subtitles…", "waiting", ...).
+        A row badged "skipped" or "done" counts in none of those three.
+        "ready": PROPOSED or REVIEWED, not skipped, not done."""
         counts = {"reviewed": 0, "needs_you": 0, "detecting": 0, "ready": 0}
         if self._project is None:
             return counts
         for name, entry in self._project.files.items():
-            if entry.review == ReviewState.REVIEWED:
-                counts["reviewed"] += 1
-            elif entry.review == ReviewState.FLAGGED:
-                counts["needs_you"] += 1
-            elif entry.review == ReviewState.PENDING:
-                counts["detecting"] += 1
-            if entry.review in READY_STATES and not entry.skipped and name not in self._done:
+            done = name in self._done
+            # run_state=None: a run's "running"/"failed" badge is transient, so a
+            # file in a run stays in the bucket of its review state.
+            text, _tone = badge_for(entry, running_detectors=self.running_detectors(name), done=done,
+                                    run_state=None)
+            if text not in (BADGE_SKIPPED, BADGE_DONE):
+                bucket = _BADGE_BUCKETS.get(entry.review)     # badge_for's remaining rungs are the review state
+                if bucket is not None:
+                    counts[bucket] += 1
+            if entry.review in READY_STATES and not entry.skipped and not done:
                 counts["ready"] += 1
         return counts
 

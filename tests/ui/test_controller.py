@@ -25,6 +25,7 @@ from app.activity import ActivitySnapshot
 from app.controller import ProjectController, default_runner_factory
 from app.logbook import LOG_LIMIT, LogBook
 from app.run_snapshot import RunSnapshot, RunTracker, notification_for, notify_duration
+from app.state_text import badge_for
 from core.detect.audio_profile import AudioProfile
 from core.detect.brightness import BrightnessResult
 from core.detect.crop import FLAG_LOW_AGREEMENT, CropResult
@@ -705,7 +706,97 @@ def test_counts_for_a_mix_of_states(make_controller, fake_runner, tmp_project):
     controller.open_folder(str(mixed_project(tmp_project)))
     set_states(controller)
     assert controller.is_done("f.mkv") and not controller.is_done("g.mkv") and not controller.is_done("a.mkv")
-    assert controller.counts() == {"reviewed": 2, "needs_you": 1, "detecting": 1, "ready": 3}
+    # e (reviewed) is skipped and f (proposed) is done: their badges say so, and no chip counts them
+    assert controller.counts() == {"reviewed": 1, "needs_you": 1, "detecting": 1, "ready": 3}
+
+
+# (review state, skipped, done) -> (badge text, chip it counts under or None, ready)
+COUNT_CASES = [
+    (ReviewState.REVIEWED, False, False, "reviewed", "reviewed", True),
+    (ReviewState.REVIEWED, True, False, "skipped", None, False),
+    (ReviewState.REVIEWED, False, True, "done", None, False),
+    (ReviewState.REVIEWED, True, True, "skipped", None, False),
+    (ReviewState.FLAGGED, False, False, "check crop", "needs_you", False),
+    (ReviewState.FLAGGED, True, False, "skipped", None, False),
+    (ReviewState.FLAGGED, False, True, "done", None, False),
+    (ReviewState.FLAGGED, True, True, "skipped", None, False),
+    (ReviewState.PENDING, False, False, "waiting", "detecting", False),
+    (ReviewState.PENDING, True, False, "skipped", None, False),
+    (ReviewState.PENDING, False, True, "done", None, False),
+    (ReviewState.PENDING, True, True, "skipped", None, False),
+    (ReviewState.PROPOSED, False, False, "ready", None, True),
+    (ReviewState.PROPOSED, True, False, "skipped", None, False),
+    (ReviewState.PROPOSED, False, True, "done", None, False),
+    (ReviewState.PROPOSED, True, True, "skipped", None, False),
+]
+
+
+def counts_project(tmp_project):
+    """One file per COUNT_CASES row; the crop is DETECTED with a blocking flag,
+    so a FLAGGED row's badge is "check crop"."""
+    names = [f"f{index:02d}.mkv" for index in range(len(COUNT_CASES))]
+    entries = [make_entry(name, crop=BOX, brightness=209, crop_source=Source.DETECTED,
+                          flags={"crop": FLAG_LOW_AGREEMENT}) for name in names]
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    (folder / "chi").mkdir()
+    for name, (_state, _skipped, done, *_rest) in zip(names, COUNT_CASES, strict=True):
+        if done:
+            (folder / "chi" / name.replace(".mkv", ".ass")).write_text("Dialogue: x\n", encoding="utf-8")
+    return folder, names
+
+
+def apply_count_cases(controller, names):
+    for name, (state, skipped, *_rest) in zip(names, COUNT_CASES, strict=True):
+        controller.entry(name).review = state
+        controller.entry(name).skipped = skipped
+
+
+def expected_counts(cases) -> dict[str, int]:
+    expected = {"reviewed": 0, "needs_you": 0, "detecting": 0, "ready": 0}
+    for *_flags, _badge, chip, ready in cases:
+        if chip is not None:
+            expected[chip] += 1
+        expected["ready"] += ready
+    return expected
+
+
+@pytest.mark.parametrize("index", range(len(COUNT_CASES)))
+def test_counts_follow_the_row_badges(make_controller, fake_runner, tmp_project, index):
+    folder, names = counts_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    apply_count_cases(controller, names)
+    name, case = names[index], COUNT_CASES[index]
+    state, skipped, done, badge, _chip, _ready = case
+    entry = controller.entry(name)
+    assert (entry.review, entry.skipped, controller.is_done(name)) == (state, skipped, done)
+    assert badge_for(entry, running_detectors=controller.running_detectors(name), done=done,
+                     run_state=None)[0] == badge
+    for other in names:                                         # this row alone
+        if other != name:
+            controller.entry(other).skipped = True
+    assert controller.counts() == expected_counts([case])
+
+
+def test_counts_keep_run_rows_in_their_review_state_bucket(make_controller, fake_runner, tmp_project,
+                                                           notifications):
+    folder, names = counts_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    apply_count_cases(controller, names)
+    before = controller.counts()
+    assert before == expected_counts(COUNT_CASES) == {"reviewed": 1, "needs_you": 1, "detecting": 1, "ready": 2}
+
+    controller.start_run(names)
+    run = fake_runner.last("run")
+    fake_runner.emit(run, "run_file_started", file=names[0])                     # reviewed row: "running"
+    fake_runner.emit(run, "run_file_started", file=names[4])                     # flagged row: then "failed"
+    fake_runner.emit(run, "run_file_finished", file=names[4], result={"ok": False, "lines": 0, "error": "boom"})
+    fake_runner.emit(run, "run_file_started", file=names[8])                     # pending row: "running"
+    controller.drain_events()
+    assert controller.run_snapshot().row(names[0]).state == "running"
+    assert controller.run_snapshot().row(names[4]).state == "failed"
+    assert controller.counts() == before
 
 
 def test_startable_files_and_overwrite(make_controller, fake_runner, tmp_project):
