@@ -4,10 +4,10 @@ column about the selected episode only, scrolling vertically. Top to bottom:
 1. header -- "◆ THIS EPISODE ONLY", the file name, its media line;
 2. the active stage tab's `inspector_panel()`, swapped on `tab_changed`;
 3. "DETECTED" -- crop, brightness and OCR window with confidence bars;
-4. "PROOF · REAL OCR OF 30 S";
+4. "PROOF · REAL OCR OF 30 S" (ruling C4);
 5. "IF YOU CHANGE SOMETHING HERE" -- after a manual crop or brightness edit
    in this session, the offer to re-detect the other files with it as a
-   hint (`controller.hint_targets` counts them);
+   hint (`controller.hint_targets` counts them, ruling C3);
 6. footer (pinned below the scroll area) -- "✓ Mark reviewed (Space)" /
    "Mark not reviewed" (disabled while the file is PENDING) and "skip file" /
    "include file".
@@ -15,16 +15,35 @@ column about the selected episode only, scrolling vertically. Top to bottom:
 A manual edit is noticed from `file_changed`: the file's crop box or
 brightness value differs from the last one seen and is now MANUAL. So an
 edit from anywhere (the tabs, the queue's paste) raises the offer for that
-file, while accepting a flagged value (same value, MANUAL) does not.
+file, while accepting a flagged value (same value, MANUAL) does not. Each
+edited kind keeps its own button; taking one offer leaves the other
+standing, and "apply to this file only" puts the whole offer away until the
+next edit.
+
+Proof results live in the controller for the session. Whether one still
+describes its file is this view's business: the crop, brightness and time
+ranges the file had when the proof was asked for are remembered here
+(`_proof_keys`) and compared on every `file_changed`. Evidence is never
+consulted -- a detection that only wrote evidence changed nothing OCR would
+see, and a proof must not go stale because of it.
 """
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
-from app.state_text import REVIEW_WAIT_TOOLTIP, can_mark_reviewed, is_manual, is_reviewed, media_text
+from app.state_text import (
+    REVIEW_WAIT_TOOLTIP,
+    can_mark_reviewed,
+    is_manual,
+    is_reviewed,
+    media_text,
+    proof_window_clock,
+    series_median_brightness,
+    series_median_note,
+)
 from app.theme import tokens
-from app.views.inspector_sections import ChangeOffer, DetectedSection, ProofSection, Section
+from app.views.inspector_sections import HINT_KINDS, ChangeOffer, DetectedSection, ProofSection, Section
 from app.widgets.base import Button, ElidedLabel
 
 SCOPE_TEXT = "◆ THIS EPISODE ONLY"
@@ -42,6 +61,16 @@ def _is_manual(entry, kind: str) -> bool:
     return is_manual(entry.crop if kind == "crop" else entry.brightness)
 
 
+def _proof_key(entry) -> tuple:
+    """Everything a proof OCR of `entry` depends on per file: its crop, its
+    brightness and its keep ranges (the folder's own settings are not this
+    view's to watch -- a folder change rebuilds every section anyway)."""
+    keys = _edit_keys(entry)
+    ranges = entry.time_ranges
+    return (keys["crop"], keys["brightness"],
+            None if ranges is None else tuple((item.start, item.end) for item in ranges.ranges))
+
+
 class Inspector(QWidget):
     tab_requested = pyqtSignal(str)             # a stage tab title
 
@@ -51,7 +80,10 @@ class Inspector(QWidget):
         self._stage = stage
         self._file: str | None = None
         self._seen: dict[str, dict[str, object]] = {}       # file -> last crop box / brightness seen
-        self._edited: dict[str, str] = {}                    # file -> kind of its latest manual edit
+        self._edited: dict[str, set[str]] = {}              # file -> kinds it was manually edited in
+        self._proof_keys: dict[str, tuple] = {}             # file -> settings its proof was asked for with
+        self._stale_proofs: set[str] = set()                # files whose proof no longer matches them
+        self._redetecting: dict[tuple[str, str], list[str]] = {}   # (source, kind) -> files still re-detecting
         self.setObjectName("Inspector")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedWidth(tokens.INSPECTOR_WIDTH)
@@ -129,10 +161,13 @@ class Inspector(QWidget):
         self.brightness_row, self.brightness_conf = self.detected.brightness_row, self.detected.brightness_conf
         self.window_row, self.window_conf = self.detected.window_row, self.detected.window_conf
         self.redetect_button = self.detected.redetect_button
+        self.detected_note = self.detected.note_label
         self.proof_button, self.proof_status, self.proof_note = (
             self.proof.run_button, self.proof.status_label, self.proof.note_label)
+        self.proof_show_all = self.proof.show_all_button
         self.offer_section, self.offer_note = self.offer, self.offer.note_label
-        self.hint_button, self.this_file_only_button = self.offer.hint_button, self.offer.this_file_only_button
+        self.offer_status = self.offer.status_label
+        self.hint_buttons, self.this_file_only_button = self.offer.hint_buttons, self.offer.this_file_only_button
         self.proof_texts = self.proof.texts
 
         stage.tab_changed.connect(self._show_panel)
@@ -142,8 +177,9 @@ class Inspector(QWidget):
         controller.files_changed.connect(self._on_files_changed)
         controller.file_changed.connect(self._on_file_changed)
         controller.folder_changed.connect(self.refresh)
-        controller.proof_started.connect(self._on_proof_event)
+        controller.proof_started.connect(self._on_proof_started)
         controller.proof_finished.connect(self._on_proof_event)
+        controller.activity_changed.connect(self._on_activity_changed)
         self.set_file(None)
 
     # --- the file and the tab panel -------------------------------------------------------
@@ -184,7 +220,7 @@ class Inspector(QWidget):
         entry = controller.entry(name)
         self.file_label.set_full_text(name)
         self.media_label.setText(media_text(entry.media))
-        self.detected.set_entry(entry)
+        self.detected.set_entry(entry, self._median_note(entry))
         reviewed = is_reviewed(entry)
         reviewable = can_mark_reviewed(entry)
         self.review_button.setText(UNREVIEW_TEXT if reviewed else REVIEW_TEXT)
@@ -197,14 +233,25 @@ class Inspector(QWidget):
     # --- commands -----------------------------------------------------------------------------
 
     def run_proof_for(self, name: str | None) -> None:
-        """Real OCR of 30 s of `name` (the queue's T, the "T run" button)."""
-        if name is None or name not in self._controller.names():
+        """Real OCR of 30 s of `name` -- the one command behind the "T run"
+        button, the T key and the queue's "Test OCR (T)" (ruling 5). Ignored
+        while that file's proof is already running: a second run would only
+        queue the same window again."""
+        if name is None or name not in self._controller.names() or self._controller.proof_pending(name):
             return
         try:
             self._controller.run_proof(name)
         except ValueError as exc:                      # the duration is not known yet
             if name == self._file:
                 self.proof.show_error(f"Can't run yet: {exc}")
+
+    def _median_note(self, entry) -> str:
+        """The series-median sentence for the Detected note -- only for a file
+        that has a brightness of its own to keep."""
+        if entry.brightness is None:
+            return ""
+        controller = self._controller
+        return series_median_note(series_median_brightness(controller.entry(name) for name in controller.names()))
 
     def _has_file(self) -> bool:
         return self._file is not None and self._file in self._controller.names()
@@ -227,6 +274,15 @@ class Inspector(QWidget):
 
     # --- proof ----------------------------------------------------------------------------------
 
+    def _on_proof_started(self, name: str) -> None:
+        """Remember what the file looked like when its proof was asked for:
+        ProofOcrJob froze the same values at construction, so a later edit
+        makes whatever comes back stale."""
+        if name in self._controller.names():
+            self._proof_keys[name] = _proof_key(self._controller.entry(name))
+            self._stale_proofs.discard(name)
+        self._on_proof_event(name)
+
     def _on_proof_event(self, name: str) -> None:
         if name == self._file:
             self._show_proof()
@@ -236,31 +292,47 @@ class Inspector(QWidget):
         if name is None or name not in self._controller.names():
             self.proof.show_nothing()
         elif self._controller.proof_pending(name):
-            self.proof.show_running()
+            entry = self._controller.entry(name)
+            self.proof.show_running(proof_window_clock(entry.sample_time, entry.media.duration))
         elif (result := self._controller.proof_result(name)) is not None:
-            self.proof.show_result(result)
+            self.proof.show_result(result, stale=name in self._stale_proofs)
         else:
             self.proof.show_nothing()
 
-    # --- the change offer --------------------------------------------------------------------
+    # --- what this session knows about the folder --------------------------------------
 
     def adopt_open_project(self) -> None:
         """Start tracking edits in a folder opened before this view existed."""
         self._on_project_opened(self._controller.project.path)
 
     def _on_project_opened(self, _path: str) -> None:
-        self._edited.clear()
+        self._forget_session()
         self._seen = {name: _edit_keys(self._controller.entry(name)) for name in self._controller.names()}
 
     def _on_project_closed(self) -> None:
-        self._edited.clear()
+        self._forget_session()
         self._seen.clear()
         self.set_file(None)
+
+    def _forget_session(self) -> None:
+        """Edits, proof staleness and re-detects belong to one open folder."""
+        self._edited.clear()
+        self._proof_keys.clear()
+        self._stale_proofs.clear()
+        self._redetecting.clear()
 
     def _on_files_changed(self) -> None:
         names = set(self._controller.names())
         self._seen = {name: keys for name, keys in self._seen.items() if name in names}
-        self._edited = {name: kind for name, kind in self._edited.items() if name in names}
+        self._edited = {name: kinds for name, kinds in self._edited.items() if name in names}
+        self._proof_keys = {name: key for name, key in self._proof_keys.items() if name in names}
+        self._stale_proofs &= names
+        redetecting = {}
+        for key, targets in self._redetecting.items():     # a vanished source or target ends its wait
+            kept = [target for target in targets if target in names]
+            if key[0] in names and kept:
+                redetecting[key] = kept
+        self._redetecting = redetecting
         for name in names - set(self._seen):
             self._seen[name] = _edit_keys(self._controller.entry(name))
         self.refresh()
@@ -271,32 +343,65 @@ class Inspector(QWidget):
         entry = self._controller.entry(name)
         keys = _edit_keys(entry)
         before = self._seen.get(name, keys)
-        for kind in ("crop", "brightness"):
+        for kind in HINT_KINDS:
             if keys[kind] != before[kind] and _is_manual(entry, kind):
-                self._edited[name] = kind
+                self._edited.setdefault(name, set()).add(kind)
         self._seen[name] = keys
+        if name in self._proof_keys and _proof_key(entry) != self._proof_keys[name]:
+            self._stale_proofs.add(name)               # the proof ran on settings the file no longer has
         if name == self._file:
             self.refresh()
+            self._show_proof()
         elif self._file in self._edited:
             self._refresh_offer()                      # another file's change can change the count
 
-    def _refresh_offer(self) -> None:
-        name = self._file
-        kind = self._edited.get(name) if name is not None else None
-        if kind is None:
-            self.offer.hide()
-            return
-        self.offer.set_targets(len(self._controller.hint_targets(name, kind)))
-        self.offer.show()
+    # --- the change offer -----------------------------------------------------------------
 
-    def _redetect_others(self) -> None:
+    def _on_activity_changed(self) -> None:
+        """Auto-pilot's queue moved: a hint re-detect may be over."""
+        if self._redetecting:
+            self._refresh_offer()
+
+    def _prune_redetecting(self) -> None:
+        """A hint re-detect is over (ruling C3's "re-detecting N files…") once
+        none of the files it covers has a detection of that kind still to
+        come. "To come" is auto-pilot's own pending map, not the runner's
+        queue: a brightness job waits for the folder's ranges analysis and has
+        no job of its own until that ends, and a queued job has not started."""
+        if not self._redetecting:
+            return
+        pending = self._controller.pending_detectors()
+        self._redetecting = {key: targets for key, targets in self._redetecting.items()
+                             if any(key[1] in pending.get(name, ()) for name in targets)}
+
+    def _refresh_offer(self) -> None:
+        self._prune_redetecting()
         name = self._file
-        kind = self._edited.pop(name, None) if self._has_file() else None
-        if kind is not None:
+        kinds = self._edited.get(name, set()) if name is not None else set()
+        self.offer.set_targets({kind: len(self._controller.hint_targets(name, kind))
+                                for kind in HINT_KINDS if kind in kinds})
+        # "re-detecting {n} files…" counts distinct FILES, not jobs: a file
+        # covered by both this file's crop and brightness hints counts once.
+        targets = {target for (source, _kind), files in self._redetecting.items()
+                   if source == name for target in files}
+        self.offer.set_redetecting(len(targets))
+        self.offer.setVisible(not self.offer.is_empty())
+
+    def _redetect_others(self, kind: str) -> None:
+        name = self._file
+        if self._has_file() and kind in self._edited.get(name, set()):
+            self._edited[name].discard(kind)
+            if not self._edited[name]:
+                del self._edited[name]
+            targets = self._controller.hint_targets(name, kind)
             self._controller.redetect_others_with_hint(name, kind)
+            if targets:
+                self._redetecting[(name, kind)] = targets
         self._refresh_offer()
 
     def _dismiss_offer(self) -> None:
+        """"apply to this file only": the edit stands, nothing else is
+        re-detected, and the offer waits for the next edit of that file."""
         if self._file is not None:
             self._edited.pop(self._file, None)
         self._refresh_offer()
