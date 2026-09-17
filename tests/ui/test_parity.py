@@ -382,6 +382,20 @@ def test_main_py_launches_the_new_window(tmp_path):
     assert (tmp_path / "config" / "OCRManager" / "OCRTool.conf").exists()
 
 
+def test_main_py_and_python_m_app_both_describe_themselves(tmp_path):
+    """--help names whichever way the app was started."""
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=str(tmp_path / "config"))
+
+    def usage(args):
+        result = subprocess.run([sys.executable, *args, "--help"], cwd=str(REPO_ROOT), env=env,
+                                capture_output=True, text=True, timeout=120, check=False)
+        assert result.returncode == 0, result.stderr[-2000:]
+        return result.stdout.splitlines()[0]
+
+    assert usage([str(REPO_ROOT / "main.py")]).startswith("usage: main.py")
+    assert usage(["-m", "app"]).startswith("usage: python -m app")
+
+
 def test_no_module_imports_the_removed_ones():
     """The cut-over's grep, as a test: no source file outside .venv may name
     a removed module again."""
