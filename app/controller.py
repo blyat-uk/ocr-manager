@@ -153,6 +153,17 @@ def _box(crop) -> tuple[int, int, int, int] | None:
     return None if crop is None else (crop.x, crop.y, crop.width, crop.height)
 
 
+def _frame_key(name: str, time: float) -> tuple:
+    """FrameCache key of a whole frame."""
+    return (name, "frame", float(time))
+
+
+def _strip_key(name: str, crop_box, time: float) -> tuple:
+    """FrameCache key of an OCR-exact strip: the crop box is part of it, so
+    strips of another box are other entries."""
+    return (name, "strip", tuple(int(value) for value in crop_box), float(time))
+
+
 def _same_folder(first: str, second: str) -> bool:
     try:
         return os.path.samefile(first, second)
@@ -399,15 +410,23 @@ class ProjectController(QObject):
         for each frame that arrives; a time that could not be read stays None
         (the view draws its placeholder) and is not asked for again until the
         file or the folder is reopened.
+
+        A view asks from paintEvent, so with no folder open (or after
+        shutdown) this does nothing rather than raise. An unknown file, while
+        a folder is open, is a bug: KeyError.
         """
         project = self._view_project(name)
-        wanted, keys = self._missing_times(times, lambda time_value: (name, "frame", time_value))
+        if project is None:
+            return
+        wanted, keys = self._missing_times(times, lambda time_value: _frame_key(name, time_value))
         if wanted:
             self._submit_view_job(FrameJob(project.path, name, wanted), keys)
 
     def frame(self, name: str, time: float) -> np.ndarray | None:
-        """The cached whole frame at `time` (a BGR numpy array), or None."""
-        return self._frames.get((name, "frame", float(time)))
+        """The cached whole frame at `time` (a BGR numpy array), or None --
+        for a time not fetched yet, one still on its way, and one that could
+        not be read."""
+        return self._frames.get(_frame_key(name, time))
 
     def request_strips(self, name: str, crop_box: tuple[int, int, int, int], times: list[float]) -> None:
         """Fetch `name`'s OCR-exact crop strips at `times`, for `crop_box`.
@@ -416,17 +435,21 @@ class ProjectController(QObject):
         strips of a request have arrived. Strips are cached per crop box, so
         editing the crop never shows strips measured on the old one -- and a
         time that could not be read for one box is asked for again for the
-        next, since the box is part of the key.
+        next, since the box is part of the key. With no folder open (or after
+        shutdown) this does nothing, as request_frames does.
         """
         project = self._view_project(name)
+        if project is None:
+            return
         box = tuple(int(value) for value in crop_box)
-        wanted, keys = self._missing_times(times, lambda time_value: (name, "strip", box, time_value))
+        wanted, keys = self._missing_times(times, lambda time_value: _strip_key(name, box, time_value))
         if wanted:
             self._submit_view_job(StripJob(project.path, name, box, wanted), keys)
 
     def strip(self, name: str, crop_box: tuple[int, int, int, int], time: float) -> np.ndarray | None:
-        """The cached OCR-exact strip at `time` for `crop_box`, or None."""
-        return self._frames.get((name, "strip", tuple(int(value) for value in crop_box), float(time)))
+        """The cached OCR-exact strip at `time` for `crop_box`, or None (same
+        three cases as frame())."""
+        return self._frames.get(_strip_key(name, crop_box, time))
 
     def _missing_times(self, times: list[float],
                        key_of: Callable[[float], tuple]) -> tuple[list[float], list[tuple]]:
@@ -445,12 +468,16 @@ class ProjectController(QObject):
             keys.append(key)
         return wanted, keys
 
-    def _view_project(self, name: str) -> Project:
-        self._check_alive()
-        project, _ = self._require()
-        if name not in project.files:
+    def _view_project(self, name: str) -> Project | None:
+        """The open project, or None when there is nothing to fetch from: no
+        folder open, or the controller shut down. A view repaints on its own
+        schedule -- possibly between close_folder() and hearing about it --
+        and a repaint must never raise."""
+        if self._shut_down or self._project is None:
+            return None
+        if name not in self._project.files:
             raise KeyError(name)
-        return project
+        return self._project
 
     def _submit_view_job(self, job, keys: list[tuple]) -> None:
         try:
@@ -824,17 +851,25 @@ class ProjectController(QObject):
         if event.type == "failed":
             self._log(PIPELINE_LOG, f"Could not load {event.kind} for {event.file}: {event.message}")
         result, files = event.result, self._project.files
+        arrived = set()
         if isinstance(result, FramesResult) and result.file in files:
             for time_value, image in result.frames.items():
-                self._frames.put((result.file, "frame", float(time_value)), image)
+                key = _frame_key(result.file, time_value)
+                self._frames.put(key, image)
+                arrived.add(key)
                 self._emit_frames.append((result.file, float(time_value)))
         elif isinstance(result, StripsResult) and result.file in files and result.strips:
             for time_value, strip in result.strips.items():
-                self._frames.put((result.file, "strip", result.crop_box, float(time_value)), strip)
+                key = _strip_key(result.file, result.crop_box, time_value)
+                self._frames.put(key, strip)
+                arrived.add(key)
             self._emit_strips.append(result.file)
         if event.type != "cancelled" and event.file in files:
+            # What is missing comes from the RESULT, never from what is still
+            # in the cache: the last put of a batch may have evicted the first.
             for key in requested:
-                self._frames.mark_unavailable(key)      # a no-op for the keys just filled
+                if key not in arrived:
+                    self._frames.mark_unavailable(key)
 
     def _on_proof_event(self, event: JobEvent) -> None:
         name = event.file
@@ -983,7 +1018,7 @@ class ProjectController(QObject):
                 self.file_changed.emit(name)
             for name in dict.fromkeys(thumbnails):
                 self.thumbnail_ready.emit(name)
-            for name, time_value in frames:
+            for name, time_value in dict.fromkeys(frames):
                 if name in project.files:
                     self.frame_ready.emit(name, time_value)
             for name in dict.fromkeys(strips):

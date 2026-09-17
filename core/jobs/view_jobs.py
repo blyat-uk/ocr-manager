@@ -29,7 +29,11 @@ Identity
               so several can be in flight for one file; an identical request
               replaces a queued one (the runner's rule), which is exactly
               what a view repainting wants.
-    priority  0, like the auto-pilot's own jobs.
+    priority  VIEW_PRIORITY: above every priority AutoPilot gives its CPU
+              work (at most 15), because someone is looking at these pixels
+              and the CPU lane has two workers for a whole folder's metadata,
+              thumbnails and audio profiles; below the proof's 100, which the
+              user asked for explicitly.
 
 Cancellation follows core.jobs.detect_jobs' convention: a job that saw the
 request returns None rather than a partial result. Neither frame source takes
@@ -53,6 +57,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 FRAME_HEIGHT = 720        # rows a canvas frame is scaled to at most (grab_frames never upscales)
+VIEW_PRIORITY = 50        # between AutoPilot's CPU work (<= 15) and the proof (100)
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,7 @@ class FrameJob:
 
     kind = "frames"
     lane = Lane.CPU
-    priority = 0
+    priority = VIEW_PRIORITY
 
     def __init__(self, project_dir: str, file: str, times: list[float], target_height: int = FRAME_HEIGHT):
         self.file = file
@@ -127,7 +132,7 @@ class StripJob:
 
     kind = "strips"
     lane = Lane.CPU
-    priority = 0
+    priority = VIEW_PRIORITY
 
     def __init__(self, project_dir: str, file: str, crop_box: tuple[int, int, int, int], times: list[float]):
         self.file = file
