@@ -49,13 +49,20 @@ NO_LINES_TEXT = "No subtitles recognised in this window — check crop and brigh
 RUNNING_TEXT = "running on {window}…"
 RUNNING_UNKNOWN_TEXT = "running…"            # defensive: run_proof refuses an unknown duration
 HINT_TEXT = "↻ re-detect the other {count} using this {what} as a hint"
+# Count 0: the offer is still shown, disabled, so the user can see there is
+# nothing else to re-detect -- but "the other 0" reads as a template with a
+# hole in it, and there is no ↻ to press.
+HINT_NONE_TEXT = "no other file to re-detect with this {what}"
 REDETECTING_TEXT = "re-detecting {count} files…"
 HINT_KINDS = ("crop", "brightness")          # the two kinds ruling C3 offers, in inspector order
 
 
 def hint_text(count: int, what: str) -> str:
-    """ui-spec §3.7's hint button label, verbatim and on one line. What the
-    button shows is this text wrapped to the column (see `wrap_to_width`)."""
+    """ui-spec §3.7's hint button label, verbatim and on one line -- or, with
+    nothing to re-detect, the sentence for that. What the button shows is
+    this text wrapped to the column (see `wrap_to_width`)."""
+    if count <= 0:
+        return HINT_NONE_TEXT.format(what=what)
     return HINT_TEXT.format(count=count, what=what)
 
 

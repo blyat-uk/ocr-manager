@@ -590,7 +590,10 @@ class CropCanvas(QWidget):
         x, y, box_width, box_height = self._box
         tags = {"top_left": f"{width} × {height} · t {_timecode(self._time)}",
                 "top_right": f"crop {x}, {y} · {box_width} × {box_height}"}
-        if self._overlays["envelope"]:
+        # Only with an envelope to explain: `_paint_envelope` draws nothing
+        # without one, and the legend would then name a dashed rectangle
+        # that is not on screen ("across all 0 samples").
+        if self._overlays["envelope"] and self._envelope is not None:
             tags["bottom_right"] = f"dashed = text found across all {self._kept} samples"
         if self._detected is not None:
             # Ruling C2 is not a toggle: the user must always be able to see

@@ -686,6 +686,17 @@ def test_the_canvas_tags_name_the_frame_the_crop_and_the_envelope(make_tab):
     assert "bottom_right" not in harness.tab.canvas.tags()
 
 
+def test_the_envelope_legend_is_left_out_when_there_is_no_envelope(make_tab):
+    """The legend explains a dashed rectangle. With no envelope none is
+    drawn, and "dashed = text found across all 0 samples" points at nothing
+    while telling the user the detector found nothing -- twice over."""
+    harness = make_tab(evidence=crop_evidence(box=None, envelope=None, samples=[]))
+    canvas = harness.tab.canvas
+    assert canvas.overlays()["envelope"] is True        # the toggle is still on
+    assert "bottom_right" not in canvas.tags()
+    canvas.grab()
+
+
 def test_the_page_mounts_the_compact_timeline_under_the_stage(make_tab):
     """Ruling B5: the same timeline the Time ranges tab hosts, read-only."""
     timeline = make_tab().tab.timeline

@@ -178,6 +178,10 @@ def unwrapped(button) -> str:
     return button.text().replace("\n", " ")
 
 
+def menu_actions(menu) -> dict:
+    return {action.text(): action for action in menu.actions() if not action.isSeparator()}
+
+
 def finish_proof(window, fake_runner, name: str, lines=(), seconds: float = 4.1,
                  window_seconds=(SAMPLE_TIME, SAMPLE_TIME + 30.0)) -> None:
     submission = fake_runner.last("proof", name)
@@ -231,6 +235,23 @@ def test_the_queue_menu_does_not_queue_a_second_proof_of_a_running_file(window, 
     finish_proof(window, fake_runner, name, LINES[:1])
     actions["Test OCR (T)"].trigger()
     assert proofs.calls == [(name,), (name,)]
+
+
+def test_the_queue_menu_disables_test_ocr_when_the_proof_cannot_run(window, fake_runner):
+    """The menu is built fresh so its enabled states are current, and the
+    proof is one command (ruling C4): the item is live exactly when the
+    command would do something. `run_proof` refuses a file whose duration
+    nothing has measured, and refuses a second window while one is running."""
+    controller, name = window.controller, NAMES[0]
+    assert menu_actions(window.queue.context_menu(name))["Test OCR (T)"].isEnabled()
+
+    window.inspector.proof_button.click()                # running: a second is the same window
+    assert not menu_actions(window.queue.context_menu(name))["Test OCR (T)"].isEnabled()
+    finish_proof(window, fake_runner, name, LINES[:1])
+    assert menu_actions(window.queue.context_menu(name))["Test OCR (T)"].isEnabled()
+
+    controller.entry(name).media = Media()               # metadata has not landed yet
+    assert not menu_actions(window.queue.context_menu(name))["Test OCR (T)"].isEnabled()
 
 
 def test_a_finished_proof_shows_its_lines_the_count_and_a_show_all_link(window, fake_runner):
@@ -404,11 +425,17 @@ def test_the_counts_are_the_files_the_re_detect_would_submit(make_window):
     assert unwrapped(inspector.hint_buttons["brightness"]) == hint_text(1, "brightness")
 
 
-def test_a_hint_button_with_nothing_to_re_detect_is_disabled(make_window):
+def test_a_hint_button_with_nothing_to_re_detect_says_so_in_its_own_words(make_window):
+    """"re-detect the other 0 using this crop as a hint" offers an action
+    with a hole where its object should be. Zero gets its own sentence, and
+    no ↻: there is nothing to press."""
     window = make_window([entry(NAMES[0])])
     controller, inspector = window.controller, window.inspector
     controller.set_crop(NAMES[0], (290, 780, 1340, 60))
     assert not inspector.offer_section.isHidden()
+    assert hint_text(0, "crop") == "no other file to re-detect with this crop"
+    assert hint_text(0, "brightness") == "no other file to re-detect with this brightness"
+    assert "0" not in hint_text(0, "crop")
     assert unwrapped(inspector.hint_buttons["crop"]) == hint_text(0, "crop")
     assert not inspector.hint_buttons["crop"].isEnabled()
 

@@ -382,6 +382,32 @@ def test_queue_filter_counts_and_filtering(mixed_window):
     assert queue.visible_names() == ["a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv"]
 
 
+def test_a_filter_that_matches_nothing_says_so_and_drops_the_selection(mixed_window):
+    """An empty rail while the stage and the inspector still describe a file
+    the rail does not list is a window at odds with itself. Switching filter
+    is navigation, so the selection goes where the filter goes -- nowhere."""
+    window = mixed_window
+    queue = window.queue
+    window.controller.mark_reviewed("b.mkv")                 # nothing needs the user now
+    settle()
+    assert queue.filter.labels()[1] == "Needs you 0"
+    assert queue.empty_label.isHidden()
+
+    queue.filter.findChildren(QPushButton)[1].click()        # "Needs you"
+    settle()
+    assert queue.visible_names() == []
+    assert not queue.empty_label.isHidden()
+    assert queue.empty_label.text() == "No files match this filter."
+    assert queue.selected() is None
+    assert window.stage.current_file() is None
+    assert window.inspector.file_label.full_text() == "No file selected"
+
+    queue.filter.findChildren(QPushButton)[0].click()        # back to "All"
+    settle()
+    assert queue.empty_label.isHidden()
+    assert queue.selected() == "a.mkv"
+
+
 def test_queue_keyboard_moves_marks_and_proves(slay_window, fake_runner):
     window, controller = slay_window, slay_window.controller
     queue = window.queue
