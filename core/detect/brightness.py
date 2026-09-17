@@ -227,13 +227,16 @@ class StripSample:
         small to split.
     background_level: mean min-channel level of the strip's pixels outside
         its glyph pixels; of the whole strip when it has no glyph pixels.
-    stroke_px: stroke thickness estimate in px: the median over the glyph
+    stroke_px: stroke thickness estimate in px: the MEAN over the glyph
         pixels of 2 x their Euclidean distance (cv2.distanceTransform,
         DIST_L2, precise mask) to the nearest pixel that is not a glyph
         pixel, the strip's border counting as one. It orders strokes by
-        width but reads below the true width: across a long bar w px wide
-        the distances run 1..(w + 1) / 2 and back, so bars 3, 5, 9 and 13 px
-        wide measure 2, 4, 6 and 8. None where glyph_level is None.
+        width but reads below the true width of thick ones: across a long
+        bar w px wide the distances run 1..(w + 1) / 2 and back, so it reads
+        about (w + 1)^2 / 2w -- bars 3, 5, 9 and 13 px wide measure about
+        2.7, 3.6, 5.6 and 7.5. (The median of the same distances takes
+        only a few values: 2.0 on every text strip of a 4K reference file.)
+        None where glyph_level is None.
     lines: distinct text rows among the boxes (_count_lines); 0 for empty
         strips.
     boxes: the detector's polygons as (x, y, w, h) in strip pixels, the
@@ -577,7 +580,7 @@ def _strip_sample(time: float, strip: np.ndarray, polys, value: int) -> StripSam
         # A zero border makes the strip's edge the glyph's edge.
         bordered = cv2.copyMakeBorder(glyph.astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
         distance = cv2.distanceTransform(bordered, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
-        stroke = float(np.median(2.0 * distance[glyph]))
+        stroke = 2.0 * float(np.mean(distance[glyph], dtype=np.float64))
         if not glyph.all():
             background = min_channel[~glyph]
     boxes = tuple(box for box in (_poly_box(p) for p in (polys if is_text else ())) if box is not None)

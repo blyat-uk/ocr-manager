@@ -535,17 +535,36 @@ def test_an_empty_strips_background_level_is_the_whole_strip():
     assert sample.lines == 0 and sample.boxes == ()
 
 
-@pytest.mark.parametrize("bar_w, expected", [
-    # 2 x the median over the bar's pixels of their distance to its edge:
-    # across the bar the distances run 1..(bar_w + 1) / 2 and back.
-    (3, 2.0),     # 1 2 1
-    (5, 4.0),     # 1 2 3 2 1
-    (9, 6.0),     # 1 2 3 4 5 4 3 2 1
-    (13, 8.0),    # 1 2 3 4 5 6 7 6 5 4 3 2 1
+def _bar_distances(bar_w):
+    """Each bar pixel's Euclidean distance to the nearest pixel outside the
+    bar, by hand: for an axis-aligned rectangle on a flat background that
+    pixel lies straight up, down, left or right of it."""
+    rows = np.arange(27 - bar_w // 2, 27 + bar_w // 2 + 1)
+    cols = np.arange(450, 891)
+    r, c = np.meshgrid(rows, cols, indexing="ij")
+    return np.minimum.reduce([r - rows[0] + 1, rows[-1] - r + 1, c - cols[0] + 1, cols[-1] - c + 1])
+
+
+@pytest.mark.parametrize("bar_w, about", [
+    # Across a long bar the distances run 1..(bar_w + 1) / 2 and back, so
+    # 2 x their mean is about (bar_w + 1)^2 / (2 bar_w); the bar's short
+    # ends pull it slightly lower.
+    (3, 2.67),     # 1 2 1
+    (5, 3.6),      # 1 2 3 2 1
+    (9, 5.56),     # 1 2 3 4 5 4 3 2 1
+    (13, 7.54),    # 1 2 3 4 5 6 7 6 5 4 3 2 1
 ])
-def test_stroke_px_is_twice_the_median_distance_to_the_strokes_edge(bar_w, expected):
+def test_stroke_px_is_twice_the_mean_distance_to_the_strokes_edge(bar_w, about):
     sample = B._strip_sample(0.0, _bar_strip(bar_w), [TEXT_POLY], 227)
-    assert sample.stroke_px == expected
+    assert sample.stroke_px == pytest.approx(2.0 * float(_bar_distances(bar_w).mean()), abs=1e-9)
+    assert about - 0.1 < sample.stroke_px <= about + 0.005
+
+
+def test_every_stroke_width_measures_differently():
+    # The median of these distances cannot tell 5 px from 7 px (both read 4),
+    # and on real 4K subtitles read 2.0 for every strip.
+    widths = [B._strip_sample(0.0, _bar_strip(w), [TEXT_POLY], 227).stroke_px for w in range(1, 16, 2)]
+    assert widths == sorted(widths) and len(set(widths)) == len(widths)
 
 
 def test_stroke_px_counts_the_strip_border_as_outside_the_glyph():
@@ -735,15 +754,17 @@ def _s(time, is_text=True, glyph_level=230, background_level=40.0, stroke_px=5.0
 
 def _scene():
     return [
-        _s(1.0, glyph_level=180, lines=1),                      # darkest glyphs, one line
+        _s(1.0, glyph_level=180, lines=1),                      # darkest glyphs (a boxed HUD, say), one line
         _s(2.0, glyph_level=220, lines=2),
-        _s(3.0, glyph_level=210, lines=3),                      # darkest of the multi-line strips
+        _s(3.0, glyph_level=210, lines=3),                      # darkest glyphs of the multi-line strips
         _s(4.0, glyph_level=240, background_level=120.0),       # brightest background behind text
         _s(5.0, stroke_px=2.5),                                 # thinnest strokes
         _s(6.0, glyph_level=245, background_level=110.0, stroke_px=9.0),
         _s(7.0, is_text=False, background_level=200.0, gate=False),   # brightest empty strip, but quiet
         _s(8.0, is_text=False, background_level=150.0, gate=True),    # loudest leak
         _s(9.0, is_text=False, background_level=100.0, gate=True),
+        _s(10.0, glyph_level=235, background_level=8.0),        # darkest scene behind text
+        _s(11.0, is_text=False, background_level=1.0, gate=True),     # darker still, but no text
     ]
 
 
@@ -752,7 +773,14 @@ def test_tile_kinds():
 
 
 def test_choose_tiles_picks_each_kind():
-    assert choose_tiles(_scene(), 227) == {"dark": 1.0, "bright": 4.0, "thin": 5.0, "two_line": 3.0, "leaking": 8.0}
+    assert choose_tiles(_scene(), 227) == {"dark": 10.0, "bright": 4.0, "thin": 5.0, "two_line": 3.0, "leaking": 8.0}
+
+
+def test_the_dark_tile_is_the_darkest_scene_not_the_darkest_glyphs():
+    # 1.0 has the lowest glyph level -- on the reference 1080p file that was a
+    # HUD the detector boxed -- but 10.0 is the darkest scene behind text.
+    tiles = choose_tiles(_scene(), 227)
+    assert tiles["dark"] == 10.0 and tiles["dark"] != min(_scene(), key=lambda s: s.glyph_level or 999).time
 
 
 def test_choose_tiles_returns_kinds_in_tile_order():
@@ -760,19 +788,21 @@ def test_choose_tiles_returns_kinds_in_tile_order():
 
 
 def test_text_strips_are_never_leaking_and_empty_strips_never_text_tiles():
-    strips = [_s(1.0, is_text=False, background_level=250.0, gate=True), _s(2.0, background_level=30.0)]
+    strips = [_s(1.0, is_text=False, background_level=250.0, gate=True), _s(2.0, background_level=30.0),
+              _s(0.5, is_text=False, background_level=0.0, gate=False)]
     strips.append(B.StripSample(time=3.0, is_text=True, glyph_level=100, background_level=255.0, stroke_px=1.0,
                                 lines=2, boxes=(), gate_at_value=None))
-    assert choose_tiles(strips, 227) == {"dark": 3.0, "bright": 3.0, "thin": 3.0, "two_line": 3.0, "leaking": 1.0}
+    assert choose_tiles(strips, 227) == {"dark": 2.0, "bright": 3.0, "thin": 3.0, "two_line": 3.0, "leaking": 1.0}
 
 
 @pytest.mark.parametrize("make, expected", [
     (lambda: [], {}),
-    (lambda: [_s(1.0), _s(2.0, glyph_level=200)], {"dark": 2.0, "bright": 1.0, "thin": 1.0}),
+    (lambda: [_s(1.0), _s(2.0, background_level=30.0)], {"dark": 2.0, "bright": 1.0, "thin": 1.0}),
     (lambda: [_s(1.0, is_text=False, gate=False), _s(2.0, is_text=False, gate=False)], {}),
     (lambda: [_s(1.0, is_text=False, gate=True)], {"leaking": 1.0}),
-    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 1, (), None)], {"bright": 1.0}),
-    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 2, (), None)], {"bright": 1.0, "two_line": 1.0}),
+    # a text strip too small to split still has a background: dark and bright, never thin
+    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 1, (), None)], {"dark": 1.0, "bright": 1.0}),
+    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 2, (), None)], {"dark": 1.0, "bright": 1.0, "two_line": 1.0}),
 ])
 def test_kinds_without_a_candidate_are_omitted(make, expected):
     assert choose_tiles(make(), 227) == expected
@@ -784,7 +814,7 @@ def test_a_multi_line_strip_without_a_glyph_level_is_chosen_only_when_nothing_be
 
 
 @pytest.mark.parametrize("kind, make", [
-    ("dark", lambda t: _s(t, glyph_level=100)),
+    ("dark", lambda t: _s(t, background_level=1.0)),
     ("bright", lambda t: _s(t, background_level=250.0)),
     ("thin", lambda t: _s(t, stroke_px=0.5)),
     ("two_line", lambda t: _s(t, lines=2)),
@@ -804,7 +834,7 @@ def test_choose_tiles_is_deterministic():
 
 
 def test_tiles_from_a_real_detection_point_at_its_strips(monkeypatch):
-    dark = _glyph_strip(core=(215,) * 3)
+    dark = _glyph_strip(bg=10)
     two_line = _glyph_strip(core=(240,) * 3)
     bright_bg = _glyph_strip(bg=100)
     thin = _bar_strip(3)
