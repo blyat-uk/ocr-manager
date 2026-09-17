@@ -18,12 +18,25 @@ Events
          the applied values;
       4. recompute_all(project, pending=..., ranges_pending=...);
       5. signals, and a debounced save.
-    Proof and run events have their own branches. Events of any other kind
-    are logged to "Pipeline". A failed detection is logged under "Detections",
-    never retried: re-detect is the user's retry. An apply that raises is
-    logged to "Pipeline" and steps 3-4 still run, so the key never stays
-    outstanding. The controller never submits an auto-pilot kind itself:
-    AutoPilot counts every submission per key.
+    Proof, run and view (frames/strips) events have their own branches.
+    Events of any other kind are logged to "Pipeline". A failed detection is
+    logged under "Detections", never retried: re-detect is the user's retry.
+    An apply that raises is logged to "Pipeline" and steps 3-4 still run, so
+    the key never stays outstanding. The controller never submits an
+    auto-pilot kind itself: AutoPilot counts every submission per key.
+
+Frames and strips
+    request_frames / request_strips submit their own CPU-lane jobs (not
+    through AutoPilot: they are nobody's pipeline step) for the times that
+    are neither cached nor already on their way, so a view may call them on
+    every repaint. Each job's terminal event caches what came back, releases
+    the times it held and emits frame_ready / strips_ready; a failed or
+    cancelled job releases its times too, so a later request retries. The
+    two sources are never mixed -- whole frames for the crop views, OCR-exact
+    strips (keyed by the crop box they were grabbed with) for anything
+    showing OCR pixels. The cache is dropped per file when the file
+    disappears, its strips when its crop box changes, and all of it when the
+    folder closes.
 
 Sessions
     One runner lives as long as the controller. Closing a folder cancels its
@@ -71,13 +84,14 @@ import subprocess
 import time
 import traceback
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-import numpy as np
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from app.activity import TERMINAL_EVENTS, ActivitySnapshot, ActivityTracker
 from app.folder_watch import OUTPUT_DIR, FolderWatch
+from app.imaging import FrameCache, bgr_to_qimage
 from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
@@ -95,10 +109,14 @@ from core.jobs.detect_jobs import (
 )
 from core.jobs.run import RunFile, RunJob, RunSummary, output_name
 from core.jobs.runner import JobEvent, JobRunner
+from core.jobs.view_jobs import FrameJob, FramesResult, StripJob, StripsResult
 from core.project import store
 from core.project.model import FileEntry, FolderSettings, Project, ReviewState
 from core.project.ocr_kwargs import ocr_call_for
 from core.project.store import UnsupportedProjectVersion
+
+if TYPE_CHECKING:
+    import numpy as np                      # only for the frame/strip annotations
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +128,11 @@ BADGE_SKIPPED, BADGE_DONE = "skipped", "done"          # app.state_text.badge_fo
 # "reviewed", a "check ..." badge (FLAGGED) or a pending badge. PROPOSED ("ready") has no chip.
 _BADGE_BUCKETS = {ReviewState.REVIEWED: "reviewed", ReviewState.FLAGGED: "needs_you",
                   ReviewState.PENDING: "detecting"}
+# Jobs a view asks for directly (core/jobs/view_jobs.py): pixels for the crop,
+# brightness and time-range views. Not auto-pilot kinds -- the controller
+# submits them itself -- and not activity: a view repainting must not push the
+# detectors out of the activity strip.
+VIEW_KINDS = frozenset({"frames", "strips"})
 MAX_EVENTS_PER_DRAIN = 2000
 MAX_DRAINS_AT_CLOSE = 50                 # close/shutdown apply what arrived, without chasing a busy runner forever
 NOTIFY_TIMEOUT_SECONDS = 10
@@ -118,25 +141,6 @@ _FOLDER_FIELDS = frozenset(field.name for field in dataclasses.fields(FolderSett
 
 def default_runner_factory(on_event: Callable[[JobEvent], None]) -> JobRunner:
     return JobRunner(on_event, cpu_workers=2)
-
-
-def bgr_to_qimage(image) -> QImage | None:
-    """A QImage that owns a copy of a BGR (or grayscale) uint8 frame; None
-    for no frame or one it cannot convert."""
-    if image is None:
-        return None
-    array = np.asarray(image)
-    if array.dtype != np.uint8 or array.size == 0:
-        return None
-    if array.ndim == 2:
-        gray = np.ascontiguousarray(array)
-        height, width = gray.shape
-        return QImage(gray.data, width, height, width, QImage.Format.Format_Grayscale8).copy()
-    if array.ndim == 3 and array.shape[2] == 3:
-        rgb = np.ascontiguousarray(array[:, :, ::-1])
-        height, width = rgb.shape[:2]
-        return QImage(rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888).copy()
-    return None
 
 
 def _box(crop) -> tuple[int, int, int, int] | None:
@@ -169,6 +173,8 @@ class ProjectController(QObject):
     folder_changed = pyqtSignal()               # FolderSettings changed
     activity_changed = pyqtSignal()             # running/queued jobs or auto-pilot holds changed
     thumbnail_ready = pyqtSignal(str)
+    frame_ready = pyqtSignal(str, float)        # file, time: frame(file, time) now has pixels
+    strips_ready = pyqtSignal(str)              # file: strips of the requested crop box arrived
     proof_started = pyqtSignal(str)
     proof_finished = pyqtSignal(str)            # result in proof_result(file)
     run_changed = pyqtSignal()                  # run started/progress/finished/paused
@@ -207,6 +213,9 @@ class ProjectController(QObject):
 
     def _reset_session(self) -> None:
         self._thumbnails: dict[str, QImage] = {}
+        self._frames = FrameCache()
+        self._frame_inflight: set[tuple] = set()        # cache keys a frames/strips job is fetching
+        self._view_jobs: dict[str, list[tuple]] = {}    # job key -> the cache keys it was submitted for
         self._proof_results: dict[str, ProofResult] = {}
         self._proof_outstanding: dict[str, int] = {}
         self._proof_stale: dict[str, int] = {}          # proofs of removed entries, still to end: never reported
@@ -227,6 +236,8 @@ class ProjectController(QObject):
         self._emit_run = False
         self._emit_changed: set[str] = set()
         self._emit_thumbnails: list[str] = []
+        self._emit_frames: list[tuple[str, float]] = []
+        self._emit_strips: list[str] = []
         self._emit_proofs: list[str] = []
 
     # --- lifecycle ------------------------------------------------------------------
@@ -371,15 +382,96 @@ class ProjectController(QObject):
     def can_paste(self) -> bool:
         return self._clipboard is not None and any(value is not None for value in self._clipboard.values())
 
+    # --- frames and strips for the review views ---------------------------------------
+
+    def request_frames(self, name: str, times: list[float]) -> None:
+        """Fetch `name`'s whole frames at `times` for the crop views.
+
+        Only the times that are neither cached nor already on their way are
+        fetched, so a view may call this on every repaint. frame_ready(name,
+        time) follows for each frame that arrives; a time whose frame could
+        not be grabbed (and a cancelled or failed job) leaves nothing behind,
+        so a later request tries again.
+        """
+        project = self._view_project(name)
+        wanted, keys = self._missing_times(times, lambda time_value: (name, "frame", time_value))
+        if wanted:
+            self._submit_view_job(FrameJob(project.path, name, wanted), keys)
+
+    def frame(self, name: str, time: float) -> np.ndarray | None:
+        """The cached whole frame at `time` (a BGR numpy array), or None."""
+        return self._frames.get((name, "frame", float(time)))
+
+    def request_strips(self, name: str, crop_box: tuple[int, int, int, int], times: list[float]) -> None:
+        """Fetch `name`'s OCR-exact crop strips at `times`, for `crop_box`.
+
+        Same rules as request_frames; strips_ready(name) follows once the
+        strips of a request have arrived. Strips are cached per crop box, so
+        editing the crop never shows strips measured on the old one.
+        """
+        project = self._view_project(name)
+        box = tuple(int(value) for value in crop_box)
+        wanted, keys = self._missing_times(times, lambda time_value: (name, "strip", box, time_value))
+        if wanted:
+            self._submit_view_job(StripJob(project.path, name, box, wanted), keys)
+
+    def strip(self, name: str, crop_box: tuple[int, int, int, int], time: float) -> np.ndarray | None:
+        """The cached OCR-exact strip at `time` for `crop_box`, or None."""
+        return self._frames.get((name, "strip", tuple(int(value) for value in crop_box), float(time)))
+
+    def _missing_times(self, times: list[float],
+                       key_of: Callable[[float], tuple]) -> tuple[list[float], list[tuple]]:
+        """The times of `times` that are neither cached nor already being
+        fetched, with their cache keys, marked as being fetched now. A
+        repeated time counts once."""
+        wanted, keys = [], []
+        for value in times:
+            time_value = float(value)
+            key = key_of(time_value)
+            if key in self._frames or key in self._frame_inflight:
+                continue
+            self._frame_inflight.add(key)
+            wanted.append(time_value)
+            keys.append(key)
+        return wanted, keys
+
+    def _view_project(self, name: str) -> Project:
+        self._check_alive()
+        project, _ = self._require()
+        if name not in project.files:
+            raise KeyError(name)
+        return project
+
+    def _submit_view_job(self, job, keys: list[tuple]) -> None:
+        try:
+            self._runner.submit(job)
+        except BaseException:
+            self._frame_inflight.difference_update(keys)
+            raise
+        # Extend rather than replace: should two requests ever share a key
+        # (the same file and times), one terminal event releases both sets.
+        self._view_jobs.setdefault(job.key, []).extend(keys)
+
     # --- edits ------------------------------------------------------------------------
 
     def set_crop(self, name: str, box: tuple[int, int, int, int]) -> None:
-        project, autopilot = self._require()
+        project, _ = self._require()
         before = _box(project.files[name].crop)
         rules.set_manual_crop(project, name, box)
         if _box(project.files[name].crop) != before:
-            autopilot.on_crop_changed(name)
+            self._crop_box_changed(name)
         self._after_edit(name)
+
+    def _crop_box_changed(self, name: str) -> None:
+        """The file's crop box is a new one: re-detect what depends on it and
+        drop the strips grabbed with the old box (they are keyed by it, so
+        they would otherwise sit in the cache until they aged out).
+
+        A strips job already fetching the old box is left to finish; its
+        result lands under that box's keys, which nothing asks for again, and
+        the LRU ages it out."""
+        self._autopilot.on_crop_changed(name)
+        self._frames.clear_file(name, "strip")
 
     def set_brightness(self, name: str, value: int) -> None:
         project, _ = self._require()
@@ -407,13 +499,13 @@ class ProjectController(QObject):
 
     def paste_settings(self, name: str) -> bool:
         """False when the clipboard holds nothing to paste."""
-        project, autopilot = self._require()
+        project, _ = self._require()
         before = _box(project.files[name].crop)
         if not self.can_paste():
             return False
         rules.paste_settings(project, name, self._clipboard)
         if _box(project.files[name].crop) != before:
-            autopilot.on_crop_changed(name)
+            self._crop_box_changed(name)
         self._after_edit(name)
         return True
 
@@ -641,6 +733,9 @@ class ProjectController(QObject):
             self._last_job_id = max(self._last_job_id, event.job_id)
 
     def _handle_event(self, event: JobEvent) -> None:
+        if event.kind in VIEW_KINDS:                    # a view's own fetches are not activity
+            self._on_view_event(event)
+            return
         if self._activity.on_event(event, time.monotonic()):
             self._emit_activity = True
         if event.kind == "run":
@@ -701,6 +796,26 @@ class ProjectController(QObject):
             return
         self._emit_changed.update(name for name in touched if name in project.files)
         self._schedule_save()
+
+    def _on_view_event(self, event: JobEvent) -> None:
+        """A frames/strips job ended: cache what came back and release the
+        times it was fetching, whether it finished, failed or was cancelled
+        (a released time is fetched again next time a view asks for it)."""
+        if event.type not in TERMINAL_EVENTS:
+            return
+        for key in self._view_jobs.pop(event.key, ()):
+            self._frame_inflight.discard(key)
+        if event.type == "failed":
+            self._log(PIPELINE_LOG, f"Could not load {event.kind} for {event.file}: {event.message}")
+        result, files = event.result, self._project.files
+        if isinstance(result, FramesResult) and result.file in files:
+            for time_value, image in result.frames.items():
+                self._frames.put((result.file, "frame", float(time_value)), image)
+                self._emit_frames.append((result.file, float(time_value)))
+        elif isinstance(result, StripsResult) and result.file in files and result.strips:
+            for time_value, strip in result.strips.items():
+                self._frames.put((result.file, "strip", result.crop_box, float(time_value)), strip)
+            self._emit_strips.append(result.file)
 
     def _on_proof_event(self, event: JobEvent) -> None:
         name = event.file
@@ -837,6 +952,7 @@ class ProjectController(QObject):
         """Emit the signals collected while handling events or a command."""
         files, folder, activity, run = self._emit_files, self._emit_folder, self._emit_activity, self._emit_run
         changed, thumbnails, proofs = self._emit_changed, self._emit_thumbnails, self._emit_proofs
+        frames, strips = self._emit_frames, self._emit_strips
         self._reset_emits()
         project = self._project
         if files:
@@ -848,6 +964,12 @@ class ProjectController(QObject):
                 self.file_changed.emit(name)
             for name in dict.fromkeys(thumbnails):
                 self.thumbnail_ready.emit(name)
+            for name, time_value in frames:
+                if name in project.files:
+                    self.frame_ready.emit(name, time_value)
+            for name in dict.fromkeys(strips):
+                if name in project.files:
+                    self.strips_ready.emit(name)
             for name in dict.fromkeys(proofs):
                 if name in project.files:
                     self.proof_finished.emit(name)
@@ -912,6 +1034,7 @@ class ProjectController(QObject):
         added, removed = store.reconcile_files(project, names)
         for name in removed:
             self._thumbnails.pop(name, None)
+            self._frames.clear_file(name)
             self._proof_results.pop(name, None)
             outstanding = self._proof_outstanding.pop(name, 0)
             if outstanding:
