@@ -107,3 +107,6 @@ class Project:
     folder: FolderSettings
     files: dict[str, FileEntry]                # insertion order = sorted filename order
     migrated_from_v1: bool = False             # True until the first save writes .ocr.json.v1.bak
+    # Store bookkeeping, not project data: file name -> digest of the evidence
+    # last loaded from or saved to its evidence cache file (core/project/store.py).
+    evidence_digests: dict[str, str] = field(default_factory=dict, compare=False, repr=False)

@@ -509,7 +509,351 @@ def test_save_project_fsyncs_every_file_before_replacing_it(tmp_path, monkeypatc
 
     replaces = [call for call in calls if call[0] == "replace"]
     assert {Path(dst).name for _, _, dst in replaces} >= {".ocr.json"}
+    assert len(replaces) == 2                                 # the config and one evidence file
     for index, call in enumerate(calls):
         if call[0] == "replace":
             assert calls[index - 1] == ("fsync", call[1])      # that temp file was synced just before
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+# --- F3: evidence lives in .ocr-cache/evidence, not in .ocr.json -------------
+
+
+def _crop_evidence(i: int = 0) -> dict:
+    return {"box": [288, 780 + i, 1344, 61], "envelope": [300, 786, 1300, 50], "agreed": 8, "probes_used": 20,
+            "flagged": None, "hit_pts": [500.0 + k for k in range(8)], "frame_size": [1920, 888],
+            "cutoff_frac": 0.55,
+            "samples": [{"time": 500.123 + k, "boxes": [[400 + k, 786, 900, 30], [420, 820, 850, 30]],
+                         "kept": k % 2 == 0, "lines": 2} for k in range(20)]}
+
+
+def _brightness_evidence(i: int = 0) -> dict:
+    return {"value": 209 - i, "plateau": [190, 229], "seed": 228, "gate_floor": 180, "flagged": "no-speech",
+            "curve": [[t, 0.97] for t in range(203, 254, 5)], "clutter_curve": [[t, 0.1] for t in range(203, 254, 5)],
+            "strips": [{"time": 100.5 + k, "is_text": k % 3 != 0, "glyph_level": 240, "background_level": 40.123,
+                        "stroke_px": 3.4567, "lines": 1, "boxes": [[10, 5, 600, 40], [620, 5, 300, 40]],
+                        "gate_at_value": None} for k in range(48)],
+            "tiles": {"dark": 101.5, "bright": 110.5, "thin": 120.5, "two_line": 130.5, "leaking": 103.5},
+            "crop_box": [288, 780, 1344, 61], "value_crop_box": [288, 780, 1344, 61]}
+
+
+def _audio_evidence() -> dict:
+    return {"envelope": [round((k * 37 % 101) / 100, 4) for k in range(600)],
+            "speech": [[k * 7.25, k * 7.25 + 3.5] for k in range(200)], "duration": 1418.0}
+
+
+def _ranges_evidence() -> dict:
+    return {"blocks": [{"start_sec": 0.0, "end_sec": 90.0, "kind": "intro", "matched_files": 5, "score": 0.9},
+                       {"start_sec": 1330.5, "end_sec": 1418.0, "kind": "outro", "matched_files": 4, "score": 0.8}],
+            "duration": 1418.0}
+
+
+def _full_evidence(i: int = 0) -> dict:
+    return {"crop": _crop_evidence(i), "brightness": _brightness_evidence(i), "audio": _audio_evidence(),
+            "ranges": _ranges_evidence()}
+
+
+def _evidence_project(tmp_path: Path, names, evidence=_full_evidence) -> Project:
+    files = {}
+    for i, name in enumerate(names):
+        _touch(tmp_path / name)
+        files[name] = FileEntry(
+            name=name,
+            crop=Crop(288, 780 + i, 1344, 61, Source.DETECTED),
+            brightness=Brightness(209 - i, Source.DETECTED),
+            time_ranges=TimeRanges([TimeRange("1:30", "23:00")], Source.DETECTED),
+            media=Media(1920, 888, 1418.0, 23.976),
+            review=ReviewState.PROPOSED,
+            sample_time=500.0,
+            flags={"crop": "", "brightness": "no-speech"},
+            evidence=evidence(i) if evidence else {},
+        )
+    return Project(path=str(tmp_path), folder=FolderSettings(), files=files)
+
+
+def _evidence_dir(tmp_path: Path) -> Path:
+    return tmp_path / ".ocr-cache" / "evidence"
+
+
+class _WriteSpy:
+    def __init__(self, monkeypatch):
+        import core.project.store as store
+
+        self.paths: list[Path] = []
+        real = store._atomic_write_text
+
+        def spy(path, text):
+            self.paths.append(Path(path))
+            return real(path, text)
+
+        monkeypatch.setattr(store, "_atomic_write_text", spy)
+
+    def take(self) -> list[str]:
+        names = sorted(path.name for path in self.paths)
+        self.paths.clear()
+        return names
+
+
+NAMES_CJK = ["ep01 第一集.mkv", "ep02.mp4"]
+
+
+def test_every_evidence_kind_round_trips_through_the_evidence_cache(tmp_path):
+    project = _evidence_project(tmp_path, NAMES_CJK)
+    project.files["ep02.mp4"].evidence["crop"]["flagged"] = "中文+low-agreement"
+    expected = {name: json.loads(json.dumps(entry.evidence)) for name, entry in project.files.items()}
+
+    save_project(project)
+    reloaded = load_project(str(tmp_path))
+
+    assert {name: entry.evidence for name, entry in reloaded.files.items()} == expected
+    assert reloaded == project                                   # every other field too
+
+
+def test_ocr_json_holds_no_evidence_and_its_size_does_not_depend_on_it(tmp_path):
+    small, large = tmp_path / "small", tmp_path / "large"
+    small.mkdir()
+    large.mkdir()
+    save_project(_evidence_project(small, NAMES_CJK, evidence=lambda i: {"crop": {"box": [1, 2, 3, 4]}}))
+    save_project(_evidence_project(large, NAMES_CJK))
+
+    config = json.loads((large / ".ocr.json").read_text(encoding="utf-8"))
+    assert all("evidence" not in entry for entry in config["files"].values())
+    assert (small / ".ocr.json").read_bytes() == (large / ".ocr.json").read_bytes()
+
+
+def test_evidence_files_are_compact_utf8_json_named_by_the_hash_of_the_file_name(tmp_path):
+    import hashlib
+
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, NAMES_CJK)
+    save_project(project)
+
+    for name, entry in project.files.items():
+        path = evidence_path(str(tmp_path), name)
+        assert path == _evidence_dir(tmp_path) / (hashlib.sha256(name.encode("utf-8")).hexdigest() + ".json")
+        text = path.read_text(encoding="utf-8")
+        assert text == json.dumps({"version": 1, "name": name, "evidence": entry.evidence},
+                                  separators=(",", ":"), ensure_ascii=False)
+    assert "第一集" in evidence_path(str(tmp_path), NAMES_CJK[0]).read_text(encoding="utf-8")
+    assert sorted(p.name for p in _evidence_dir(tmp_path).iterdir()) == sorted(
+        evidence_path(str(tmp_path), name).name for name in NAMES_CJK)
+
+
+def test_unchanged_evidence_is_not_rewritten(tmp_path, monkeypatch):
+    from core.project.store import evidence_path
+
+    spy = _WriteSpy(monkeypatch)
+    names = ["a.mkv", "b.mkv", "c.mkv"]
+    file_of = {name: evidence_path(str(tmp_path), name).name for name in names}
+    project = _evidence_project(tmp_path, names)
+
+    save_project(project)
+    assert spy.take() == sorted([".ocr.json"] + list(file_of.values()))
+
+    save_project(project)
+    assert spy.take() == [".ocr.json"]
+
+    reloaded = load_project(str(tmp_path))                       # digests come from what was loaded
+    save_project(reloaded)
+    assert spy.take() == [".ocr.json"]
+
+    reloaded.files["b.mkv"].evidence["crop"]["samples"][3]["kept"] = True     # mutated in place
+    save_project(reloaded)
+    assert spy.take() == sorted([".ocr.json", file_of["b.mkv"]])
+
+    evidence_path(str(tmp_path), "c.mkv").unlink()                # the cache was cleaned behind our back
+    save_project(reloaded)
+    assert spy.take() == sorted([".ocr.json", file_of["c.mkv"]])
+
+
+def test_a_file_without_evidence_has_no_evidence_file(tmp_path):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
+    project.files["b.mkv"].evidence = {}
+    save_project(project)
+    assert evidence_path(str(tmp_path), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path), "b.mkv").exists()
+
+    project.files["a.mkv"].evidence.clear()
+    save_project(project)
+    assert not evidence_path(str(tmp_path), "a.mkv").exists()
+    assert load_project(str(tmp_path)).files["a.mkv"].evidence == {}
+
+
+def test_no_evidence_no_cache_directory(tmp_path):
+    save_project(_evidence_project(tmp_path, ["a.mkv"], evidence=None))
+    assert not (tmp_path / ".ocr-cache").exists()
+
+
+def test_a_removed_files_evidence_is_deleted_and_other_cache_files_are_kept(tmp_path):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
+    save_project(project)
+    other = _evidence_dir(tmp_path) / "notes.json"
+    other.write_text("{}", encoding="utf-8")
+    fingerprints = tmp_path / ".ocr-cache" / "fingerprints"
+    fingerprints.mkdir()
+    (fingerprints / "x.npz").write_bytes(b"x")
+
+    (tmp_path / "b.mkv").unlink()
+    reloaded = load_project(str(tmp_path))
+    assert list(reloaded.files) == ["a.mkv"]
+    save_project(reloaded)
+
+    assert evidence_path(str(tmp_path), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path), "b.mkv").exists()
+    assert other.exists() and (fingerprints / "x.npz").exists()
+
+
+@pytest.mark.parametrize("content", [
+    b"{not json",
+    b"[1, 2]",
+    b"\xff\xfe",
+    json.dumps({"version": 1, "name": "someone-else.mkv", "evidence": {"crop": {}}}).encode(),
+    json.dumps({"version": 1, "name": "a.mkv", "evidence": [1]}).encode(),
+    json.dumps({"version": 1, "name": "a.mkv"}).encode(),
+])
+def test_a_corrupt_evidence_file_gives_empty_evidence_and_a_warning(tmp_path, caplog, content):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
+    save_project(project)
+    evidence_path(str(tmp_path), "a.mkv").write_bytes(content)
+
+    with caplog.at_level(logging.WARNING):
+        reloaded = load_project(str(tmp_path))
+
+    assert reloaded.files["a.mkv"].evidence == {}
+    assert reloaded.files["b.mkv"].evidence == project.files["b.mkv"].evidence
+    assert reloaded.files["a.mkv"].crop == project.files["a.mkv"].crop          # values are not a cache
+    assert any(r.levelno == logging.WARNING and "a.mkv" in r.getMessage() for r in caplog.records)
+
+    save_project(reloaded)                                         # the corrupt cache file goes away
+    assert not evidence_path(str(tmp_path), "a.mkv").exists()
+
+
+def test_a_missing_evidence_file_warns_only_when_evidence_was_stored(tmp_path, caplog):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
+    project.files["b.mkv"].flags = {}
+    project.files["b.mkv"].evidence = {"audio": _audio_evidence()}
+    save_project(project)
+    evidence_path(str(tmp_path), "a.mkv").unlink()
+    evidence_path(str(tmp_path), "b.mkv").unlink()
+    _touch(tmp_path / "fresh.mkv")
+
+    with caplog.at_level(logging.WARNING):
+        reloaded = load_project(str(tmp_path))
+
+    assert all(entry.evidence == {} for entry in reloaded.files.values())
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "a.mkv" in warnings[0] and "b.mkv" not in warnings[0] and "fresh.mkv" not in warnings[0]
+
+
+def test_a_v2_file_with_inline_evidence_loads_and_the_next_save_moves_it_out(tmp_path, monkeypatch):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, NAMES_CJK)
+    (tmp_path / ".ocr.json").write_text(json.dumps(to_json(project), ensure_ascii=False, indent=2),
+                                        encoding="utf-8")        # as this branch wrote v2 before
+
+    loaded = load_project(str(tmp_path))
+    assert loaded == project
+    assert {n: e.evidence for n, e in loaded.files.items()} == {n: e.evidence for n, e in project.files.items()}
+
+    spy = _WriteSpy(monkeypatch)
+    save_project(loaded)
+    assert spy.take() == sorted([".ocr.json"] + [evidence_path(str(tmp_path), n).name for n in NAMES_CJK])
+    config = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
+    assert all("evidence" not in entry for entry in config["files"].values())
+    again = load_project(str(tmp_path))
+    assert {n: e.evidence for n, e in again.files.items()} == {n: e.evidence for n, e in project.files.items()}
+
+
+def test_inline_evidence_wins_over_an_evidence_file_left_by_an_interrupted_save(tmp_path):
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv"])
+    newer = _full_evidence(5)
+    save_project(Project(path=str(tmp_path), folder=FolderSettings(),
+                         files={"a.mkv": FileEntry(name="a.mkv", evidence=newer)}))
+    (tmp_path / ".ocr.json").write_text(json.dumps(to_json(project)), encoding="utf-8")   # the old inline file
+
+    loaded = load_project(str(tmp_path))
+    assert loaded.files["a.mkv"].evidence == project.files["a.mkv"].evidence
+    save_project(loaded)
+    stored = json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))
+    assert stored["evidence"] == project.files["a.mkv"].evidence
+
+
+def test_evidence_digests_belong_to_each_project_not_the_module(tmp_path):
+    from core.project.store import evidence_path
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    save_project(_evidence_project(first, ["a.mkv"]))
+    save_project(_evidence_project(second, ["a.mkv"]))              # same name, same evidence
+    assert evidence_path(str(second), "a.mkv").exists()
+    assert Project(path="x", folder=FolderSettings(), files={}).evidence_digests == {}
+
+
+def test_a_failed_evidence_write_is_retried_on_the_next_save(tmp_path, monkeypatch):
+    import core.project.store as store
+    from core.project.store import evidence_path
+
+    project = _evidence_project(tmp_path, ["a.mkv"])
+    real = store._atomic_write_text
+
+    def failing(path, text):
+        if Path(path).parent == _evidence_dir(tmp_path):
+            raise OSError("disk full")
+        return real(path, text)
+
+    monkeypatch.setattr(store, "_atomic_write_text", failing)
+    with pytest.raises(OSError):
+        save_project(project)
+    monkeypatch.setattr(store, "_atomic_write_text", real)
+    save_project(project)
+    assert json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
+        project.files["a.mkv"].evidence
+
+
+def test_to_json_can_leave_evidence_out():
+    project = _evidence_project(Path("/nonexistent"), [], evidence=None)
+    project.files["a.mkv"] = FileEntry(name="a.mkv", evidence={"crop": {"box": [1, 2, 3, 4]}})
+    assert to_json(project)["files"]["a.mkv"]["evidence"] == {"crop": {"box": [1, 2, 3, 4]}}
+    assert "evidence" not in to_json(project, include_evidence=False)["files"]["a.mkv"]
+
+
+def test_the_evidence_cache_shares_the_ranges_cache_directory():
+    from core.detect.ranges.pipeline import CACHE_DIRNAME as RANGES_CACHE_DIRNAME
+    from core.project.store import CACHE_DIRNAME
+
+    assert CACHE_DIRNAME == RANGES_CACHE_DIRNAME == ".ocr-cache"
+
+
+def test_saving_forty_files_with_realistic_evidence_is_fast(tmp_path):
+    import time as _time
+
+    project = _evidence_project(tmp_path, [f"ep{i:03d}.mp4" for i in range(40)])
+    started = _time.perf_counter()
+    save_project(project)
+    first = _time.perf_counter() - started
+    timings = []
+    for _ in range(5):
+        started = _time.perf_counter()
+        save_project(project)
+        timings.append(_time.perf_counter() - started)
+    unchanged = sorted(timings)[len(timings) // 2]
+    config_size = (tmp_path / ".ocr.json").stat().st_size
+    evidence_size = sum(p.stat().st_size for p in _evidence_dir(tmp_path).iterdir())
+    print(f"40 files: first save {first * 1000:.1f} ms, unchanged save median {unchanged * 1000:.1f} ms, "
+          f".ocr.json {config_size / 1e3:.1f} kB, evidence {evidence_size / 1e6:.2f} MB")
+    assert config_size < 100_000
+    assert unchanged < 1.0                                          # generous: GUI-thread budget, shared machine
