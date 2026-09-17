@@ -25,7 +25,8 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from app.controller import ProjectController
-from app.main_window import MainWindow
+from app.controller import UnsupportedProjectVersion
+from app.main_window import OPEN_FAILED_TITLE, SAVE_FAILED_TITLE, MainWindow
 from app.views import open_folder as open_folder_module
 from app.views.stage import Stage, StageTab, placeholder_tabs
 from app.widgets.base import KvRow
@@ -161,6 +162,9 @@ def make_window(controller):
 
     yield make
     for window in windows:
+        # The teardown is not a user: it never answers closeEvent's questions
+        # (a run in progress, settings that could not be saved).
+        window._closing = True
         window.close()
         window.deleteLater()
 
@@ -834,6 +838,67 @@ def test_a_failed_save_is_reported_in_a_banner(slay_window):
     slay_window.controller.save_failed.emit("Could not save /x/.ocr.json: disk full")
     assert not slay_window.error_banner.isHidden()
     assert slay_window.error_banner.text() == "Could not save /x/.ocr.json: disk full"
+
+
+def test_the_not_saved_banner_goes_when_the_next_save_works(slay_window):
+    """Only reopening or the ✕ cleared it, so a folder that saved fine a
+    second later still read "Not saved"."""
+    window = slay_window
+    window.controller.save_failed.emit("Could not save /x/.ocr.json: disk full")
+    assert not window.error_banner.isHidden()
+
+    window.controller.project_saved.emit()
+    assert window.error_banner.isHidden()
+
+
+def test_a_successful_save_leaves_an_open_failure_on_screen(slay_window, tmp_project):
+    window = slay_window
+    window.open_folder(str(tmp_project(["ep01.mkv"], config={"version": 99, "files": {}})))
+    assert window.error_banner.title() == OPEN_FAILED_TITLE
+
+    window.controller.project_saved.emit()
+    assert not window.error_banner.isHidden()
+
+
+def test_closing_warns_again_while_saving_is_blocked(make_window, tmp_project, monkeypatch):
+    """_save_blocked latches, so every later save -- close_folder's and
+    shutdown's -- returned silently and the session's work went with it."""
+    from PyQt6.QtGui import QCloseEvent
+    from PyQt6.QtWidgets import QMessageBox
+
+    from app.main_window import BLOCKED_SAVE_TITLE
+    from core.project import store as store_module
+
+    window = make_window()
+    window.open_folder(str(tmp_project(fixture="slay")))
+    settle()
+
+    def refuse(project):
+        raise UnsupportedProjectVersion(project.path, 99)
+
+    monkeypatch.setattr(store_module, "save_project", refuse)
+    window.controller.set_brightness(SLAY_NAMES[0], 150)
+    assert wait_for(lambda: not window.error_banner.isHidden())
+    assert window.controller.save_blocked
+
+    asked = []
+
+    def question(parent, title, text, buttons, default):
+        asked.append(title)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert asked == [BLOCKED_SAVE_TITLE]
+    assert not event.isAccepted()                       # Cancel: the window stays, the values stay
+
+    asked.clear()
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *args: QMessageBox.StandardButton.Yes))
+    window.closeEvent(QCloseEvent())
+    assert window.error_banner.title() == SAVE_FAILED_TITLE
+    assert "without saving" in window.error_banner.text()
 
 
 def test_files_appearing_and_disappearing_update_the_queue(qapp, fake_runner, tmp_project):

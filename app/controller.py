@@ -199,6 +199,7 @@ class ProjectController(QObject):
     log_appended = pyqtSignal(str, str)         # key ("Pipeline" or filename), text
     logs_cleared = pyqtSignal()                 # logs restarted (a run start keeps "Detections"): re-read log_keys()
     save_failed = pyqtSignal(str)               # message; the values stay in memory
+    project_saved = pyqtSignal()                # .ocr.json written: whatever save_failed said is over
 
     def __init__(self, runner_factory: Callable[[Callable[[JobEvent], None]], JobRunner] = default_runner_factory,
                  parent: QObject | None = None, *, save_debounce_ms: int = 500, drain_interval_ms: int = 30,
@@ -293,6 +294,7 @@ class ProjectController(QObject):
             return
         self._drain_all()
         self._save_now()
+        self._warn_if_save_blocked()
         self._runner.cancel_where(lambda job: True)
         self._autopilot.resume()            # lift this folder's holds from the lanes
         self._discard_events()
@@ -314,6 +316,7 @@ class ProjectController(QObject):
         if self._project is not None:
             self._drain_all()
             self._save_now()
+            self._warn_if_save_blocked()
         self._shut_down = True
         self._drain_timer.stop()
         self._save_timer.stop()
@@ -1078,6 +1081,18 @@ class ProjectController(QObject):
         if self._project is not None and not self._shut_down and not self._save_blocked:
             self._save_timer.start()
 
+    @property
+    def save_blocked(self) -> bool:
+        """True once a save was refused because the folder's `.ocr.json` was
+        written by a newer version: nothing is saved from here on, so the
+        window warns again before the session's work is lost."""
+        return self._save_blocked
+
+    def _warn_if_save_blocked(self) -> None:
+        if self._project is not None and self._save_blocked:
+            self._save_failure(f"Closing {self._project.path} without saving: "
+                               f"its {store.CONFIG_FILENAME} was written by a newer version.")
+
     def _save_now(self) -> None:
         self._save_timer.stop()
         project = self._project
@@ -1085,6 +1100,7 @@ class ProjectController(QObject):
             return
         try:
             store.save_project(project)
+            self.project_saved.emit()
         except UnsupportedProjectVersion as exc:
             self._save_blocked = True           # someone put a newer project file there: never overwrite it
             self._save_failure(f"Not saving: {exc}")

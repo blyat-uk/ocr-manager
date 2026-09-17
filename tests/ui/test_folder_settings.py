@@ -136,6 +136,9 @@ def make_window(controller):
 
     yield make
     for window in windows:
+        # The teardown is not a user: it never answers closeEvent's questions
+        # (a run in progress, settings that could not be saved).
+        window._closing = True
         window.close()
         window.deleteLater()
 
