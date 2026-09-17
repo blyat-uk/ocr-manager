@@ -55,6 +55,7 @@ from app.logbook import PIPELINE_LOG
 from app.state_text import can_mark_reviewed
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
+from app.views.folder_settings import FolderSettingsSheet
 from app.views.inspector import Inspector
 from app.views.open_folder import (
     FolderPicker,
@@ -160,6 +161,7 @@ class MainWindow(QMainWindow):
         self.activity_strip = ActivityStrip(self.controller)
         column.addWidget(self.activity_strip)
         self.setCentralWidget(central)
+        self.folder_settings = FolderSettingsSheet(self.controller, central, anchor=self.centre)
 
         self._connect()
         self.quit_action = self._shortcut("Quit", "Ctrl+Q", self.close)
@@ -200,6 +202,7 @@ class MainWindow(QMainWindow):
         self.inspector.tab_requested.connect(self._on_tab_requested)
         self.topbar.open_requested.connect(self.choose_folder)
         self.topbar.folder_settings_requested.connect(self.open_folder_settings)
+        self.folder_settings.closed.connect(lambda: self.queue.setFocus(Qt.FocusReason.OtherFocusReason))
         self.topbar.logs_requested.connect(lambda: self.open_logs(None))
         self.topbar.start_requested.connect(self.start_run)
         self.open_view.choose_requested.connect(self.choose_folder)
@@ -246,7 +249,8 @@ class MainWindow(QMainWindow):
         widget consumes keys, and Space not while the file is PENDING."""
         name = self.queue.selected()
         has_file = name is not None and name in self.controller.names()
-        editing = consumes_keys(QApplication.focusWidget())
+        focused = QApplication.focusWidget()
+        editing = consumes_keys(focused) or self.folder_settings.contains_focus(focused)
         self.proof_action.setEnabled(has_file and not editing)
         self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
 
@@ -265,6 +269,7 @@ class MainWindow(QMainWindow):
 
     def open_folder_settings(self) -> None:
         """The Folder settings sheet (plan 3B Task 4)."""
+        self.folder_settings.open()
 
     def open_logs(self, key: str | None = None) -> None:
         """The logs window, at `key`'s section (plan 3B Task 5)."""
