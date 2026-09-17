@@ -1711,7 +1711,7 @@ def _entry_for_proof(**kwargs) -> FileEntry:
     (lambda f: RangesJob(PROJECT_DIR, list(NAMES), f), "ranges:*", "ranges", Lane.CPU, None, 0),
     (lambda f: AudioProfileJob(PROJECT_DIR, "a.mp4", 1418.0), "audio_profile:a.mp4", "audio_profile",
      Lane.CPU, "a.mp4", 0),
-    (lambda f: ProofOcrJob(PROJECT_DIR, _entry_for_proof(), f), "proof:a.mp4", "proof", Lane.GPU, "a.mp4", 10),
+    (lambda f: ProofOcrJob(PROJECT_DIR, _entry_for_proof(), f), "proof:a.mp4", "proof", Lane.GPU, "a.mp4", 100),
 ])
 def test_job_identity(make, key, kind, lane, file, priority):
     job = make(FolderSettings())

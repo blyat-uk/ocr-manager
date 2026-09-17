@@ -12,7 +12,9 @@ Identity
               queued job and waits behind a running one (see the runner).
     lane      GPU: crop, brightness, proof (they lease OCR engines).
               CPU: metadata, thumbnail, ranges, audio_profile.
-    priority  0; the proof is 10, because the user is waiting for it.
+    priority  0; the proof is PROOF_PRIORITY (100), above every priority
+              AutoPilot gives (at most 15, a boosted re-detect's metadata),
+              because the user is waiting for it.
 
 Engines (ruling A1)
     CropJob, BrightnessJob and ProofOcrJob reach engines only through
@@ -88,7 +90,7 @@ if TYPE_CHECKING:
 THUMB_HEIGHT = 72                 # px; thumbnails are whole frames scaled to this height
 PROOF_WINDOW_SEC = 30.0           # length of the proof OCR window
 PROOF_START_FRACTION = 0.4        # window start without a sample time, as a fraction of the duration
-PROOF_PRIORITY = 10
+PROOF_PRIORITY = 100              # above every auto-pilot priority (tests/test_autopilot.py checks)
 
 
 # --------------------------------------------------------------------------
