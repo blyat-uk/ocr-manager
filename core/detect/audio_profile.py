@@ -11,7 +11,7 @@ not "no speech present".
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -73,23 +73,53 @@ def audio_profile(video_path: str, duration_sec: float,
     return AudioProfile(duration=duration_sec, envelope=envelope, speech=speech)
 
 
+SkipSpan = Block | Mapping | tuple[float, float] | list[float]
+
+
+def _skip_bounds(skip) -> tuple[float, float]:
+    """(start_sec, end_sec) of one skipped span: a Block (anything with
+    start_sec/end_sec attributes), a mapping with "start_sec"/"end_sec" keys
+    (the entries of a file's evidence["ranges"]["blocks"]), or a
+    (start_sec, end_sec) pair. TypeError for anything else."""
+    if hasattr(skip, "start_sec") and hasattr(skip, "end_sec"):
+        return float(skip.start_sec), float(skip.end_sec)
+    if isinstance(skip, Mapping):
+        if "start_sec" not in skip or "end_sec" not in skip:
+            raise TypeError(f"a skip span mapping needs start_sec and end_sec: {skip!r}")
+        return float(skip["start_sec"]), float(skip["end_sec"])
+    try:
+        start, end = skip
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"not a skip span (Block, mapping or (start_sec, end_sec) pair): {skip!r}") from exc
+    return float(start), float(end)
+
+
 def speech_in_skips(
-    speech: list[tuple[float, float]],
-    blocks: list[Block],
+    speech: Iterable[tuple[float, float]],
+    blocks: Iterable[SkipSpan],
     min_overlap_sec: float = 2.0,
 ) -> list[tuple[float, float]]:
-    """Speech spans that fall inside a block about to be skipped.
+    """Speech spans that fall inside a span about to be skipped.
 
-    For every (speech span, block) pair, the overlap clipped to the block's
-    own [start_sec, end_sec) is kept only when its length is at least
-    ``min_overlap_sec``. A speech span overlapping two blocks yields two
-    (independently clipped) entries. Result order: ascending start time.
+    `speech` holds (start_sec, end_sec) pairs (AudioProfile.speech, or the
+    lists evidence["audio"]["speech"] holds). `blocks` holds the skipped
+    spans, each a Block, a mapping with "start_sec"/"end_sec" (the evidence
+    dicts of evidence["ranges"]["blocks"]) or a (start_sec, end_sec) pair, in
+    any iterable and mixed freely.
+
+    For every (speech span, skipped span) pair, the overlap clipped to the
+    skipped span's own [start_sec, end_sec) is kept only when its length is
+    at least ``min_overlap_sec``. A speech span overlapping two skipped spans
+    yields two (independently clipped) entries. Result order: ascending
+    start time.
     """
+    speech = [(s, e) for s, e in speech]
     warnings: list[tuple[float, float]] = []
-    for block in blocks:
+    for skip in blocks:
+        skip_start, skip_end = _skip_bounds(skip)
         for s, e in speech:
-            start = max(s, block.start_sec)
-            end = min(e, block.end_sec)
+            start = max(s, skip_start)
+            end = min(e, skip_end)
             if end - start >= min_overlap_sec:
                 warnings.append((start, end))
     warnings.sort(key=lambda span: span[0])

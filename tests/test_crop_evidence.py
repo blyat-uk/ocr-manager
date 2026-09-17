@@ -438,7 +438,7 @@ def test_to_evidence_is_json_serialisable_and_carries_every_sample(monkeypatch):
 
     assert json.loads(json.dumps(evidence)) == evidence
     assert set(evidence) == {"box", "envelope", "agreed", "probes_used", "flagged", "hit_pts",
-                             "frame_size", "samples"}
+                             "frame_size", "samples", "cutoff_frac"}
     assert evidence["box"] == list(result.box)
     assert evidence["envelope"] == list(result.envelope)
     assert evidence["frame_size"] == list(result.frame_size)
@@ -473,3 +473,56 @@ def test_to_evidence_converts_numpy_scalars():
 
     assert json.loads(json.dumps(evidence)) == evidence
     assert evidence["samples"] == [{"time": 1.5, "boxes": [[400, 980, 1100, 50]], "kept": True, "lines": 1}]
+
+
+# --- The detection band in the evidence (F8) -----------------------------------
+
+@pytest.mark.parametrize("name, cutoff", [
+    ("one-line", crop.BOTTOM_HALF_CUTOFF),
+    ("two-line-band-geometry", crop.BOTTOM_HALF_CUTOFF),
+    ("settings", 0.7),                                   # the folder's own band
+    ("no-speech-fallback", crop.BOTTOM_HALF_CUTOFF),
+    ("speech-probes-exhausted", crop.BOTTOM_HALF_CUTOFF),
+    ("cancelled-during-audio-extraction", crop.BOTTOM_HALF_CUTOFF),
+    ("full-frame-retry", 0.0),                           # the retry judged the whole frame
+    ("full-frame-retry-band-geometry", 0.0),
+    ("no-hits-anywhere", 0.0),
+])
+def test_evidence_records_the_cutoff_the_kept_samples_were_judged_with(monkeypatch, name, cutoff):
+    result = IDENTITY_CASES[name](monkeypatch)
+    assert result.cutoff_frac == cutoff
+    evidence = result.to_evidence()
+    assert evidence["cutoff_frac"] == cutoff and type(evidence["cutoff_frac"]) is float
+    assert (crop.FLAG_TOP_POSITIONED in (result.flagged or "")) == (cutoff == 0.0)
+
+
+def test_a_result_built_without_detection_has_no_recorded_cutoff():
+    assert crop.CropResult(box=None).to_evidence()["cutoff_frac"] is None
+
+
+def _fit_to_kept_samples(evidence: dict, settings: dict | None, cutoff: float):
+    """What "fit to all samples" does: aggregate_box over the kept samples' boxes."""
+    kept = [sample for sample in evidence["samples"] if sample["kept"]]
+    polys = [[_poly(x, y, x + w, y + h) for x, y, w, h in sample["boxes"]] for sample in kept]
+    return crop.aggregate_box(polys, tuple(evidence["frame_size"]), cutoff,
+                              {**(settings or {}), "bottom_half_cutoff": cutoff},
+                              [sample["time"] for sample in kept])
+
+
+@pytest.mark.parametrize("name, settings", [
+    ("one-line", None),
+    ("settings", {"bottom_half_cutoff": 0.7, "crop_vertical_padding": 0.01,
+                  "crop_width_fraction": 0.8, "crop_min_height_fraction": 0.03}),
+    ("full-frame-retry", None),
+    ("full-frame-retry-band-geometry", None),
+])
+def test_the_recorded_cutoff_lets_fit_to_all_samples_rebuild_the_box(monkeypatch, name, settings):
+    result = IDENTITY_CASES[name](monkeypatch)
+    evidence = result.to_evidence()
+
+    rebuilt = _fit_to_kept_samples(evidence, settings, evidence["cutoff_frac"])
+
+    assert rebuilt is not None and result.box is not None
+    assert all(abs(a - b) <= 1 for a, b in zip(rebuilt, result.box)), (rebuilt, result.box)
+    if evidence["cutoff_frac"] == 0.0:                   # the band default would find nothing there
+        assert _fit_to_kept_samples(evidence, settings, crop.BOTTOM_HALF_CUTOFF) is None
