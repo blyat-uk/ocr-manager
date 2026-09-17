@@ -54,3 +54,6 @@ Thumbs.db
 
 # Fidelity harness output for a failing case, never a golden.
 tests/goldens/*.actual.ass
+
+# Git worktrees for parallel branches.
+.worktrees/
