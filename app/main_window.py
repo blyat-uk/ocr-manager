@@ -273,6 +273,10 @@ class MainWindow(QMainWindow):
         self.set_mode(MODE_REVIEW)
 
     def _on_selection_changed(self, name) -> None:
+        # Before the views ask for their pixels: the frames and strips of the
+        # file being left are not worth a worker any more (see
+        # ProjectController.set_view_file).
+        self.controller.set_view_file(name)
         self.stage.set_file(name)
         self.inspector.set_file(name)
         self._sync_actions()

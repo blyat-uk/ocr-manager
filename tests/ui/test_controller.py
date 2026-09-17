@@ -22,7 +22,7 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
 
 from app.activity import ActivitySnapshot
-from app.controller import ProjectController, default_runner_factory
+from app.controller import VIEW_KINDS, ProjectController, default_runner_factory
 from app.logbook import LOG_LIMIT, LogBook
 from app.run_snapshot import RunSnapshot, RunTracker, notification_for, notify_duration
 from app.state_text import badge_for
@@ -1808,3 +1808,97 @@ def test_metadata_that_fits_the_stored_crop_changes_nothing(make_controller, fak
     entry = controller.entry("ep01.mkv")
     assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == BOX
     assert entry.review == ReviewState.REVIEWED
+
+
+# --------------------------------------------------------------------------
+# View jobs follow the selection
+# --------------------------------------------------------------------------
+
+class Cancels:
+    """Runs the cancel_where predicates the controller records against the
+    fake runner's queue, as the real runner does: a matching queued job ends
+    "cancelled". Only jobs queued when a predicate is recorded can match it,
+    so the predicates are applied in the order they arrive."""
+
+    def __init__(self, controller, fake_runner):
+        self._controller = controller
+        self._runner = fake_runner
+        self._seen = len(fake_runner.cancel_predicates)
+
+    def settle(self) -> None:
+        for predicate in self._runner.cancel_predicates[self._seen:]:
+            for submission in list(self._runner.queued()):
+                if predicate(submission.job):
+                    self._runner.emit(submission, "cancelled", result=None)
+        self._seen = len(self._runner.cancel_predicates)
+        self._controller.drain_events()
+
+    def view_jobs(self) -> list:
+        self.settle()
+        return [s.job for s in self._runner.queued() if s.job.kind in VIEW_KINDS]
+
+
+def test_walking_the_queue_leaves_only_the_current_files_view_jobs(
+        make_controller, fake_runner, tmp_project):
+    """VIEW_PRIORITY outranks every auto-pilot job on a two-worker lane, so
+    frames for files the user has walked past would decode ahead of the
+    metadata and thumbnails of the file they are looking at."""
+    names = [f"ep{index:02d}.mkv" for index in range(1, 6)]
+    controller, _ = _frames_controller(make_controller, tmp_project, names)
+    cancels = Cancels(controller, fake_runner)
+
+    for name in names:
+        controller.set_view_file(name)
+        cancels.settle()
+        controller.request_frames(name, [10.0, 20.0])
+        controller.request_strips(name, BOX, [10.0])
+
+    live = cancels.view_jobs()
+    assert {job.file for job in live} == {"ep05.mkv"}
+    assert sorted(job.kind for job in live) == ["frames", "strips"]
+
+
+def test_leaving_every_file_cancels_all_view_work(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    cancels = Cancels(controller, fake_runner)
+    controller.set_view_file("ep01.mkv")
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+
+    controller.set_view_file(None)
+    assert cancels.view_jobs() == []
+
+
+def test_set_view_file_never_cancels_anything_but_view_jobs(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.set_view_file("ep02.mkv")
+
+    other = [job for job in (s.job for s in fake_runner.submissions) if job.kind not in VIEW_KINDS]
+    assert other, "the folder submits thumbnails at least"
+    for predicate in fake_runner.cancel_predicates:
+        assert not any(predicate(job) for job in other)
+
+
+def test_a_cancelled_view_job_releases_its_times_for_the_next_visit(
+        make_controller, fake_runner, tmp_project):
+    """_on_view_event marks nothing for a cancelled job: coming back to the
+    file must fetch those times again rather than draw the placeholder."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.set_view_file("ep01.mkv")
+    controller.request_frames("ep01.mkv", [10.0])
+    submission = fake_runner.last("frames", "ep01.mkv")
+
+    controller.set_view_file("ep02.mkv")
+    fake_runner.emit(submission, "cancelled", result=None)
+    controller.drain_events()
+
+    controller.set_view_file("ep01.mkv")
+    controller.request_frames("ep01.mkv", [10.0])
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 2
+
+
+def test_set_view_file_without_a_folder_does_nothing(make_controller):
+    controller = make_controller()
+    controller.set_view_file("ep01.mkv")
+    controller.set_view_file(None)

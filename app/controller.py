@@ -409,6 +409,23 @@ class ProjectController(QObject):
 
     # --- frames and strips for the review views ---------------------------------------
 
+    def set_view_file(self, name: str | None) -> None:
+        """The file the review views are showing, from the window's selection.
+
+        Frames and strips are submitted at VIEW_PRIORITY, above every
+        priority AutoPilot gives its CPU work, on a lane with two workers for
+        the whole folder: view work for a file nobody is looking at any more
+        would decode ahead of the metadata and thumbnails of the file that is
+        on screen. Walking a queue of forty files must not leave thirty-nine
+        files' frames queued, so leaving a file cancels its view jobs.
+
+        A cancelled job teaches nothing about its times (_on_view_event marks
+        nothing for it), so coming back fetches them again. None is "no file
+        shown": all view work is cancelled. Safe with no folder open."""
+        if self._project is None or self._shut_down:
+            return
+        self._runner.cancel_where(lambda job: job.kind in VIEW_KINDS and job.file != name)
+
     def request_frames(self, name: str, times: list[float]) -> None:
         """Fetch `name`'s whole frames at `times` for the crop views.
 

@@ -416,6 +416,19 @@ def test_queue_keyboard_moves_marks_and_proves(slay_window, fake_runner):
     assert window.inspector.proof_status.text() == f"running on {PROOF_WINDOW_TEXT}…"
 
 
+def test_moving_the_selection_hands_the_new_file_to_the_controller(slay_window):
+    """So the frames and strips of the file being left stop competing for the
+    CPU lane (ProjectController.set_view_file)."""
+    window, queue = slay_window, slay_window.queue
+    view_files = Calls(window.controller, "set_view_file")
+    activate(window)
+    queue.setFocus()
+
+    QTest.keyClick(queue, Qt.Key.Key_Down)
+    QTest.keyClick(queue, Qt.Key.Key_Down)
+    assert view_files.calls == [(SLAY_NAMES[1],), (SLAY_NAMES[2],)]
+
+
 def test_clicking_a_row_selects_it(slay_window):
     queue = slay_window.queue
     row = queue.row(SLAY_NAMES[3])
