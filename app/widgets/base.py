@@ -178,13 +178,21 @@ class KvRow(QWidget):
     def set_value(self, value: str, tone: str | None = None, *, tint_border: bool = True) -> None:
         """`tint_border=False` colours only the value, as the inspector's
         Detected rows do (workbench-hifi figure 1: a warn "211" in a plain
-        row)."""
+        row).
+
+        The repolish is what makes Qt re-evaluate the QSS after a dynamic
+        property changed, so it is only worth doing when one did: this runs
+        for every row of every section on every refresh, and a rewritten
+        value with the tone it already had selects no different rule."""
         self._value_label.setText(value)
         tone_prop = tone or ""
-        self._value_label.setProperty("tone", tone_prop)
-        self.setProperty("tone", tone_prop if tint_border else "")
-        _repolish(self._value_label)
-        _repolish(self)
+        row_tone = tone_prop if tint_border else ""
+        if self._value_label.property("tone") != tone_prop:
+            self._value_label.setProperty("tone", tone_prop)
+            _repolish(self._value_label)
+        if self.property("tone") != row_tone:
+            self.setProperty("tone", row_tone)
+            _repolish(self)
 
 
 class SectionHeader(QWidget):
@@ -262,6 +270,7 @@ class SegmentedControl(QWidget):
     def set_labels(self, items: list[str]) -> None:
         for button in self._buttons:
             self._layout.removeWidget(button)
+            button.setParent(None)   # removeWidget alone leaves it parented and painting
             button.deleteLater()
         self._buttons = []
         if self._current >= len(items):

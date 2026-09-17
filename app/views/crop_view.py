@@ -1247,6 +1247,7 @@ class CropInspectorPanel(Section):
         if ids != self._row_ids:
             for row in self._rows:
                 self.body.removeWidget(row)
+                row.setParent(None)  # removeWidget alone leaves it parented and painting
                 row.deleteLater()
             self._rows = []
             position = self.body.indexOf(self.evidence_header) + 1

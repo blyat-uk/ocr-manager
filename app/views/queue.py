@@ -195,6 +195,7 @@ class QueueView(QWidget):
         for name in [name for name in self._rows if name not in names]:
             row = self._rows.pop(name)
             self._list_layout.removeWidget(row)
+            row.setParent(None)      # removeWidget alone leaves it parented and painting
             row.deleteLater()
         for name in names:
             if name not in self._rows:

@@ -1121,6 +1121,7 @@ class BrightnessTab:
             return
         for tile in self._tiles:
             self._grid.removeWidget(tile)
+            tile.setParent(None)     # removeWidget alone leaves it parented and painting
             tile.deleteLater()
         self._grid.removeWidget(self.pin_tile_widget)
         self._tiles = []

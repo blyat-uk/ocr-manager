@@ -171,6 +171,7 @@ class LogsWindow(QWidget):
         position = self.scroll_area.verticalScrollBar().value()
         for section in self._sections.values():
             self._layout.removeWidget(section)
+            section.setParent(None)      # removeWidget alone leaves it parented and painting
             section.deleteLater()
         self._sections = {}
         for key in self._controller.log_keys():

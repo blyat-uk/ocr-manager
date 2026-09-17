@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QLabel, QPushButton
 
 import app
 from app.theme import qss, tokens
+from app.widgets import base
 from app.widgets.base import (
     Badge,
     Button,
@@ -235,6 +236,29 @@ def test_kvrow_set_value_updates_text_and_tone(qapp):
     row.set_value("211", "acc")
     assert row._value_label.text() == "211"
     assert row.property("tone") == "acc"
+
+
+def test_kvrow_only_repolishes_when_the_tone_actually_changes(qapp, monkeypatch):
+    """Every hot refresh path rewrites every row. An unpolish/polish pass per
+    row per refresh -- two of them, row and value -- buys nothing when the
+    tone is what it already was; only the text changed, and a QSS rule does
+    not select on text."""
+    calls = []
+    monkeypatch.setattr(base, "_repolish", lambda widget: calls.append(widget))
+    row = KvRow("Brightness", "209")
+    calls.clear()
+
+    row.set_value("211")                       # same tone, new text
+    assert calls == []
+    assert row.value() == "211"
+
+    row.set_value("211", "warn")               # the tone changed: both repolish
+    assert calls == [row._value_label, row]
+    calls.clear()
+
+    row.set_value("214", "warn")
+    assert calls == []
+    assert row.value_tone() == "warn" and row.property("tone") == "warn"
 
 
 def test_section_header_uppercases_and_holds_trailing_widget(qapp):

@@ -33,6 +33,7 @@ from app.run_snapshot import (
     run_status_text,
 )
 from app.views import run_view as run_view_module
+from app.views.logs import LogSection
 from app.views.run_view import LIVE_NOTE, feed_time, parse_gpu_utilisation, phase_text
 from core.jobs.run import RunSummary
 from core.project import (
@@ -727,6 +728,29 @@ def test_logs_window_is_non_modal_ordered_live_and_capped(window, fake_runner):
     start(window, fake_runner)                                  # a run start keeps only "Detections"
     assert logs.keys() == ["Detections"]
     assert logs.section("Detections").text() == "ep03.mkv: crop failed: boom\n"
+
+
+def test_a_reload_leaves_no_log_section_behind(window):
+    """`removeWidget` takes a row out of the layout but leaves it a child of
+    the list, at whatever size it had -- a section that was never laid out
+    keeps QWidget's default 640x480 and paints over everything beneath it
+    until it is really deleted. A LogSection outlives the call that dropped
+    it (its header's `toggled` is connected back to it), and `reload()` runs
+    on every run start; `held` stands in for that."""
+    controller = window.controller
+    for key in ("Pipeline", "Detections"):
+        controller.append_log(key, "a line")
+    window.open_logs(None)
+    settle()
+    logs = window.logs_window
+    held = logs.findChildren(LogSection)
+    assert len(held) == 2
+
+    logs.reload()
+    settle()
+    sections = logs.findChildren(LogSection)
+    assert len(sections) == 2
+    assert not set(sections) & set(held)
 
 
 def test_open_logs_from_the_queue_scrolls_to_that_files_section(window):
