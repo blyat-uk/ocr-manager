@@ -315,10 +315,13 @@ class ProjectController(QObject):
     def running_detectors(self, name: str) -> set[str]:
         return self._activity.running_kinds(name) & AUTOPILOT_KINDS
 
-    def outstanding_detectors(self, name: str) -> set[str]:
-        """running_detectors() plus the file's queued detections: whether a
-        re-detect of `name` is still to come. Changes with activity_changed."""
-        return self._activity.outstanding_kinds(name) & AUTOPILOT_KINDS
+    def pending_detectors(self) -> dict[str, set[str]]:
+        """file -> the detection kinds still to come for it: queued, running,
+        or held by auto-pilot until something else finishes (a brightness
+        measurement waits for the folder's ranges analysis, so it has no job
+        yet). `AutoPilot.pending()`, the same map the review states are
+        recomputed from; a fresh dict, empty with no folder open."""
+        return {} if self._project is None else self._autopilot.pending()
 
     def thumbnail(self, name: str) -> QImage | None:
         return self._thumbnails.get(name)

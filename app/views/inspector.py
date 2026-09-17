@@ -358,19 +358,24 @@ class Inspector(QWidget):
     # --- the change offer -----------------------------------------------------------------
 
     def _on_activity_changed(self) -> None:
-        """A hint re-detect is over once none of the files it submitted has a
-        detection of that kind left to run (ruling C3's "re-detecting N
-        files…"). Queued jobs count, so the line does not blink out while the
-        GPU lane works through them one at a time."""
-        controller = self._controller
-        done = [key for key, targets in self._redetecting.items()
-                if not any(key[1] in controller.outstanding_detectors(name) for name in targets)]
-        for key in done:
-            del self._redetecting[key]
-        if done:
+        """Auto-pilot's queue moved: a hint re-detect may be over."""
+        if self._redetecting:
             self._refresh_offer()
 
+    def _prune_redetecting(self) -> None:
+        """A hint re-detect is over (ruling C3's "re-detecting N files…") once
+        none of the files it covers has a detection of that kind still to
+        come. "To come" is auto-pilot's own pending map, not the runner's
+        queue: a brightness job waits for the folder's ranges analysis and has
+        no job of its own until that ends, and a queued job has not started."""
+        if not self._redetecting:
+            return
+        pending = self._controller.pending_detectors()
+        self._redetecting = {key: targets for key, targets in self._redetecting.items()
+                             if any(key[1] in pending.get(name, ()) for name in targets)}
+
     def _refresh_offer(self) -> None:
+        self._prune_redetecting()
         name = self._file
         kinds = self._edited.get(name, set()) if name is not None else set()
         self.offer.set_targets({kind: len(self._controller.hint_targets(name, kind))

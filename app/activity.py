@@ -84,16 +84,7 @@ class ActivityTracker:
     def running_kinds(self, file: str) -> set[str]:
         """Kinds of the file's running jobs; a running folder-wide ranges
         analysis counts for every file."""
-        return self._kinds(self._running(), file)
-
-    def outstanding_kinds(self, file: str) -> set[str]:
-        """running_kinds() plus the file's jobs that are still queued -- what
-        is left to happen for it, not just what is happening now."""
-        return self._kinds(self._jobs.values(), file)
-
-    @staticmethod
-    def _kinds(jobs, file: str) -> set[str]:
-        return {job.kind for job in jobs
+        return {job.kind for job in self._running()
                 if job.file == file or (job.file is None and job.kind == "ranges")}
 
     def snapshot(self, *, paused: bool, held: bool) -> ActivitySnapshot:

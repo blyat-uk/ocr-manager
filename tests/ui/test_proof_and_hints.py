@@ -48,6 +48,7 @@ DURATION = 1628.0
 SAMPLE_TIME = 578.0                 # a 30 s proof window of 09:38–10:08
 WINDOW_TEXT = "09:38–10:08"
 WAIT_MS = 5000
+WHOLE_FILE = object()               # entry(ranges=...) default: a MANUAL "use whole file" choice
 LINES = [(578.0, 580.0, "你竟掌握了鲲鹏道法"), (581.0, 583.0, "我早已不是当年的我"),
          (584.0, 586.0, "今日便让你见识见识"), (588.0, 590.0, "纵使千难万险"),
          (591.0, 593.0, "我也要闯一闯"), (594.0, 596.0, "这条路没有回头"),
@@ -74,12 +75,14 @@ def settle() -> None:
     QApplication.processEvents()
 
 
-def entry(name: str, *, crop=BOX, brightness=209, source=Source.DETECTED,
-          review=ReviewState.REVIEWED, skipped=False, sample_time=SAMPLE_TIME) -> FileEntry:
-    """A file with known media and a MANUAL whole-file range choice, so the
-    folder's ranges analysis never holds it PENDING."""
+def entry(name: str, *, crop=BOX, brightness=209, source=Source.DETECTED, review=ReviewState.REVIEWED,
+          skipped=False, sample_time=SAMPLE_TIME, ranges=WHOLE_FILE) -> FileEntry:
+    """A file with known media and, by default, a MANUAL whole-file range
+    choice, so the folder's ranges analysis never runs. `ranges=None` leaves
+    the ranges unset, which makes auto-pilot analyse the folder."""
     item = FileEntry(name, media=Media(1920, 888, DURATION, 25.0), review=review, skipped=skipped,
-                     sample_time=sample_time, time_ranges=TimeRanges([], Source.MANUAL))
+                     sample_time=sample_time,
+                     time_ranges=TimeRanges([], Source.MANUAL) if ranges is WHOLE_FILE else ranges)
     if crop is not None:
         item.crop = Crop(*crop, source)
     if brightness is not None:
@@ -444,6 +447,45 @@ def test_the_re_detecting_line_follows_the_jobs(window, fake_runner):
     controller.drain_events()
     assert inspector.offer_status.isHidden()
     assert inspector.offer_section.isHidden()            # nothing left to offer
+
+
+def test_a_brightness_hint_waiting_for_the_ranges_analysis_keeps_the_line(make_window, fake_runner):
+    """Auto-pilot holds a brightness job until the folder's ranges analysis
+    ends (detect_brightness samples inside the keep ranges), so the files the
+    hint re-detect covers have no job of their own yet. The line follows
+    auto-pilot's pending kinds, not the runner's queue, and stays up."""
+    window = make_window([entry(name, ranges=None) for name in NAMES])
+    controller, inspector = window.controller, window.inspector
+    name = NAMES[0]
+    assert fake_runner.last("ranges")                    # outstanding: brightness waits for it
+
+    controller.set_brightness(name, 214)
+    targets = controller.hint_targets(name, "brightness")
+    assert targets == NAMES[1:]
+    inspector.hint_buttons["brightness"].click()
+    assert fake_runner.of_kind("brightness") == []       # nothing submitted: the jobs wait
+    assert inspector.offer_status.text() == "re-detecting 4 files…"
+    controller.drain_events()
+    assert not inspector.offer_status.isHidden()
+
+    for target in targets:                               # other jobs come and go meanwhile
+        audio = fake_runner.last("audio_profile", target)
+        fake_runner.finish(audio, None)
+        controller.drain_events()
+        assert not inspector.offer_status.isHidden()
+
+    fake_runner.finish(fake_runner.last("ranges"), None)  # the analysis ends: the jobs go out
+    controller.drain_events()
+    assert [s.job.file for s in fake_runner.of_kind("brightness")] == targets
+    assert not inspector.offer_status.isHidden()
+
+    for target in targets:
+        assert not inspector.offer_status.isHidden()
+        submission = fake_runner.last("brightness", target)
+        fake_runner.finish(submission, brightness_result(submission))
+        controller.drain_events()
+    assert inspector.offer_status.isHidden()
+    assert inspector.offer_section.isHidden()
 
 
 def test_the_re_detecting_line_survives_a_failed_job(window, fake_runner):
