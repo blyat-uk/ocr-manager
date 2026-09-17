@@ -7,7 +7,10 @@ Measures three suites against the reference media in `/mnt/FAST/work`
            split into model-load / decode / OCR-inference / label-scan time.
   crop   - `core.detect.crop.detect_crop()` (what
            `core.jobs.detect_jobs.CropJob` runs), one file per reference
-           project.
+           project. NOTE: since plan 3B Task 6 only the detector call is
+           timed; the engine lease/build, which the old Qt worker had inside
+           its timed region, is outside it. Crop seconds are NOT comparable
+           with the Stage 2 crop baselines (see CROP_TIMING_NOTE).
   ranges - `core.detect.ranges.pipeline.analyse()` (what
            `core.jobs.detect_jobs.RangesJob` runs), cold (no cache) and warm
            (cache present), one project run per project.
@@ -95,8 +98,16 @@ def _fmt_ratio(before_s: float, after_s: float) -> str:
     return f"{1.0 / ratio:.2f}x SLOWER"
 
 
+CROP_TIMING_NOTE = (
+    "crop: since plan 3B Task 6 only detect_crop() is timed -- the engine lease and build sit "
+    "outside the timed region, where the old Qt worker had them inside it. Crop seconds are not "
+    "directly comparable with baselines recorded before that change."
+)
+
+
 def compare(before: dict, after: dict) -> str:
-    """Render a markdown before/after table.
+    """Render a markdown before/after table, with CROP_TIMING_NOTE beneath it
+    whenever the crop suite appears (its timed region changed in plan 3B).
 
     `before` and `after` are `{suite: {key: Measurement.as_dict()}}` trees
     (exactly what one suite run produces, NOT the full baseline-file
@@ -143,6 +154,8 @@ def compare(before: dict, after: dict) -> str:
                 f"| {label} | {_fmt_seconds(b.seconds)} | {_fmt_seconds(a.seconds)} | {change} |"
             )
 
+    if (before.get("crop") or after.get("crop")):
+        lines += ["", f"_{CROP_TIMING_NOTE}_"]
     return "\n".join(lines)
 
 
@@ -446,9 +459,15 @@ def _probe_duration_seconds(video: Path) -> float:
 
 def _run_crop_case(key: str, entry: dict) -> dict | None:
     """One detect_crop() call on one file, inside a detection-engine lease --
-    the same shape core.jobs.detect_jobs.CropJob runs, timed around the
-    detector itself (the lease and the engine build are excluded, as they
-    were when this drove the old Qt worker).
+    the same shape core.jobs.detect_jobs.CropJob runs.
+
+    TIMED REGION CHANGED (plan 3B Task 6). Only detect_crop() is timed; the
+    lease and, on the first call, the engine build sit outside it. Until this
+    task, the suite drove the old Qt adapter's SubtitleDetectionWorker._run(),
+    which leased and built the engine INSIDE the timed region. Crop numbers
+    recorded from here on are therefore not directly comparable with the
+    Stage 2 crop baselines -- they are lower by whatever the lease and build
+    cost that run. Compare crop against a new baseline taken with this code.
 
     The detector's own CropResult is what is measured, not what the app would
     apply: a box that is not auto-applicable is still a measured detection,
@@ -670,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         "git_sha": _git_sha(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "note": "machine shared with a concurrent GPU workload; absolute numbers are noisy, treat as relative baselines",
+        "crop_timing_note": CROP_TIMING_NOTE,
         "repeat": args.repeat,
         "suites": suites,
     }

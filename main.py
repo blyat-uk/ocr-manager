@@ -3,7 +3,10 @@
 
 The window itself lives in `app/` (ruling C10) and `python -m app` starts
 exactly the same thing; this file only exists so the app can still be started
-by its script name (and by `[project.scripts] ocr-manager = "main:main"`).
+by its script name, which is how the desktop entry and PyInstaller's
+`ocr-manager.spec` launch it. (The installed console script goes straight to
+`app.__main__:main` -- see `[project.scripts]` in pyproject.toml -- because
+`main.py` is a loose module, not part of the shipped packages.)
 
 `main` takes today's optional folder argument and the `--quit-after SECONDS`
 test hook -- see app/__main__.py, which parses them.
