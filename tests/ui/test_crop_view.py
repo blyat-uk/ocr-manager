@@ -27,6 +27,7 @@ from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.views.crop_view import DETECTED_TAG, CropCanvas, CropTab, SampleStrip
+from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
 from core.detect import crop as crop_mod
@@ -654,7 +655,7 @@ def test_label_masks_are_drawn_on_every_file(make_tab):
 
 
 # --------------------------------------------------------------------------
-# Tags and the timeline placeholder
+# Tags and the compact timeline
 # --------------------------------------------------------------------------
 
 def test_the_canvas_tags_name_the_frame_the_crop_and_the_envelope(make_tab):
@@ -667,9 +668,13 @@ def test_the_canvas_tags_name_the_frame_the_crop_and_the_envelope(make_tab):
     assert "bottom_right" not in harness.tab.canvas.tags()
 
 
-def test_the_page_leaves_room_for_the_compact_timeline(make_tab):
-    placeholder = make_tab().tab.timeline_placeholder
-    assert placeholder.height() == 68
+def test_the_page_mounts_the_compact_timeline_under_the_stage(make_tab):
+    """Ruling B5: the same timeline the Time ranges tab hosts, read-only."""
+    timeline = make_tab().tab.timeline
+    assert isinstance(timeline, Timeline)
+    assert timeline.mode == "compact"
+    assert timeline.grips() == []
+    assert timeline.height() == 68
 
 
 # --------------------------------------------------------------------------
@@ -724,8 +729,9 @@ def test_the_toolbar_is_mounted_in_the_stage_head_and_swaps_with_the_tab(qapp, f
         stage.set_current(1)
         assert stage.current_toolbar() is brightness_toolbar
         assert toolbar.isHidden()
-        stage.set_current(2)                            # a PlaceholderTab: no toolbar
-        assert stage.current_toolbar() is None
+        ranges_toolbar = stage.tabs()[2].toolbar()      # Time ranges: its dim header line
+        stage.set_current(2)
+        assert stage.current_toolbar() is ranges_toolbar
         assert toolbar.isHidden() and brightness_toolbar.isHidden()
         stage.set_current(0)
         assert stage.current_toolbar() is toolbar
