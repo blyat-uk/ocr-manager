@@ -54,7 +54,13 @@ class FrameCache:
     for and could not be read. `get` still answers None (a view draws its
     placeholder either way), but `knows` is True, so the caller does not ask
     for it again. Markers hold no pixels: they are outside the byte budget
-    and never evict a frame.
+    and never evict a frame. They are also not capped -- there is one per
+    time that failed, and they live until `clear_file` or `clear` drops them
+    (a file removed, its crop box changed, the folder closed), which in a
+    session bounds them by the times the views actually asked for.
+
+    Evicting an entry is not the same as marking it unavailable: an evicted
+    frame is simply unknown again, and asking for it fetches it once more.
     """
 
     def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES):

@@ -55,6 +55,7 @@ SLAY_NAMES = [
 BOX = (288, 786, 1344, 53)
 WAIT_MS = 5000
 REPO_ROOT = Path(__file__).resolve().parents[2]
+PROOF_WINDOW_TEXT = "09:37–10:07"      # the first slay file's 30 s proof window, from its sample time
 NEWER_VERSION_TEXT = ("This folder was saved by a newer version of OCR Manager (project version 99). "
                       "Update the app to open it.")
 
@@ -411,7 +412,7 @@ def test_queue_keyboard_moves_marks_and_proves(slay_window, fake_runner):
     QTest.keyClick(queue, Qt.Key.Key_T)
     assert proofs.calls == [(SLAY_NAMES[0],)]
     assert fake_runner.last("proof", SLAY_NAMES[0])
-    assert window.inspector.proof_status.text() == "running…"
+    assert window.inspector.proof_status.text() == f"running on {PROOF_WINDOW_TEXT}…"
 
 
 def test_clicking_a_row_selects_it(slay_window):
@@ -581,20 +582,22 @@ def test_change_offer_appears_after_a_manual_crop_edit(detected_window):
 
     controller.set_crop(name, (290, 780, 1340, 60))
     assert not inspector.offer_section.isHidden()
-    assert inspector.hint_button.text() == "↻ re-detect the other 4 using this as a hint"
+    assert inspector.hint_buttons["crop"].text().replace("\n", " ") == (
+        "↻ re-detect the other 4 using this crop as a hint")
     assert inspector.offer_note.text() == (
         "Corrections are never copied verbatim to other episodes. Instead the app offers:")
-    inspector.hint_button.click()
+    inspector.hint_buttons["crop"].click()
     assert hints.calls == [(name, "crop")]
-    assert inspector.offer_section.isHidden()
+    assert inspector.hint_buttons["crop"].isHidden()
+    assert inspector.offer_status.text() == "re-detecting 4 files…"   # until those jobs end
 
     controller.set_brightness(name, 215)
-    assert not inspector.offer_section.isHidden()
+    assert not inspector.hint_buttons["brightness"].isHidden()
     inspector.this_file_only_button.click()
-    assert inspector.offer_section.isHidden()
+    assert inspector.hint_buttons["brightness"].isHidden()
     window.queue.select(SLAY_NAMES[1])
     window.queue.select(name)
-    assert inspector.offer_section.isHidden()                          # dismissed stays dismissed
+    assert inspector.hint_buttons["brightness"].isHidden()             # dismissed stays dismissed
 
 
 def test_change_offer_ignores_accepting_a_flagged_value(mixed_window):
@@ -614,7 +617,7 @@ def test_proof_section_shows_running_then_lines(slay_window, fake_runner):
     inspector = window.inspector
     name = SLAY_NAMES[0]
     inspector.proof_button.click()
-    assert inspector.proof_status.text() == "running…"
+    assert inspector.proof_status.text() == f"running on {PROOF_WINDOW_TEXT}…"
     assert not inspector.proof_status.isHidden()
     submission = fake_runner.last("proof", name)
     lines = [(578.0, 580.0, "你竟掌握了鲲鹏道法"), (581.0, 583.0, "我早已不是当年的我"),
@@ -623,7 +626,7 @@ def test_proof_section_shows_running_then_lines(slay_window, fake_runner):
     controller.drain_events()
     assert inspector.proof_status.isHidden()
     assert inspector.proof_texts() == [
-        "09:38 你竟掌握了鲲鹏道法", "09:41 我早已不是当年的我", "09:44 今日便让你见识见识"]
+        "09:38 你竟掌握了鲲鹏道法", "09:41 我早已不是当年的我", "09:44 今日便让你见识见识", "09:48 纵使千难万险"]
     assert inspector.proof_note.text() == "4 lines · took 4.1 s"
 
 
@@ -887,7 +890,8 @@ def test_main_restores_the_excepthook(qapp, monkeypatch):
 # Follow-up: window-level shortcuts, crash guard, pending review button
 # --------------------------------------------------------------------------
 
-def test_space_and_t_act_from_the_queue_and_stage_but_step_aside_for_key_consumers(make_window, tmp_project):
+def test_space_and_t_act_from_the_queue_and_stage_but_step_aside_for_key_consumers(make_window, tmp_project,
+                                                                                   fake_runner):
     window = make_window(tabs_factory=lambda controller: [EditorTab("Crop"), EditorTab("Brightness")])
     window.open_folder(str(tmp_project(fixture="slay")))
     controller, name = window.controller, SLAY_NAMES[0]
@@ -902,6 +906,8 @@ def test_space_and_t_act_from_the_queue_and_stage_but_step_aside_for_key_consume
     assert marks.calls == [(name, False)]
     QTest.keyClick(tab.surface, Qt.Key.Key_T)
     assert proofs.calls == [(name,)]
+    fake_runner.finish(fake_runner.last("proof", name), None)  # T is disabled while that proof runs
+    controller.drain_events()
     window.queue.setFocus()                                    # the queue
     QTest.keyClick(window.queue, Qt.Key.Key_Space)
     assert marks.calls == [(name, False), (name, True)]
