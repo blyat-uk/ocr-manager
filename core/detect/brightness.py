@@ -58,6 +58,16 @@ inside the folder plateau is accepted and picked PICK_BELOW_TOP below itself
 the plateau's start; otherwise the result is flagged "escalate" for the
 caller to re-run full detection.
 
+Evidence for review (BrightnessResult.strips, .clutter_curve): one
+StripSample per strip sampled, from every round and in time order, measured
+on the strips already in memory -- no extra decode, detection or OCR -- and
+only once the result's value is final, so it can never move the value, the
+plateau, the seed, the gate floor, the flags or the curve. The clutter curve
+is, per threshold, the share of empty strips whose masked strip still trips
+the OCR pass's gate: on the verification grid when verification ran, else on
+CLUTTER_THRESHOLDS; empty on the cheap path. core.detect.tiles.choose_tiles()
+picks the review tab's zoom tiles from the strips.
+
 Which results a caller may apply without review: `BrightnessResult.
 auto_applicable`. No Qt imports (core/detect/ is Qt-free).
 """
@@ -67,7 +77,7 @@ import logging
 import math
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as _dataclass_fields
 
 import cv2
@@ -196,6 +206,54 @@ NEIGHBOUR_FETCH_CHUNK = 8
 # leaves 3 candidates of headroom, not double.
 MAX_NEIGHBOUR_CANDIDATES = 8
 
+# --- Evidence
+# Thresholds of the clutter curve when no verification grid exists (coloured
+# text, no text): the whole range a subtitle threshold is ever picked from.
+CLUTTER_THRESHOLDS = tuple(range(100, 256, 5))
+
+
+@dataclass(frozen=True)
+class StripSample:
+    """What one sampled strip shows, for the review tab. No pixels: re-fetch
+    the strip with ocr_view.grab_ocr_strips_at(video, crop_box, [time]).
+
+    time: the sample time the strip was grabbed at.
+    is_text: the detector found polygons on the unmasked strip.
+    glyph_level: the strip's glyph level -- the median min-channel level of
+        its glyph pixels, the per-strip value analytic_seed takes its median
+        over -- rounded half up to a whole level. Glyph pixels are those
+        inside the eroded polygons above the Otsu split of the min-channel
+        there (_glyph_pixels). None for empty strips and for text strips too
+        small to split.
+    background_level: mean min-channel level of the strip's pixels outside
+        its glyph pixels; of the whole strip when it has no glyph pixels.
+    stroke_px: stroke thickness estimate in px: the MEAN over the glyph
+        pixels of 2 x their Euclidean distance (cv2.distanceTransform,
+        DIST_L2, precise mask) to the nearest pixel that is not a glyph
+        pixel, the strip's border counting as one. It orders strokes by
+        width but reads below the true width of thick ones: across a long
+        bar w px wide the distances run 1..(w + 1) / 2 and back, so it reads
+        about (w + 1)^2 / 2w -- bars 3, 5, 9 and 13 px wide measure about
+        2.7, 3.6, 5.6 and 7.5. (The median of the same distances takes
+        only a few values: 2.0 on every text strip of a 4K reference file.)
+        None where glyph_level is None.
+    lines: distinct text rows among the boxes (_count_lines); 0 for empty
+        strips.
+    boxes: the detector's polygons as (x, y, w, h) in strip pixels, the
+        inclusive extent of the rounded points the glyph mask fills.
+    gate_at_value: EMPTY strips only: ocr_view.gate_fires(ocr_view.mask(
+        strip, value)) at the result's final value -- whether the OCR pass
+        would OCR this text-free frame. None for text strips.
+    """
+    time: float
+    is_text: bool
+    glyph_level: int | None
+    background_level: float
+    stroke_px: float | None
+    lines: int
+    boxes: tuple[tuple[int, int, int, int], ...]
+    gate_at_value: bool | None
+
 
 @dataclass
 class BrightnessResult:
@@ -218,6 +276,13 @@ class BrightnessResult:
         full detection for that file.
     curve: (t, agreement * mean confidence) for every threshold verified, in
         ascending t; empty when verification did not run.
+    strips: one StripSample per strip sampled, every round, in time order.
+        Empty when nothing was sampled (needs-crop, ranges-empty?) or the
+        run was cancelled.
+    clutter_curve: (t, share of EMPTY strips whose masked strip trips the
+        OCR pass's gate at t), on the same thresholds as `curve` when
+        verification ran, else on CLUTTER_THRESHOLDS. Empty without empty
+        strips, on the cheap path, and when `strips` is empty.
     """
     value: int
     plateau: tuple[int, int] | None
@@ -225,6 +290,32 @@ class BrightnessResult:
     gate_floor: int | None
     flagged: str | None
     curve: list[tuple[int, float]]
+    strips: list[StripSample] = field(default_factory=list)
+    clutter_curve: list[tuple[int, float]] = field(default_factory=list)
+
+    def to_evidence(self) -> dict:
+        """The result as JSON-able data: value, plateau ([lo, hi] or None),
+        seed, gate_floor, flagged, curve and clutter_curve ([t, score]
+        pairs), and strips (one dict per StripSample, boxes as [x, y, w, h])."""
+        return {
+            "value": int(self.value),
+            "plateau": None if self.plateau is None else [int(self.plateau[0]), int(self.plateau[1])],
+            "seed": int(self.seed),
+            "gate_floor": None if self.gate_floor is None else int(self.gate_floor),
+            "flagged": self.flagged,
+            "curve": [[int(t), float(score)] for t, score in self.curve],
+            "clutter_curve": [[int(t), float(share)] for t, share in self.clutter_curve],
+            "strips": [{
+                "time": float(s.time),
+                "is_text": bool(s.is_text),
+                "glyph_level": None if s.glyph_level is None else int(s.glyph_level),
+                "background_level": float(s.background_level),
+                "stroke_px": None if s.stroke_px is None else float(s.stroke_px),
+                "lines": int(s.lines),
+                "boxes": [[int(v) for v in box] for box in s.boxes],
+                "gate_at_value": None if s.gate_at_value is None else bool(s.gate_at_value),
+            } for s in self.strips],
+        }
 
     @property
     def auto_applicable(self) -> bool:
@@ -346,26 +437,42 @@ def _detect_text_polys(det_engine, strips: list[np.ndarray]) -> list[list[np.nda
 # Seed and gate floor
 # --------------------------------------------------------------------------
 
-def _glyph_level(strip: np.ndarray, polys) -> float | None:
-    """Median min-channel level of one strip's glyph pixels: Otsu inside the
-    eroded polygons splits glyph fill from the background they enclose. None
-    when the strip offers too little to split."""
+def _poly_points(poly) -> np.ndarray:
+    """A detection polygon as the int32 pixel points it is filled with."""
+    return np.asarray(poly, dtype=np.float64).reshape(-1, 2).round().astype(np.int32)
+
+
+def _glyph_pixels(strip: np.ndarray, polys) -> tuple[np.ndarray, np.ndarray | None]:
+    """(min-channel, glyph mask) of one strip. Otsu inside the eroded
+    polygons splits glyph fill from the background they enclose; the glyph
+    pixels are those inside above the split. The mask is None when the strip
+    offers too little to split (no polygons, or fewer than
+    MIN_GLYPH_REGION_PIXELS pixels inside them) or nothing lies above it."""
+    min_channel = strip.min(axis=2)
     if polys is None or len(polys) == 0:
-        return None
+        return min_channel, None
     h, w = strip.shape[:2]
     region = np.zeros((h, w), dtype=np.uint8)
     for poly in polys:
-        pts = np.asarray(poly, dtype=np.float64).reshape(-1, 2).round().astype(np.int32)
-        cv2.fillPoly(region, [pts], 255)
-    region = cv2.erode(region, np.ones((POLY_ERODE_KERNEL, POLY_ERODE_KERNEL), np.uint8))
-    values = strip.min(axis=2)[region > 0]
+        cv2.fillPoly(region, [_poly_points(poly)], 255)
+    inside = cv2.erode(region, np.ones((POLY_ERODE_KERNEL, POLY_ERODE_KERNEL), np.uint8)) > 0
+    values = min_channel[inside]
     if values.size < MIN_GLYPH_REGION_PIXELS:
-        return None
+        return min_channel, None
     otsu, _ = cv2.threshold(values.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    glyph = values[values > otsu]
-    if glyph.size == 0:
+    glyph = inside & (min_channel > otsu)
+    if not glyph.any():
+        return min_channel, None
+    return min_channel, glyph
+
+
+def _glyph_level(strip: np.ndarray, polys) -> float | None:
+    """Median min-channel level of one strip's glyph pixels (_glyph_pixels).
+    None when the strip offers too little to split."""
+    min_channel, glyph = _glyph_pixels(strip, polys)
+    if glyph is None:
         return None
-    return float(np.median(glyph))
+    return float(np.median(min_channel[glyph]))
 
 
 def _round_half_up(value: float, step: int) -> int:
@@ -424,6 +531,101 @@ def gate_floor(empty_strips: list[np.ndarray]) -> int | None:
             break
         floor = t
     return floor
+
+
+# --------------------------------------------------------------------------
+# Evidence
+# --------------------------------------------------------------------------
+
+def _poly_box(poly) -> tuple[int, int, int, int] | None:
+    """(x, y, w, h) of the pixels a polygon fills; None for a polygon
+    without points."""
+    pts = _poly_points(poly)
+    if pts.size == 0:
+        return None
+    (x0, y0), (x1, y1) = pts.min(axis=0), pts.max(axis=0)
+    return int(x0), int(y0), int(x1 - x0) + 1, int(y1 - y0) + 1
+
+
+def _count_lines(boxes) -> int:
+    """Distinct text rows among (x, y, w, h) boxes. Two boxes share a row
+    when their vertical extents overlap by at least half the smaller box's
+    height; rows chain through such pairs (single linkage)."""
+    row = list(range(len(boxes)))
+
+    def root(i):
+        while row[i] != i:
+            row[i] = row[row[i]]
+            i = row[i]
+        return i
+
+    for i, (_, yi, _, hi) in enumerate(boxes):
+        for j in range(i):
+            _, yj, _, hj = boxes[j]
+            overlap = min(yi + hi, yj + hj) - max(yi, yj)
+            if 2 * overlap >= min(hi, hj):
+                row[root(i)] = root(j)
+    return sum(1 for i in range(len(boxes)) if root(i) == i)
+
+
+def _strip_sample(time: float, strip: np.ndarray, polys, value: int) -> StripSample:
+    """The StripSample of one sampled strip with its detection polygons, its
+    empty-strip gate measured at `value`. Reads the strip; never writes it."""
+    is_text = polys is not None and len(polys) > 0
+    min_channel, glyph = _glyph_pixels(strip, polys)
+    level = stroke = None
+    background = min_channel
+    if glyph is not None:
+        level = _round_half_up(float(np.median(min_channel[glyph])), 1)
+        # A zero border makes the strip's edge the glyph's edge.
+        bordered = cv2.copyMakeBorder(glyph.astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        distance = cv2.distanceTransform(bordered, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
+        stroke = 2.0 * float(np.mean(distance[glyph], dtype=np.float64))
+        if not glyph.all():
+            background = min_channel[~glyph]
+    boxes = tuple(box for box in (_poly_box(p) for p in (polys if is_text else ())) if box is not None)
+    return StripSample(
+        time=float(time),
+        is_text=is_text,
+        glyph_level=level,
+        background_level=float(background.mean()),
+        stroke_px=stroke,
+        lines=_count_lines(boxes),
+        boxes=boxes,
+        gate_at_value=None if is_text else bool(ocr_view.gate_fires(ocr_view.mask(strip, value))),
+    )
+
+
+def _strip_samples(times: list[float], strips: list[np.ndarray], polys_per_strip, value: int) -> list[StripSample]:
+    """StripSamples of every sampled strip, in time order (sampling order
+    among equal times)."""
+    order = sorted(range(len(strips)), key=lambda i: times[i])
+    return [_strip_sample(times[i], strips[i], polys_per_strip[i], value) for i in order]
+
+
+def _gate_square(strip: np.ndarray) -> np.ndarray:
+    """The part of `strip` the OCR pass's gate looks at: its h x h centre
+    square, or the whole strip when it is narrower than it is tall (the gate
+    then slices it itself). Masking is per-pixel, so gate_fires(mask(
+    _gate_square(strip), t)) == gate_fires(mask(strip, t)) -- gate_floor()'s
+    crop, and pinned against whole-strip masking by the tests."""
+    h, w = strip.shape[:2]
+    x0 = (w - h) // 2
+    return strip[:, x0:x0 + h] if 0 <= x0 else strip
+
+
+def _clutter_curve(empty_strips: list[np.ndarray], thresholds) -> list[tuple[int, float]]:
+    """(t, share of `empty_strips` whose strip masked at t trips the OCR
+    pass's gate) for each threshold; [] without empty strips. Only the gate's
+    centre square is masked (_gate_square): the same answer at about a
+    quarter of the cost (72 strips of 1344 x 54 at 32 thresholds: 0.21 s ->
+    0.06 s)."""
+    if not empty_strips:
+        return []
+    squares = [_gate_square(strip) for strip in empty_strips]
+    n = len(squares)
+    return [(int(t), sum(ocr_view.gate_fires(ocr_view.mask(square, t)) for square in squares) / n)
+            for t in thresholds]
 
 
 # --------------------------------------------------------------------------
@@ -829,27 +1031,35 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
     except ValueError:
         seed = None
 
+    def with_evidence(result: BrightnessResult, thresholds=CLUTTER_THRESHOLDS) -> BrightnessResult:
+        """`result`, finished, with the evidence of the strips sampled for it:
+        measured at its final value, and setting no other field."""
+        result.strips = _strip_samples(times, strips, polys, result.value)
+        if not cheap:
+            result.clutter_curve = _clutter_curve(empty_strips, thresholds)
+        return result
+
     if cheap:
         lo, hi = folder_plateau
         if seed is not None and seed < IMPLAUSIBLE_SEED:
             # Same verdict full detection would reach; escalating cannot help.
-            return BrightnessResult(seed, None, seed, None, FLAG_COLOURED_TEXT, [])
+            return with_evidence(BrightnessResult(seed, None, seed, None, FLAG_COLOURED_TEXT, []))
         if seed is None or not lo <= seed <= hi:
             fallback = DEFAULT_BRIGHTNESS if seed is None else seed
-            return BrightnessResult(fallback, None, fallback, None, FLAG_ESCALATE, [])
+            return with_evidence(BrightnessResult(fallback, None, fallback, None, FLAG_ESCALATE, []))
         flagged = FLAG_NARROW_PLATEAU if seed - PICK_BELOW_TOP < lo else None
-        return BrightnessResult(max(lo, seed - PICK_BELOW_TOP), (lo, hi), seed, None, flagged, [])
+        return with_evidence(BrightnessResult(max(lo, seed - PICK_BELOW_TOP), (lo, hi), seed, None, flagged, []))
 
     floor = gate_floor(empty_strips)
     # No empty strips: the floor was not measured, which is not evidence of clutter.
     flagged = FLAG_NO_CLEAN_THRESHOLD if floor is None and empty_strips else None
     if seed is None:
-        return BrightnessResult(DEFAULT_BRIGHTNESS, None, DEFAULT_BRIGHTNESS, floor,
-                                _compose_flag(flagged, FLAG_NO_TEXT), [])
+        return with_evidence(BrightnessResult(DEFAULT_BRIGHTNESS, None, DEFAULT_BRIGHTNESS, floor,
+                                              _compose_flag(flagged, FLAG_NO_TEXT), []))
     if seed < IMPLAUSIBLE_SEED:
         # The min-channel mask erases coloured (e.g. yellow) glyphs at any
         # useful threshold; OCR around a meaningless seed proves nothing.
-        return BrightnessResult(seed, None, seed, floor, _compose_flag(flagged, FLAG_COLOURED_TEXT), [])
+        return with_evidence(BrightnessResult(seed, None, seed, floor, _compose_flag(flagged, FLAG_COLOURED_TEXT), []))
 
     if _is_cancelled(cancel_check):
         return cancelled(seed, floor)
@@ -870,4 +1080,5 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
         flagged = _compose_flag(flagged, FLAG_DIM_TEXT)
     if floor is not None and value < floor + GATE_FLOOR_MARGIN:
         flagged = _compose_flag(flagged, FLAG_NO_CLEAN_THRESHOLD)
-    return BrightnessResult(int(value), plateau, seed, floor, flagged, verification.curve)
+    return with_evidence(BrightnessResult(int(value), plateau, seed, floor, flagged, verification.curve),
+                         [t for t, _ in verification.curve])

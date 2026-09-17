@@ -13,7 +13,7 @@ a result without review.
 |---|---|---|---|
 | crop.detect_crop | CropResult.sample_pts, hit_pts, samples[i].time: the REQUESTED probe times (samples[i].boxes are full-frame native pixels, not grab_frames' band coordinates) | crop.grab_frames(video, times) (either fetch path) | first frame at or after the time rounded to whole ms, container-relative (crop._seek_seconds). May precede the frame's own PTS by up to one frame; never re-fetch with the PTS. |
 | OCR pass (videocr.video.Video.run_ocr) | ASS times from each frame's PTS minus the container start | range starts/ends are "MM:SS" strings: videocr.utils.get_frame_index truncates int(t * fps), then Capture.set(CAP_PROP_POS_FRAMES) | index -> first frame whose round(PTS * fps) reaches it |
-| ocr_view.grab_ocr_strips_at (brightness sampling and neighbours) | the times it was given | ocr_view.grab_ocr_strips_at(video, crop_box, times) | index round(t * fps) (rounds, where the OCR pass truncates), then the same Capture.set as the OCR pass; pixels identical to what the OCR pass masks |
+| ocr_view.grab_ocr_strips_at (brightness sampling and neighbours; BrightnessResult.strips[].time) | the times it was given | ocr_view.grab_ocr_strips_at(video, crop_box, times) | index round(t * fps) (rounds, where the OCR pass truncates), then the same Capture.set as the OCR pass; pixels identical to what the OCR pass masks |
 | label scanner phase 1 | PTS from Capture.get_last_pts() | Capture.seek_to_pts(pts) | first frame whose PTS is at or after it: exactly that frame |
 | label scanner phases 3-4 | decision times t | Capture.seek_to_display_time(t) | the frame on screen at t: last frame whose PTS <= t (the first frame if t precedes it) |
 | ranges.analyse | keep ranges as "MM:SS" strings (None for an open end) | the OCR pass's time_ranges | as the OCR pass row |
@@ -32,7 +32,7 @@ a result without review.
 | detector | how to cancel | what comes back |
 |---|---|---|
 | crop.detect_crop | cancel_check callable, polled during audio extraction (every 0.1 s), between probe batches and between rounds | a CropResult, not an exception: flagged gains "cancelled", and `box` is whatever the evidence so far gives -- possibly clipped, possibly None. auto_applicable is False. |
-| brightness.detect_brightness | cancel_check callable, polled before each sampling round, before OCR verification, and before each OCR batch / neighbour grab of the dim-text check | a BrightnessResult with flagged == "cancelled", value DEFAULT_BRIGHTNESS (nothing measured), plateau None, curve []. auto_applicable is False. |
+| brightness.detect_brightness | cancel_check callable, polled before each sampling round, before OCR verification, and before each OCR batch / neighbour grab of the dim-text check | a BrightnessResult with flagged == "cancelled", value DEFAULT_BRIGHTNESS (nothing measured), plateau None, curve [], strips [], clutter_curve []. auto_applicable is False. |
 | ranges.pipeline.analyse | cancel callable, polled between files and between phases | raises ranges.pipeline.AnalysisCancelled (no partial result). core/audio_analysis.py turns it into finished({}). |
 
 (c) Flags and auto_applicable. Both detectors join reasons with "+"
