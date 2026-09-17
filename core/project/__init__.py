@@ -16,6 +16,7 @@ from core.project.model import (
     TimeRange,
     TimeRanges,
 )
+from core.project.ocr_kwargs import DEFAULT_BRIGHTNESS, OcrCall, ocr_call_for
 from core.project.store import (
     CONFIG_FILENAME,
     VIDEO_EXTENSIONS,
@@ -40,6 +41,9 @@ __all__ = [
     "TimeRanges",
     "CONFIG_FILENAME",
     "VIDEO_EXTENSIONS",
+    "DEFAULT_BRIGHTNESS",
+    "OcrCall",
+    "ocr_call_for",
     "from_json",
     "list_video_files",
     "load_project",
