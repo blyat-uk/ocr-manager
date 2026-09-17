@@ -710,3 +710,14 @@ def test_field_blocking_follows_value_source():
     assert not field_blocking(FileEntry("a.mkv"), "brightness")
     hinted = FileEntry("a.mkv", brightness=Brightness(200, Source.HINT), flags={"brightness": "differs-from-hint?"})
     assert field_blocking(hinted, "brightness")
+
+
+@pytest.mark.parametrize("review, expected", [
+    (ReviewState.PENDING, False),
+    (ReviewState.PROPOSED, True),
+    (ReviewState.FLAGGED, True),
+    (ReviewState.REVIEWED, True),
+])
+def test_can_mark_reviewed_waits_for_pending_files(review, expected):
+    assert state_text.can_mark_reviewed(FileEntry("a.mkv", review=review)) is expected
+    assert state_text.REVIEW_WAIT_TOOLTIP == "waiting for detections to finish"

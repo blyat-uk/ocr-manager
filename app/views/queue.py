@@ -7,7 +7,9 @@ file, and the keyboard hint.
 - Row: thumbnail with the crop box at its true position, file name
   (elided), duration and badge (`state_text.badge_for`, ruling B10).
 - Keys while the queue has focus: ↑/↓ move the selection over the visible
-  rows, Space toggles "reviewed", T asks for a proof (`proof_requested`).
+  rows. Space (toggle reviewed) and T (test OCR) are window shortcuts
+  (`MainWindow.review_action` / `proof_action`), so they also work from the
+  stage and the inspector.
 - Right-click: the ruling B11 menu (`context_menu`).
 
 Badges depend on which detectors are running, which changes on job
@@ -21,7 +23,7 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QMenu, QScrollArea, QVBoxLayout, QWidget
 
 from app.run_snapshot import FAILED, QUEUED, RUNNING
-from app.state_text import badge_for, format_duration
+from app.state_text import badge_for, can_mark_reviewed, format_duration
 from app.theme import tokens
 from app.views.thumbnail import Thumbnail
 from app.widgets.base import Badge, ElidedLabel, SegmentedControl, repolish
@@ -291,18 +293,15 @@ class QueueView(QWidget):
             self.move_selection(1)
         elif key == Qt.Key.Key_Up:
             self.move_selection(-1)
-        elif key == Qt.Key.Key_Space and self._selected is not None:
-            self._toggle_reviewed(self._selected)
-        elif key == Qt.Key.Key_T and self._selected is not None:
-            self.proof_requested.emit(self._selected)
         else:
             super().keyPressEvent(event)
 
     # --- commands and the context menu (ruling B11) ------------------------------------
 
     def _toggle_reviewed(self, name: str) -> None:
-        reviewed = self._controller.entry(name).review == ReviewState.REVIEWED
-        self._controller.mark_reviewed(name, not reviewed)
+        entry = self._controller.entry(name)
+        if can_mark_reviewed(entry):
+            self._controller.mark_reviewed(name, entry.review != ReviewState.REVIEWED)
 
     def _toggle_skipped(self, name: str) -> None:
         self._controller.set_skipped(name, not self._controller.entry(name).skipped)
@@ -329,7 +328,8 @@ class QueueView(QWidget):
         add("Open logs", lambda: self.logs_requested.emit(name))
         menu.addSeparator()
         reviewed = entry.review == ReviewState.REVIEWED
-        add("Mark not reviewed" if reviewed else "Mark reviewed", lambda: self._toggle_reviewed(name))
+        add("Mark not reviewed" if reviewed else "Mark reviewed", lambda: self._toggle_reviewed(name),
+            can_mark_reviewed(entry))
         add("Include file" if entry.skipped else "Skip file", lambda: self._toggle_skipped(name))
         return menu
 

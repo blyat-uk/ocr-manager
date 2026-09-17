@@ -41,6 +41,7 @@ class Banner(QWidget):
     def show_message(self, title: str, text: str, tone: str = "warn") -> None:
         self._title.setText(title)
         self._text.setText(text)
+        self._text.setVisible(bool(text))
         self.setProperty("tone", tone)
         repolish(self)
         for label in (self._title, self._text):

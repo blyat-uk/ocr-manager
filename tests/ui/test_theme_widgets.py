@@ -378,3 +378,11 @@ def test_elided_label_keeps_the_full_text(qapp):
     assert label.sizeHint().width() >= label.fontMetrics().horizontalAdvance(label.full_text())
     assert label.minimumSizeHint().width() == 0
     label.close()
+
+
+def test_stylesheet_restates_the_disabled_look_for_button_variants():
+    sheet = qss.build_stylesheet()
+    assert 'QPushButton[variant="primary"]:disabled' in sheet
+    assert 'QPushButton[variant="ghost"]:disabled' in sheet
+    # The disabled rule must come after the variant rule it overrides.
+    assert sheet.index('QPushButton[variant="primary"]:disabled') > sheet.index('QPushButton[variant="primary"] {')

@@ -82,6 +82,17 @@ QPushButton[variant="primary"] {{
 QPushButton[variant="primary"]:hover {{
     background-color: {tokens.ACC};
 }}
+/* Variant rules outrank plain :disabled (same specificity, later), so the
+   disabled look is restated for them. */
+QPushButton[variant="primary"]:disabled {{
+    background-color: {tokens.PANEL2};
+    border-color: {tokens.LINE};
+    color: {tokens.DIM2};
+}}
+QPushButton[variant="ghost"]:disabled {{
+    border-color: {tokens.LINE};
+    color: {tokens.DIM2};
+}}
 QPushButton[small="true"] {{
     font-size: {tokens.FONT_SIZE_BTN_SM}px;
     padding: 3px 8px;

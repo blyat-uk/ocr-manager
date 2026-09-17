@@ -9,6 +9,14 @@ message box, with today's texts. New: drag-and-drop of a folder, the
 remembered last folder ("project/last_path"), and folders that cannot be
 opened reported in place (the open folder stays open).
 
+Space (mark reviewed / not reviewed) and T (test OCR) are window shortcuts
+for the selected file, so they work from the queue, the stage and the
+inspector; they step aside while a text-editing widget has focus. ↑/↓ stay
+with the queue (plan 3C's crop canvas nudges with the arrows).
+
+`report_unexpected_error` is where `python -m app`'s excepthook sends an
+exception raised in a slot: the Pipeline log and a dismissible banner.
+
 "⚙ Folder settings", "⤓ Logs", "▶ Start" and the Review · Run switch are
 wired by plan 3B Tasks 4 and 5 (`open_folder_settings`, `open_logs`,
 `start_run`).
@@ -22,9 +30,23 @@ from collections.abc import Callable
 
 from PyQt6.QtCore import QByteArray, Qt
 from PyQt6.QtGui import QAction, QGuiApplication, QKeySequence
-from PyQt6.QtWidgets import QHBoxLayout, QMainWindow, QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
+    QHBoxLayout,
+    QLineEdit,
+    QMainWindow,
+    QPlainTextEdit,
+    QStackedWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.controller import ProjectController
+from app.logbook import PIPELINE_LOG
+from app.state_text import can_mark_reviewed
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
 from app.views.inspector import Inspector
@@ -48,6 +70,9 @@ DEFAULT_SIZE = (1440, 900)
 REQUIRED_TOOLS = ("ffmpeg",)
 OPEN_FAILED_TITLE = "Could not open this folder"
 SAVE_FAILED_TITLE = "Not saved"
+CRASH_TITLE = "Something went wrong — details are in Logs (Pipeline)."
+NEWER_VERSION_TEXT = ("This folder was saved by a newer version of OCR Manager (project version {version}). "
+                      "Update the app to open it.")
 EXPECTED_OPEN_ERRORS = (UnsupportedProjectVersion, OSError, ValueError)
 
 
@@ -71,7 +96,20 @@ def dependency_problems() -> list[tuple[str, str]]:
     return problems
 
 
+def is_text_input(widget: QWidget | None) -> bool:
+    """A widget that types text: the Space and T shortcuts step aside for it."""
+    if isinstance(widget, QLineEdit | QAbstractSpinBox):
+        return True
+    if isinstance(widget, QComboBox):
+        return widget.isEditable()
+    if isinstance(widget, QTextEdit | QPlainTextEdit):
+        return not widget.isReadOnly()
+    return False
+
+
 def _open_error_text(path: str, exc: Exception) -> str:
+    if isinstance(exc, UnsupportedProjectVersion):
+        return NEWER_VERSION_TEXT.format(version=exc.version)
     if isinstance(exc, NotADirectoryError):
         return f"{path} is not a folder."
     return str(exc) or f"{type(exc).__name__} while opening {path}"
@@ -95,8 +133,9 @@ class MainWindow(QMainWindow):
         column.addWidget(self.topbar)
         self.dependency_banner = Banner()
         self.error_banner = Banner()
-        column.addWidget(self.dependency_banner)
-        column.addWidget(self.error_banner)
+        self.crash_banner = Banner()
+        for banner in (self.dependency_banner, self.error_banner, self.crash_banner):
+            column.addWidget(banner)
 
         self.centre = QStackedWidget()
         self.open_view = OpenFolderView()
@@ -121,12 +160,18 @@ class MainWindow(QMainWindow):
         self._connect()
         self.quit_action = self._shortcut("Quit", "Ctrl+Q", self.close)
         self.open_action = self._shortcut("Open folder…", "Ctrl+O", self.choose_folder)
+        self.review_action = self._shortcut("Mark reviewed", "Space", self.inspector.toggle_reviewed)
+        self.proof_action = self._shortcut("Test OCR", "T", lambda: self.inspector.run_proof_for(self.queue.selected()))
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._sync_actions)
         self._restore_geometry()
         self._check_dependencies()
         if self.controller.project is not None:          # a controller that already has a folder open
             self.inspector.adopt_open_project()
             self.queue.rebuild()
             self._on_project_opened(self.controller.project.path)
+        self._sync_actions()
 
     def _shortcut(self, text: str, keys: str, slot) -> QAction:
         action = QAction(text, self)
@@ -142,6 +187,9 @@ class MainWindow(QMainWindow):
         controller.project_closed.connect(self._on_project_closed)
         controller.save_failed.connect(lambda message: self.error_banner.show_message(SAVE_FAILED_TITLE, message,
                                                                                       "bad"))
+        for signal in (controller.project_opened, controller.project_closed, controller.files_changed,
+                       controller.file_changed):
+            signal.connect(self._sync_actions)
         self.queue.selection_changed.connect(self._on_selection_changed)
         self.queue.proof_requested.connect(self.inspector.run_proof_for)
         self.queue.logs_requested.connect(self.open_logs)
@@ -187,6 +235,22 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self, name) -> None:
         self.stage.set_file(name)
         self.inspector.set_file(name)
+        self._sync_actions()
+
+    def _sync_actions(self, *_args) -> None:
+        """Space and T act on the selected file; neither while a text-editing
+        widget has focus, and Space not while the file is PENDING."""
+        name = self.queue.selected()
+        has_file = name is not None and name in self.controller.names()
+        editing = is_text_input(QApplication.focusWidget())
+        self.proof_action.setEnabled(has_file and not editing)
+        self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
+
+    def report_unexpected_error(self, text: str) -> None:
+        """An exception nothing handled (see app/__main__.py's excepthook): its
+        traceback goes to the Pipeline log and a dismissible banner says so."""
+        self.controller.append_log(PIPELINE_LOG, f"Unexpected error:\n{text}")
+        self.crash_banner.show_message(CRASH_TITLE, "", "bad")
 
     def _on_tab_requested(self, title: str) -> None:
         index = self.stage.index_of(title)

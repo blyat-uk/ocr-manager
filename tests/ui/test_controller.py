@@ -1354,3 +1354,12 @@ def test_default_runner_factory_builds_a_job_runner_with_two_cpu_workers():
         assert sorted(t.name for t in runner._threads) == ["jobs-cpu-0", "jobs-cpu-1", "jobs-gpu-0", "jobs-run-0"]
     finally:
         assert runner.shutdown(timeout=2.0)
+
+
+def test_append_log_records_text_under_a_key(make_controller, tmp_project):
+    controller = make_controller()
+    controller.open_folder(str(tmp_project(["ep01.mkv"])))
+    logs = Spy(controller.log_appended)
+    controller.append_log("Pipeline", "Unexpected error:\nTraceback ...")
+    assert "Traceback ..." in controller.log_text("Pipeline")
+    assert logs.calls and logs.calls[-1][0] == "Pipeline"

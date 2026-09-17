@@ -347,6 +347,11 @@ class ProjectController(QObject):
     def log_text(self, key: str) -> str:
         return self._logs.text(key)
 
+    def append_log(self, key: str, text: str) -> None:
+        """Append `text` to the log `key` ("Pipeline", "Detections" or a file
+        name), as job events do: the window records unexpected errors here."""
+        self._log(key, text)
+
     def can_paste(self) -> bool:
         return self._clipboard is not None and any(value is not None for value in self._clipboard.values())
 

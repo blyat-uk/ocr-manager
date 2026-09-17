@@ -9,7 +9,8 @@ column about the selected episode only, scrolling vertically. Top to bottom:
    in this session, the offer to re-detect the other files with it as a
    hint (`controller.hint_targets` counts them);
 6. footer (pinned below the scroll area) -- "✓ Mark reviewed (Space)" /
-   "Mark not reviewed" and "skip file" / "include file".
+   "Mark not reviewed" (disabled while the file is PENDING) and "skip file" /
+   "include file".
 
 A manual edit is noticed from `file_changed`: the file's crop box or
 brightness value differs from the last one seen and is now MANUAL. So an
@@ -21,7 +22,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
-from app.state_text import media_text
+from app.state_text import REVIEW_WAIT_TOOLTIP, can_mark_reviewed, media_text
 from app.theme import tokens
 from app.views.inspector_sections import ChangeOffer, DetectedSection, ProofSection, Section
 from app.widgets.base import Button, ElidedLabel
@@ -118,7 +119,7 @@ class Inspector(QWidget):
         self.skip_button = Button("skip file", "ghost")
         for button in (self.review_button, self.skip_button):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.review_button.clicked.connect(self._toggle_reviewed)
+        self.review_button.clicked.connect(self.toggle_reviewed)
         self.skip_button.clicked.connect(self._toggle_skipped)
         footer_layout.addWidget(self.review_button, 1)
         footer_layout.addWidget(self.skip_button)
@@ -175,6 +176,7 @@ class Inspector(QWidget):
         for section in (self._panel_host, self.detected, self.proof):
             section.setVisible(has_file)
         self.review_button.setEnabled(has_file)
+        self.review_button.setToolTip("")
         self.skip_button.setEnabled(has_file)
         if not has_file:
             self.file_label.set_full_text("No file selected" if controller.project is not None else "")
@@ -186,8 +188,11 @@ class Inspector(QWidget):
         self.media_label.setText(media_text(entry.media))
         self.detected.set_entry(entry)
         reviewed = entry.review == ReviewState.REVIEWED
+        reviewable = can_mark_reviewed(entry)
         self.review_button.setText(UNREVIEW_TEXT if reviewed else REVIEW_TEXT)
         self.review_button.set_variant("default" if reviewed else "primary")
+        self.review_button.setEnabled(reviewable)
+        self.review_button.setToolTip("" if reviewable else REVIEW_WAIT_TOOLTIP)
         self.skip_button.setText("include file" if entry.skipped else "skip file")
         self._refresh_offer()
 
@@ -210,10 +215,13 @@ class Inspector(QWidget):
         if self._has_file():
             self._controller.redetect(self._file)
 
-    def _toggle_reviewed(self) -> None:
+    def toggle_reviewed(self) -> None:
+        """Mark the file reviewed, or not reviewed (the footer button, Space);
+        nothing while it is PENDING."""
         if self._has_file():
-            reviewed = self._controller.entry(self._file).review == ReviewState.REVIEWED
-            self._controller.mark_reviewed(self._file, not reviewed)
+            entry = self._controller.entry(self._file)
+            if can_mark_reviewed(entry):
+                self._controller.mark_reviewed(self._file, entry.review != ReviewState.REVIEWED)
 
     def _toggle_skipped(self) -> None:
         if self._has_file():

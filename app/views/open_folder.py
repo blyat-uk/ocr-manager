@@ -15,7 +15,7 @@ import shutil
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QProcess, QSettings, Qt, pyqtSignal
-from PyQt6.QtWidgets import QFileDialog, QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from app.widgets.base import Button
 
@@ -110,8 +110,13 @@ class OpenFolderView(QWidget):
         self.error_label.setFixedWidth(ERROR_WIDTH)
         self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.error_label.hide()
-        for widget in (self.title_label, self.hint_label, self.choose_button, self.error_label):
+        for widget in (self.title_label, self.hint_label, self.choose_button):
             layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignHCenter)
+        error_row = QHBoxLayout()                # no alignment flag: the label wraps to its full height
+        error_row.addStretch(1)
+        error_row.addWidget(self.error_label)
+        error_row.addStretch(1)
+        layout.addLayout(error_row)
         layout.addStretch(1)
 
     def show_error(self, message: str) -> None:

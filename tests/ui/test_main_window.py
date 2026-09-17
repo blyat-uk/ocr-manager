@@ -13,14 +13,15 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
+from PyQt6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QPushButton
+from PyQt6.QtWidgets import QApplication, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from app.controller import ProjectController
 from app.main_window import MainWindow
@@ -52,6 +53,8 @@ SLAY_NAMES = [
 ]
 BOX = (288, 786, 1344, 53)
 WAIT_MS = 5000
+NEWER_VERSION_TEXT = ("This folder was saved by a newer version of OCR Manager (project version 99). "
+                      "Update the app to open it.")
 
 
 # --------------------------------------------------------------------------
@@ -168,6 +171,43 @@ def detected_window(make_window, tmp_project):
     window = make_window()
     window.open_folder(str(folder))
     return window
+
+
+def activate(window: MainWindow) -> None:
+    """Show the window and make it active: window shortcuts only fire in the
+    active window."""
+    window.show()
+    window.activateWindow()
+    assert wait_for(lambda: QApplication.activeWindow() is window)
+
+
+class EditorTab:
+    """A StageTab whose page holds a focusable surface and a spin box and a
+    line edit (plan 3C's tabs have such editors)."""
+
+    def __init__(self, title: str):
+        self.title = title
+        self._page = QWidget()
+        layout = QVBoxLayout(self._page)
+        self.surface = QWidget()
+        self.surface.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.spin = QSpinBox()
+        self.line = QLineEdit()
+        for widget in (self.surface, self.spin, self.line):
+            layout.addWidget(widget)
+        self._panel = QWidget()
+
+    def page(self) -> QWidget:
+        return self._page
+
+    def inspector_panel(self) -> QWidget:
+        return self._panel
+
+    def set_file(self, name) -> None:
+        pass
+
+    def refresh(self) -> None:
+        pass
 
 
 def menu_actions(menu) -> dict:
@@ -320,6 +360,8 @@ def test_queue_filter_counts_and_filtering(mixed_window):
 def test_queue_keyboard_moves_marks_and_proves(slay_window, fake_runner):
     window, controller = slay_window, slay_window.controller
     queue = window.queue
+    activate(window)
+    queue.setFocus()
     marks = Calls(controller, "mark_reviewed")
     proofs = Calls(controller, "run_proof")
     assert queue.selected() == SLAY_NAMES[0]
@@ -565,6 +607,8 @@ def test_proof_section_shows_running_then_lines(slay_window, fake_runner):
 def test_proof_with_unknown_duration_says_so_instead_of_raising(make_window, tmp_project):
     window = make_window()
     window.open_folder(str(tmp_project(["new.mkv"])))
+    activate(window)
+    window.queue.setFocus()
     QTest.keyClick(window.queue, Qt.Key.Key_T)
     assert "duration unknown" in window.inspector.proof_note.text()
 
@@ -710,14 +754,14 @@ def test_unsupported_version_is_reported_without_closing_the_open_folder(make_wi
 
     window.open_folder(str(bad))                            # nothing open: inline in the empty state
     assert window.centre.currentWidget() is window.open_view
-    assert "unsupported project version 99" in window.open_view.error_label.text()
+    assert window.open_view.error_label.text() == NEWER_VERSION_TEXT
     assert not window.open_view.error_label.isHidden()
 
     window.open_folder(str(good))
     assert window.open_view.error_label.isHidden()
     window.open_folder(str(bad))                            # a folder open: a banner, the folder stays
     assert window.controller.project.path == str(good)
-    assert "unsupported project version 99" in window.error_banner.text()
+    assert window.error_banner.text() == NEWER_VERSION_TEXT
     assert not window.error_banner.isHidden()
     assert window.windowTitle().endswith(os.path.basename(good))
 
@@ -798,4 +842,121 @@ def test_ctrl_q_closes_and_close_shuts_the_controller_down(controller, fake_runn
 def test_python_m_app_smoke(qapp, tmp_project):
     from app.__main__ import main
 
+    hook = sys.excepthook
     assert main(["--quit-after", "1"]) == 0
+    assert sys.excepthook is hook                      # main() restores the hook it replaced
+
+
+# --------------------------------------------------------------------------
+# Follow-up: window-level shortcuts, crash guard, pending review button
+# --------------------------------------------------------------------------
+
+def test_space_and_t_work_from_the_stage_and_inspector_but_not_in_editors(make_window, tmp_project):
+    window = make_window(tabs_factory=lambda controller: [EditorTab("Crop"), EditorTab("Brightness")])
+    window.open_folder(str(tmp_project(fixture="slay")))
+    controller, name = window.controller, SLAY_NAMES[0]
+    marks = Calls(controller, "mark_reviewed")
+    proofs = Calls(controller, "run_proof")
+    redetects = Calls(controller, "redetect")
+    activate(window)
+    tab = window.stage.current_tab()
+
+    tab.surface.setFocus()
+    QTest.keyClick(tab.surface, Qt.Key.Key_Space)
+    assert marks.calls == [(name, False)]
+    QTest.keyClick(tab.surface, Qt.Key.Key_T)
+    assert proofs.calls == [(name,)]
+
+    button = window.inspector.redetect_button                 # Space is the shortcut's, not the button's
+    button.setFocus()
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    assert marks.calls == [(name, False), (name, True)]
+    assert redetects.calls == []
+
+    for editor in (tab.spin, tab.line):
+        editor.setFocus()
+        assert wait_for(lambda editor=editor: QApplication.focusWidget() is editor)
+        assert not window.review_action.isEnabled() and not window.proof_action.isEnabled()
+        QTest.keyClick(editor, Qt.Key.Key_Space)
+        QTest.keyClick(editor, Qt.Key.Key_T)
+        assert len(marks.calls) == 2 and len(proofs.calls) == 1
+    assert tab.line.text() == " t"                             # the keys went to the editor
+
+    tab.surface.setFocus()
+    assert window.review_action.isEnabled() and window.proof_action.isEnabled()
+    QTest.keyClick(tab.surface, Qt.Key.Key_T)
+    assert len(proofs.calls) == 2
+
+
+def test_text_input_detection():
+    from PyQt6.QtWidgets import QComboBox, QPlainTextEdit
+
+    from app.main_window import is_text_input
+
+    editable = QComboBox()
+    editable.setEditable(True)
+    read_only = QPlainTextEdit()
+    read_only.setReadOnly(True)
+    assert is_text_input(QLineEdit()) and is_text_input(QSpinBox()) and is_text_input(editable)
+    assert is_text_input(QPlainTextEdit())
+    assert not is_text_input(QComboBox()) and not is_text_input(read_only)
+    assert not is_text_input(QPushButton()) and not is_text_input(None)
+
+
+def test_an_exception_in_a_slot_is_reported_instead_of_aborting(slay_window, capsys):
+    from app.__main__ import install_excepthook
+
+    window = slay_window
+    assert window.crash_banner.isHidden()
+
+    def boom():
+        raise RuntimeError("boom in a slot")
+
+    previous = sys.excepthook
+    replaced = install_excepthook(window)
+    try:
+        assert replaced is previous
+        QTimer.singleShot(0, boom)
+        QTest.qWait(30)
+    finally:
+        sys.excepthook = previous
+    assert not window.crash_banner.isHidden()
+    assert window.crash_banner.title() == "Something went wrong — details are in Logs (Pipeline)."
+    log = window.controller.log_text("Pipeline")
+    assert "Traceback (most recent call last)" in log and "RuntimeError: boom in a slot" in log
+    assert "RuntimeError: boom in a slot" in capsys.readouterr().err
+    window.crash_banner.dismiss_button.click()
+    assert window.crash_banner.isHidden()
+
+
+def test_mark_reviewed_is_disabled_while_the_selected_file_is_pending(make_window, tmp_project, fake_runner):
+    names = ["a.mkv", "b.mkv"]
+    folder = write_project(tmp_project(names), [entry("a.mkv", crop=None, brightness=None, review=ReviewState.PENDING),
+                                                entry("b.mkv")])
+    window = make_window()
+    window.open_folder(str(folder))
+    controller, inspector, queue = window.controller, window.inspector, window.queue
+    marks = Calls(controller, "mark_reviewed")
+    activate(window)
+    queue.setFocus()
+    assert queue.selected() == "a.mkv" and controller.entry("a.mkv").review == ReviewState.PENDING
+
+    assert not inspector.review_button.isEnabled()
+    assert inspector.review_button.toolTip() == "waiting for detections to finish"
+    assert not window.review_action.isEnabled()
+    assert not menu_actions(queue.context_menu("a.mkv"))["Mark reviewed"].isEnabled()
+    QTest.keyClick(queue, Qt.Key.Key_Space)
+    assert marks.calls == []
+
+    crop = fake_runner.last("crop", "a.mkv")
+    fake_runner.finish(crop, crop_result(crop))
+    controller.drain_events()
+    brightness = fake_runner.last("brightness", "a.mkv")
+    fake_runner.finish(brightness, brightness_result(brightness))
+    controller.drain_events()
+    assert controller.entry("a.mkv").review == ReviewState.PROPOSED
+    assert inspector.review_button.isEnabled() and inspector.review_button.toolTip() == ""
+    assert window.review_action.isEnabled()
+    assert menu_actions(queue.context_menu("a.mkv"))["Mark reviewed"].isEnabled()
+    QTest.keyClick(queue, Qt.Key.Key_Space)
+    assert marks.calls == [("a.mkv", True)]

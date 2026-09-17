@@ -356,3 +356,17 @@ def field_blocking(entry: FileEntry, field: str) -> bool:
     value -- the `blocking=` argument of the captions above. `field`: "crop" |
     "brightness" | "ranges"."""
     return _flag_blocks_detected_value(entry, field, getattr(entry, _FIELD_VALUE[field]))
+
+
+# --------------------------------------------------------------------------
+# Marking reviewed
+# --------------------------------------------------------------------------
+
+REVIEW_WAIT_TOOLTIP = "waiting for detections to finish"
+
+
+def can_mark_reviewed(entry: FileEntry) -> bool:
+    """"Mark reviewed" (the button, Space, the queue menu) is offered unless
+    the file is still PENDING: its detections have not finished, so there is
+    nothing settled to accept yet."""
+    return entry.review != ReviewState.PENDING
