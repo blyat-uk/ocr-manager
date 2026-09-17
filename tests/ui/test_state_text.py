@@ -6,7 +6,7 @@ MANUAL text) gets its own case.
 No PyQt6 import anywhere: verified in a subprocess (test_state_text_module_
 imports_no_qt below) rather than by asserting on this test process's own
 sys.modules, since PyQt6 is already imported here by the time this file's
-other tests run (conftest.py's qapp fixture, and tests/app/test_theme_
+other tests run (conftest.py's qapp fixture, and tests/ui/test_theme_
 widgets.py earlier in the session) -- only a fresh interpreter can prove
 `import app.state_text` alone never pulls it in.
 """
@@ -240,7 +240,8 @@ def test_brightness_caption_no_plateau_is_not_verified():
 
 
 def test_brightness_caption_wide_plateau_no_flag_is_ok_no_narrow_prefix():
-    evidence = {"plateau": [180, 220], "flagged": None}
+    # A non-empty curve marks this a full (not cheap-path) detection.
+    evidence = {"plateau": [180, 220], "flagged": None, "curve": [[200, 0.98]]}
     caption, bar, tone = state_text.brightness_caption(evidence, Source.DETECTED)
     assert caption == "safe range 180–220"
     assert bar == pytest.approx(40 / 60)
@@ -248,7 +249,7 @@ def test_brightness_caption_wide_plateau_no_flag_is_ok_no_narrow_prefix():
 
 
 def test_brightness_caption_narrow_plateau_prefixes_and_warns():
-    evidence = {"plateau": [203, 216], "flagged": None}
+    evidence = {"plateau": [203, 216], "flagged": None, "curve": [[210, 0.98]]}
     caption, bar, tone = state_text.brightness_caption(evidence, Source.DETECTED)
     assert caption == "narrow safe range 203–216"
     assert bar == pytest.approx(13 / 60)
@@ -256,22 +257,116 @@ def test_brightness_caption_narrow_plateau_prefixes_and_warns():
 
 
 def test_brightness_caption_wide_plateau_but_blocking_flag_still_warns():
-    evidence = {"plateau": [180, 230], "flagged": "dim-text?"}
+    evidence = {"plateau": [180, 230], "flagged": "dim-text?", "curve": [[200, 0.98]]}
     caption, bar, tone = state_text.brightness_caption(evidence, Source.DETECTED)
     assert caption == "safe range 180–230"  # not narrow: 230-180 == 50 >= 20
     assert tone == "warn"
 
 
 def test_brightness_caption_wide_plateau_informational_flag_is_ok():
-    evidence = {"plateau": [180, 230], "flagged": "no-clean-threshold"}
+    evidence = {"plateau": [180, 230], "flagged": "no-clean-threshold", "curve": [[200, 0.98]]}
     _, _, tone = state_text.brightness_caption(evidence, Source.HINT)
     assert tone == "ok"
 
 
 def test_brightness_caption_bar_clamps_to_one():
-    evidence = {"plateau": [100, 200], "flagged": None}
+    evidence = {"plateau": [100, 200], "flagged": None, "curve": [[150, 0.98]]}
     _, bar, _ = state_text.brightness_caption(evidence, Source.DETECTED)
     assert bar == 1.0
+
+
+# --------------------------------------------------------------------------
+# brightness_caption() -- cheap-path (folder plateau) evidence
+# --------------------------------------------------------------------------
+
+def test_brightness_caption_cheap_path_wide_plateau_reads_folder_safe_range():
+    # detect_brightness(..., folder_plateau=...) never populates `curve` --
+    # see core/detect/brightness.py's cheap-path branch -- so an empty (or
+    # missing) curve marks this a cheap-path result whose plateau is the
+    # folder's, not one measured on this file.
+    evidence = {"plateau": [180, 220], "flagged": None, "curve": []}
+    caption, bar, tone = state_text.brightness_caption(evidence, Source.DETECTED)
+    assert caption == "folder safe range 180–220"
+    assert bar == pytest.approx(40 / 60)
+    assert tone == "ok"
+
+
+def test_brightness_caption_cheap_path_narrow_plateau_has_no_narrow_prefix_but_warns():
+    # The "narrow " prefix is reserved for the per-file (full-detection)
+    # form; the cheap-path caption always reads "folder safe range ...", but
+    # still turns warn when narrow.
+    evidence = {"plateau": [203, 216], "flagged": None, "curve": []}
+    caption, bar, tone = state_text.brightness_caption(evidence, Source.DETECTED)
+    assert caption == "folder safe range 203–216"
+    assert tone == "warn"
+
+
+def test_brightness_caption_cheap_path_missing_curve_key_is_also_cheap_path():
+    evidence = {"plateau": [180, 220], "flagged": None}
+    caption, _, tone = state_text.brightness_caption(evidence, Source.DETECTED)
+    assert caption == "folder safe range 180–220"
+    assert tone == "ok"
+
+
+# --------------------------------------------------------------------------
+# crop_caption() / brightness_caption() / ranges_caption() -- blocking=True
+# --------------------------------------------------------------------------
+
+def test_crop_caption_blocking_forces_warn_even_when_evidence_is_clean():
+    evidence = {"agreed": 12, "probes_used": 12, "flagged": None}
+    caption, bar, tone = state_text.crop_caption(evidence, Source.HINT, blocking=True)
+    assert caption == "12 of 12 samples agree"
+    assert tone == "warn"
+
+
+def test_crop_caption_blocking_false_default_keeps_clean_evidence_ok():
+    evidence = {"agreed": 12, "probes_used": 12, "flagged": None}
+    _, _, tone = state_text.crop_caption(evidence, Source.HINT)
+    assert tone == "ok"
+
+
+def test_crop_caption_manual_ignores_blocking():
+    caption, bar, tone = state_text.crop_caption(None, Source.MANUAL, blocking=True)
+    assert (caption, bar, tone) == ("set by you", 1.0, "ok")
+
+
+def test_brightness_caption_blocking_forces_warn_on_wide_clean_plateau():
+    evidence = {"plateau": [180, 220], "flagged": None, "curve": [[200, 0.98]]}
+    caption, bar, tone = state_text.brightness_caption(evidence, Source.HINT, blocking=True)
+    assert caption == "safe range 180–220"  # blocking does not add "narrow "
+    assert tone == "warn"
+
+
+def test_brightness_caption_blocking_forces_warn_on_cheap_path_too():
+    evidence = {"plateau": [180, 220], "flagged": None, "curve": []}
+    caption, _, tone = state_text.brightness_caption(evidence, Source.HINT, blocking=True)
+    assert caption == "folder safe range 180–220"
+    assert tone == "warn"
+
+
+def test_brightness_caption_manual_ignores_blocking():
+    assert state_text.brightness_caption(None, Source.MANUAL, blocking=True) == ("set by you", 1.0, "ok")
+
+
+def test_ranges_caption_blocking_forces_warn_with_blocks():
+    evidence = {"blocks": [
+        {"kind": "intro", "matched_files": 4, "score": 0.98, "start_sec": 0.0, "end_sec": 1.0},
+        {"kind": "outro", "matched_files": 4, "score": 0.96, "start_sec": 2.0, "end_sec": 3.0},
+    ]}
+    caption, bar, tone = state_text.ranges_caption(evidence, Source.HINT, blocking=True)
+    assert caption == "intro+outro matched in 3 episodes"
+    assert tone == "warn"
+
+
+def test_ranges_caption_blocking_forces_warn_without_blocks():
+    evidence = {"blocks": []}
+    caption, bar, tone = state_text.ranges_caption(evidence, Source.HINT, blocking=True)
+    assert caption == "no repeating intro/outro found"
+    assert tone == "warn"
+
+
+def test_ranges_caption_manual_ignores_blocking():
+    assert state_text.ranges_caption({"blocks": []}, Source.MANUAL, blocking=True) == ("set by you", 1.0, "ok")
 
 
 # --------------------------------------------------------------------------

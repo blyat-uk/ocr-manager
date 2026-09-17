@@ -5,13 +5,16 @@ digest confirms the two hi-fi mockups define byte-for-byte identical
 tokens). Widgets are constructed offscreen (QT_QPA_PLATFORM=offscreen) and
 checked for the dynamic properties app/theme/qss.py selects on -- pytest-qt
 is not installed, so click behaviour uses PyQt6.QtTest.QTest directly (see
-tests/app/conftest.py).
+tests/ui/conftest.py).
 """
+from pathlib import Path
+
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QLabel, QPushButton
 
+import app
 from app.theme import qss, tokens
 from app.widgets.base import (
     Badge,
@@ -81,6 +84,18 @@ def test_font_stack_is_cjk_capable_fallback_chain():
 def test_rail_and_inspector_widths():
     assert tokens.RAIL_WIDTH == 246
     assert tokens.INSPECTOR_WIDTH == 322
+
+
+def test_app_package_resolves_to_real_source_package():
+    # This test tree lives at tests/ui (not tests/app) specifically so that
+    # pytest's import machinery never has to choose between this test
+    # package and the real top-level `app/` package under the same dotted
+    # name -- `app.__file__` must point at the repo's app/__init__.py, not
+    # anything under tests/, and `python -m app` (plan 3B's smoke test)
+    # must not resolve through this test tree either.
+    repo_root = Path(__file__).resolve().parents[2]
+    assert Path(app.__file__).resolve() == repo_root / "app" / "__init__.py"
+    assert "tests" not in Path(app.__file__).resolve().parts
 
 
 # --------------------------------------------------------------------------

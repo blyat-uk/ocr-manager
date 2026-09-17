@@ -1,6 +1,6 @@
 """Pure, Qt-free badge and caption text for the review queue and inspector
 (ruling B10; caption rules from Task 1's brief). No PyQt6 import belongs
-anywhere in this module -- see tests/app/test_state_text.py's subprocess
+anywhere in this module -- see tests/ui/test_state_text.py's subprocess
 import check -- so the window's Qt layer can format review-queue text
 without pulling Qt into, say, a headless job runner that also wants it.
 
@@ -157,8 +157,17 @@ def _manual_or_imported(source: Source | None) -> tuple[str, float, str] | None:
     return None
 
 
-def crop_caption(evidence: dict | None, source: Source | None) -> tuple[str, float, str]:
-    """(caption, bar fraction, tone) for the Detected section's Crop row."""
+def crop_caption(evidence: dict | None, source: Source | None, *,
+                  blocking: bool = False) -> tuple[str, float, str]:
+    """(caption, bar fraction, tone) for the Detected section's Crop row.
+
+    `blocking`: the caller's own read of whether `entry.flags["crop"]` holds
+    a blocking flag that is not in `evidence["flagged"]` -- e.g.
+    "differs-from-hint?" (core/jobs/apply.py's FLAG_DIFFERS_FROM_HINT),
+    composed onto `entry.flags` but never written into the stored evidence
+    dict itself. True forces tone "warn" on top of whatever the evidence
+    alone would say. Ignored for the MANUAL/IMPORTED/no-evidence branches,
+    which are provenance text, not a confidence reading."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
@@ -166,14 +175,27 @@ def crop_caption(evidence: dict | None, source: Source | None) -> tuple[str, flo
     agreed = int(evidence.get("agreed") or 0)
     probes_used = int(evidence.get("probes_used") or 0)
     bar = (agreed / probes_used) if probes_used else 0.0
-    ok = only_informational(evidence.get("flagged"), _crop.INFORMATIONAL_FLAGS)
+    ok = only_informational(evidence.get("flagged"), _crop.INFORMATIONAL_FLAGS) and not blocking
     return f"{agreed} of {probes_used} samples agree", bar, ("ok" if ok else "warn")
 
 
-def brightness_caption(evidence: dict | None, source: Source | None) -> tuple[str, float, str]:
+def brightness_caption(evidence: dict | None, source: Source | None, *,
+                        blocking: bool = False) -> tuple[str, float, str]:
     """(caption, bar fraction, tone) for the Detected section's Brightness
-    row. A narrow plateau (< 20 wide) prefixes "narrow " and forces warn
-    even when nothing is flagged (ui-spec: "narrow safe range (203-216)")."""
+    row.
+
+    An evidence dict with an empty `curve` is a cheap-path result (the
+    cheap path -- `detect_brightness(..., folder_plateau=...)` -- never
+    populates `curve`; see core/detect/brightness.py's module docstring and
+    `detect_brightness`'s cheap-path branch), whose `plateau` is the
+    FOLDER's plateau, not one measured on this file: its caption reads
+    "folder safe range {lo}-{hi}" and never takes the "narrow " prefix (that
+    prefix is reserved for a genuinely per-file measured plateau) -- but
+    still turns the tone "warn" when narrow, same as the per-file form.
+
+    `blocking`: as `crop_caption`'s, e.g. entry.flags["brightness"] holding
+    "differs-from-hint?" from a hint re-detection. Ignored for the MANUAL/
+    IMPORTED/no-evidence branches."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
@@ -183,29 +205,41 @@ def brightness_caption(evidence: dict | None, source: Source | None) -> tuple[st
         return "not verified", 0.0, "warn"
     lo, hi = plateau
     narrow = (hi - lo) < 20
-    blocked = not only_informational(evidence.get("flagged"), _brightness.INFORMATIONAL_FLAGS)
-    caption = f"safe range {lo}–{hi}"
-    if narrow:
-        caption = "narrow " + caption
+    flagged_blocked = not only_informational(evidence.get("flagged"), _brightness.INFORMATIONAL_FLAGS)
+    cheap_path = not evidence.get("curve")
+    if cheap_path:
+        caption = f"folder safe range {lo}–{hi}"
+    else:
+        caption = f"safe range {lo}–{hi}"
+        if narrow:
+            caption = "narrow " + caption
     bar = min(1.0, (hi - lo) / 60)
-    return caption, bar, ("warn" if (narrow or blocked) else "ok")
+    tone = "warn" if (narrow or flagged_blocked or blocking) else "ok"
+    return caption, bar, tone
 
 
-def ranges_caption(evidence: dict | None, source: Source | None) -> tuple[str, float, str]:
+def ranges_caption(evidence: dict | None, source: Source | None, *,
+                    blocking: bool = False) -> tuple[str, float, str]:
     """(caption, bar fraction, tone) for the Detected section's OCR window
     row. `n` is the highest matched_files among the file's intro/outro
     blocks, minus 1 (matched_files counts this file itself -- core/detect/
-    ranges/pipeline.py's Block docstring)."""
+    ranges/pipeline.py's Block docstring).
+
+    `blocking`: as `crop_caption`'s -- entry.flags["ranges"] holding a
+    blocking flag the caller found (core/jobs/apply.py does not write one
+    today; see the module docstring). Forces tone "warn" whether or not
+    blocks were found. Ignored for the MANUAL/IMPORTED/no-evidence
+    branches."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
         return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
     blocks = [b for b in (evidence.get("blocks") or []) if b.get("kind") in ("intro", "outro")]
     if not blocks:
-        return "no repeating intro/outro found", 0.0, "default"
+        return "no repeating intro/outro found", 0.0, ("warn" if blocking else "default")
     n = max(int(b["matched_files"]) for b in blocks) - 1
     bar = max(float(b["score"]) for b in blocks)
-    return f"intro+outro matched in {n} episodes", bar, "ok"
+    return f"intro+outro matched in {n} episodes", bar, ("warn" if blocking else "ok")
 
 
 # --------------------------------------------------------------------------
