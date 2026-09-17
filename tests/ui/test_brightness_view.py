@@ -555,9 +555,43 @@ def test_the_panel_shows_auto_and_yours(loaded, controller):
     assert loaded.panel.auto_row.value() == "209"
     assert loaded.panel.yours_row.value() == "209"
     assert loaded.panel.yours_row.value_tone() == "acc"
+    assert loaded.panel.preview_text() == ""
+    assert loaded.panel.keep_button.text() == "keep 209"
+
+
+def test_a_dragged_threshold_is_marked_as_a_preview_until_it_is_kept(loaded, controller):
+    """Dragging writes nothing. "Yours 215" would claim the file stores 215
+    while the Detected section 150 px below still reads 209, and a file switch
+    would silently revert it -- so the row names both, and a note says which
+    of the two is kept."""
     loaded.set_preview(215)
     settle()
+    assert loaded.panel.yours_row.value() == "209 → 215"
+    assert loaded.panel.preview_text() == "preview only — 215 is not kept yet"
+    assert loaded.panel.preview_text() in loaded.panel.notes()
+    assert loaded.panel.keep_button.text() == "keep 215"       # still the commit
+
+    loaded.panel.keep_button.click()                           # ... and it commits
+    settle()
+    loaded.refresh()                                           # what the Stage does on file_changed
+    assert controller.entry(NAME).brightness.value == 215
     assert loaded.panel.yours_row.value() == "215"
+    assert loaded.panel.preview_text() == ""
+
+
+def test_a_file_with_nothing_kept_says_its_threshold_is_a_preview(controller):
+    """No stored brightness at all: the curve still starts somewhere, and
+    that somewhere is not a value the file has."""
+    give_values(controller, evidence=brightness_evidence())
+    controller.entry(NAME).brightness = None
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.panel.yours_row.value() == "— → 209"
+    assert made.panel.preview_text() == "preview only — 209 is not kept yet"
+    made.page().close()
 
 
 def test_the_note_names_the_safe_range_the_losing_threshold_and_the_leak(loaded):
