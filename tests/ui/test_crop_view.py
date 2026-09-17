@@ -20,12 +20,12 @@ import pytest
 from PyQt6.QtCore import QEvent, QPointF, QSettings, Qt
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QWidget
 
 from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.views.crop_view import CropTab
-from app.views.stage import StageTab
+from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
 from core.detect import crop as crop_mod
 from core.detect import ocr_view
@@ -302,14 +302,19 @@ def test_the_centre_handles_change_height_only(make_tab, handle, expected):
     assert canvas.box() == expected                    # a big horizontal move changes neither x nor width
 
 
-def test_arrow_keys_nudge_one_pixel_and_shift_ten(make_tab):
-    canvas = make_tab().tab.canvas
+def test_all_four_arrows_nudge_one_pixel_on_the_canvas_and_shift_ten(make_tab):
+    harness = make_tab()
+    canvas = harness.tab.canvas
     arrow(canvas, Qt.Key.Key_Up)
     assert canvas.box() == (BOX[0], BOX[1] - 1, BOX[2], BOX[3])
+    arrow(canvas, Qt.Key.Key_Right)                     # horizontal nudging is 1 px too
+    assert canvas.box() == (BOX[0] + 1, BOX[1] - 1, BOX[2], BOX[3])
+    arrow(canvas, Qt.Key.Key_Left)
     arrow(canvas, Qt.Key.Key_Down, shift=True)
     assert canvas.box() == (BOX[0], BOX[1] + 9, BOX[2], BOX[3])
     arrow(canvas, Qt.Key.Key_Right, shift=True)
     assert canvas.box() == (BOX[0] + 10, BOX[1] + 9, BOX[2], BOX[3])
+    assert harness.tab.selected_index() == 0            # the canvas never steps samples
 
 
 def test_a_burst_of_nudges_commits_once(make_tab):
@@ -484,18 +489,36 @@ def test_no_sample_is_disagreeing_when_the_detection_found_no_box(make_tab):
     assert any("static-content" in text for _key, text in harness.tab.panel.rows())
 
 
-def test_clicking_a_thumbnail_and_the_arrow_keys_select_samples(make_tab):
+def test_clicking_a_thumbnail_selects_it_and_takes_the_keyboard(make_tab):
     harness = make_tab()
     strip = harness.tab.strip
-    thumb = strip.thumbnails()[3]
-    gesture(thumb, QPointF(10, 10), QPointF(10, 10))
+    harness.tab.canvas.setFocus()
+    gesture(strip.thumbnails()[3], QPointF(10, 10), QPointF(10, 10))
     assert harness.tab.selected_index() == 3
     assert harness.tab.current_time() == SAMPLE_TIMES[3]
-    arrow(harness.tab.canvas, Qt.Key.Key_Right)
+    assert strip.hasFocus()                             # ◀ / ▶ carry on from the strip
+
+
+def test_the_filmstrip_steps_samples_with_the_arrow_keys(make_tab):
+    harness = make_tab()
+    strip = harness.tab.strip
+    harness.tab.select(3)
+    arrow(strip, Qt.Key.Key_Right)
     assert harness.tab.selected_index() == 4
-    arrow(strip, Qt.Key.Key_Left)
-    arrow(strip, Qt.Key.Key_Left)
+    for _ in range(2):
+        arrow(strip, Qt.Key.Key_Left)
     assert harness.tab.selected_index() == 2
+    arrow(strip, Qt.Key.Key_Left, shift=True)           # Shift changes nothing on the strip
+    assert harness.tab.selected_index() == 1
+    assert harness.tab.canvas.box() == BOX              # the strip never nudges the box
+
+
+def test_tab_walks_from_the_canvas_to_the_filmstrip(make_tab):
+    harness = make_tab()
+    canvas, strip = harness.tab.canvas, harness.tab.strip
+    canvas.setFocus()
+    assert harness.tab.page().focusNextPrevChild(True)
+    assert strip.hasFocus()
 
 
 def test_the_two_line_sample_draws_two_bars(make_tab):
@@ -680,6 +703,60 @@ def test_the_window_can_be_built_with_the_evidence_tabs(qapp, fake_runner, tmp_p
     finally:
         window.close()
         window.deleteLater()
+        controller.shutdown(timeout=0.5)
+
+
+def test_the_toolbar_is_mounted_in_the_stage_head_and_swaps_with_the_tab(qapp, fake_runner, tmp_project):
+    """Ruling B3: the per-tab controls live in `.stage-head`, right of the
+    tab buttons -- and a tab without a toolbar leaves the head clean."""
+    controller = ProjectController(fake_runner, save_debounce_ms=10)
+    stage = Stage(controller, evidence_tabs(controller))
+    try:
+        crop_tab = stage.tabs()[0]
+        toolbar = crop_tab.toolbar()
+        assert stage.current_toolbar() is toolbar
+        assert toolbar.parentWidget() is stage.head()
+        for button in (crop_tab.envelope_button, crop_tab.fit_button):
+            assert button.parentWidget() is toolbar
+        stage.set_current(1)                            # a PlaceholderTab: no toolbar
+        assert stage.current_toolbar() is None
+        assert toolbar.isHidden()
+        stage.set_current(0)
+        assert stage.current_toolbar() is toolbar
+    finally:
+        stage.deleteLater()
+        controller.shutdown(timeout=0.5)
+
+
+def test_a_tab_without_a_toolbar_attribute_still_works(qapp, fake_runner):
+    """`toolbar()` is optional: the Stage asks with getattr, so a tab written
+    before it (or a test's stand-in) is fine."""
+    class Bare:
+        title = "Bare"
+
+        def __init__(self):
+            self._page, self._panel = QWidget(), QWidget()
+
+        def page(self):
+            return self._page
+
+        def inspector_panel(self):
+            return self._panel
+
+        def set_file(self, name):
+            pass
+
+        def refresh(self):
+            pass
+
+    controller = ProjectController(fake_runner, save_debounce_ms=10)
+    stage = Stage(controller, [Bare(), Bare()])
+    try:
+        assert stage.current_toolbar() is None
+        stage.set_current(1)
+        assert stage.current_toolbar() is None
+    finally:
+        stage.deleteLater()
         controller.shutdown(timeout=0.5)
 
 

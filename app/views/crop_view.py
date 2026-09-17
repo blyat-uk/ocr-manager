@@ -219,7 +219,6 @@ class CropCanvas(QWidget):
     box_changed = pyqtSignal()
     commit_requested = pyqtSignal(tuple)       # the box to store
     nudged = pyqtSignal()                      # a key nudge: start the commit debounce
-    sample_stepped = pyqtSignal(int)           # -1 / +1
     masks_changed = pyqtSignal(list)
 
     def __init__(self, parent: QWidget | None = None):
@@ -480,19 +479,17 @@ class CropCanvas(QWidget):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:
+        """All four arrows nudge the box by 1 px, Shift+arrow by 10.
+
+        Stepping the samples is ◀ / ▶ on the filmstrip -- the two are split
+        by which widget has focus, so nudging keeps both axes (Tab walks
+        canvas -> filmstrip, and clicking a sample moves focus there)."""
         key = event.key()
-        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
-            step = -1 if key == Qt.Key.Key_Left else 1
-            if shift:
-                self._nudge(step * NUDGE_LARGE, 0)
-            else:
-                self.sample_stepped.emit(step)      # ruling B5: ◀ / ▶ walk the samples
-            event.accept()
-            return
-        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            step = -1 if key == Qt.Key.Key_Up else 1
-            self._nudge(0, step * (NUDGE_LARGE if shift else NUDGE_SMALL))
+        step = NUDGE_LARGE if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else NUDGE_SMALL
+        deltas = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0),
+                  Qt.Key.Key_Up: (0, -step), Qt.Key.Key_Down: (0, step)}
+        if key in deltas:
+            self._nudge(*deltas[key])
             event.accept()
             return
         super().keyPressEvent(event)
@@ -820,7 +817,7 @@ class SampleStrip(QWidget):
         self._thumbs: list[SampleThumbnail] = []
         for _ in range(self.PAGE):
             thumb = SampleThumbnail(self.THUMB_WIDTH, self.THUMB_HEIGHT)
-            thumb.clicked.connect(self.selected)
+            thumb.clicked.connect(self._on_clicked)
             layout.addWidget(thumb)
             self._thumbs.append(thumb)
         self.more_button = Button("more ▸", "ghost", small=True)
@@ -829,6 +826,12 @@ class SampleStrip(QWidget):
         layout.addWidget(self.more_button)
         layout.addStretch(1)
         layout.addWidget(note_label(ARROW_HINT))
+
+    def _on_clicked(self, index: int) -> None:
+        """Picking a sample with the mouse hands the strip the keyboard too,
+        so ◀ / ▶ carry on from there."""
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.selected.emit(index)
 
     def label_text(self) -> str:
         return self._label.text()
@@ -875,8 +878,9 @@ class SampleStrip(QWidget):
         self.more_button.setVisible(len(self._samples) > self.PAGE)
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) \
-                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        """◀ / ▶ walk the samples while the filmstrip has focus (the canvas
+        nudges the box with the same keys); Shift changes nothing here."""
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             self.stepped.emit(-1 if event.key() == Qt.Key.Key_Left else 1)
             event.accept()
             return
@@ -1087,12 +1091,13 @@ class CropTab:
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        toolbar = QWidget()
-        toolbar.setObjectName("CropToolbar")
-        bar = QHBoxLayout(toolbar)
-        bar.setContentsMargins(12, 8, 12, 8)
+        # Ruling B3: these live right-aligned in the stage head, which the
+        # Stage mounts through `toolbar()` -- not on the page.
+        self._toolbar = QWidget()
+        self._toolbar.setObjectName("CropToolbar")
+        bar = QHBoxLayout(self._toolbar)
+        bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(4)
-        bar.addStretch(1)
         self.envelope_button = self._toggle("envelope", "envelope", on=True)
         self.masked_button = self._toggle("masked", "masked")
         self.grid_button = self._toggle("grid", "grid")
@@ -1103,11 +1108,10 @@ class CropTab:
         self.fit_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.fit_button.clicked.connect(self.fit_to_samples)
         bar.addWidget(self.fit_button)
-        outer.addWidget(toolbar)
 
         body = QWidget()
         column = QVBoxLayout(body)
-        column.setContentsMargins(12, 0, 12, 12)
+        column.setContentsMargins(12, 12, 12, 12)
         column.setSpacing(0)
         self.canvas = CropCanvas()
         column.addWidget(self.canvas)
@@ -1119,6 +1123,7 @@ class CropTab:
         column.addWidget(self.timeline_placeholder)
         column.addStretch(1)                     # the slack goes below, not around the frame
         outer.addWidget(body, 1)
+        QWidget.setTabOrder(self.canvas, self.strip)
 
         self.panel = CropInspectorPanel()
 
@@ -1133,7 +1138,6 @@ class CropTab:
 
         self.canvas.commit_requested.connect(self._commit_box)
         self.canvas.nudged.connect(self._commit.start)
-        self.canvas.sample_stepped.connect(self.step)
         self.canvas.masks_changed.connect(self._commit_masks)
         self.canvas.box_changed.connect(self._on_box_changed)
         self.strip.selected.connect(self.select)
@@ -1155,6 +1159,11 @@ class CropTab:
 
     def inspector_panel(self) -> QWidget:
         return self.panel
+
+    def toolbar(self) -> QWidget:
+        """envelope / masked / grid and "⤢ fit to all N samples", which the
+        Stage mounts in the stage head (ruling B3)."""
+        return self._toolbar
 
     def set_file(self, name: str | None) -> None:
         if name != self._file:
