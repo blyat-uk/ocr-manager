@@ -388,6 +388,27 @@ def test_stylesheet_restates_the_disabled_look_for_button_variants():
     assert sheet.index('QPushButton[variant="primary"]:disabled') > sheet.index('QPushButton[variant="primary"] {')
 
 
+def test_stylesheet_shows_keyboard_focus_on_every_button():
+    """With a stylesheet installed Qt draws no default focus rectangle, so
+    without a rule of its own a focused button is indistinguishable from an
+    unfocused one -- while Space and T step aside for whatever widget has the
+    focus. The sheet paints the same 1 px accent border the folder-settings
+    spin boxes already use."""
+    sheet = qss.build_stylesheet()
+    assert "QPushButton:focus" in sheet
+    rule = sheet[sheet.index("QPushButton:focus"):]
+    assert f"border: 1px solid {tokens.ACC};" in rule[:rule.index("}")]
+    # ... and after the plain QPushButton rule it overrides.
+    assert sheet.index("QPushButton:focus") > sheet.index("QPushButton {")
+    # An ID selector outranks a bare pseudo-class, so the buttons that have
+    # one are named too, or they would keep their own border when focused.
+    for name in ("StageTab", "LogHeader", "SegmentItem"):
+        assert f"QPushButton#{name}:focus" in sheet
+    # The primary variant's fill IS the accent, so its ring is the dark ink.
+    primary = sheet[sheet.index('QPushButton[variant="primary"]:focus'):]
+    assert f"border: 1px solid {tokens.PRIMARY_TEXT};" in primary[:primary.index("}")]
+
+
 def test_chip_radius_is_the_qt_adjusted_token():
     # CSS clamps `.chip`'s 20px to a pill; Qt draws square corners for a radius above half the height.
     assert tokens.RADIUS_CHIP == 20

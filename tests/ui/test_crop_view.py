@@ -516,6 +516,24 @@ def test_the_filmstrip_steps_samples_with_the_arrow_keys(make_tab):
     assert harness.tab.canvas.box() == BOX              # the strip never nudges the box
 
 
+def test_the_canvas_and_the_filmstrip_paint_a_focus_ring(make_tab):
+    """The arrows mean "nudge the box" on the canvas and "step samples" on
+    the filmstrip, so which of the two holds the keyboard is the difference
+    between two commands. A stylesheet suppresses Qt's own focus rectangle,
+    so each surface paints its own."""
+    harness = make_tab()
+    canvas, strip = harness.tab.canvas, harness.tab.strip
+    canvas.setFocus()
+    canvas.grab(), strip.grab()
+    assert canvas.focus_ring_painted() is True
+    assert strip.focus_ring_painted() is False
+
+    strip.setFocus()
+    canvas.grab(), strip.grab()
+    assert canvas.focus_ring_painted() is False
+    assert strip.focus_ring_painted() is True
+
+
 def test_tab_walks_from_the_canvas_to_the_filmstrip(make_tab):
     harness = make_tab()
     canvas, strip = harness.tab.canvas, harness.tab.strip

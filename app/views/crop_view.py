@@ -79,6 +79,10 @@ COVERED_NOTE = "The amber box already covers it. Click the warned sample to insp
 OUTSIDE_NOTE = "This sample falls outside the box."
 ARROW_HINT = "◀ ▶ arrow keys"
 DETECTED_TAG = "dashed grey = the latest detection"
+# The keyboard-focus ring the canvas and the filmstrip paint themselves: a
+# widget with a stylesheet gets no focus rectangle from Qt, and the arrows
+# mean different things on the two surfaces (nudge the box / step samples).
+FOCUS_RING_WIDTH = 1.5
 # The detector settings "fit to all samples" re-aggregates with; the cutoff is
 # added from the evidence, never from the folder alone (see the module docstring).
 DETECTOR_FIELDS = ("crop_width_fraction", "crop_vertical_padding", "crop_min_height_fraction")
@@ -280,6 +284,24 @@ class CropCanvas(QWidget):
         self._pending = False                   # edited, not committed yet: a refresh must not undo it
         self._mask_drag: list | None = None
         self._mask_cache: tuple | None = None
+        self._focus_ring = False                # what the last paint actually drew
+
+    # --- focus ------------------------------------------------------------------
+
+    def focus_ring_painted(self) -> bool:
+        """Whether the last paint drew the keyboard-focus ring. The arrows
+        mean "nudge the box" here and "step samples" on the filmstrip, so
+        which surface holds the keyboard has to be visible -- and a
+        stylesheet suppresses the focus rectangle Qt would draw itself."""
+        return self._focus_ring
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.update()
 
     # --- state ------------------------------------------------------------------
 
@@ -596,7 +618,20 @@ class CropCanvas(QWidget):
         self._paint_box(painter)
         self._paint_grid(painter)
         self._paint_tags(painter, bounds)
+        self._focus_ring = self._paint_focus_ring(painter, bounds)
         painter.end()
+
+    def _paint_focus_ring(self, painter: QPainter, bounds: QRectF) -> bool:
+        """The frame's own edge, in the accent. Inside the clip path, so it
+        follows the canvas' rounded corners rather than the widget's."""
+        if not self.hasFocus():
+            return False
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(tokens.ACC), FOCUS_RING_WIDTH))
+        inset = FOCUS_RING_WIDTH / 2
+        painter.drawRoundedRect(bounds.adjusted(inset, inset, -inset, -inset),
+                                tokens.RADIUS_BTN, tokens.RADIUS_BTN)
+        return True
 
     def _paint_frame(self, painter: QPainter, bounds: QRectF) -> None:
         width, height = bounds.width(), bounds.height()
@@ -860,7 +895,9 @@ class SampleStrip(QWidget):
         self._warned: set[int] = set()
         self._images: dict[int, QImage | None] = {}
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 9, 0, 0)
+        # The 3 px on the sides and the bottom is clearance for the focus
+        # ring, which the row paints on its own edge (`_paint_focus_ring`).
+        layout.setContentsMargins(3, 9, 3, 3)
         layout.setSpacing(6)
         self._label = note_label("samples")
         self._label.setFixedWidth(self.LABEL_WIDTH)
@@ -877,6 +914,44 @@ class SampleStrip(QWidget):
         layout.addWidget(self.more_button)
         layout.addStretch(1)
         layout.addWidget(note_label(ARROW_HINT))
+        self._focus_ring = False
+
+    # --- focus ----------------------------------------------------------------
+
+    def focus_ring_painted(self) -> bool:
+        """Whether the last paint drew the keyboard-focus ring -- see
+        `CropCanvas.focus_ring_painted`: ◀ / ▶ step samples here and nudge
+        the box there, so the two must be told apart at a glance."""
+        return self._focus_ring
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        self._focus_ring = self._paint_focus_ring()
+
+    def _paint_focus_ring(self) -> bool:
+        """The whole row, including the "◀ ▶ arrow keys" hint on its right:
+        those are the keys the ring says are live. Around the thumbnails
+        alone it would have nothing to enclose on a file whose detection
+        produced no samples -- the row still takes the focus."""
+        if not self.hasFocus():
+            return False
+        inset = FOCUS_RING_WIDTH / 2
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(tokens.ACC), FOCUS_RING_WIDTH))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset),
+                                tokens.RADIUS_BTN, tokens.RADIUS_BTN)
+        painter.end()
+        return True
 
     def _on_clicked(self, index: int) -> None:
         """Picking a sample with the mouse hands the strip the keyboard too,

@@ -96,6 +96,30 @@ QPushButton[toggled="true"] {{
     border-color: {tokens.ACC};
     color: {tokens.ACC};
 }}
+/* Keyboard focus. A widget with a stylesheet gets no default focus
+   rectangle from Qt, so without this rule a focused button looks exactly
+   like an unfocused one -- and the window's Space/T shortcuts step aside
+   for whichever widget has the focus, so the user has to be able to see
+   it. Same 1 px accent border the folder-settings editors use, last so it
+   outranks the variant and toggled rules above.
+
+   The #Ids are listed because an ID selector outranks a bare pseudo-class:
+   without them a focused stage tab, log header or segment would keep its
+   own rule's border. `border:` rather than `border-color:` because
+   #SegmentItem's is `none` (its own `[on="true"]` state already adds one
+   the same way).
+
+   The primary variant fills with ACC, so an ACC ring on it is invisible;
+   it gets the dark ink it already writes its label in. */
+QPushButton:focus,
+QPushButton#StageTab:focus,
+QPushButton#LogHeader:focus,
+QPushButton#SegmentItem:focus {{
+    border: 1px solid {tokens.ACC};
+}}
+QPushButton[variant="primary"]:focus {{
+    border: 1px solid {tokens.PRIMARY_TEXT};
+}}
 
 /* -- Chip (.chip, top-bar counters) ---------------------------------- */
 QWidget#Chip {{
