@@ -7,9 +7,14 @@ only through core.jobs.apply, applied by the model owner.
 
 Order (ruling C1: fill missing values only; re-detects ignore sources)
     1. metadata for every file whose duration is unknown;
-    2. once the duration is known: crop (no crop, folder not labels-only),
-       thumbnail (at sample_time, else THUMBNAIL_FRACTION of the duration)
-       and audio profile (no "audio" evidence);
+    2. once the duration is known: thumbnail (at sample_time, else
+       THUMBNAIL_FRACTION of the duration), audio profile (no "audio"
+       evidence) and crop (no crop, folder not labels-only). Auto-fill crops
+       run as a chain, one at a time in name order: the next is submitted when
+       the previous one's terminal event arrives (after the owner applied it),
+       so each is seeded with every result before it (below). The GPU lane
+       runs one job at a time anyway, and brightness (2) still queues behind
+       the next crop (3). Files waiting in the chain are pending "crop";
     3. once the crop is known: brightness (missing or stale, dialogue on), in
        two tiers (below). An applied crop result that moves sample_time
        re-runs the thumbnail there;
@@ -20,10 +25,15 @@ Order (ruling C1: fill missing values only; re-detects ignore sources)
     thumbnail, audio 1 > ranges 0; re-detects get +REDETECT_BOOST.
 
 Crop consensus (crop_consensus)
-    (y / height, h / height) of every other file whose crop is IMPORTED, or
-    DETECTED with only informational crop flags (auto-applicable), whose
-    media height is known, in name order. Taken when the job is built; the
-    file being detected is never part of its own consensus.
+    The old adapter's pool (core/subtitle_detector.py), in name order:
+    (y / height, h / height) of every other file whose crop is IMPORTED or
+    MANUAL, or DETECTED from a result with no flag at all (an informational
+    flag such as no-speech keeps it out), with media height known. Taken when
+    the job is built; the file being detected is never part of its own
+    consensus. A consensus of >= CONSENSUS_MIN_ENTRIES that agrees with the
+    raw union lets detect_crop stop early, which is why the chain grows it.
+    redetect() is not part of the chain: it is submitted at once, with the
+    pool as it stands. Hint re-detects use the hint consensus (CropJob).
 
 Two-tier brightness
     The first folder.brightness_full_detect_files files in name order that
@@ -54,20 +64,22 @@ Superseded jobs
     keys it never submitted (proof, run) are current and otherwise ignored.
 
 autopilot_enabled
-    Gates detection AutoPilot starts on its own: on_open, on_files_added and
-    on_folder_changed (turning it on schedules the folder as on_open does).
-    Explicit requests (redetect, the hint re-detects), on_crop_changed and the
-    continuation of chains already submitted (metadata -> crop -> brightness,
-    escalation, the tier) run regardless.
+    Gates the detections AutoPilot starts on its own (crop, brightness,
+    ranges, audio profile) where they are first wanted: on_open,
+    on_files_added, after a scheduled file's metadata, and on_folder_changed
+    (turning it on schedules the folder's detections). Metadata and
+    thumbnails always run on on_open/on_files_added: the queue needs
+    durations and thumbnails. Explicit requests (redetect, the hint
+    re-detects), on_crop_changed and the continuation of work already
+    started (the crop chain, brightness after a crop, escalation, the tier)
+    run regardless.
 """
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from core.detect import crop as _crop
 from core.detect.brightness import FLAG_ESCALATE
-from core.detect.flags import only_informational
 from core.jobs.apply import DETECTION_SOURCES, brightness_is_stale
 from core.jobs.detect_jobs import (
     AudioProfileJob,
@@ -97,18 +109,19 @@ def is_autopilot_job(job: Job) -> bool:
     return getattr(job, "kind", None) in AUTOPILOT_KINDS
 
 
+CONSENSUS_SOURCES = frozenset({Source.IMPORTED, Source.MANUAL})   # plus unflagged DETECTED crops
+
+
 def crop_consensus(project: Project, exclude: str | None = None) -> list[tuple[float, float]]:
-    """(y_frac, h_frac) of every file except `exclude` whose crop is IMPORTED,
-    or DETECTED with only informational crop flags, and whose media height is
+    """(y_frac, h_frac) of every file except `exclude` whose crop is IMPORTED
+    or MANUAL, or DETECTED with no crop flag at all, and whose media height is
     known, in name order."""
     consensus = []
     for name, entry in project.files.items():
         crop, height = entry.crop, entry.media.height
         if name == exclude or crop is None or not height or height <= 0:
             continue
-        if crop.source == Source.IMPORTED or (
-                crop.source == Source.DETECTED
-                and only_informational(entry.flags.get("crop") or None, _crop.INFORMATIONAL_FLAGS)):
+        if crop.source in CONSENSUS_SOURCES or (crop.source == Source.DETECTED and not entry.flags.get("crop")):
             consensus.append((crop.y / height, crop.height / height))
     return consensus
 
@@ -211,6 +224,8 @@ class AutoPilot:
         self._identity: dict[str, tuple[str, str | None]] = {}    # key -> (kind, file), while outstanding
         self._brightness_requests: dict[str, _BrightnessRequest] = {}
         self._deferred_crops: dict[str, _CropRequest] = {}
+        self._crop_chain: set[str] = set()        # files waiting for their auto-fill crop
+        self._crop_active: str | None = None      # the file whose auto-fill crop is outstanding
         self._redetect: set[str] = set()          # files whose crop re-detect is followed by brightness
         self._scheduled: set[str] = set()         # files the folder schedule covers (metadata -> everything)
         self._thumbnail_times: dict[str, float] = {}
@@ -224,23 +239,21 @@ class AutoPilot:
     # --- triggers ---------------------------------------------------------------
 
     def on_open(self) -> None:
-        """Schedule the folder; a no-op when folder.autopilot_enabled is False."""
-        project = self._project()
-        if project.folder.autopilot_enabled:
-            self._schedule_folder(project)
+        """Schedule the folder: metadata and thumbnails always, detections when
+        folder.autopilot_enabled."""
+        self._schedule_folder(self._project())
 
     def on_files_added(self, names: list[str]) -> None:
-        """Schedule the added files and resubmit the ranges analysis (when
-        autopilot_enabled)."""
+        """Schedule the added files (metadata and thumbnails always) and, when
+        autopilot_enabled, their detections and the ranges analysis again."""
         project = self._project()
-        if not project.folder.autopilot_enabled:
-            return
         added = set(names)
         for name in project.files:
             if name in added:
                 self._thumbnail_times.pop(name, None)      # a file that came back has no thumbnail
                 self._schedule_file(project, name)
-        self._schedule_ranges(project, force=True)
+        if project.folder.autopilot_enabled:
+            self._schedule_ranges(project, force=True)
         self._settle_tier(project)
 
     def on_job_event(self, event: JobEvent) -> None:
@@ -262,6 +275,7 @@ class AutoPilot:
             self._after_metadata_event(project, file)
         elif kind == "crop":
             self._after_crop_event(project, file)
+            self._advance_crop_chain(project)
         elif kind == "brightness":
             self._after_brightness_event(project, file, event)
         elif kind == "ranges" and event.type != "cancelled":
@@ -276,6 +290,7 @@ class AutoPilot:
         if file not in project.files or project.folder.labels_only:
             return
         self._redetect.add(file)
+        self._crop_chain.discard(file)                     # this detection replaces the auto-fill one
         self._submit_crop(project, file, boost=True)
         self._settle_tier(project)
 
@@ -292,6 +307,7 @@ class AutoPilot:
         hint = (source.crop.y / height, source.crop.height / height)
         for name in project.files:
             if name != source_file:
+                self._crop_chain.discard(name)
                 self._submit_crop(project, name, hint=hint, boost=True)
         self._settle_tier(project)
 
@@ -337,9 +353,10 @@ class AutoPilot:
                 if needs_crop and not self._is_outstanding("metadata", name):
                     self._submit(MetadataJob(project.path, name), PRIORITY["metadata"])
             elif needs_crop and not self._is_outstanding("crop", name):
-                self._submit_crop(project, name)
+                self._crop_chain.add(name)
             if new.dialogue_enabled and _brightness_missing(entry):
                 self._want_brightness(project, name)
+        self._advance_crop_chain(project)
         self._settle_tier(project)
 
     # --- pause ------------------------------------------------------------------
@@ -423,26 +440,33 @@ class AutoPilot:
     def _schedule_folder(self, project: Project) -> None:
         for name in list(project.files):
             self._schedule_file(project, name)
-        self._schedule_ranges(project, force=False)
+        if project.folder.autopilot_enabled:
+            self._schedule_ranges(project, force=False)
         self._settle_tier(project)
 
     def _schedule_file(self, project: Project, name: str) -> None:
         self._scheduled.add(name)
         entry = project.files[name]
+        folder = project.folder
         if entry.media.duration <= 0:
             if not self._is_outstanding("metadata", name):
                 self._submit(MetadataJob(project.path, name), PRIORITY["metadata"])
-            if project.folder.dialogue_enabled and _brightness_missing(entry):
+            if folder.autopilot_enabled and folder.dialogue_enabled and _brightness_missing(entry):
                 self._want_brightness(project, name)     # takes its place in the tier, in name order
             return
         self._after_metadata(project, name)
 
     def _after_metadata(self, project: Project, name: str, *, crop: bool = True) -> None:
+        """A scheduled file's duration is known: its thumbnail, and, when
+        autopilot_enabled, its detections."""
         entry = project.files[name]
         folder = project.folder
-        if crop and entry.crop is None and not folder.labels_only and not self._is_outstanding("crop", name):
-            self._submit_crop(project, name)
         self._submit_thumbnail(project, name)
+        if not folder.autopilot_enabled:
+            return
+        if crop and entry.crop is None and not folder.labels_only and not self._is_outstanding("crop", name):
+            self._crop_chain.add(name)
+            self._advance_crop_chain(project)
         if "audio" not in entry.evidence and not self._is_outstanding("audio_profile", name):
             self._submit(AudioProfileJob(project.path, name, entry.media.duration), PRIORITY["audio_profile"])
         if folder.dialogue_enabled and _brightness_missing(entry):
@@ -473,6 +497,24 @@ class AutoPilot:
         consensus = [] if hint is not None else crop_consensus(project, exclude=name)
         self._submit(CropJob(project.path, name, entry.media.duration, consensus, project.folder, hint=hint),
                      PRIORITY["crop"] + bonus)
+
+    def _advance_crop_chain(self, project: Project) -> None:
+        """Submit the next auto-fill crop, in name order, unless one is still
+        outstanding. Files that no longer need one (a crop arrived, another
+        crop detection is outstanding, the folder went labels-only, removed)
+        leave the chain."""
+        if self._crop_active is not None and self._is_outstanding("crop", self._crop_active):
+            return
+        self._crop_active = None
+        for name in [n for n in project.files if n in self._crop_chain]:
+            self._crop_chain.discard(name)
+            entry = project.files[name]
+            if (entry.crop is None and not project.folder.labels_only and entry.media.duration > 0
+                    and not self._is_outstanding("crop", name)):
+                self._submit_crop(project, name)
+                self._crop_active = name
+                return
+        self._crop_chain.clear()
 
     def _submit_thumbnail(self, project: Project, name: str) -> None:
         entry = project.files[name]
@@ -599,13 +641,17 @@ class AutoPilot:
     # --- the full tier ----------------------------------------------------------
 
     def _crop_pending(self, project: Project, name: str, entry: FileEntry) -> bool:
-        """A crop detection is outstanding, or will follow outstanding metadata."""
+        """A crop detection is outstanding, waits in the auto-fill chain, or
+        will follow outstanding metadata."""
+        folder = project.folder
         if self._is_outstanding("crop", name):
+            return True
+        if name in self._crop_chain and entry.crop is None and not folder.labels_only:
             return True
         if not self._is_outstanding("metadata", name):
             return False
         return name in self._deferred_crops or (
-            name in self._scheduled and entry.crop is None and not project.folder.labels_only)
+            name in self._scheduled and folder.autopilot_enabled and entry.crop is None and not folder.labels_only)
 
     def _member_alive(self, project: Project, name: str) -> bool:
         """A tier file that may still report a full-run plateau."""

@@ -246,10 +246,7 @@ def test_open_on_a_fresh_folder_submits_every_detection_in_dependency_order(tmp_
         owner.deliver(sub, metadata_done(sub))
     after_metadata = owner.take()
     assert sorted(pairs(after_metadata)) == sorted(
-        (kind, name) for name in names for kind in ("crop", "thumbnail", "audio_profile"))
-    for sub in of_kind(after_metadata, "crop"):
-        assert sub.job.priority == 3 and sub.job.hint is None and sub.job.consensus == ()
-        assert sub.job.duration == DURATION
+        [("crop", names[0])] + [(kind, name) for name in names for kind in ("thumbnail", "audio_profile")])
     for sub in of_kind(after_metadata, "thumbnail"):
         assert sub.job.priority == 1 and sub.job.time == pytest.approx(0.4 * DURATION)
     for sub in of_kind(after_metadata, "audio_profile"):
@@ -257,18 +254,30 @@ def test_open_on_a_fresh_folder_submits_every_detection_in_dependency_order(tmp_
     finish_side_jobs(owner, after_metadata)
     assert owner.take() == []
 
+    # Crops run one at a time, in name order, each seeded with the unflagged results before it.
+    boxes = {name: (288, 780 + index, 1344, 50 + index) for index, name in enumerate(names)}
     hits = {name: 100.0 + index for index, name in enumerate(names)}
-    for sub in of_kind(after_metadata, "crop"):
-        owner.deliver(sub, crop_done(sub, hit=hits[sub.job.file]))
-    after_crop = owner.take()
-    full = of_kind(after_crop, "brightness")
+    (crop,) = of_kind(after_metadata, "crop")
+    full, rethumbs = [], []
+    for index, name in enumerate(names):
+        assert crop.job.file == name and crop.job.priority == 3 and crop.job.hint is None
+        assert crop.job.duration == DURATION
+        assert list(crop.job.consensus) == [(boxes[n][1] / HEIGHT, boxes[n][3] / HEIGHT) for n in names[:index]]
+        assert all("crop" in owner.autopilot.pending()[n] for n in names[index:])
+        owner.deliver(crop, crop_done(crop, box=boxes[name], hit=hits[name]))
+        new = owner.take()
+        crops = of_kind(new, "crop")
+        assert len(crops) == (1 if index < len(names) - 1 else 0)
+        full += of_kind(new, "brightness")
+        rethumbs += of_kind(new, "thumbnail")
+        assert len(new) == len(crops) + len(of_kind(new, "brightness")) + len(of_kind(new, "thumbnail"))
+        crop = crops[0] if crops else None
     assert [s.job.file for s in full] == names[:3]
     for sub in full:
         assert sub.job.folder_plateau is None and sub.job.hint_value is None
-        assert sub.job.crop_box == BOX and sub.job.priority == 2
-    rethumbs = of_kind(after_crop, "thumbnail")
+        assert sub.job.crop_box == boxes[sub.job.file] and sub.job.priority == 2
     assert {(s.job.file, s.job.time) for s in rethumbs} == set(hits.items())
-    assert len(after_crop) == len(full) + len(rethumbs)
+    assert all("crop" not in kinds for kinds in owner.autopilot.pending().values())
     # The files waiting for the folder plateau are pending, not flagged.
     assert {owner.state(name) for name in names} == {ReviewState.PENDING}
     assert all("brightness" in owner.autopilot.pending()[name] for name in names[3:])
@@ -282,7 +291,8 @@ def test_open_on_a_fresh_folder_submits_every_detection_in_dependency_order(tmp_
     cheap = owner.take()
     assert pairs(cheap) == [("brightness", name) for name in names[3:]]
     for sub in cheap:
-        assert sub.job.folder_plateau == (190, 225) and sub.job.crop_box == BOX and sub.job.priority == 2
+        assert sub.job.folder_plateau == (190, 225) and sub.job.crop_box == boxes[sub.job.file]
+        assert sub.job.priority == 2
 
     for sub in cheap:
         owner.deliver(sub, brightness_done(sub, value=205, plateau=(190, 225)))
@@ -311,44 +321,53 @@ def test_an_imported_project_gets_only_thumbnails_and_audio_profiles(tmp_path):
     assert {owner.state(name) for name in SLAY_NAMES} == {ReviewState.REVIEWED}
 
 
-def test_autopilot_disabled_submits_nothing_on_open_but_redetect_works(tmp_path):
+def test_autopilot_disabled_runs_only_metadata_and_thumbnails_but_redetect_works(tmp_path):
     project = _project(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], FolderSettings(autopilot_enabled=False))
+    _media(project.files["a.mkv"]).crop = Crop(*BOX, Source.DETECTED)
     b = _media(project.files["b.mkv"])
     b.crop = Crop(*OTHER_BOX, Source.IMPORTED)
     b.brightness = Brightness(209, Source.IMPORTED)
-    _media(project.files["a.mkv"]).crop = Crop(*BOX, Source.DETECTED)
     owner = Owner(project)
 
     owner.autopilot.on_open()
+    opened = owner.take()
+    assert sorted(pairs(opened)) == [("metadata", "c.mkv"), ("thumbnail", "a.mkv"), ("thumbnail", "b.mkv")]
+    assert owner.autopilot.pending() == {"a.mkv": {"thumbnail"}, "b.mkv": {"thumbnail"}, "c.mkv": {"metadata"}}
+    finish_side_jobs(owner, opened)
+    (metadata,) = of_kind(opened, "metadata")
+    owner.deliver(metadata, metadata_done(metadata))
+    assert pairs(owner.take()) == [("thumbnail", "c.mkv")]              # no crop, audio or brightness
+    assert "crop" not in owner.autopilot.pending().get("c.mkv", set())
+    assert owner.state("c.mkv") == ReviewState.FLAGGED                 # nothing will detect its crop
+
     project.files["d.mkv"] = FileEntry(name="d.mkv")
     owner.autopilot.on_files_added(["d.mkv"])
+    added = owner.take()
+    assert pairs(added) == [("metadata", "d.mkv")]                      # no ranges either
+    owner.autopilot.redetect("d.mkv")                                   # waits for the queued metadata
     assert owner.take() == []
+    assert owner.autopilot.pending()["d.mkv"] >= {"metadata", "crop", "brightness"}
+    owner.deliver(added[0], metadata_done(added[0]))
+    after = owner.take()
+    assert sorted(pairs(after)) == [("crop", "d.mkv"), ("thumbnail", "d.mkv")]
+    (crop,) = of_kind(after, "crop")
+    assert crop.job.priority == 13
+    owner.deliver(crop, crop_done(crop))
+    brightness = of_kind(owner.take(), "brightness")
+    assert pairs(brightness) == [("brightness", "d.mkv")]
+    assert brightness[0].job.priority == 12 and brightness[0].job.crop_box == BOX
 
     owner.autopilot.redetect("b.mkv")
     crop = owner.take()
     assert pairs(crop) == [("crop", "b.mkv")]
     assert crop[0].job.priority == 13
-    assert crop[0].job.consensus == ((BOX[1] / HEIGHT, BOX[3] / HEIGHT),)    # the others' crops only
+    assert crop[0].job.consensus == ((BOX[1] / HEIGHT, BOX[3] / HEIGHT),) * 2   # a and d: the others' crops
     owner.deliver(crop[0], crop_done(crop[0], box=BOX))
     assert project.files["b.mkv"].crop == Crop(*OTHER_BOX, Source.IMPORTED)   # the user's value stays
-    brightness = owner.take()
+    brightness = of_kind(owner.take(), "brightness")
     assert pairs(brightness) == [("brightness", "b.mkv")]                     # sources ignored
     assert brightness[0].job.priority == 12
     assert brightness[0].job.folder_plateau is None and brightness[0].job.crop_box == OTHER_BOX
-    owner.deliver(brightness[0], brightness_done(brightness[0]))
-    assert owner.take() == []
-
-    owner.autopilot.redetect("c.mkv")                        # duration unknown: metadata first
-    metadata = owner.take()
-    assert pairs(metadata) == [("metadata", "c.mkv")] and metadata[0].job.priority == 15
-    assert owner.autopilot.pending()["c.mkv"] >= {"metadata", "crop", "brightness"}
-    owner.deliver(metadata[0], metadata_done(metadata[0]))
-    crop = owner.take()
-    assert pairs(crop) == [("crop", "c.mkv")] and crop[0].job.priority == 13   # no thumbnail or audio
-    owner.deliver(crop[0], crop_done(crop[0]))
-    brightness = owner.take()
-    assert pairs(brightness) == [("brightness", "c.mkv")]
-    assert brightness[0].job.priority == 12 and brightness[0].job.crop_box == BOX
 
 
 def test_a_labels_only_folder_gets_no_crop_or_brightness(tmp_path):
@@ -498,14 +517,18 @@ def test_a_full_tier_file_that_gets_no_crop_is_replaced_by_the_next_file(tmp_pat
         _media(entry)
     owner = Owner(project)
     owner.autopilot.on_open()
-    crops = {s.job.file: s for s in of_kind(owner.take(), "crop")}
+    (crop_a,) = of_kind(owner.take(), "crop")
 
-    owner.deliver(crops["a.mkv"], crop_done(crops["a.mkv"], box=None, flagged=crop_mod.FLAG_LOW_AGREEMENT))
-    assert of_kind(owner.take(), "brightness") == []
+    owner.deliver(crop_a, crop_done(crop_a, box=None, flagged=crop_mod.FLAG_LOW_AGREEMENT))
+    after_a = owner.take()
+    assert of_kind(after_a, "brightness") == []
     assert owner.state("a.mkv") == ReviewState.FLAGGED
-    owner.deliver(crops["b.mkv"], crop_done(crops["b.mkv"]))
-    owner.deliver(crops["c.mkv"], crop_done(crops["c.mkv"]))
-    full = of_kind(owner.take(), "brightness")
+    (crop_b,) = of_kind(after_a, "crop")
+    owner.deliver(crop_b, crop_done(crop_b))
+    after_b = owner.take()
+    (crop_c,) = of_kind(after_b, "crop")
+    owner.deliver(crop_c, crop_done(crop_c))
+    full = of_kind(after_b + owner.take(), "brightness")
     assert [s.job.file for s in full] == ["b.mkv", "c.mkv"]
     assert all(s.job.folder_plateau is None for s in full)
 
@@ -611,7 +634,7 @@ def test_ranges_run_only_for_two_or_more_files_with_ranges_open_to_detection(tmp
 # Consensus and hints
 # --------------------------------------------------------------------------
 
-def test_crop_consensus_lists_detected_and_imported_crops_in_name_order(tmp_path):
+def test_crop_consensus_follows_the_old_adapters_pool_rule_in_name_order(tmp_path):
     names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     project = _project(tmp_path, names)
     for entry in project.files.values():
@@ -622,28 +645,112 @@ def test_crop_consensus_lists_detected_and_imported_crops_in_name_order(tmp_path
     files["b"].media.height = 1000
     files["b"].flags["crop"] = crop_mod.FLAG_LOW_AGREEMENT      # flags describe a detection, not the import
     files["c"].crop = Crop(0, 700, 1920, 40, Source.DETECTED)
-    files["c"].flags["crop"] = crop_mod.FLAG_LOW_AGREEMENT      # not auto-applicable
+    files["c"].flags["crop"] = crop_mod.FLAG_LOW_AGREEMENT      # flagged
     files["d"].crop = Crop(0, 972, 1920, 54, Source.DETECTED)
-    files["d"].flags["crop"] = crop_mod.FLAG_NO_SPEECH          # informational only
+    files["d"].flags["crop"] = crop_mod.FLAG_NO_SPEECH          # informational, but still a flag
     files["e"].crop = Crop(0, 600, 1920, 40, Source.MANUAL)
     files["f"].crop = Crop(0, 610, 1920, 40, Source.HINT)
     files["g"].crop = Crop(0, 620, 1920, 40, Source.DETECTED)
     files["g"].media.height = 0                                 # height unknown
     files["i"].crop = Crop(0, 540, 1920, 108, Source.IMPORTED)
     files["j"].crop = None
-    expected = [(810 / 1080, 60 / 1080), (900 / 1000, 50 / 1000), (972 / 1080, 54 / 1080), (540 / 1080, 108 / 1080)]
+    expected = [(810 / 1080, 60 / 1080), (900 / 1000, 50 / 1000), (600 / 1080, 40 / 1080), (540 / 1080, 108 / 1080)]
 
     assert crop_consensus(project) == expected
     assert crop_consensus(project, exclude="b") == [expected[0], expected[2], expected[3]]
 
     owner = Owner(project)
     owner.autopilot.on_open()
-    crops = {s.job.file: s.job for s in of_kind(owner.take(), "crop")}
-    assert sorted(crops) == ["h", "j"]
-    assert list(crops["h"].consensus) == expected
-    owner.autopilot.redetect("a")
+    (first,) = of_kind(owner.take(), "crop")                   # h now, j once h ends
+    assert first.job.file == "h" and list(first.job.consensus) == expected
+    owner.autopilot.redetect("a")                              # outside the chain: now, with the current pool
     (redetect,) = of_kind(owner.take(), "crop")
-    assert list(redetect.job.consensus) == expected[1:]
+    assert redetect.job.file == "a" and list(redetect.job.consensus) == expected[1:]
+
+
+def test_auto_fill_crops_run_one_at_a_time_and_grow_the_consensus(tmp_path):
+    names = ["a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv", "f.mkv", "g.mkv"]
+    project = _project(tmp_path, names)
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.sample_time = 300.0
+    project.files["a.mkv"].crop = Crop(0, 972, 1920, 54, Source.IMPORTED)
+    project.files["c.mkv"].crop = Crop(0, 900, 1920, 60, Source.MANUAL)
+    project.files["c.mkv"].media.height = 1000
+    pool = [(972 / 1080, 54 / 1080), (900 / 1000, 60 / 1000)]
+    owner = Owner(project)
+
+    def next_crops():
+        return of_kind(owner.take(), "crop")
+
+    owner.autopilot.on_open()
+    (b,) = next_crops()
+    assert b.job.file == "b.mkv" and b.job.priority == 3 and list(b.job.consensus) == pool
+    assert all("crop" in owner.autopilot.pending()[name] for name in ("d.mkv", "e.mkv", "f.mkv", "g.mkv"))
+
+    owner.autopilot.redetect("g.mkv")                          # submitted now, outside the chain
+    (g,) = next_crops()
+    assert g.job.file == "g.mkv" and g.job.priority == 13 and list(g.job.consensus) == pool
+
+    owner.deliver(b, crop_done(b, box=(0, 950, 1920, 50), flagged=crop_mod.FLAG_NO_SPEECH))
+    assert project.files["b.mkv"].crop == Crop(0, 950, 1920, 50, Source.DETECTED)   # applied, not pooled
+    (d,) = next_crops()
+    assert d.job.file == "d.mkv" and list(d.job.consensus) == pool
+
+    owner.deliver(d, type="failed")
+    (e,) = next_crops()
+    assert e.job.file == "e.mkv" and list(e.job.consensus) == pool
+
+    owner.deliver(e, type="cancelled")
+    (f,) = next_crops()
+    assert f.job.file == "f.mkv" and list(f.job.consensus) == pool
+
+    owner.deliver(g, type="failed")
+    assert next_crops() == []                                  # the chain waits for f
+    owner.deliver(f, crop_done(f, box=(0, 940, 1920, 52)))
+    assert next_crops() == []                                  # g's re-detect replaced its auto-fill: done
+    assert all("crop" not in kinds for kinds in owner.autopilot.pending().values())
+    assert {owner.state(name) for name in ("d.mkv", "e.mkv", "g.mkv")} == {ReviewState.FLAGGED}
+
+    owner.autopilot.redetect("d.mkv")
+    (again,) = next_crops()
+    assert list(again.job.consensus) == pool + [(940 / 1080, 52 / 1080)]
+
+
+def test_the_crop_chain_skips_a_file_the_user_gave_a_crop_while_it_waited(tmp_path):
+    project = _project(tmp_path, ["a.mkv", "b.mkv", "c.mkv"])
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.sample_time = 300.0
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (crop_a,) = of_kind(owner.take(), "crop")
+    set_manual_crop(project, "b.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("b.mkv")
+    owner.take()
+    owner.deliver(crop_a, crop_done(crop_a))
+    (crop_c,) = of_kind(owner.take(), "crop")
+    assert crop_c.job.file == "c.mkv"
+    assert list(crop_c.job.consensus) == [(BOX[1] / HEIGHT, BOX[3] / HEIGHT), (OTHER_BOX[1] / HEIGHT, OTHER_BOX[3] / HEIGHT)]
+
+
+def test_hint_redetects_replace_the_auto_fill_crops_still_waiting(tmp_path):
+    project = _project(tmp_path, ["a.mkv", "b.mkv", "c.mkv"])
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.sample_time = 300.0
+    project.files["a.mkv"].crop = Crop(*BOX, Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (auto_b,) = of_kind(owner.take(), "crop")                  # c waits in the chain
+    owner.autopilot.redetect_others_with_crop_hint("a.mkv")
+    hinted = {s.job.file: s for s in of_kind(owner.take(), "crop")}
+    assert sorted(hinted) == ["b.mkv", "c.mkv"] and all(s.job.hint for s in hinted.values())
+    assert owner.deliver(auto_b, None, type="cancelled") is False   # replaced while queued
+    owner.deliver(hinted["c.mkv"], type="failed")
+    owner.deliver(hinted["b.mkv"], type="failed")
+    assert of_kind(owner.take(), "crop") == []
+    assert all("crop" not in kinds for kinds in owner.autopilot.pending().values())
 
 
 def test_hint_redetects_seed_every_other_file_from_the_edited_file(tmp_path):
@@ -891,13 +998,15 @@ def test_the_thumbnail_reruns_only_when_the_crop_moves_the_sample_time(tmp_path)
     opened = owner.take()
     thumbs = {s.job.file: s.job.time for s in of_kind(opened, "thumbnail")}
     assert thumbs == {"a.mkv": pytest.approx(0.4 * DURATION), "b.mkv": 50.0}
-    crops = {s.job.file: s for s in of_kind(opened, "crop")}
+    (crop_a,) = of_kind(opened, "crop")
 
-    owner.deliver(crops["b.mkv"], crop_done(crops["b.mkv"], box=None, flagged=crop_mod.FLAG_LOW_AGREEMENT))
-    assert of_kind(owner.take(), "thumbnail") == []         # nothing written, sample time kept
-    owner.deliver(crops["a.mkv"], crop_done(crops["a.mkv"], hit=123.0))
-    (rethumb,) = of_kind(owner.take(), "thumbnail")
+    owner.deliver(crop_a, crop_done(crop_a, hit=123.0))
+    after_a = owner.take()
+    (rethumb,) = of_kind(after_a, "thumbnail")
     assert rethumb.job.file == "a.mkv" and rethumb.job.time == 123.0 and rethumb.job.priority == 1
+    (crop_b,) = of_kind(after_a, "crop")
+    owner.deliver(crop_b, crop_done(crop_b, box=None, flagged=crop_mod.FLAG_LOW_AGREEMENT))
+    assert of_kind(owner.take(), "thumbnail") == []         # nothing written, sample time kept
 
 
 def test_labels_only_to_dialogue_submits_crop_then_brightness(tmp_path):
@@ -917,14 +1026,16 @@ def test_labels_only_to_dialogue_submits_crop_then_brightness(tmp_path):
     apply_folder_change(project, old, project.folder)
     owner.autopilot.on_folder_changed(old, project.folder)
     crops = owner.take()
-    assert pairs(crops) == [("crop", name) for name in names]
+    assert pairs(crops) == [("crop", "a.mkv")]                  # b follows when a ends
     owner.recompute()
     assert all(owner.autopilot.pending()[name] == {"crop", "brightness"} for name in names)
     assert {owner.state(name) for name in names} == {ReviewState.PENDING}
 
-    for sub in crops:
-        owner.deliver(sub, crop_done(sub))
-    assert pairs(of_kind(owner.take(), "brightness")) == [("brightness", name) for name in names]
+    owner.deliver(crops[0], crop_done(crops[0]))
+    after_a = owner.take()
+    (crop_b,) = of_kind(after_a, "crop")
+    owner.deliver(crop_b, crop_done(crop_b))
+    assert pairs(of_kind(after_a + owner.take(), "brightness")) == [("brightness", name) for name in names]
 
     back = replace(project.folder)
     project.folder = replace(project.folder, dialogue_enabled=False)
@@ -932,15 +1043,23 @@ def test_labels_only_to_dialogue_submits_crop_then_brightness(tmp_path):
     assert owner.take() == []
 
 
-def test_turning_autopilot_on_schedules_the_folder_and_off_schedules_nothing(tmp_path):
+def test_turning_autopilot_on_schedules_detections_and_off_schedules_nothing(tmp_path):
     project = _project(tmp_path, ["a.mkv", "b.mkv"], FolderSettings(autopilot_enabled=False))
     owner = Owner(project)
     owner.autopilot.on_open()
-    assert owner.take() == []
+    opened = owner.take()
+    assert pairs(opened) == [("metadata", "a.mkv"), ("metadata", "b.mkv")]
+    assert owner.autopilot.pending() == {"a.mkv": {"metadata"}, "b.mkv": {"metadata"}}
+
     old = replace(project.folder)
     project.folder = replace(project.folder, autopilot_enabled=True)
     owner.autopilot.on_folder_changed(old, project.folder)
-    assert pairs(owner.take()) == [("metadata", "a.mkv"), ("metadata", "b.mkv"), ("ranges", None)]
+    assert pairs(owner.take()) == [("ranges", None)]                     # metadata is already queued
+    assert owner.autopilot.pending()["a.mkv"] == {"metadata", "crop", "brightness"}
+    for sub in opened:
+        owner.deliver(sub, metadata_done(sub))
+    assert sorted(pairs(owner.take())) == sorted(
+        [("crop", "a.mkv")] + [(kind, name) for name in ("a.mkv", "b.mkv") for kind in ("thumbnail", "audio_profile")])
 
     old = replace(project.folder)
     project.folder = replace(project.folder, autopilot_enabled=False, labels_enabled=False)
