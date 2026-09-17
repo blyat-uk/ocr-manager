@@ -189,3 +189,70 @@ def test_clearing_the_cache_empties_it():
 
     assert cache.nbytes == 0 and len(cache) == 0
     assert cache.get(("a.mp4", "frame", 1.0)) is None
+
+
+# --------------------------------------------------------------------------
+# FrameCache: times that could not be read
+# --------------------------------------------------------------------------
+
+def test_an_unavailable_time_is_known_without_being_cached():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+
+    cache.mark_unavailable(key)
+
+    assert cache.is_unavailable(key) and cache.knows(key)
+    assert cache.get(key) is None                       # the view still draws its placeholder
+    assert key not in cache                             # "in" means pixels
+    assert cache.nbytes == 0 and len(cache) == 0        # markers carry no pixels
+
+
+def test_markers_never_evict_a_frame():
+    cache = FrameCache(max_bytes=150)
+    frame = _frame(1)
+    cache.put(("a.mp4", "frame", 0.0), frame)
+
+    for index in range(1, 1000):
+        cache.mark_unavailable(("a.mp4", "frame", float(index)))
+
+    assert cache.get(("a.mp4", "frame", 0.0)) is frame
+    assert cache.nbytes == 100
+
+
+def test_a_frame_that_arrives_later_forgets_its_marker():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    cache.mark_unavailable(key)
+    frame = _frame(1)
+
+    cache.put(key, frame)
+
+    assert not cache.is_unavailable(key)
+    assert cache.get(key) is frame
+
+
+def test_clear_file_forgets_the_markers_too():
+    cache = FrameCache()
+    box = (288, 786, 1344, 53)
+    cache.mark_unavailable(("a.mp4", "frame", 1.0))
+    cache.mark_unavailable(("a.mp4", "strip", box, 1.0))
+    cache.mark_unavailable(("b.mp4", "frame", 1.0))
+
+    cache.clear_file("a.mp4", "strip")
+    assert cache.is_unavailable(("a.mp4", "frame", 1.0))
+    assert not cache.is_unavailable(("a.mp4", "strip", box, 1.0))
+
+    cache.clear_file("a.mp4")
+    assert not cache.is_unavailable(("a.mp4", "frame", 1.0))
+    assert cache.is_unavailable(("b.mp4", "frame", 1.0))
+
+    cache.clear()
+    assert not cache.is_unavailable(("b.mp4", "frame", 1.0))
+
+
+def test_knows_is_true_for_a_cached_frame_and_false_for_an_untried_one():
+    cache = FrameCache()
+    cache.put(("a.mp4", "frame", 1.0), _frame(1))
+
+    assert cache.knows(("a.mp4", "frame", 1.0))
+    assert not cache.knows(("a.mp4", "frame", 2.0))

@@ -30,13 +30,19 @@ Frames and strips
     through AutoPilot: they are nobody's pipeline step) for the times that
     are neither cached nor already on their way, so a view may call them on
     every repaint. Each job's terminal event caches what came back, releases
-    the times it held and emits frame_ready / strips_ready; a failed or
-    cancelled job releases its times too, so a later request retries. The
-    two sources are never mixed -- whole frames for the crop views, OCR-exact
-    strips (keyed by the crop box they were grabbed with) for anything
-    showing OCR pixels. The cache is dropped per file when the file
-    disappears, its strips when its crop box changes, and all of it when the
-    folder closes.
+    the times it held and emits frame_ready / strips_ready. A time that could
+    not be read is remembered as unavailable (a finished job marks what is
+    missing from its result, a failed one everything it was asked for), so it
+    is attempted once per session and not once per repaint; a CANCELLED job
+    marks nothing, since nothing was learned. The two sources are never mixed
+    -- whole frames for the crop views, OCR-exact strips (keyed by the crop
+    box they were grabbed with) for anything showing OCR pixels. The cache,
+    markers included, is dropped per file when the file disappears, its
+    strips when its crop box changes, and all of it when the folder closes.
+
+    These jobs are deliberately kept out of the ActivityTracker: a view
+    repainting must not put "frames" in the activity strip or push the
+    detectors out of its five-deep history.
 
 Sessions
     One runner lives as long as the controller. Closing a folder cancels its
@@ -387,11 +393,12 @@ class ProjectController(QObject):
     def request_frames(self, name: str, times: list[float]) -> None:
         """Fetch `name`'s whole frames at `times` for the crop views.
 
-        Only the times that are neither cached nor already on their way are
-        fetched, so a view may call this on every repaint. frame_ready(name,
-        time) follows for each frame that arrives; a time whose frame could
-        not be grabbed (and a cancelled or failed job) leaves nothing behind,
-        so a later request tries again.
+        Only the times that are worth fetching are: the ones not cached, not
+        already on their way and not already found unreadable. A view may
+        therefore call this on every repaint. frame_ready(name, time) follows
+        for each frame that arrives; a time that could not be read stays None
+        (the view draws its placeholder) and is not asked for again until the
+        file or the folder is reopened.
         """
         project = self._view_project(name)
         wanted, keys = self._missing_times(times, lambda time_value: (name, "frame", time_value))
@@ -407,7 +414,9 @@ class ProjectController(QObject):
 
         Same rules as request_frames; strips_ready(name) follows once the
         strips of a request have arrived. Strips are cached per crop box, so
-        editing the crop never shows strips measured on the old one.
+        editing the crop never shows strips measured on the old one -- and a
+        time that could not be read for one box is asked for again for the
+        next, since the box is part of the key.
         """
         project = self._view_project(name)
         box = tuple(int(value) for value in crop_box)
@@ -421,14 +430,15 @@ class ProjectController(QObject):
 
     def _missing_times(self, times: list[float],
                        key_of: Callable[[float], tuple]) -> tuple[list[float], list[tuple]]:
-        """The times of `times` that are neither cached nor already being
-        fetched, with their cache keys, marked as being fetched now. A
-        repeated time counts once."""
+        """The times of `times` that are worth fetching -- not cached, not
+        already being fetched and not known to be unreadable -- with their
+        cache keys, marked as being fetched now. A repeated time counts
+        once."""
         wanted, keys = [], []
         for value in times:
             time_value = float(value)
             key = key_of(time_value)
-            if key in self._frames or key in self._frame_inflight:
+            if self._frames.knows(key) or key in self._frame_inflight:
                 continue
             self._frame_inflight.add(key)
             wanted.append(time_value)
@@ -798,12 +808,18 @@ class ProjectController(QObject):
         self._schedule_save()
 
     def _on_view_event(self, event: JobEvent) -> None:
-        """A frames/strips job ended: cache what came back and release the
-        times it was fetching, whether it finished, failed or was cancelled
-        (a released time is fetched again next time a view asks for it)."""
+        """A frames/strips job ended: cache what came back, release the times
+        it was fetching, and remember the ones that could not be read.
+
+        A finished job marks the times missing from its result, a failed one
+        every time it was asked for: each is attempted once per session, not
+        once per repaint. A CANCELLED job marks nothing -- nothing was
+        learned about those times -- so the next request fetches them again.
+        """
         if event.type not in TERMINAL_EVENTS:
             return
-        for key in self._view_jobs.pop(event.key, ()):
+        requested = self._view_jobs.pop(event.key, [])
+        for key in requested:
             self._frame_inflight.discard(key)
         if event.type == "failed":
             self._log(PIPELINE_LOG, f"Could not load {event.kind} for {event.file}: {event.message}")
@@ -816,6 +832,9 @@ class ProjectController(QObject):
             for time_value, strip in result.strips.items():
                 self._frames.put((result.file, "strip", result.crop_box, float(time_value)), strip)
             self._emit_strips.append(result.file)
+        if event.type != "cancelled" and event.file in files:
+            for key in requested:
+                self._frames.mark_unavailable(key)      # a no-op for the keys just filled
 
     def _on_proof_event(self, event: JobEvent) -> None:
         name = event.file

@@ -49,11 +49,18 @@ class FrameCache:
 
     Arrays are stored as given, not copied: they come straight from a job
     result nobody else holds. Callers must not mutate what they get back.
+
+    A key can also be marked unavailable: the frame at that time was asked
+    for and could not be read. `get` still answers None (a view draws its
+    placeholder either way), but `knows` is True, so the caller does not ask
+    for it again. Markers hold no pixels: they are outside the byte budget
+    and never evict a frame.
     """
 
     def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES):
         self.max_bytes = int(max_bytes)
         self._items: OrderedDict[tuple, np.ndarray] = OrderedDict()
+        self._missing: set[tuple] = set()
         self._bytes = 0
 
     def get(self, key) -> np.ndarray | None:
@@ -66,24 +73,45 @@ class FrameCache:
 
     def put(self, key, image: np.ndarray) -> None:
         self._drop(key)
+        self._missing.discard(key)              # it could be read after all
         self._items[key] = image
         self._bytes += int(image.nbytes)
         while self._bytes > self.max_bytes and len(self._items) > 1:
             self._drop(next(iter(self._items)))
 
-    def clear_file(self, file: str, kind: str | None = None) -> None:
-        """Forget `file`'s entries: every kind, or only "frame" / "strip".
+    def mark_unavailable(self, key) -> None:
+        """Remember that this frame was asked for and could not be read."""
+        if key not in self._items:
+            self._missing.add(key)
 
-        Whole file: the entry is gone (a removed video, a closed folder).
+    def is_unavailable(self, key) -> bool:
+        return key in self._missing
+
+    def knows(self, key) -> bool:
+        """True once this frame has been fetched, successfully or not: it is
+        cached, or known to be unreadable. Either way, do not ask again."""
+        return key in self._items or key in self._missing
+
+    def clear_file(self, file: str, kind: str | None = None) -> None:
+        """Forget `file`'s entries and markers: every kind, or only "frame" /
+        "strip".
+
+        Whole file: the entry is gone (a removed video, a closed folder), and
+        a file of the same name that comes back starts from nothing.
         Strips only: the file's crop box changed, so strips grabbed with the
         old box can never be drawn again -- they are keyed by that box, so
         they would otherwise sit in the cache until they aged out.
         """
-        for key in [key for key in self._items if key[0] == file and (kind is None or key[1] == kind)]:
+        def matches(key) -> bool:
+            return key[0] == file and (kind is None or key[1] == kind)
+
+        for key in [key for key in self._items if matches(key)]:
             self._drop(key)
+        self._missing.difference_update([key for key in self._missing if matches(key)])
 
     def clear(self) -> None:
         self._items.clear()
+        self._missing.clear()
         self._bytes = 0
 
     @property
