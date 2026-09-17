@@ -247,6 +247,115 @@ def test_submitting_a_running_key_queues_a_second_job_without_cancelling(h):
     assert [e.result for e in h.rec.of("k") if e.type == "finished"] == ["first", "second"]
 
 
+def test_job_ids_tell_instances_with_the_same_key_apart(h):
+    blocker = h.blocker("blocker")
+    h.runner.submit(FakeJob("k"))
+    h.runner.submit(FakeJob("k", body=lambda ctx: ctx.emit("run_file_started", file="a.mp4")))
+    blocker.gate.set()
+    assert h.rec.wait_terminal("k", count=2) is not None
+
+    events = h.rec.of("k")
+    assert [e.type for e in events] == ["queued", "cancelled", "queued", "started",
+                                        "run_file_started", "finished"]
+    replaced, replacement = events[0].job_id, events[2].job_id
+    assert [e.job_id for e in events] == [replaced] * 2 + [replacement] * 4
+    assert 0 < h.rec.of("blocker")[0].job_id < replaced < replacement
+
+
+@pytest.mark.parametrize("old_lane", [Lane.CPU, Lane.GPU], ids=["same-lane", "other-lane"])
+def test_a_job_waits_until_the_running_job_with_its_key_has_ended(old_lane):
+    """Same-key jobs never overlap, even with a free worker; other keys run past."""
+    rec = Recorder()
+    slow_terminal_for = {}
+
+    def listener(event):
+        # Deliver the old job's terminal event slowly: the new job must not
+        # start until that delivery is over.
+        if event.type in TERMINAL and event.job_id == slow_terminal_for.get("id"):
+            time.sleep(QUIET)
+        rec(event)
+
+    runner = JobRunner(listener, cpu_workers=2)
+    gate = threading.Event()
+    try:
+        old = FakeJob("metadata:a.mp4", old_lane, body=lambda ctx: (gate.wait(WAIT), "old")[1])
+        runner.submit(old)
+        assert old.ran.wait(WAIT)
+        slow_terminal_for["id"] = rec.of("metadata:a.mp4")[0].job_id
+
+        new = FakeJob("metadata:a.mp4", Lane.CPU, body=lambda ctx: "new")
+        other = FakeJob("metadata:b.mp4", Lane.CPU, body=lambda ctx: "other")
+        runner.submit(new)
+        runner.submit(other)
+
+        assert rec.wait_terminal("metadata:b.mp4").result == "other"  # not blocked behind it
+        assert not new.ran.wait(QUIET)
+        assert runner.queued() == [new]
+
+        gate.set()
+        assert rec.wait_terminal("metadata:a.mp4", count=2) is not None
+    finally:
+        gate.set()
+        runner.shutdown(timeout=2.0)
+
+    events = rec.of("metadata:a.mp4")
+    assert [(e.type, e.result) for e in events] == [
+        ("queued", None), ("started", None), ("queued", None),
+        ("finished", "old"), ("started", None), ("finished", "new"),
+    ]
+    old_id, new_id = events[0].job_id, events[2].job_id
+    assert old_id != new_id
+    assert [e.job_id for e in events] == [old_id, old_id, new_id, old_id, new_id, new_id]
+
+
+def test_a_listener_resubmitting_a_key_during_its_replacement_keeps_every_job_consistent():
+    rec = Recorder()
+    runner = None
+
+    def listener(event):
+        rec(event)
+        if event.type == "cancelled" and event.file == "old":
+            runner.submit(FakeJob("k", file="from-listener"))
+
+    runner = JobRunner(listener)
+    try:
+        runner.pause(Lane.GPU)
+        runner.submit(FakeJob("k", file="old"))
+        runner.submit(FakeJob("k", file="new"))
+        queued = [job.file for job in runner.queued()]
+    finally:
+        runner.shutdown(timeout=2.0)
+
+    def types(file):
+        return [e.type for e in rec.of("k") if e.file == file]
+
+    assert types("old") == ["queued", "cancelled"]
+    assert types("from-listener") == ["queued", "cancelled"]
+    assert types("new") == ["queued", "cancelled"]  # its own "queued"; cancelled by shutdown
+    assert queued == ["new"]
+
+
+def test_lifecycle_events_and_cancel_use_the_identity_captured_at_submit(h):
+    renamed = threading.Event()
+
+    def body(ctx):
+        job.key, job.kind, job.file = "renamed", "other", "other.mp4"
+        renamed.set()
+        return _wait_cancel_event(ctx)
+
+    job = FakeJob("crop:a.mp4", kind="crop", file="a.mp4", body=body)
+    h.runner.submit(job)
+    assert renamed.wait(WAIT)
+
+    h.runner.cancel("crop:a.mp4")
+
+    terminal = h.rec.wait_terminal("crop:a.mp4")
+    assert terminal is not None
+    assert (terminal.type, terminal.result) == ("cancelled", "stopped")
+    assert {(e.key, e.kind, e.file) for e in h.rec.of("crop:a.mp4")} == {("crop:a.mp4", "crop", "a.mp4")}
+    assert h.rec.of("renamed") == []
+
+
 # --- cancellation ------------------------------------------------------------
 
 def test_cancelling_a_queued_job_removes_it_without_running(h):
@@ -301,7 +410,7 @@ def test_cancelling_a_running_job_sets_its_event_and_reports_cancelled(h, watch)
     terminal = h.rec.wait_terminal("busy")
     assert terminal is not None
     assert terminal.type == "cancelled"
-    assert terminal.result is None
+    assert terminal.result == "stopped"  # what run() returned after stopping
     assert job.ctx.cancel_event.is_set()
     assert h.rec.types("busy") == ["queued", "started", "cancelled"]
 
@@ -380,6 +489,58 @@ def test_exception_reports_failed_with_traceback_and_the_lane_keeps_working(h):
     good = h.rec.wait_terminal("good")
     assert good is not None
     assert (good.type, good.result) == ("finished", "ok")
+
+
+class _Unprintable(Exception):
+    def __str__(self):
+        raise RuntimeError("str() is broken too")
+
+
+def test_an_exception_that_cannot_be_printed_still_reports_failed(h):
+    def explode(ctx):
+        raise _Unprintable()
+
+    h.runner.submit(FakeJob("unprintable", body=explode))
+    failed = h.rec.wait_terminal("unprintable")
+    assert failed is not None
+    assert failed.type == "failed"
+    assert failed.message == "_Unprintable"
+    assert "_Unprintable" in failed.error
+    assert h.runner.running() == []
+
+    h.runner.submit(FakeJob("after", body=lambda ctx: "ok"))
+    after = h.rec.wait_terminal("after")
+    assert after is not None and after.result == "ok"
+
+
+class _ListenerAbort(BaseException):
+    pass
+
+
+def test_a_listener_raising_baseexception_on_started_still_ends_the_job_failed():
+    rec = Recorder()
+
+    def listener(event):
+        rec(event)
+        if event.type == "started" and event.key == "fragile":
+            raise _ListenerAbort("adapter blew up")
+
+    runner = JobRunner(listener, cpu_workers=1)
+    fragile = FakeJob("fragile", body=lambda ctx: "never")
+    try:
+        runner.submit(fragile)
+        failed = rec.wait_terminal("fragile")
+        runner.submit(FakeJob("next", body=lambda ctx: "ok"))
+        after = rec.wait_terminal("next")
+    finally:
+        runner.shutdown(timeout=2.0)
+
+    assert rec.types("fragile") == ["queued", "started", "failed"]
+    assert failed.message == "adapter blew up"
+    assert "_ListenerAbort" in failed.error
+    assert not fragile.ran.is_set()
+    assert runner.running() == []
+    assert (after.type, after.result) == ("finished", "ok")
 
 
 def test_listener_exceptions_are_logged_and_never_stop_a_lane(caplog):
@@ -493,6 +654,8 @@ def test_progress_log_and_custom_events_arrive_in_order(h):
         ("finished", None, "", None, "done"),
     ]
     assert all((e.key, e.kind) == ("run", "run") for e in h.rec.of("run"))
+    assert len({e.job_id for e in h.rec.of("run")}) == 1  # custom events included
+    assert h.rec.of("run")[0].job_id > 0
     assert all(thread != caller for _, thread in h.rec.with_threads("run")[1:])
 
 
@@ -608,3 +771,16 @@ def test_shutdown_times_out_on_an_uncooperative_job_without_killing_it():
     assert terminal is not None
     assert (terminal.type, terminal.result) == ("finished", "done anyway")
     assert runner.shutdown(timeout=WAIT) is True  # its worker survived and exited
+
+
+def test_shutdown_called_from_inside_a_job_leaves_its_own_thread_out():
+    rec = Recorder()
+    runner = JobRunner(rec)
+    try:
+        runner.submit(FakeJob("self-stop", body=lambda ctx: runner.shutdown(timeout=WAIT)))
+        terminal = rec.wait_terminal("self-stop")
+    finally:
+        runner.shutdown(timeout=2.0)
+
+    assert terminal is not None
+    assert (terminal.type, terminal.result) == ("finished", True)
