@@ -291,7 +291,7 @@ def test_a_proof_of_a_file_whose_duration_is_unknown_says_so(make_window):
     window = make_window([entry(NAMES[0])] + [entry(name) for name in NAMES[1:]])
     window.controller.entry(NAMES[0]).media = Media(0, 0, 0.0, 0.0)
     window.inspector.proof_button.click()
-    assert "duration unknown" in window.inspector.proof_note.text()
+    assert window.inspector.proof_note.text() == "Can't run yet: this file hasn't been scanned yet"
     assert window.inspector.proof_note.property("tone") == "warn"
 
 

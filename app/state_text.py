@@ -32,6 +32,7 @@ from core.detect import crop as _crop
 from core.detect.flags import only_informational
 from core.jobs import apply as _apply
 from core.jobs.apply import brightness_is_stale
+from core.jobs.detect_jobs import UNSCANNED_MESSAGE
 from core.jobs.detect_jobs import proof_window as _proof_window
 from core.project.model import FileEntry, ReviewState, Source
 
@@ -372,6 +373,17 @@ def proof_window_clock(sample_time: float | None, duration: float) -> str | None
     except ValueError:
         return None
     return f"{clock(start)}–{clock(end)}"
+
+
+PROOF_WAIT_TOOLTIP = UNSCANNED_MESSAGE     # the same sentence run_proof refuses with
+
+
+def can_run_proof(entry: FileEntry) -> bool:
+    """Whether "Test OCR" (T, the inspector's "T run", the queue's menu item)
+    has a window to run on. `proof_window` refuses a file whose duration is
+    not known yet -- its metadata job has not run, or could not -- so the
+    action is not offered rather than offered and refused."""
+    return proof_window_clock(entry.sample_time, entry.media.duration) is not None
 
 
 # --------------------------------------------------------------------------

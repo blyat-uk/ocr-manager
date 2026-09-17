@@ -32,7 +32,7 @@ from app.views.stage import Stage, StageTab, placeholder_tabs
 from app.widgets.base import KvRow
 from core.detect.brightness import BrightnessResult
 from core.detect.crop import FLAG_LOW_AGREEMENT, CropResult
-from core.jobs.detect_jobs import BrightnessJobResult, CropJobResult, ProofResult
+from core.jobs.detect_jobs import BrightnessJobResult, CropJobResult, MetadataResult, ProofResult
 from core.project import (
     Brightness,
     Crop,
@@ -672,13 +672,25 @@ def test_proof_section_shows_running_then_lines(slay_window, fake_runner):
     assert inspector.proof_note.text() == "4 lines · took 4.1 s"
 
 
-def test_proof_with_unknown_duration_says_so_instead_of_raising(make_window, tmp_project):
+def test_t_is_not_offered_before_the_file_has_been_scanned(make_window, tmp_project, fake_runner):
+    """proof_window refuses a file whose duration is unknown, so T is gated
+    the way it is for a proof already running rather than offered and
+    refused."""
     window = make_window()
     window.open_folder(str(tmp_project(["new.mkv"])))
     activate(window)
     window.queue.setFocus()
+    assert not window.proof_action.isEnabled()
+
     QTest.keyClick(window.queue, Qt.Key.Key_T)
-    assert "duration unknown" in window.inspector.proof_note.text()
+    assert fake_runner.of_kind("proof") == []
+    assert window.inspector.proof_note.text() == ""
+
+    metadata = fake_runner.last("metadata", "new.mkv")
+    fake_runner.finish(metadata, MetadataResult("new.mkv", 1920, 1080, 1400.0, 23.976))
+    window.controller.drain_events()
+    settle()
+    assert window.proof_action.isEnabled()
 
 
 # --------------------------------------------------------------------------

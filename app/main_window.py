@@ -65,7 +65,7 @@ from PyQt6.QtWidgets import (
 
 from app.controller import ProjectController, UnsupportedProjectVersion
 from app.logbook import PIPELINE_LOG
-from app.state_text import can_mark_reviewed
+from app.state_text import can_mark_reviewed, can_run_proof
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
 from app.views.folder_settings import FolderSettingsSheet
@@ -331,15 +331,18 @@ class MainWindow(QMainWindow):
 
     def _sync_actions(self, *_args) -> None:
         """Space and T act on the selected file; neither while the focused
-        widget consumes keys, Space not while the file is PENDING, and T not
-        while that file's proof is already running (ruling C4: T and the
+        widget consumes keys, Space not while the file is PENDING or a value
+        it needs is missing, and T not while that file's proof is already
+        running or its metadata has not been read (ruling C4: T and the
         inspector's "T run" button are one command)."""
         name = self.queue.selected()
         has_file = name is not None and name in self.controller.names()
         focused = QApplication.focusWidget()
         editing = consumes_keys(focused) or self.folder_settings.contains_focus(focused)
-        self.proof_action.setEnabled(has_file and not editing and not self.controller.proof_pending(name))
-        self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
+        entry = self.controller.entry(name) if has_file else None
+        self.proof_action.setEnabled(has_file and not editing and not self.controller.proof_pending(name)
+                                     and can_run_proof(entry))
+        self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(entry))
 
     def report_unexpected_error(self, text: str) -> None:
         """An exception nothing handled (see app/__main__.py's excepthook): its
