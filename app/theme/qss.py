@@ -202,7 +202,7 @@ QPushButton#SegmentItem[on="true"] {{
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE2};
 }}
-""".strip("\n") + "\n" + _views_stylesheet() + "\n" + _folder_settings_stylesheet()
+""".strip("\n") + "\n" + _views_stylesheet() + "\n" + _folder_settings_stylesheet() + "\n" + _run_stylesheet()
 
 
 def _views_stylesheet() -> str:
@@ -451,6 +451,110 @@ QLabel#OpenTitle {{
 QLabel#OpenError {{
     color: {tokens.BAD};
     font-size: {tokens.FONT_SIZE_BTN_SM}px;
+}}
+""".strip("\n")
+
+
+def _run_stylesheet() -> str:
+    """The run mode (plan 3B Task 5): the top bar's start error, the Run view
+    (tabs-hifi.html figure 4: `.rrow`, `.feed`, the live panel) and the logs
+    window."""
+    return f"""
+/* == Run (plan 3B Task 5) ============================================== */
+QLabel#StartError {{
+    color: {tokens.BAD};
+    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+}}
+
+/* -- Run view: table (.rrow), footer, live panel (.feed) --------------- */
+QWidget#RunView, QWidget#RunTable, QWidget#RunRows, QWidget#FeedLines,
+QScrollArea#RunScroll, QScrollArea#FeedScroll,
+QScrollArea#RunScroll > QWidget#qt_scrollarea_viewport,
+QScrollArea#FeedScroll > QWidget#qt_scrollarea_viewport {{
+    background-color: {tokens.BG};
+    border: none;
+}}
+QWidget#RunRow, QWidget#RunHeader {{
+    background: transparent;
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QWidget#RunRow[last="true"] {{
+    border-bottom: none;
+}}
+QLabel#RunHeaderCell {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_SCOPE}px;
+}}
+QLabel#RunFile, QLabel#RunPhase, QLabel#RunResult {{
+    color: {tokens.TXT};
+    font-size: {tokens.FONT_SIZE_BODY}px;
+}}
+QLabel#RunPhase[tone="ok"], QLabel#RunResult[tone="ok"] {{
+    color: {tokens.OK};
+}}
+QLabel#RunPhase[tone="bad"] {{
+    color: {tokens.BAD};
+}}
+QLabel#RunPhase[tone="dim"] {{
+    color: {tokens.DIM2};
+}}
+QWidget#RunFooter {{
+    background-color: {tokens.BG};
+    border-top: 1px solid {tokens.LINE};
+}}
+QWidget#RunFooter QLabel {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+}}
+QWidget#LivePanel {{
+    background-color: {tokens.BG};
+    border-left: 1px solid {tokens.LINE};
+}}
+QLabel#LiveTitle {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_SCOPE}px;
+}}
+QWidget#FeedLine {{
+    background: transparent;
+    border-bottom: 1px dashed {tokens.LINE};
+}}
+QLabel#FeedTime {{
+    color: {tokens.DIM2};
+    font-size: {tokens.FONT_SIZE_SM}px;
+}}
+QLabel#FeedText {{
+    color: {tokens.TXT};
+    font-size: 11px;
+}}
+
+/* -- Logs window ------------------------------------------------------- */
+QWidget#LogsWindow, QWidget#LogsList, QScrollArea#LogsScroll,
+QScrollArea#LogsScroll > QWidget#qt_scrollarea_viewport {{
+    background-color: {tokens.BG};
+    border: none;
+}}
+QPushButton#LogHeader {{
+    text-align: left;
+    font-size: {tokens.FONT_SIZE_BODY}px;
+    padding: 5px 9px;
+    color: {tokens.TXT};
+    background-color: {tokens.PANEL2};
+    border: 1px solid {tokens.LINE};
+    border-radius: {tokens.RADIUS_BTN}px;
+}}
+QPushButton#LogHeader:checked {{
+    border-color: {tokens.LINE2};
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}}
+QPlainTextEdit#LogBody {{
+    background-color: {tokens.PANEL};
+    color: {tokens.TXT};
+    border: 1px solid {tokens.LINE};
+    border-top: none;
+    font-size: 11px;
+    selection-background-color: {tokens.ACC};
+    selection-color: {tokens.PRIMARY_TEXT};
 }}
 """.strip("\n")
 

@@ -1130,6 +1130,56 @@ def test_run_end_re_derives_done_states(make_controller, fake_runner, tmp_projec
     assert controller.startable_files() == ["ep02.mkv"]
 
 
+def test_parallel_files_changed_during_a_run_reach_the_run_job(
+        make_controller, fake_runner, tmp_project, notifications, monkeypatch):
+    names = ["ep01.mkv", "ep02.mkv", "ep03.mkv"]
+    folder = tmp_project(names, config=manual_config(names, ocr_parallel=2))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    calls = []
+    spy_method(monkeypatch, RunJob, "set_parallel", calls)
+
+    controller.update_folder(ocr_parallel=3)                    # no run: nothing to reach
+    assert calls == []
+    controller.start_run(names)
+    run = fake_runner.last("run")
+    assert run.job.parallel == 3 and controller.run_snapshot().parallel == 3
+    run_changed = Spy(controller.run_changed)
+
+    controller.update_folder(ocr_parallel=4)
+    assert calls == [(4,)]
+    assert run.job.parallel == 4 and controller.project.folder.ocr_parallel == 4
+    assert controller.run_snapshot().parallel == 4 and run_changed.calls
+
+    with pytest.raises(ValueError):
+        controller.update_folder(ocr_parallel=0)
+    assert run.job.parallel == 4 and controller.project.folder.ocr_parallel == 4
+    controller.update_folder(labels_enabled=not controller.project.folder.labels_enabled, ocr_parallel=4)
+    assert calls == [(4,)]                                      # parallel unchanged: not sent again
+
+    run_to_end(fake_runner, run, RunSummary(names, {}, [], 3.0))
+    controller.drain_events()
+    controller.update_folder(ocr_parallel=1)                    # the run is over
+    assert run.job.parallel == 4 and controller.run_snapshot().parallel == 4
+
+
+def test_a_run_job_that_cannot_add_workers_is_logged_and_the_setting_kept(
+        make_controller, fake_runner, tmp_project, monkeypatch):
+    names = ["ep01.mkv", "ep02.mkv"]
+    folder = tmp_project(names, config=manual_config(names, ocr_parallel=1))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    controller.start_run(names)
+
+    def refuse(self, parallel):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(RunJob, "set_parallel", refuse)
+    controller.update_folder(ocr_parallel=2)
+    assert controller.project.folder.ocr_parallel == 2
+    assert "can't start new thread" in controller.log_text("Pipeline")
+
+
 def test_pause_resume_and_stop_the_run(make_controller, fake_runner, tmp_project, notifications):
     names = ["ep01.mkv", "ep02.mkv"]
     folder = tmp_project(names, config=manual_config(names))
