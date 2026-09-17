@@ -1,6 +1,7 @@
 """Project JSON store: v2 `.ocr.json` read/write, v1 migration dispatch,
 and reconciliation against the video files actually on disk.
 """
+import copy
 import json
 import logging
 import shutil
@@ -165,8 +166,8 @@ def to_json(project: Project) -> dict:
             "review": entry.review.value,
             "skipped": entry.skipped,
             "sample_time": entry.sample_time,
-            "flags": dict(entry.flags),
-            "evidence": dict(entry.evidence),
+            "flags": dict(entry.flags),  # str -> str: a shallow copy is a full copy, values are scalar
+            "evidence": copy.deepcopy(entry.evidence),  # str -> dict: shallow copy would still alias the nested dicts
         }
 
     return {
@@ -252,7 +253,7 @@ def from_json(data: dict, project_dir: str) -> Project:
             skipped=fd.get("skipped", False),
             sample_time=fd.get("sample_time"),
             flags=dict(fd.get("flags") or {}),
-            evidence=dict(fd.get("evidence") or {}),
+            evidence=copy.deepcopy(fd.get("evidence") or {}),
         )
 
     return Project(path=project_dir, folder=folder, files=files, migrated_from_v1=False)

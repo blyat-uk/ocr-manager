@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.project.migrate import migrate_v1
 from core.project.model import (
     Brightness,
     Crop,
@@ -147,7 +148,11 @@ def test_default_brightness_constant_is_230():
 
 def test_crop_and_brightness_produce_expected_kwargs():
     entry = _entry_crop_and_brightness()
-    folder = FolderSettings()
+    # labels_enabled=False: isolates crop/brightness from the label kwargs,
+    # which get their own tests below. FolderSettings()'s own default is
+    # now True (matches the old app -- see test_labels_disabled_... for the
+    # labels-off shape pinned on its own).
+    folder = FolderSettings(labels_enabled=False)
 
     call = ocr_call_for(entry, folder, PROJECT_DIR)
 
@@ -173,7 +178,7 @@ def test_crop_and_brightness_produce_expected_kwargs():
 
 def test_no_crop_falls_back_to_default_brightness():
     entry = _entry_no_crop_no_brightness()
-    folder = FolderSettings()
+    folder = FolderSettings(labels_enabled=False)  # isolates brightness fallback from label kwargs
 
     call = ocr_call_for(entry, folder, PROJECT_DIR)
 
@@ -294,6 +299,45 @@ def test_no_ranges_yields_empty_list():
     folder = FolderSettings()
 
     call = ocr_call_for(entry, folder, PROJECT_DIR)
+
+    assert call.time_ranges == []
+
+
+# --- composing regression: migrate_v1() feeding straight into ocr_call_for -
+
+
+def test_migrated_all_empty_time_ranges_entry_composes_to_empty_ocr_call_time_ranges():
+    """A v1 file entry whose only `time_ranges` list entries are all empty
+    (start AND end both blank) migrates via `migrate_v1()` to
+    `time_ranges=None` (whole file -- the Task 1 follow-up drop-empty-
+    ranges fix in core/project/migrate.py), and `ocr_call_for()` then maps
+    that `None` the same way it maps a file with no `time_ranges` key at
+    all: to `[]`.
+
+    This composes to the exact same OCR request the old app made for this
+    shape: the run job only ever calls `save_subtitles_to_file` (its
+    single-session, <=1-range call) when `len(time_ranges) <= 1`, passing
+    `time_start='0:00', time_end=''` for the implicit whole-file case --
+    i.e. an empty `[]` list here and the old code's one-element
+    `[('0:00', '')]` list both resolve to that identical single whole-file
+    call; `[]` is just how a fully-resolved FileEntry represents "no
+    ranges" instead of carrying an explicit placeholder range around.
+    """
+    data = {
+        "files": {
+            "vid.mkv": {
+                "time_ranges": [
+                    {"start": "", "end": ""},
+                    {"start": None, "end": None},
+                ],
+            },
+        },
+    }
+    project = migrate_v1(data, PROJECT_DIR, ["vid.mkv"])
+    entry = project.files["vid.mkv"]
+    assert entry.time_ranges is None  # pins the Task 1 follow-up this composes with
+
+    call = ocr_call_for(entry, project.folder, PROJECT_DIR)
 
     assert call.time_ranges == []
 

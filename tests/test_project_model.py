@@ -61,6 +61,14 @@ def test_labels_only_false_when_labels_disabled():
     assert fs.labels_only is False
 
 
+def test_folder_settings_default_labels_enabled_is_true():
+    """Matches the old app's default (core.config.Config.labels_enabled =
+    True, old UI checkbox default checked) so a fresh, never-saved project
+    keeps label detection on like before.
+    """
+    assert FolderSettings().labels_enabled is True
+
+
 # --- list_video_files -----------------------------------------------------
 
 
@@ -91,6 +99,18 @@ def test_load_project_fresh_when_no_config_file(tmp_path):
     assert all(isinstance(e, FileEntry) for e in project.files.values())
     assert project.files["one.mkv"].review == ReviewState.PENDING
     assert project.folder == FolderSettings()
+
+
+def test_load_project_fresh_when_no_config_file_has_labels_enabled(tmp_path):
+    """A fresh project (no .ocr.json at all) must keep label detection on,
+    matching the old app's default -- only a migrated v1 project's own
+    saved value should ever turn it off.
+    """
+    _touch(tmp_path / "one.mkv")
+
+    project = load_project(str(tmp_path))
+
+    assert project.folder.labels_enabled is True
 
 
 def test_load_project_reads_v2_round_trip(tmp_path):
@@ -325,14 +345,42 @@ def test_to_json_folder_includes_label_mask_crops_as_lists(tmp_path):
     assert payload["folder"]["label_mask_crops"] == [[1, 2, 3, 4], [5, 6, 7, 8]]
 
 
-def test_to_json_evidence_is_copied_mutating_payload_does_not_mutate_model(tmp_path):
+def test_to_json_evidence_is_deep_copied_mutating_nested_value_does_not_mutate_model(tmp_path):
+    """entry.evidence is dict[str, dict] -- a shallow dict(...) copy only
+    protects the top-level dict, not the nested per-key dicts, so a caller
+    mutating a NESTED value in the returned payload (e.g. changing a score
+    inside evidence["crop"]) must not reach back into the model.
+    """
     project = _fully_populated_project(tmp_path)
     payload = to_json(project)
 
+    # Nested mutation -- what a shallow dict(...) copy fails to protect.
+    payload["files"]["a.mkv"]["evidence"]["crop"]["score"] = 999
+    # Top-level mutations too, for good measure.
     payload["files"]["a.mkv"]["evidence"]["new_key"] = {"whatever": True}
-    del payload["files"]["a.mkv"]["evidence"]["crop"]
+    del payload["files"]["a.mkv"]["evidence"]["brightness"]
 
     assert project.files["a.mkv"].evidence == {
         "crop": {"score": 0.9},
         "brightness": {"plateau": [200, 220]},
     }
+
+
+def test_from_json_deep_copies_evidence_so_caller_held_input_cant_alias_model(tmp_path):
+    """from_json must not alias the model's evidence with the caller's
+    input dict either -- mutating the dict the caller passed in (including
+    a nested value) after the call must not reach the model.
+    """
+    evidence_in = {"crop": {"score": 0.5}}
+    data = {
+        "version": 2,
+        "folder": {},
+        "files": {"a.mkv": {"evidence": evidence_in}},
+    }
+
+    project = from_json(data, str(tmp_path))
+
+    evidence_in["crop"]["score"] = 999
+    evidence_in["new_key"] = "leak"
+
+    assert project.files["a.mkv"].evidence == {"crop": {"score": 0.5}}
