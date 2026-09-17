@@ -46,7 +46,10 @@ Auto-pilot holds
 Run
     start_run snapshots each file's OCR call (ocr_call_for), holds auto-pilot
     and submits a RunJob; nothing is deleted (ruling C5). Per-file outcomes
-    come from run_file_finished events and the RunSummary. When the run ends:
+    come from run_file_finished events and the RunSummary. Changing
+    ocr_parallel during the run reaches the run job (RunJob.set_parallel):
+    files not yet started follow the new limit, in-flight files carry on.
+    When the run ends:
     auto-pilot holds are re-derived, done states re-read, the folder is
     reconciled (the watcher ignores changes while a run writes chi/) and,
     unless the user stopped it, notify-send reports it as today.
@@ -100,6 +103,7 @@ from core.project.store import UnsupportedProjectVersion
 logger = logging.getLogger(__name__)
 
 BOTH_OFF_MESSAGE = "At least one of dialogue or labels must be on."
+PARALLEL_MESSAGE = "Parallel files must be at least 1."
 READY_STATES = frozenset({ReviewState.PROPOSED, ReviewState.REVIEWED})
 BADGE_SKIPPED, BADGE_DONE = "skipped", "done"          # app.state_text.badge_for's texts for those rows
 # The chip a row counts under, once its badge is neither "skipped" nor "done":
@@ -415,7 +419,9 @@ class ProjectController(QObject):
 
     def update_folder(self, **changes) -> None:
         """Replace FolderSettings fields. TypeError for an unknown field;
-        ValueError when dialogue and labels would both be off."""
+        ValueError when dialogue and labels would both be off, or when
+        ocr_parallel is below 1. A new ocr_parallel during a run also goes to
+        the run job."""
         project, autopilot = self._require()
         unknown = sorted(set(changes) - _FOLDER_FIELDS)
         if unknown:
@@ -424,12 +430,16 @@ class ProjectController(QObject):
         if not changes.get("dialogue_enabled", old.dialogue_enabled) and \
                 not changes.get("labels_enabled", old.labels_enabled):
             raise ValueError(BOTH_OFF_MESSAGE)
+        if "ocr_parallel" in changes and int(changes["ocr_parallel"]) < 1:
+            raise ValueError(PARALLEL_MESSAGE)
         if all(getattr(old, key) == value for key, value in changes.items()):
             return
         before = self._states()
         for key, value in changes.items():
             setattr(project.folder, key, value)
         new = project.folder
+        if new.ocr_parallel != old.ocr_parallel:
+            self._set_run_parallel(new.ocr_parallel)
         rules.apply_folder_change(project, old, new)
         autopilot.on_folder_changed(old, new)
         self._emit_folder = True
@@ -565,6 +575,21 @@ class ProjectController(QObject):
         self._run.set_paused(paused)
         self._emit_run = True
         self._flush()
+
+    def _set_run_parallel(self, parallel: int) -> None:
+        """The running run job takes `parallel` files at once from now on.
+        A job that cannot add workers keeps running with those it has; the
+        error is logged and the folder setting stays."""
+        if not self._run_active:
+            return
+        try:
+            self._run_job.set_parallel(parallel)
+        except Exception as exc:                        # e.g. no thread could be started
+            logger.warning("could not change the run's parallel files: %s", exc)
+            self._log(PIPELINE_LOG, f"Could not run {parallel} files at once: {exc}")
+            return
+        self._run.set_parallel(parallel)
+        self._emit_run = True
 
     def stop_run(self) -> None:
         """Cooperative: every in-flight file's cancel is set (ruling C6)."""

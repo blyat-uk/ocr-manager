@@ -20,9 +20,17 @@ canvas nudges with the arrows).
 `report_unexpected_error` is where `python -m app`'s excepthook sends an
 exception raised in a slot: the Pipeline log and a dismissible banner.
 
-"⚙ Folder settings", "⤓ Logs", "▶ Start" and the Review · Run switch are
-wired by plan 3B Tasks 4 and 5 (`open_folder_settings`, `open_logs`,
-`start_run`).
+"⚙ Folder settings" is wired by plan 3B Task 4 (`open_folder_settings`).
+
+Run (plan 3B Task 5, rulings B12, C5): "▶ Start" collects the startable
+files, done ones included; when some already have `chi/` output, one Yes/No
+question (default No, the window's only modal) decides whether they are
+re-run -- nothing is deleted either way. A start the controller refuses
+(e.g. two files writing the same output) is shown beside Start and the mode
+stays. Otherwise the window switches to Run mode: the Run view replaces the
+stage and inspector, the queue stays, and the top bar's Review · Run switch
+goes back and forth. "⤓ Logs" and a queue row's "Open logs" open the
+non-modal logs window.
 """
 from __future__ import annotations
 
@@ -43,6 +51,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QStackedWidget,
     QTextEdit,
@@ -56,6 +65,7 @@ from app.state_text import can_mark_reviewed
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
 from app.views.inspector import Inspector
+from app.views.logs import LogsWindow
 from app.views.open_folder import (
     FolderPicker,
     OpenFolderView,
@@ -65,6 +75,7 @@ from app.views.open_folder import (
     remember_path,
 )
 from app.views.queue import QueueView
+from app.views.run_view import RunView
 from app.views.stage import Stage, StageTab, placeholder_tabs
 from app.views.topbar import APP_NAME, TopBar
 
@@ -79,6 +90,10 @@ CRASH_TITLE = "Something went wrong — details are in Logs (Pipeline)."
 NEWER_VERSION_TEXT = ("This folder was saved by a newer version of OCR Manager (project version {version}). "
                       "Update the app to open it.")
 EXPECTED_OPEN_ERRORS = (UnsupportedProjectVersion, OSError, ValueError)
+MODE_REVIEW, MODE_RUN = 0, 1
+OVERWRITE_TITLE = "Replace existing subtitles?"
+OVERWRITE_TEXT = ("{n} file(s) already have subtitles in chi/. Re-run and replace them when their new output "
+                  "is ready?")
 
 
 def dependency_problems() -> list[tuple[str, str]]:
@@ -146,13 +161,23 @@ class MainWindow(QMainWindow):
         self.queue = QueueView(self.controller)
         self.stage = Stage(self.controller, tabs_factory(self.controller))
         self.inspector = Inspector(self.controller, self.stage)
+        self.run_view = RunView(self.controller)
+        self.logs_window: LogsWindow | None = None
         workbench = QWidget()
         body = QHBoxLayout(workbench)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         body.addWidget(self.queue)
-        body.addWidget(self.stage, 1)
-        body.addWidget(self.inspector)
+        self.review_area = QWidget()
+        review = QHBoxLayout(self.review_area)
+        review.setContentsMargins(0, 0, 0, 0)
+        review.setSpacing(0)
+        review.addWidget(self.stage, 1)
+        review.addWidget(self.inspector)
+        self.modes = QStackedWidget()                    # Review · Run: what sits right of the queue
+        self.modes.addWidget(self.review_area)
+        self.modes.addWidget(self.run_view)
+        body.addWidget(self.modes, 1)
         self.workbench = workbench
         self.centre.addWidget(self.open_view)
         self.centre.addWidget(workbench)
@@ -202,6 +227,7 @@ class MainWindow(QMainWindow):
         self.topbar.folder_settings_requested.connect(self.open_folder_settings)
         self.topbar.logs_requested.connect(lambda: self.open_logs(None))
         self.topbar.start_requested.connect(self.start_run)
+        self.topbar.mode_changed.connect(self.set_mode)
         self.open_view.choose_requested.connect(self.choose_folder)
 
     # --- folders --------------------------------------------------------------------------
@@ -230,11 +256,13 @@ class MainWindow(QMainWindow):
         self.open_view.clear_error()
         self.error_banner.hide()
         self.centre.setCurrentWidget(self.workbench)
+        self.set_mode(MODE_REVIEW)
         self.queue.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_project_closed(self) -> None:
         self.setWindowTitle(APP_NAME)
         self.centre.setCurrentWidget(self.open_view)
+        self.set_mode(MODE_REVIEW)
 
     def _on_selection_changed(self, name) -> None:
         self.stage.set_file(name)
@@ -266,11 +294,49 @@ class MainWindow(QMainWindow):
     def open_folder_settings(self) -> None:
         """The Folder settings sheet (plan 3B Task 4)."""
 
-    def open_logs(self, key: str | None = None) -> None:
-        """The logs window, at `key`'s section (plan 3B Task 5)."""
+    # --- run and logs -----------------------------------------------------------------------
+
+    def mode(self) -> int:
+        return self.modes.currentIndex()
+
+    def set_mode(self, mode: int) -> None:
+        """MODE_REVIEW (stage + inspector) or MODE_RUN (the Run view)."""
+        self.modes.setCurrentIndex(mode)
+        self.topbar.set_mode(mode)
 
     def start_run(self) -> None:
-        """Start the ready files (plan 3B Task 5)."""
+        """Start the startable files. Done files are asked about first; on No
+        they stay out of the run (ruling C5: nothing is deleted)."""
+        controller = self.controller
+        if controller.project is None:
+            return
+        self.topbar.clear_start_error()
+        names = controller.startable_files(include_done=True)
+        replace = controller.files_needing_overwrite(names)
+        if replace:
+            answers = QMessageBox.StandardButton
+            reply = QMessageBox.question(self, OVERWRITE_TITLE, OVERWRITE_TEXT.format(n=len(replace)),
+                                         answers.Yes | answers.No, answers.No)
+            if reply != answers.Yes:
+                names = [name for name in names if name not in set(replace)]
+        if not names:
+            return
+        try:
+            controller.start_run(names)
+        except (ValueError, RuntimeError) as exc:        # e.g. two files write the same chi/ output
+            self.topbar.show_start_error(str(exc))
+            return
+        self.set_mode(MODE_RUN)
+
+    def open_logs(self, key: str | None = None) -> None:
+        """Show the logs window (one per window), at `key`'s section when given."""
+        if self.logs_window is None:
+            self.logs_window = LogsWindow(self.controller, self)
+        self.logs_window.show()
+        self.logs_window.raise_()
+        self.logs_window.activateWindow()
+        if key is not None:
+            self.logs_window.show_key(key)
 
     # --- drag and drop --------------------------------------------------------------------
 
@@ -312,5 +378,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         app_settings().setValue(GEOMETRY_KEY, self.saveGeometry())
+        if self.logs_window is not None:
+            self.logs_window.close()
+        self.run_view.shutdown()
         self.controller.shutdown()
         event.accept()

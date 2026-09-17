@@ -38,6 +38,17 @@ File workers, pause and stop (ruling C6)
     after that. Nothing is killed; run() joins every file worker without a
     timeout, so no thread is abandoned while it holds an engine lease.
 
+    set_parallel(n) changes that limit at any time, from any thread; it
+    changes only how many files run at once, never a file's OCR call. Before
+    the run it sets how many workers run() starts. During the run, raising it
+    starts extra file workers for files not yet started (never more workers
+    than the files still to finish need) and wakes any waiting ones; lowering
+    it stops nothing: in-flight files finish, and a worker takes a new file
+    only while fewer than `parallel` files are in flight, otherwise it waits.
+    After a stop, or once run() has joined its workers, it only records the
+    number. It never reads ctx.cancel_event (only the job's own threads do),
+    and run() joins the workers it added too.
+
     The runner gives no callback on cancel, and a thread blocked on
     ctx.cancel_event.wait() could not be woken at the end of the run without
     setting the event (which would report the run cancelled). So run()'s own
@@ -148,6 +159,11 @@ class RunJob:
         self._stopping = False
         self._workers_left = 0
         self._outcomes: dict[int, tuple[str, str]] = {}
+        # While run() accepts extra workers: its context, the workers it must
+        # join and the next worker's number (thread names run-file-<n>).
+        self._ctx: JobContext | None = None
+        self._added: list[threading.Thread] = []
+        self._next_worker = 0
 
     def pause(self) -> None:
         """Start no new files; in-flight files continue."""
@@ -159,19 +175,46 @@ class RunJob:
             self._paused = False
             self._cond.notify_all()
 
+    def set_parallel(self, parallel: int) -> None:
+        """At most `parallel` files at once from now on (see the module
+        docstring). ValueError below 1. If an extra worker cannot be started,
+        the workers already running carry on and the error is raised."""
+        parallel = int(parallel)
+        if parallel < 1:
+            raise ValueError(f"parallel must be at least 1, got {parallel}")
+        with self._cond:
+            self.parallel = parallel
+            self._cond.notify_all()             # a worker waiting under the old limit may take a file now
+            ctx = self._ctx
+            if ctx is None or self._stopping:
+                return
+            wanted = min(parallel, len(self._in_flight) + len(self._pending))
+            # Started under the lock: a new worker cannot take a file (or end)
+            # before it is counted and listed for run() to join.
+            for _ in range(wanted - self._workers_left):
+                worker = threading.Thread(target=self._work, args=(ctx,),
+                                          name=f"run-file-{self._next_worker}", daemon=True)
+                self._next_worker += 1
+                worker.start()
+                self._workers_left += 1
+                self._added.append(worker)
+
     def run(self, ctx: JobContext) -> RunSummary:
         started = time.perf_counter()
         for sub in OUTPUT_DIRS:
             os.makedirs(os.path.join(self.project_dir, sub), exist_ok=True)
 
-        workers = [threading.Thread(target=self._work, args=(ctx,), name=f"run-file-{index}", daemon=True)
-                   for index in range(min(self.parallel, len(self.files)))]
         with self._cond:
+            workers = [threading.Thread(target=self._work, args=(ctx,), name=f"run-file-{index}", daemon=True)
+                       for index in range(min(self.parallel, len(self.files)))]
             self._pending = deque(enumerate(self.files))
             self._in_flight = set()
             self._stopping = False
             self._outcomes = {}
             self._workers_left = len(workers)
+            self._added = []
+            self._next_worker = len(workers)
+            self._ctx = ctx
 
         running: list[threading.Thread] = []
         try:
@@ -205,12 +248,16 @@ class RunJob:
     # --- file workers -----------------------------------------------------------
 
     def _wait_for_workers(self, ctx: JobContext, workers: list[threading.Thread]) -> None:
+        """Wait until every worker has ended, then join them all: `workers`
+        (run()'s own) and those set_parallel added."""
         with self._cond:
             while self._workers_left > 0:
                 if not self._stopping and ctx.cancel_event.is_set():
                     self._stop_locked()
                 self._cond.wait(STOP_POLL_SECONDS)
-        for worker in workers:
+            self._ctx = None                    # set_parallel adds no worker from here on
+            added, self._added = self._added, []
+        for worker in [*workers, *added]:
             worker.join()
 
     def _stop_locked(self) -> None:
@@ -232,6 +279,7 @@ class RunJob:
                         self._in_flight.discard(cancel_event)
                         if outcome is not None:
                             self._outcomes[index] = outcome
+                        self._cond.notify_all()     # a worker held by the parallel limit may take a file
         finally:
             with self._cond:
                 self._workers_left -= 1
@@ -246,7 +294,7 @@ class RunJob:
                 if ctx.cancel_event.is_set():
                     self._stop_locked()
                     return None
-                if not self._paused:
+                if not self._paused and len(self._in_flight) < self.parallel:
                     break
                 self._cond.wait()
             index, run_file = self._pending.popleft()

@@ -1,4 +1,5 @@
-"""The OCR run as the window sees it: per-file rows, and the end-of-run
+"""The OCR run as the window sees it: per-file rows, the top bar's run
+status (elapsed, ETA), the Run view's idle-worker count, and the end-of-run
 desktop notification text.
 
 Qt-free and pure: RunTracker is fed the run job's events (core/jobs/run.py's
@@ -12,8 +13,10 @@ Times are time.monotonic() seconds.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
+from app.state_text import format_duration
 from core.jobs.run import ERROR_CANCELLED, RunSummary
 
 QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
@@ -129,6 +132,9 @@ class RunTracker:
     def set_paused(self, paused: bool) -> None:
         self._paused = bool(paused)
 
+    def set_parallel(self, parallel: int) -> None:
+        self._parallel = int(parallel)
+
     def set_stopping(self) -> None:
         self._stopping = True
 
@@ -154,6 +160,67 @@ class RunTracker:
         row = self._rows.get(name)
         if row is not None:
             self._rows[name] = replace(row, **changes)
+
+
+# --------------------------------------------------------------------------
+# Run status (the top bar during a run, ruling B13) and idle workers
+# --------------------------------------------------------------------------
+
+def elapsed_seconds(snapshot: RunSnapshot, now: float) -> float:
+    end = snapshot.finished_at if snapshot.finished and snapshot.finished_at is not None else now
+    return max(0.0, end - snapshot.started_at)
+
+
+def eta_seconds(snapshot: RunSnapshot) -> float | None:
+    """Today's OCRManager._calculate_eta: the average time of the files that
+    finished (done or failed; a stopped file is no measure) x the files still
+    queued or running / the files running now (at least 1, at most the
+    remaining). None until a file finished, or when nothing remains."""
+    durations = [row.finished_at - row.started_at for row in snapshot.files
+                 if row.state in (DONE, FAILED) and row.started_at is not None and row.finished_at is not None]
+    remaining = snapshot.count(QUEUED, RUNNING)
+    if not durations or remaining == 0:
+        return None
+    average = sum(durations) / len(durations)
+    active = min(snapshot.count(RUNNING), remaining) or 1
+    return average * remaining / active
+
+
+def eta_text(seconds: float) -> str:
+    """"~20 s left", "~9 min left", "~1 h 5 min left" (rounded up)."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"~{max(1, math.ceil(seconds))} s left"
+    minutes = math.ceil(seconds / 60)
+    if minutes < 60:
+        return f"~{minutes} min left"
+    hours, minutes = divmod(minutes, 60)
+    return f"~{hours} h {minutes} min left" if minutes else f"~{hours} h left"
+
+
+def run_status_text(snapshot: RunSnapshot, now: float) -> str:
+    """"· running · 2 of 5 done · 14:22 elapsed · ~9 min left" ("paused" /
+    "stopping" instead of "running"; no ETA before a file finished or while
+    stopping)."""
+    word = "stopping" if snapshot.stopping else "paused" if snapshot.paused else "running"
+    parts = [word, f"{snapshot.count(DONE)} of {len(snapshot.files)} done",
+             f"{format_duration(elapsed_seconds(snapshot, now))} elapsed"]
+    eta = None if snapshot.stopping else eta_seconds(snapshot)
+    if eta is not None:
+        parts.append(eta_text(eta))
+    return "· " + " · ".join(parts)
+
+
+def idle_workers(snapshot: RunSnapshot, parallel: int) -> int:
+    """Worker slots `parallel` leaves unused while files wait (ruling B13's
+    "N workers idle"): parallel - running files, while the run is going (not
+    paused, stopping or finished), has started a file, and still has queued
+    files; otherwise 0."""
+    if snapshot.finished or snapshot.paused or snapshot.stopping or snapshot.count(QUEUED) == 0:
+        return 0
+    if not any(row.started_at is not None for row in snapshot.files):
+        return 0                                # the run job has not started its files yet
+    return max(0, int(parallel) - snapshot.count(RUNNING))
 
 
 # --------------------------------------------------------------------------

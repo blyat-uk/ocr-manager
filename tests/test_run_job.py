@@ -839,6 +839,171 @@ def test_a_run_paused_from_the_start_and_stopped_cancels_everything(tmp_path, oc
 
 
 # --------------------------------------------------------------------------
+# set_parallel: how many files run at once, changed while the run goes on
+# --------------------------------------------------------------------------
+
+def file_workers() -> list[threading.Thread]:
+    return [thread for thread in threading.enumerate() if thread.name.startswith("run-file-")]
+
+
+class HeldFiles:
+    """OCR hooks that hold each file until the test releases it."""
+
+    def __init__(self, ocr: FakeOcr, names: list[str]):
+        self.entered = {name: threading.Event() for name in names}
+        self.release = {name: threading.Event() for name in names}
+        for name in names:
+            ocr.hooks[name] = self._hold
+
+    def _hold(self, kwargs):
+        name = os.path.basename(kwargs["video_path"])
+        self.entered[name].set()
+        assert self.release[name].wait(WAIT)
+
+    def release_all(self) -> None:
+        for event in self.release.values():
+            event.set()
+
+
+@pytest.mark.parametrize("parallel", [0, -1])
+def test_set_parallel_must_be_at_least_one(tmp_path, parallel):
+    job = RunJob(str(tmp_path), [], 2)
+    with pytest.raises(ValueError):
+        job.set_parallel(parallel)
+    assert job.parallel == 2
+
+
+def test_set_parallel_before_the_run_sets_how_many_files_start(tmp_path, ocr, qa):
+    names = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+    held = HeldFiles(ocr, names)
+    ctx, events = make_ctx()
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 1)
+    job.set_parallel(3)
+    assert job.parallel == 3
+    running = Running(job, ctx)
+    assert all(held.entered[n].wait(WAIT) for n in names[:3])
+    time.sleep(QUIET)
+    assert not events.started("d.mp4")
+    held.release_all()
+    assert running.join().succeeded == names
+    assert ocr.max_active == 3
+
+
+def test_raising_parallel_mid_run_starts_files_not_yet_started(tmp_path, ocr, qa):
+    names = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+    held = HeldFiles(ocr, names)
+    ctx, events = make_ctx()
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 1)
+    running = Running(job, ctx)
+    assert held.entered["a.mp4"].wait(WAIT)
+    time.sleep(QUIET)
+    assert not events.started("b.mp4")
+
+    job.set_parallel(3)
+    assert job.parallel == 3
+    assert held.entered["b.mp4"].wait(WAIT) and held.entered["c.mp4"].wait(WAIT)
+    assert ocr.active == 3                                  # a.mp4 is still in flight: nothing was stopped
+    time.sleep(QUIET)
+    assert not events.started("d.mp4")                      # never more than the new limit
+
+    held.release_all()
+    summary = running.join()
+    assert summary.succeeded == names and summary.cancelled == []
+    assert ocr.max_active == 3
+    assert file_workers() == []                             # every worker, the added ones too, was joined
+
+
+def test_lowering_parallel_mid_run_keeps_in_flight_files_and_limits_new_starts(tmp_path, ocr, qa):
+    names = ["a.mp4", "b.mp4", "c.mp4", "d.mp4", "e.mp4"]
+    held = HeldFiles(ocr, names)
+    ctx, events = make_ctx()
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 3)
+    running = Running(job, ctx)
+    assert all(held.entered[n].wait(WAIT) for n in names[:3])
+
+    job.set_parallel(1)
+    time.sleep(QUIET)
+    assert ocr.active == 3                                  # lowering stops nothing
+    held.release["a.mp4"].set()
+    held.release["b.mp4"].set()
+    assert events.wait_for(lambda: events.finished("a.mp4") and events.finished("b.mp4"))
+    time.sleep(QUIET)
+    assert not events.started("d.mp4")                      # c.mp4 still runs: at the new limit
+    assert events.of("a.mp4")[-1].result["ok"] and events.of("b.mp4")[-1].result["ok"]
+
+    held.release["c.mp4"].set()
+    assert held.entered["d.mp4"].wait(WAIT)
+    time.sleep(QUIET)
+    assert not events.started("e.mp4")                      # one at a time from now on
+
+    held.release_all()
+    summary = running.join()
+    assert summary.succeeded == names and summary.cancelled == []
+    assert file_workers() == []
+
+
+def test_raising_parallel_while_paused_starts_nothing_until_resume(tmp_path, ocr, qa):
+    names = ["a.mp4", "b.mp4", "c.mp4"]
+    held = HeldFiles(ocr, names)
+    ctx, events = make_ctx()
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 1)
+    running = Running(job, ctx)
+    assert held.entered["a.mp4"].wait(WAIT)
+    job.pause()
+    job.set_parallel(3)
+    time.sleep(QUIET)
+    assert not events.started("b.mp4") and not events.started("c.mp4")
+
+    job.resume()
+    assert held.entered["b.mp4"].wait(WAIT) and held.entered["c.mp4"].wait(WAIT)
+    held.release_all()
+    assert running.join().succeeded == names
+
+
+def test_set_parallel_after_a_stop_or_the_end_starts_nothing(tmp_path, ocr, qa):
+    entered = threading.Event()
+    ocr.hooks["a.mp4"] = blocking_until_cancelled(entered)
+    ctx, events = make_ctx()
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in ("a.mp4", "b.mp4", "c.mp4")], 1)
+    running = Running(job, ctx)
+    assert entered.wait(WAIT)
+    ctx.cancel_event.set()
+    job.set_parallel(3)
+    summary = running.join()
+    assert summary.cancelled == ["a.mp4", "b.mp4", "c.mp4"]
+    assert events.of("b.mp4") == [] and events.of("c.mp4") == []
+
+    job.set_parallel(5)                                     # the run is over: only the number changes
+    assert job.parallel == 5
+    assert file_workers() == []
+
+
+def test_set_parallel_from_many_threads_keeps_the_limit(tmp_path, ocr, qa):
+    names = [f"{i:02d}.mp4" for i in range(16)]
+    for name in names:
+        ocr.hooks[name] = lambda kwargs: time.sleep(0.02)
+    ctx, events = make_ctx()
+    job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 1)
+    running = Running(job, ctx)
+
+    def churn(seed: int) -> None:
+        for step in range(40):
+            job.set_parallel(1 + (seed + step) % 4)
+            time.sleep(0.001)
+
+    callers = [threading.Thread(target=churn, args=(seed,)) for seed in range(6)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(WAIT)
+    job.set_parallel(4)
+    summary = running.join()
+    assert summary.succeeded == names
+    assert ocr.max_active <= 4
+    assert file_workers() == []
+
+
+# --------------------------------------------------------------------------
 # Events
 # --------------------------------------------------------------------------
 
