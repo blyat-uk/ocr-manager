@@ -350,6 +350,26 @@ def test_the_run_switch_appears_and_toggles_the_centre_and_right_area(window, fa
     assert window.run_view.names() == []
 
 
+def test_the_folder_settings_sheet_never_covers_the_run_view(window, fake_runner):
+    """B12 plus Task 4: the sheet belongs to Review mode."""
+    window.show()
+    window.open_folder_settings()
+    settle()
+    assert not window.folder_settings.isHidden() and window.mode() == MODE_REVIEW
+
+    run = start(window, fake_runner)                            # the run switches modes: the sheet closes
+    settle()
+    assert window.mode() == MODE_RUN and window.folder_settings.isHidden()
+    assert window.topbar.settings_button.isHidden()              # and its button is gone during the run
+
+    fake_runner.finish(run, RunSummary([], {}, NAMES, 1.0), "cancelled")
+    deliver(window)
+    assert window.mode() == MODE_RUN and not window.topbar.settings_button.isHidden()
+    window.open_folder_settings()                                # opening it comes back to Review
+    settle()
+    assert window.mode() == MODE_REVIEW and not window.folder_settings.isHidden()
+
+
 def test_top_bar_status_text_follows_the_run(window, fake_runner, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])

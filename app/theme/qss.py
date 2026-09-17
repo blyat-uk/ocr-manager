@@ -202,7 +202,7 @@ QPushButton#SegmentItem[on="true"] {{
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE2};
 }}
-""".strip("\n") + "\n" + _views_stylesheet() + "\n" + _run_stylesheet()
+""".strip("\n") + "\n" + _views_stylesheet() + "\n" + _folder_settings_stylesheet() + "\n" + _run_stylesheet()
 
 
 def _views_stylesheet() -> str:
@@ -555,6 +555,94 @@ QPlainTextEdit#LogBody {{
     font-size: 11px;
     selection-background-color: {tokens.ACC};
     selection-color: {tokens.PRIMARY_TEXT};
+}}
+""".strip("\n")
+
+
+def _folder_settings_stylesheet() -> str:
+    """The Folder settings sheet (plan 3B Task 4, `app/views/folder_settings.py`,
+    workbench-hifi.html figure 3): its own `.topbar`-style header, the 150 px
+    vertical `.seg` nav, `.sec` blocks of `.kv` rows with an editor as the
+    value, and the `.drawer` edge (`border-left:1px solid var(--acc-dim)`,
+    ui-spec §2.1's "folder-settings drawer border")."""
+    return f"""
+/* == Folder settings sheet (plan 3B Task 4) ============================ */
+QWidget#FolderSettings {{
+    background-color: {tokens.BG};
+    border-left: 1px solid {tokens.ACC_DIM};
+}}
+QWidget#FolderSettingsHead {{
+    background-color: {tokens.PANEL};
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QLabel#FolderSettingsTitle {{
+    font-size: {tokens.FONT_SIZE_PROJ}px;
+    font-weight: {tokens.FONT_WEIGHT_PROJ};
+    color: {tokens.TXT};
+}}
+QLabel#FolderSettingsScope {{
+    font-size: 11px;
+    color: {tokens.DIM2};
+}}
+QWidget#FolderSettingsNav {{
+    background-color: {tokens.BG};
+    border-right: 1px solid {tokens.LINE};
+}}
+QWidget#SegmentedControl[orientation="vertical"] QPushButton#SegmentItem {{
+    text-align: left;
+    border: 1px solid transparent;
+}}
+QWidget#SegmentedControl[orientation="vertical"] QPushButton#SegmentItem[on="true"] {{
+    border: 1px solid {tokens.LINE2};
+}}
+QWidget#SegmentedControl[orientation="vertical"] QPushButton#SegmentItem:hover {{
+    color: {tokens.TXT};
+}}
+QScrollArea#FolderSettingsScroll,
+QScrollArea#FolderSettingsScroll > QWidget#qt_scrollarea_viewport,
+QWidget#FolderSettingsContent {{
+    background-color: {tokens.BG};
+    border: none;
+}}
+QWidget#FolderSection {{
+    background-color: {tokens.BG};
+}}
+QWidget#FolderSection[first="false"] {{
+    border-top: 1px solid {tokens.LINE};
+}}
+
+/* -- Editors in the kv rows ------------------------------------------- */
+QWidget#FolderSettings QAbstractSpinBox,
+QWidget#FolderSettings QComboBox {{
+    background-color: {tokens.BG};
+    color: {tokens.TXT};
+    border: 1px solid {tokens.LINE2};
+    border-radius: {tokens.RADIUS_TAG}px;
+    padding: 1px 6px;
+    font-size: {tokens.FONT_SIZE_BODY}px;
+    selection-background-color: {tokens.ACC_DIM};
+    selection-color: {tokens.TXT};
+}}
+QWidget#FolderSettings QAbstractSpinBox:hover,
+QWidget#FolderSettings QComboBox:hover {{
+    border-color: {tokens.DIM2};
+}}
+QWidget#FolderSettings QAbstractSpinBox:focus,
+QWidget#FolderSettings QComboBox:focus {{
+    border-color: {tokens.ACC};
+}}
+QWidget#FolderSettings QAbstractSpinBox::up-button,
+QWidget#FolderSettings QAbstractSpinBox::down-button {{
+    width: 0;
+    border: none;
+}}
+QWidget#FolderSettings QComboBox QAbstractItemView {{
+    background-color: {tokens.PANEL2};
+    color: {tokens.TXT};
+    border: 1px solid {tokens.LINE2};
+    selection-background-color: {tokens.ROW_SELECTED};
+    selection-color: {tokens.TXT};
+    outline: none;
 }}
 """.strip("\n")
 

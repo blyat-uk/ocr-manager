@@ -20,7 +20,11 @@ canvas nudges with the arrows).
 `report_unexpected_error` is where `python -m app`'s excepthook sends an
 exception raised in a slot: the Pipeline log and a dismissible banner.
 
-"⚙ Folder settings" is wired by plan 3B Task 4 (`open_folder_settings`).
+"⚙ Folder settings" opens the sheet of plan 3B Task 4
+(`open_folder_settings`). It belongs to reviewing, so it never covers the
+Run view: opening it switches back to Review mode, and switching to Run
+closes it. During a run the top bar hides its button anyway (B12), while
+"⤓ Logs" stays.
 
 Run (plan 3B Task 5, rulings B12, C5): "▶ Start" collects the startable
 files, done ones included; when some already have `chi/` output, one Yes/No
@@ -64,6 +68,7 @@ from app.logbook import PIPELINE_LOG
 from app.state_text import can_mark_reviewed
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
+from app.views.folder_settings import FolderSettingsSheet
 from app.views.inspector import Inspector
 from app.views.logs import LogsWindow
 from app.views.open_folder import (
@@ -186,6 +191,7 @@ class MainWindow(QMainWindow):
         self.activity_strip = ActivityStrip(self.controller)
         column.addWidget(self.activity_strip)
         self.setCentralWidget(central)
+        self.folder_settings = FolderSettingsSheet(self.controller, central, anchor=self.centre)
 
         self._connect()
         self.quit_action = self._shortcut("Quit", "Ctrl+Q", self.close)
@@ -226,6 +232,7 @@ class MainWindow(QMainWindow):
         self.inspector.tab_requested.connect(self._on_tab_requested)
         self.topbar.open_requested.connect(self.choose_folder)
         self.topbar.folder_settings_requested.connect(self.open_folder_settings)
+        self.folder_settings.closed.connect(lambda: self.queue.setFocus(Qt.FocusReason.OtherFocusReason))
         self.topbar.logs_requested.connect(lambda: self.open_logs(None))
         self.topbar.start_requested.connect(self.start_run)
         self.topbar.mode_changed.connect(self.set_mode)
@@ -275,7 +282,8 @@ class MainWindow(QMainWindow):
         widget consumes keys, and Space not while the file is PENDING."""
         name = self.queue.selected()
         has_file = name is not None and name in self.controller.names()
-        editing = consumes_keys(QApplication.focusWidget())
+        focused = QApplication.focusWidget()
+        editing = consumes_keys(focused) or self.folder_settings.contains_focus(focused)
         self.proof_action.setEnabled(has_file and not editing)
         self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
 
@@ -293,7 +301,10 @@ class MainWindow(QMainWindow):
     # --- later tasks ----------------------------------------------------------------------
 
     def open_folder_settings(self) -> None:
-        """The Folder settings sheet (plan 3B Task 4)."""
+        """The Folder settings sheet (plan 3B Task 4), over the review
+        layout: it never covers the Run view."""
+        self.set_mode(MODE_REVIEW)
+        self.folder_settings.open()
 
     # --- run and logs -----------------------------------------------------------------------
 
@@ -301,7 +312,10 @@ class MainWindow(QMainWindow):
         return self.modes.currentIndex()
 
     def set_mode(self, mode: int) -> None:
-        """MODE_REVIEW (stage + inspector) or MODE_RUN (the Run view)."""
+        """MODE_REVIEW (stage + inspector) or MODE_RUN (the Run view). The
+        Folder settings sheet belongs to Review, so Run closes it."""
+        if mode == MODE_RUN:
+            self.folder_settings.close_sheet()
         self.modes.setCurrentIndex(mode)
         self.topbar.set_mode(mode)
 
