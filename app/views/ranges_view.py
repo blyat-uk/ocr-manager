@@ -237,15 +237,16 @@ def _merged(keeps) -> list[tuple[float, float]]:
 
 
 def header_text(name: str, duration: float, others) -> str:
-    """"ep01.mkv · 27:08 · other episodes 23:38–27:08" (ui-spec §3.3): the
-    stage head's dim line for this tab. Parts nothing is known about are
-    left out rather than shown as "—"."""
+    """"ep01.mkv · 27:08 · other episodes 23:38 – 27:08" (ui-spec §3.3): the
+    stage head's dim line for this tab, spaced around the dash as
+    `tabs-hifi` renders it. Parts nothing is known about are left out rather
+    than shown as "—"."""
     parts = [name]
     if duration > 0:
         parts.append(format_duration(duration))
     known = sorted(float(value) for value in others if value and float(value) > 0)
     if known:
-        parts.append(f"other episodes {format_duration(known[0])}–{format_duration(known[-1])}")
+        parts.append(f"other episodes {format_duration(known[0])} – {format_duration(known[-1])}")
     return " · ".join(parts)
 
 
@@ -926,7 +927,7 @@ class RangesTab:
         return self.panel
 
     def toolbar(self) -> QWidget:
-        """"{name} · {duration} · other episodes {min}–{max}" (ui-spec §3.3),
+        """"{name} · {duration} · other episodes {min} – {max}" (ui-spec §3.3),
         which the Stage mounts in the stage head."""
         return self._toolbar
 

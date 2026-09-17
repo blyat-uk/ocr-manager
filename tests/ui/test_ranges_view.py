@@ -445,12 +445,18 @@ def test_removing_a_range_commits_the_rest(controller):
 
 def test_a_second_refresh_leaves_no_row_behind(tab):
     """A row only removed from the layout stays a child of the panel, at its
-    default size, painting over everything under it."""
-    panel = tab.inspector_panel()
+    default size, painting over everything under it -- which is how the
+    panel's buttons went missing. `held` stands in for whatever outlives the
+    refresh that dropped the row (a row's own signal connections do)."""
+    panel, page = tab.inspector_panel(), tab.page()
+    held = panel.findChildren(KeepRow) + page.findChildren(WarningRow)
+    assert len(held) == 2
     tab.refresh()
     tab.refresh()
+    rows = panel.findChildren(KeepRow) + page.findChildren(WarningRow)
     assert len(panel.findChildren(KeepRow)) == 1
-    assert len(tab.page().findChildren(WarningRow)) == 1
+    assert len(page.findChildren(WarningRow)) == 1
+    assert not set(rows) & set(held)
     assert not panel.add_button.isHidden()
 
 
@@ -483,7 +489,7 @@ def test_use_whole_file_commits_none(tab, controller):
 # --------------------------------------------------------------------------
 
 def test_the_header_names_the_file_its_duration_and_the_other_episodes(tab):
-    assert tab.header_text() == "ep01.mkv · 27:08 · other episodes 23:38–27:08"
+    assert tab.header_text() == "ep01.mkv · 27:08 · other episodes 23:38 – 27:08"
 
 
 def test_the_header_drops_the_other_episodes_when_none_is_known(controller):

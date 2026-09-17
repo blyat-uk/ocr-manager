@@ -203,6 +203,15 @@ class _KvList(QWidget):
         if keys != self._keys:
             for row in self._rows:
                 self._layout.removeWidget(row)
+                # ... and unparent it. `removeWidget` only takes the row out
+                # of the layout: it stays a child of this widget, at whatever
+                # size it had -- a row that was never laid out keeps QWidget's
+                # default 640x480 -- and paints over everything beneath it
+                # until it is really deleted. A row nothing else holds is
+                # freed with this frame, but one held by so much as a signal
+                # connection of its own outlives it (see
+                # app/views/ranges_view.py, where that hid a row of buttons).
+                row.setParent(None)
                 row.deleteLater()
             self._rows = []
             for index, key in enumerate(keys):
