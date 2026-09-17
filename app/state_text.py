@@ -58,20 +58,46 @@ def _flag_blocks(flag: str | None, informational) -> bool:
     return bool(flag) and not only_informational(flag, informational)
 
 
+def _is_detected_value(value) -> bool:
+    """Mirrors core.jobs.apply._is_detected(): only a DETECTED/HINT value
+    counts as "currently detected" for blocking-flag purposes."""
+    return value is not None and value.source in (Source.DETECTED, Source.HINT)
+
+
+def _flag_blocks_detected_value(entry: FileEntry, name: str, value) -> bool:
+    """Mirrors core.jobs.apply's `_is_detected(value) and _blocking(entry,
+    name)`, the ONLY test apply.py uses to decide a stored flag counts
+    against a field. `entry.flags[name]` is never cleared when a flagged
+    DETECTED/HINT value is accepted as MANUAL (mark_reviewed keeps the flag
+    string -- see its own docstring: "its evidence and flag stay stored"),
+    so a leftover blocking flag on a MANUAL/IMPORTED value must NOT count
+    here, or a badge would keep warning about a value the user already
+    accepted."""
+    return _is_detected_value(value) and _flag_blocks(entry.flags.get(name), _INFORMATIONAL_FLAGS[name])
+
+
 def _blocking_fields(entry: FileEntry) -> list[str]:
     """Which of crop/brightness/time-ranges a FLAGGED badge should name, in
-    B10's order. crop/brightness: missing (None, or a stale brightness --
-    see brightness_is_stale) or carrying a blocking flag, mirroring
-    core.jobs.apply's own `_counts_as_missing`/`_blocking`. ranges: no
-    "missing" concept (no keep ranges just means the whole file), so only a
-    blocking `entry.flags["ranges"]` counts."""
+    B10's order -- mirroring core.jobs.apply.compute_review_state()'s two
+    independent reasons a required field can need attention:
+    - missing (`_counts_as_missing`): crop is None; brightness is None or
+      stale (`brightness_is_stale` itself only ever calls a DETECTED/HINT
+      brightness stale, so this needs no extra source check);
+    - a blocking flag on a value apply.py still considers "detected"
+      (`_flag_blocks_detected_value`, `_is_detected(value) and
+      _blocking(entry, name)`) -- NOT simply "entry.flags[name] blocks",
+      since that string outlives the value becoming MANUAL/IMPORTED.
+    ranges: no "missing" concept (no keep ranges just means the whole
+    file), so only a blocking flag on a still-DETECTED/HINT time_ranges
+    value counts -- core/jobs/apply.py writes neither today (ranges is
+    never required and never flagged), see the module docstring."""
     fields = []
-    if entry.crop is None or _flag_blocks(entry.flags.get("crop"), _INFORMATIONAL_FLAGS["crop"]):
+    if entry.crop is None or _flag_blocks_detected_value(entry, "crop", entry.crop):
         fields.append("crop")
     if (entry.brightness is None or brightness_is_stale(entry)
-            or _flag_blocks(entry.flags.get("brightness"), _INFORMATIONAL_FLAGS["brightness"])):
+            or _flag_blocks_detected_value(entry, "brightness", entry.brightness)):
         fields.append("brightness")
-    if _flag_blocks(entry.flags.get("ranges"), _INFORMATIONAL_FLAGS["ranges"]):
+    if _flag_blocks_detected_value(entry, "ranges", entry.time_ranges):
         fields.append("ranges")
     return fields
 

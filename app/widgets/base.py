@@ -280,7 +280,7 @@ class _BarTrack(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect())
-        radius = min(2.0, rect.height() / 2)
+        radius = min(float(tokens.RADIUS_XS), rect.height() / 2)
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
         painter.setPen(Qt.PenStyle.NoPen)

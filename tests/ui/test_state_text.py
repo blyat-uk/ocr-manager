@@ -17,11 +17,17 @@ from pathlib import Path
 import pytest
 
 from app import state_text
+from core.detect.brightness import BrightnessResult
+from core.detect.crop import CropResult
+from core.jobs import apply as apply_mod
+from core.jobs.detect_jobs import BrightnessJobResult, CropJobResult
 from core.project.model import (
     Brightness,
     Crop,
     FileEntry,
+    FolderSettings,
     Media,
+    Project,
     ReviewState,
     Source,
     TimeRange,
@@ -119,12 +125,28 @@ def test_badge_flagged_time_ranges_synthetic():
     # core/jobs/apply.py never writes entry.flags["ranges"] today (ranges is
     # not a required field), but badge_for() still recognises it -- see the
     # module docstring -- so this constructs the FileEntry directly rather
-    # than going through apply.py.
+    # than going through apply.py. The ranges value must be DETECTED/HINT
+    # sourced for the flag to count (mirroring core.jobs.apply's own
+    # DETECTED/HINT gating, fix round 1) -- a MANUAL/IMPORTED one would not.
     entry = _entry(review=ReviewState.FLAGGED, crop=Crop(0, 0, 10, 10, Source.DETECTED),
                    brightness=Brightness(200, Source.DETECTED),
+                   time_ranges=TimeRanges([], Source.DETECTED),
                    flags={"ranges": "some-future-blocking-reason"})
     assert state_text.badge_for(entry, running_detectors=set(), done=False,
                                 run_state=None) == ("check time ranges", "warn")
+
+
+def test_badge_flagged_time_ranges_ignored_when_manual():
+    entry = _entry(review=ReviewState.FLAGGED, crop=Crop(0, 0, 10, 10, Source.DETECTED),
+                   brightness=Brightness(200, Source.DETECTED),
+                   time_ranges=TimeRanges([], Source.MANUAL),
+                   flags={"ranges": "some-future-blocking-reason"})
+    # brightness has no issue of its own here, and crop is clean too, so
+    # with the leftover ranges flag correctly ignored the file should read
+    # as if nothing at all were flagged for these three fields -- exercised
+    # indirectly through _blocking_fields() since badge_for() only reaches
+    # _flagged_text() when entry.review is already FLAGGED.
+    assert "ranges" not in state_text._blocking_fields(entry)
 
 
 def test_badge_reviewed():
@@ -161,6 +183,175 @@ def test_badge_run_state_overrides_skipped():
     entry = _entry(review=ReviewState.PENDING, skipped=True)
     assert state_text.badge_for(entry, running_detectors=set(), done=False,
                                 run_state="running") == ("running", "default")
+
+
+# --------------------------------------------------------------------------
+# badge_for() driven through the REAL core.jobs.apply functions (fix round
+# 1: a leftover blocking flag on a value apply.py no longer counts as
+# DETECTED/HINT -- e.g. once mark_reviewed() has accepted it as MANUAL --
+# must not make badge_for() name that field).
+# --------------------------------------------------------------------------
+
+def _project(entry: FileEntry) -> Project:
+    return Project(path="/tmp/proj", folder=FolderSettings(), files={entry.name: entry})
+
+
+def test_badge_matches_apply_rules_when_a_flagged_detected_value_becomes_manual():
+    """Regression for the coordinator's fix-round-1 repro: crop DETECTED +
+    "low-agreement", brightness DETECTED + stale + "differs-from-hint?",
+    then apply.mark_reviewed(project, name, True). crop becomes MANUAL (its
+    blocking flag string is left behind, unread -- core/jobs/apply.py never
+    clears entry.flags on acceptance); brightness stays DETECTED and stale,
+    so the file stays FLAGGED for brightness only. Before the fix,
+    badge_for() also reported "check crop" because it looked at
+    entry.flags["crop"] alone, ignoring that crop's value was no longer
+    DETECTED/HINT."""
+    entry = FileEntry(name="ep01.mp4")
+    project = _project(entry)
+    box1 = (10, 780, 1300, 60)
+    box2 = (12, 782, 1300, 58)
+
+    # 1. Clean crop detection -> DETECTED, box1.
+    apply_mod.apply_crop(project, CropJobResult(
+        file=entry.name,
+        result=CropResult(box=box1, agreed=12, probes_used=12, flagged=None, frame_size=(1920, 1080)),
+        hint=None,
+    ))
+    assert entry.crop == Crop(*box1, Source.DETECTED)
+
+    # 2. Brightness measured against box1 -> DETECTED, tied to box1.
+    apply_mod.apply_brightness(project, BrightnessJobResult(
+        file=entry.name,
+        result=BrightnessResult(value=210, plateau=(200, 220), seed=210, gate_floor=180,
+                                flagged=None, curve=[(200, 0.9)]),
+        tiles={}, hint_value=None, crop_box=box1,
+    ))
+    assert entry.brightness == Brightness(210, Source.DETECTED)
+
+    # 3. A clean re-detect moves the crop to box2 -- auto-applicable, so it
+    #    overwrites the box. Brightness's stored value was measured on
+    #    box1, so it is now stale.
+    apply_mod.apply_crop(project, CropJobResult(
+        file=entry.name,
+        result=CropResult(box=box2, agreed=12, probes_used=12, flagged=None, frame_size=(1920, 1080)),
+        hint=None,
+    ))
+    assert entry.crop == Crop(*box2, Source.DETECTED)
+    assert apply_mod.brightness_is_stale(entry)
+
+    # 4. A later re-detect on box2 disagrees (low-agreement) -- NOT
+    #    auto-applicable, so the box is untouched, but the blocking flag is
+    #    stored.
+    apply_mod.apply_crop(project, CropJobResult(
+        file=entry.name,
+        result=CropResult(box=box2, agreed=3, probes_used=12, flagged="low-agreement", frame_size=(1920, 1080)),
+        hint=None,
+    ))
+    assert entry.crop == Crop(*box2, Source.DETECTED)
+    assert entry.flags["crop"] == "low-agreement"
+
+    # 5. A hint re-detect on brightness disagrees too ("dim-text?" is not
+    #    auto-applicable either), so the stored value (still measured on
+    #    box1) is untouched, but "differs-from-hint?" is composed onto
+    #    entry.flags["brightness"].
+    apply_mod.apply_brightness(project, BrightnessJobResult(
+        file=entry.name,
+        result=BrightnessResult(value=210, plateau=None, seed=210, gate_floor=180,
+                                flagged="dim-text?", curve=[]),
+        tiles={}, hint_value=150, crop_box=box2,
+    ))
+    assert entry.brightness == Brightness(210, Source.DETECTED)
+    assert "differs-from-hint?" in entry.flags["brightness"]
+    assert apply_mod.brightness_is_stale(entry)
+
+    apply_mod.mark_reviewed(project, entry.name, True)
+    assert entry.crop.source == Source.MANUAL
+    assert entry.flags["crop"] == "low-agreement"          # leftover, no longer read
+    assert entry.brightness.source == Source.DETECTED      # stale: not accepted
+    assert entry.review == ReviewState.FLAGGED
+
+    assert state_text.badge_for(entry, running_detectors=set(), done=False,
+                                run_state=None) == ("check brightness", "warn")
+
+
+def test_badge_ignores_leftover_flag_on_a_manual_value():
+    entry = FileEntry(name="ep02.mp4")
+    project = _project(entry)
+
+    # A low-agreement crop result is never auto-applicable, so nothing is
+    # written -- entry.crop stays None, but the blocking flag is stored.
+    apply_mod.apply_crop(project, CropJobResult(
+        file=entry.name,
+        result=CropResult(box=(10, 780, 1300, 60), agreed=2, probes_used=12,
+                          flagged="low-agreement", frame_size=(1920, 1080)),
+        hint=None,
+    ))
+    assert entry.crop is None
+    assert entry.flags["crop"] == "low-agreement"
+
+    # The user sets the crop by hand; core/jobs/apply.py never clears the
+    # leftover flag string.
+    apply_mod.set_manual_crop(project, entry.name, (12, 782, 1300, 58))
+    assert entry.crop.source == Source.MANUAL
+    assert entry.flags["crop"] == "low-agreement"
+
+    apply_mod.recompute_all(project, pending={}, ranges_pending=False)
+    assert entry.review == ReviewState.FLAGGED   # brightness is still missing
+    assert "crop" not in state_text._blocking_fields(entry)
+
+    assert state_text.badge_for(entry, running_detectors=set(), done=False,
+                                run_state=None) == ("check brightness", "warn")
+
+
+def test_badge_missing_value_is_flagged_without_any_detector_flag():
+    entry = FileEntry(name="ep03.mp4")
+    project = _project(entry)
+
+    apply_mod.set_manual_brightness(project, entry.name, 210)   # crop stays None
+    apply_mod.recompute_all(project, pending={}, ranges_pending=False)
+    assert entry.review == ReviewState.FLAGGED
+    assert entry.flags.get("crop") is None   # never even ran a crop detector
+
+    assert state_text.badge_for(entry, running_detectors=set(), done=False,
+                                run_state=None) == ("check crop", "warn")
+
+
+def test_badge_stale_brightness_is_flagged_even_though_still_detected():
+    entry = FileEntry(name="ep04.mp4")
+    project = _project(entry)
+    box1 = (10, 780, 1300, 60)
+    box2 = (12, 782, 1300, 58)
+
+    apply_mod.apply_crop(project, CropJobResult(
+        file=entry.name,
+        result=CropResult(box=box1, agreed=12, probes_used=12, flagged=None, frame_size=(1920, 1080)),
+        hint=None,
+    ))
+    apply_mod.apply_brightness(project, BrightnessJobResult(
+        file=entry.name,
+        result=BrightnessResult(value=210, plateau=(200, 220), seed=210, gate_floor=180,
+                                flagged=None, curve=[(200, 0.9)]),
+        tiles={}, hint_value=None, crop_box=box1,
+    ))
+    assert entry.brightness.source == Source.DETECTED
+    assert not apply_mod.brightness_is_stale(entry)
+
+    # Re-detecting the crop onto a different box makes the stored
+    # brightness value stale, even though it is still DETECTED and carries
+    # no blocking flag of its own.
+    apply_mod.apply_crop(project, CropJobResult(
+        file=entry.name,
+        result=CropResult(box=box2, agreed=12, probes_used=12, flagged=None, frame_size=(1920, 1080)),
+        hint=None,
+    ))
+    assert apply_mod.brightness_is_stale(entry)
+    assert not entry.flags.get("brightness")   # no blocking flag string at all
+
+    apply_mod.recompute_all(project, pending={}, ranges_pending=False)
+    assert entry.review == ReviewState.FLAGGED
+
+    assert state_text.badge_for(entry, running_detectors=set(), done=False,
+                                run_state=None) == ("check brightness", "warn")
 
 
 # --------------------------------------------------------------------------

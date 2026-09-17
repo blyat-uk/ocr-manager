@@ -88,7 +88,13 @@ INSPECTOR_WIDTH = 322    # .insp
 # Radii (ui-spec.md §2.4, transcribed from the literal CSS this task's
 # widgets use)
 # --------------------------------------------------------------------------
-RADIUS_TAG = 4     # .badge, .mini, .tag, .pbar
+# ui-spec.md's own §2.4 summary table groups `.mini` under its "4px" row,
+# but the literal CSS (`.hf .mini { ... border-radius:2px; ... }`,
+# `.hf .bar { ... border-radius:2px; ... }`) says 2px for both -- read
+# directly from workbench-hifi.html/tabs-hifi.html, which is what
+# _BarTrack (app/widgets/base.py) actually paints.
+RADIUS_XS = 2      # .bar, .mini
+RADIUS_TAG = 4     # .badge, .tag, .pbar
 RADIUS_SEG = 5     # .seg span, .track, .ztile
 RADIUS_BTN = 6     # .btn, .kv, .canvas
 RADIUS_ROW = 7     # .frow
