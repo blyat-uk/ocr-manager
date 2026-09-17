@@ -1660,6 +1660,44 @@ def test_frames_and_strips_are_not_activity(make_controller, fake_runner, tmp_pr
     assert changed.calls == []
 
 
+def test_a_frame_the_cache_evicted_is_not_taken_for_unreadable(make_controller, fake_runner, tmp_project):
+    """"Unavailable" means the grab failed, never "the LRU dropped it": the
+    times that could not be read come from the result, not from what is still
+    in the cache when the last frame of the batch has been stored."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller._frames.max_bytes = 100                        # two of these frames fit, not three
+
+    controller.request_frames("ep01.mkv", [10.0, 20.0, 30.0])
+    fake_runner.finish(fake_runner.last("frames", "ep01.mkv"),
+                       FramesResult("ep01.mkv", {time: _frame(int(time), size=4) for time in (10.0, 20.0, 30.0)}))
+    controller.drain_events()
+    assert controller.frame("ep01.mkv", 10.0) is None         # evicted, not unreadable
+    assert controller.frame("ep01.mkv", 30.0) is not None
+
+    controller.request_frames("ep01.mkv", [10.0])
+    assert [s.job.times for s in fake_runner.of_kind("frames", "ep01.mkv")] == [(10.0, 20.0, 30.0), (10.0,)]
+
+
+def test_requesting_frames_without_an_open_folder_does_nothing(make_controller, fake_runner, tmp_project):
+    """Views ask from paintEvent: a repaint between close_folder() and the
+    view hearing about it must not raise."""
+    controller = make_controller()
+    controller.request_frames("ep01.mkv", [10.0])             # no folder has ever been open
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+
+    controller.open_folder(str(tmp_project(["ep01.mkv"], config=manual_config(["ep01.mkv"]))))
+    controller.close_folder()
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+
+    controller.shutdown(timeout=0.5)
+    controller.request_frames("ep01.mkv", [10.0])             # and on the way out
+
+    assert fake_runner.of_kind("frames") == [] and fake_runner.of_kind("strips") == []
+    assert controller.frame("ep01.mkv", 10.0) is None
+    assert controller.strip("ep01.mkv", BOX, 10.0) is None
+
+
 def test_requesting_frames_for_an_unknown_file_is_refused(make_controller, tmp_project):
     controller, _ = _frames_controller(make_controller, tmp_project)
     with pytest.raises(KeyError):

@@ -17,6 +17,7 @@ import inspect
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +25,17 @@ import pytest
 
 from core.detect import crop as crop_mod
 from core.detect import ocr_view
-from core.jobs.runner import JobContext, Lane
-from core.jobs.view_jobs import FRAME_HEIGHT, FrameJob, FramesResult, StripJob, StripsResult
+from core.jobs.autopilot import PRIORITY, REDETECT_BOOST
+from core.jobs.detect_jobs import PROOF_PRIORITY
+from core.jobs.runner import JobContext, JobRunner, Lane
+from core.jobs.view_jobs import (
+    FRAME_HEIGHT,
+    VIEW_PRIORITY,
+    FrameJob,
+    FramesResult,
+    StripJob,
+    StripsResult,
+)
 
 PROJECT_DIR = "/proj"
 BOX = (288, 786, 1344, 53)
@@ -41,6 +51,32 @@ def _ctx(job) -> JobContext:
 
 def _image(value: int, height: int = 4, width: int = 6) -> np.ndarray:
     return np.full((height, width, 3), value, dtype=np.uint8)
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+class _Background:
+    """A background CPU job (an auto-pilot kind's priority), recording when
+    it ran."""
+
+    kind = "metadata"
+    lane = Lane.CPU
+    priority = max(PRIORITY.values())
+
+    def __init__(self, key: str, order: list):
+        self.key = key
+        self.file = None
+        self._order = order
+
+    def run(self, ctx: JobContext) -> None:
+        self._order.append(self.key)
 
 
 def _dimensions(video_path: str) -> tuple[int, int]:
@@ -99,7 +135,7 @@ class FakeGrabStrips:
 def test_a_frame_job_is_a_cpu_job_keyed_by_file_and_times():
     job = FrameJob(PROJECT_DIR, "a.mp4", [1.5, 2.0])
 
-    assert (job.kind, job.lane, job.priority, job.file) == ("frames", Lane.CPU, 0, "a.mp4")
+    assert (job.kind, job.lane, job.priority, job.file) == ("frames", Lane.CPU, VIEW_PRIORITY, "a.mp4")
     assert job.key == f"frames:a.mp4:{hash((1.5, 2.0))}"
     assert FrameJob(PROJECT_DIR, "a.mp4", [1.5, 2.0]).key == job.key
     assert FrameJob(PROJECT_DIR, "a.mp4", [2.0, 1.5]).key != job.key       # order is part of the request
@@ -109,10 +145,35 @@ def test_a_frame_job_is_a_cpu_job_keyed_by_file_and_times():
 def test_a_strip_job_is_a_cpu_job_keyed_by_file_crop_box_and_times():
     job = StripJob(PROJECT_DIR, "a.mp4", BOX, [1.5, 2.0])
 
-    assert (job.kind, job.lane, job.priority, job.file) == ("strips", Lane.CPU, 0, "a.mp4")
+    assert (job.kind, job.lane, job.priority, job.file) == ("strips", Lane.CPU, VIEW_PRIORITY, "a.mp4")
     assert job.key == f"strips:a.mp4:{BOX}:{hash((1.5, 2.0))}"
     assert StripJob(PROJECT_DIR, "a.mp4", (0, 0, 10, 10), [1.5, 2.0]).key != job.key
     assert StripJob(PROJECT_DIR, "a.mp4", BOX, [1.5]).key != job.key
+
+
+def test_view_jobs_outrank_background_cpu_work_and_yield_to_the_proof():
+    """Someone is looking at these pixels: they must not queue behind a
+    folder's worth of metadata, thumbnails and audio profiles."""
+    assert VIEW_PRIORITY > max(PRIORITY.values()) + REDETECT_BOOST
+    assert VIEW_PRIORITY < PROOF_PRIORITY
+
+
+def test_a_frame_job_starts_before_background_work_queued_first(monkeypatch):
+    order = []
+    monkeypatch.setattr(crop_mod, "grab_frames",
+                        FakeGrabFrames({1.0: _image(1)}, during=lambda call: order.append("frames")))
+    runner = JobRunner(lambda event: None, cpu_workers=1)
+    try:
+        runner.pause(Lane.CPU)                                 # queue them all, then let one worker loose
+        runner.submit(_Background("metadata:a.mp4", order))
+        runner.submit(FrameJob(PROJECT_DIR, "a.mp4", [1.0]))
+        runner.submit(_Background("metadata:b.mp4", order))
+        runner.resume(Lane.CPU)
+        assert _wait_for(lambda: len(order) == 3), order
+    finally:
+        assert runner.shutdown(5.0)
+
+    assert order == ["frames", "metadata:a.mp4", "metadata:b.mp4"]
 
 
 def test_both_jobs_take_their_video_from_the_project_directory():
@@ -288,9 +349,9 @@ def test_view_jobs_on_a_reference_episode_match_a_direct_grab(reference_media, t
     expected_strips = ocr_view.grab_ocr_strips_at(path, box, list(times))
 
     assert isinstance(strips, StripsResult) and strips.crop_box == box
-    assert sorted(strips.strips) == sorted(time for time, _ in expected_strips) == times
-    for time, strip in expected_strips:
-        assert np.array_equal(strips.strips[time], strip), f"strip at {time} differs from a direct grab"
+    assert sorted(strips.strips) == sorted(at for at, _ in expected_strips) == times
+    for at, strip in expected_strips:
+        assert np.array_equal(strips.strips[at], strip), f"strip at {at} differs from a direct grab"
 
     frame_job = FrameJob(str(tmp_path), video.name, times)
     frames = frame_job.run(_ctx(frame_job))
@@ -298,10 +359,10 @@ def test_view_jobs_on_a_reference_episode_match_a_direct_grab(reference_media, t
 
     assert sorted(frames.frames) == times
     assert len(expected_frames) == len(times)
-    for time, expected in zip(times, expected_frames):
-        got = frames.frames[time]
+    for at, expected in zip(times, expected_frames):
+        got = frames.frames[at]
         assert got.shape == expected.shape and got.shape[0] == FRAME_HEIGHT and got.shape[2] == 3
-        assert np.array_equal(got, expected), f"frame at {time} differs from a direct grab"
+        assert np.array_equal(got, expected), f"frame at {at} differs from a direct grab"
     # Whole frames, not a bottom band: the source scaled to FRAME_HEIGHT rows,
     # keeping its full width (grab_frames rounds the width down to an even one).
     source_width, source_height = _dimensions(path)

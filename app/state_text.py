@@ -25,14 +25,13 @@ dropping a table row plan 3A hasn't wired up yet.
 """
 from __future__ import annotations
 
-import math
-import statistics
 from collections.abc import Iterable
 
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
 from core.detect.flags import only_informational
 from core.jobs.apply import brightness_is_stale
+from core.jobs.detect_jobs import proof_window as _proof_window
 from core.project.model import FileEntry, ReviewState, Source
 
 # --------------------------------------------------------------------------
@@ -352,6 +351,51 @@ def clock(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
+def proof_window_clock(sample_time: float | None, duration: float) -> str | None:
+    """"09:38–10:08": the proof window ruling C4 picks for a file, as the
+    inspector's "running on ...…" line reads it, or None while the duration
+    is unknown (`run_proof` refuses such a file).
+
+    Uses `core.jobs.detect_jobs.proof_window`, the same function ProofOcrJob
+    resolves its window with, so the line names the window OCR really runs
+    on. `clock()` truncates to whole seconds exactly as the job does."""
+    try:
+        start, end = _proof_window(sample_time, duration)
+    except ValueError:
+        return None
+    return f"{clock(start)}–{clock(end)}"
+
+
+# --------------------------------------------------------------------------
+# The series median brightness (ui-spec §3.7's Detected note)
+# --------------------------------------------------------------------------
+
+SERIES_MEDIAN_MIN_FILES = 3         # fewer measured files than this: no median worth quoting
+SERIES_MEDIAN_NOTE = "Series median brightness is {median} — this episode keeps its own."
+
+
+def series_median_brightness(entries: Iterable[FileEntry]) -> int | None:
+    """The median of the brightness values the folder's files actually have,
+    or None while fewer than SERIES_MEDIAN_MIN_FILES have one.
+
+    The lower middle value is taken for an even count, so the answer is
+    always a value some episode really uses rather than an average of two.
+    Every source counts (detected, hint, manual, imported): the note is about
+    what the series is graded like, not about who chose the numbers."""
+    values = sorted(int(entry.brightness.value) for entry in entries if entry.brightness is not None)
+    if len(values) < SERIES_MEDIAN_MIN_FILES:
+        return None
+    return values[(len(values) - 1) // 2]
+
+
+def series_median_note(median: int | None) -> str:
+    """ui-spec §3.7's second sentence of the Detected note, or "" when there
+    is no median to quote. The caller only asks for it when the file has a
+    brightness of its own -- "this episode keeps its own" says nothing about
+    a file with no value."""
+    return "" if median is None else SERIES_MEDIAN_NOTE.format(median=median)
+
+
 _FIELD_VALUE = {"crop": "crop", "brightness": "brightness", "ranges": "time_ranges"}
 
 
@@ -360,31 +404,6 @@ def field_blocking(entry: FileEntry, field: str) -> bool:
     value -- the `blocking=` argument of the captions above. `field`: "crop" |
     "brightness" | "ranges"."""
     return _flag_blocks_detected_value(entry, field, getattr(entry, _FIELD_VALUE[field]))
-
-
-# --------------------------------------------------------------------------
-# The series note (the Brightness panel and the inspector's Detected note)
-# --------------------------------------------------------------------------
-
-SERIES_MEDIAN_MIN_FILES = 3      # fewer files than this: a "median" says nothing
-
-
-def series_median_note(entries: Iterable[FileEntry]) -> str | None:
-    """"Series median brightness is {median} — this episode keeps its own."
-    for a folder where at least SERIES_MEDIAN_MIN_FILES files have a
-    brightness value; None otherwise.
-
-    The median runs over the files that HAVE a value, whatever its source:
-    the point of the line is that the episode's own value is allowed to
-    differ from the rest of the series, and a file still waiting for its
-    detection has no opinion to weigh in. An even count gives the mean of
-    the two middle values, rounded half up to a whole level -- brightness is
-    only ever a whole level."""
-    values = [entry.brightness.value for entry in entries if entry.brightness is not None]
-    if len(values) < SERIES_MEDIAN_MIN_FILES:
-        return None
-    median = math.floor(statistics.median(values) + 0.5)
-    return f"Series median brightness is {median} — this episode keeps its own."
 
 
 # --------------------------------------------------------------------------

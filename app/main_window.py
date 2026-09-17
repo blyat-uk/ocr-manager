@@ -224,7 +224,7 @@ class MainWindow(QMainWindow):
         controller.save_failed.connect(lambda message: self.error_banner.show_message(SAVE_FAILED_TITLE, message,
                                                                                       "bad"))
         for signal in (controller.project_opened, controller.project_closed, controller.files_changed,
-                       controller.file_changed):
+                       controller.file_changed, controller.proof_started, controller.proof_finished):
             signal.connect(self._sync_actions)
         self.queue.selection_changed.connect(self._on_selection_changed)
         self.queue.proof_requested.connect(self.inspector.run_proof_for)
@@ -279,12 +279,14 @@ class MainWindow(QMainWindow):
 
     def _sync_actions(self, *_args) -> None:
         """Space and T act on the selected file; neither while the focused
-        widget consumes keys, and Space not while the file is PENDING."""
+        widget consumes keys, Space not while the file is PENDING, and T not
+        while that file's proof is already running (ruling C4: T and the
+        inspector's "T run" button are one command)."""
         name = self.queue.selected()
         has_file = name is not None and name in self.controller.names()
         focused = QApplication.focusWidget()
         editing = consumes_keys(focused) or self.folder_settings.contains_focus(focused)
-        self.proof_action.setEnabled(has_file and not editing)
+        self.proof_action.setEnabled(has_file and not editing and not self.controller.proof_pending(name))
         self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
 
     def report_unexpected_error(self, text: str) -> None:

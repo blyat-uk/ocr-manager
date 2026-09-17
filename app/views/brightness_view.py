@@ -61,7 +61,12 @@ from PyQt6.QtWidgets import (
 )
 
 from app.masking import DEFAULT_BRIGHTNESS, LOST_ALERT_PERCENT, MAX_T, MIN_T, StripPixels
-from app.state_text import brightness_is_stale, clock, series_median_note
+from app.state_text import (
+    brightness_is_stale,
+    clock,
+    series_median_brightness,
+    series_median_note,
+)
 from app.theme import tokens
 from app.views.inspector_sections import note_label, small_button
 from app.widgets.base import Button, KvRow, SectionHeader
@@ -1234,8 +1239,11 @@ class BrightnessTab:
         return STALE_REDETECTING if "brightness" in running else STALE_REDETECT
 
     def _series_text(self) -> str:
-        names = self._controller.names() if self._controller.project is not None else []
-        return series_median_note([self._controller.entry(name) for name in names]) or ""
+        """The series-median sentence, shared with the inspector's Detected
+        note (`app/state_text.py`)."""
+        controller = self._controller
+        names = controller.names() if controller.project is not None else []
+        return series_median_note(series_median_brightness(controller.entry(name) for name in names))
 
     def _update_panel(self, entry, evidence, auto: int | None, stored: int | None) -> None:
         self.panel.set_state(auto=auto, value=None if entry is None else self._preview,

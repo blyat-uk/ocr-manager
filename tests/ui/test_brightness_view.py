@@ -20,7 +20,6 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from app.controller import ProjectController
-from app.state_text import series_median_note
 from app.views.brightness_view import (
     KIND_LABELS,
     PIN_TILE_TEXT,
@@ -538,28 +537,22 @@ def test_a_brightness_measured_on_an_earlier_crop_warns(controller):
 
 
 def test_the_series_median_note_appears_once_three_files_have_brightness(controller):
+    """The note is app.state_text's (shared with the inspector, plan 3C Task
+    5); this only checks the panel asks for it. With 209 on this file the
+    four values are 209, 218, 213, 230 -- median_low 213."""
     give_values(controller, evidence=brightness_evidence())
-    for name, value in zip(OTHERS, (200, 213, 230), strict=True):   # with 209: median 211
-        controller.entry(name).brightness = Brightness(value, Source.DETECTED)
     made = BrightnessTab(controller)
     made.page().resize(880, 620)
     made.page().show()
     made.set_file(NAME)
     settle()
-    assert made.panel.series_text() == "Series median brightness is 211 — this episode keeps its own."
+    assert made.panel.series_text() == ""            # only this file has a brightness
+    for name, value in zip(OTHERS, (218, 213, 230), strict=True):
+        controller.entry(name).brightness = Brightness(value, Source.DETECTED)
+    made.refresh()
+    settle()
+    assert made.panel.series_text() == "Series median brightness is 213 — this episode keeps its own."
     made.page().close()
-
-
-def test_series_median_note_needs_three_files(controller):
-    entries = [controller.entry(name) for name in [NAME, *OTHERS]]
-    for entry in entries:
-        entry.brightness = None
-    assert series_median_note(entries) is None
-    for entry, value in zip(entries[:2], (200, 214), strict=True):
-        entry.brightness = Brightness(value, Source.DETECTED)
-    assert series_median_note(entries) is None
-    entries[2].brightness = Brightness(230, Source.DETECTED)
-    assert series_median_note(entries) == "Series median brightness is 214 — this episode keeps its own."
 
 
 # --------------------------------------------------------------------------
