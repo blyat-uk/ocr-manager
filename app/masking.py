@@ -1,15 +1,22 @@
-"""The OCR pass's own pixels, per strip, for the review views.
+"""The views' bridge to `core/detect`: the detector helpers they call, and
+the pixels they measure with.
 
-`app/views/*` may not import `core` (tests/ui/test_main_window.py's
-`test_views_import_no_core_modules`), so the Brightness tab reaches
-`core.detect.ocr_view.mask` / `gate_fires` through this module instead --
-the same two functions, called by name on the module so a test can spy on
-them, never re-implemented. Nothing here changes a pixel the OCR pass would
-see; it only measures and slices what `ocr_view` returns.
+`tests/ui/test_main_window.py::test_views_import_no_core_modules` rejects any
+`core.*` import in `app/views/*.py`, so a view that needs one of the Qt-free,
+pure detector helpers reaches it through here. This is the whole of that
+bridge -- the Crop tab's box aggregation and mask preview, and the Brightness
+tab's strip measurements -- so there is one place to look for what the views
+take from `core`, and one place a detector rename has to reach.
+
+Every wrapper calls through the module object (`_crop.` / `ocr_view.`) rather
+than a name bound at import time, so a test that monkeypatches
+`core.detect.crop.aggregate_box` or `core.detect.ocr_view.mask` still sees the
+call. Nothing here holds state beyond one strip's measurements, decides
+anything, or imports Qt.
 
 `StripPixels` holds one OCR-exact strip (as `ocr_view.grab_ocr_strips_at`
 produced it) plus the detector's polygon boxes for it, and answers the
-questions the tiles ask at a threshold `t`:
+questions the Brightness tiles ask at a threshold `t`:
 
     masked(t)        the strip after the OCR pass's brightness filter
     lost(t)          the glyph pixels that filter throws away
@@ -26,18 +33,22 @@ wanted again: one `mask()` per strip per threshold change (~0.07 ms on a
 `StripSample.boxes` may extend past the strip (the detector boxes a polygon
 on the unmasked strip and rounds outwards), so every box is clipped here
 before it selects a pixel.
+
+`app/state_text.py` stays what its name says -- pure badge and caption text.
 """
 from __future__ import annotations
 
 import cv2
 import numpy as np
 
+from core.detect import crop as _crop
 from core.detect import ocr_view
 from core.detect.brightness import DEFAULT_BRIGHTNESS, MIN_GLYPH_REGION_PIXELS
 
 __all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_T",
            "StripPixels",
-           "clip_boxes", "gate_fires", "mask", "normalise_boxes"]
+           "aggregate_crop_box", "clip_boxes", "gate_fires", "mask", "mask_region",
+           "normalise_boxes"]
 
 MIN_T = 100                # the thresholds the curve spans; a subtitle threshold
 MAX_T = 255                # is never picked outside them (core/detect/brightness.py)
@@ -67,6 +78,47 @@ def normalise_boxes(boxes) -> tuple[tuple[int, int, int, int], ...]:
     everything that compares boxes (the StripPixels cache key) normalises
     through here first, on both sides."""
     return tuple(tuple(int(value) for value in box) for box in boxes or ())
+
+
+# --------------------------------------------------------------------------
+# The Crop tab
+# --------------------------------------------------------------------------
+
+def _rectangle(box) -> list[tuple[int, int]]:
+    """(x, y, width, height) as the four corner points of its rectangle --
+    the polygon shape `aggregate_box` reads."""
+    x, y, width, height = (int(value) for value in box)
+    return [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+
+
+def aggregate_crop_box(boxes_per_sample, frame_size, settings: dict | None = None,
+                       sample_times=None) -> tuple[int, int, int, int] | None:
+    """`core.detect.crop.aggregate_box` over one list of (x, y, w, h) boxes
+    per sampled frame -- the Crop tab's "⤢ fit to all N samples".
+
+    `settings` mirrors the folder's detector settings and must carry the
+    `bottom_half_cutoff` the detection itself used (`evidence["crop"]
+    ["cutoff_frac"]`, 0.0 after a full-frame retry) -- judging the samples
+    with another band would keep or drop different text than the box being
+    replaced. None when there is nothing to build a box from.
+    """
+    polygons = [[_rectangle(box) for box in boxes] for boxes in boxes_per_sample]
+    box = _crop.aggregate_box(polygons, tuple(int(value) for value in frame_size), settings=settings,
+                              sample_times=None if sample_times is None else [float(t) for t in sample_times])
+    return None if box is None else tuple(int(value) for value in box)
+
+
+def mask_region(region, threshold: int):
+    """The OCR pass's brightness filter over a BGR region -- the Crop tab's
+    "masked" preview. `mask` by another name, because the Crop tab masks a
+    region of a frame rather than a strip; one implementation, so the two
+    previews can never drift apart."""
+    return mask(region, threshold)
+
+
+# --------------------------------------------------------------------------
+# The Brightness tab
+# --------------------------------------------------------------------------
 
 
 def clip_boxes(boxes, width: int, height: int) -> list[tuple[int, int, int, int]]:

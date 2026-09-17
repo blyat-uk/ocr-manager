@@ -12,8 +12,9 @@ so every case is pinned twice:
    (plan 3B).
 2. (Skip-guarded) against the old `OCRWorker` unbound methods themselves,
    fed an equivalent `Config`/`FileConfig` pair via a `SimpleNamespace`
-   stand-in -- this is the actual parity check while the old code still
-   exists.
+   stand-in. Those modules were deleted in plan 3B Task 6, so this half now
+   always skips; it is kept as the shape of the comparison, runnable again
+   against a branch that still has the old code.
 """
 import os
 from pathlib import Path

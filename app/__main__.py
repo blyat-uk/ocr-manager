@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing
+import os
 import sys
 import traceback
 from collections.abc import Callable
@@ -21,10 +22,19 @@ from PyQt6.QtWidgets import QApplication
 
 from app.main_window import MainWindow
 from app.theme.qss import apply_theme
+from app.views.tabs import evidence_tabs
+
+
+def _program_name() -> str:
+    """How this run was started, for --help: "python -m app", or the script
+    name when it came through main.py."""
+    script = sys.argv[0] if sys.argv else ""
+    name = os.path.basename(script)
+    return "python -m app" if name in ("", "__main__.py") else name
 
 
 def _parse(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(prog="python -m app", description="OCR Manager")
+    parser = argparse.ArgumentParser(prog=_program_name(), description="OCR Manager")
     parser.add_argument("folder", nargs="?", help="a folder of episodes to open")
     parser.add_argument("--quit-after", type=float, default=None, help=argparse.SUPPRESS)
     return parser.parse_known_args(argv)
@@ -58,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     args, qt_args = _parse(sys.argv[1:] if argv is None else list(argv))
     app = QApplication.instance() or QApplication([sys.argv[0], *qt_args])
     apply_theme(app)
-    window = MainWindow()
+    window = MainWindow(tabs_factory=evidence_tabs)
     window.show()
     if args.folder:
         window.open_folder(args.folder)

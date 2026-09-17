@@ -56,16 +56,19 @@ def test_crop_suite_reports_the_probes_detection_used(monkeypatch, synthetic_vid
     """The crop detector fetches probes through its own fetch layer, never
     Capture.read(), so counting reads always reported 0: the count must be
     the detector's own CropResult.probes_used."""
-    from core import subtitle_detector
+    from core.detect import crop as crop_module
     from core.detect.crop import CropResult
     from tools import bench
 
     monkeypatch.setattr("videocr.utils.create_detection_engine", lambda det_model_dir, use_gpu: object())
-    monkeypatch.setattr(
-        subtitle_detector, "detect_crop",
-        lambda video_path, duration_sec, det_engine, consensus=None, settings=None, cancel_check=None:
-            CropResult(box=(10, 200, 300, 30), sample_pts=[0.1] * 13, hit_pts=[0.1], agreed=5,
-                       probes_used=13, flagged="low-agreement", frame_size=(320, 240)))
+    calls = []
+
+    def fake_detect_crop(video_path, duration_sec, det_engine, consensus=None, settings=None, cancel_check=None):
+        calls.append((video_path, duration_sec, det_engine, consensus, settings, cancel_check))
+        return CropResult(box=(10, 200, 300, 30), sample_pts=[0.1] * 13, hit_pts=[0.1], agreed=5,
+                          probes_used=13, flagged="low-agreement", frame_size=(320, 240))
+
+    monkeypatch.setattr(crop_module, "detect_crop", fake_detect_crop)
 
     entry = {"video": synthetic_video, "dir": tmp_path}
     result = bench._run_crop_case("synthetic", entry)
@@ -76,3 +79,6 @@ def test_crop_suite_reports_the_probes_detection_used(monkeypatch, synthetic_vid
     # A box withheld from the UI for review is still a measured detection.
     assert result["extra"]["flagged"] == "low-agreement"
     assert result["extra"]["auto_applicable"] is False
+    # Detection runs on an engine leased from the registry, never a shared one.
+    (_path, _duration, engine, consensus, settings, _cancel), = calls
+    assert engine is not None and consensus == [] and settings is None

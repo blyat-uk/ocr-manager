@@ -467,3 +467,42 @@ def can_mark_reviewed(entry: FileEntry) -> bool:
     the file is still PENDING: its detections have not finished, so there is
     nothing settled to accept yet."""
     return not is_pending(entry)
+
+
+# --------------------------------------------------------------------------
+# Crop evidence flags (plan 3C Task 2's inspector panel)
+# --------------------------------------------------------------------------
+# `evidence["crop"]["flagged"]` is a "+"-joined string of `core.detect.crop`'s
+# FLAG_* tokens, written for the log, not for a person. The panel shows this
+# copy instead, and only warns when a reason actually blocks review --
+# "no-speech" says how the probes were chosen, not that the box is in doubt
+# (core/detect/__init__.py's flag table).
+
+_CROP_FLAG_TEXT = {
+    _crop.FLAG_NO_SPEECH: "no speech — probed evenly",
+    _crop.FLAG_SPEECH_PROBES_EXHAUSTED: "no text where speech was",
+    _crop.FLAG_TOP_POSITIONED: "text outside the subtitle band",
+    _crop.FLAG_CEILING_EXCEEDED: "text too tall for a subtitle",
+    _crop.FLAG_LOW_AGREEMENT: "few frames agreed",
+    _crop.FLAG_STATIC_CONTENT: "a watermark, not subtitles",
+    _crop.FLAG_WATERMARK_UNCERTAIN: "may be a watermark",
+    _crop.FLAG_MULTIPLE_POSITIONS: "subtitles at several heights",
+    _crop.FLAG_OUTLIER_DISCARDED: "one odd frame dropped",
+    _crop.FLAG_CANCELLED: "stopped early",
+    _crop.FLAG_UNKNOWN_REJECTION: "no box could be built",
+}
+
+
+def crop_flag_summary(flagged: str | None) -> tuple[str, bool] | None:
+    """(text, blocking) for a crop result's `flagged`, or None when clean.
+
+    Several reasons read as one line joined by " · ". A reason with no copy
+    of its own falls back to its token, and counts as blocking -- an
+    unrecognised flag always does (`only_informational`)."""
+    if not flagged:
+        return None
+    parts = [part for part in flagged.split("+") if part]
+    if not parts:
+        return None
+    text = " · ".join(_CROP_FLAG_TEXT.get(part, part) for part in parts)
+    return text, not only_informational(flagged, _crop.INFORMATIONAL_FLAGS)

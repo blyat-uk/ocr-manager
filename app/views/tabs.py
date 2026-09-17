@@ -1,19 +1,21 @@
-"""The stage's real tabs (plan 3C): `evidence_tabs(controller)` is the
-factory `MainWindow` is given in place of `placeholder_tabs`.
+"""`evidence_tabs(controller)`: the stage's three real tabs (plan 3C).
 
-The three titles and their order -- Crop, Brightness, Time ranges -- are the
-stage's (ui-spec §3.3), and the inspector follows whichever is current
-(ruling B4). Each task of plan 3C replaces one placeholder with its real
-view, so a tab still being built keeps showing its values as key/value rows
-rather than an empty page.
+The factory `MainWindow` is built with. Each tab lives in its own module and
+implements `StageTab`; a tab plan 3C has not landed yet keeps the Task-1
+`PlaceholderTab`, so the stage always shows all three titles in the same
+order. Replacing one is a one-line change here.
 """
 from __future__ import annotations
 
 from app.views.brightness_view import BrightnessTab
+from app.views.crop_view import CropTab
 from app.views.stage import StageTab, placeholder_tabs
 
 
 def evidence_tabs(controller) -> list[StageTab]:
-    tabs = placeholder_tabs(controller)
-    tabs[1] = BrightnessTab(controller)           # plan 3C Task 3
-    return tabs
+    placeholders = {tab.title: tab for tab in placeholder_tabs(controller)}
+    return [
+        CropTab(controller),
+        BrightnessTab(controller),
+        placeholders["Time ranges"],
+    ]

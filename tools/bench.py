@@ -5,11 +5,15 @@ Measures three suites against the reference media in `/mnt/FAST/work`
 
   ocr    - the three `tools/fidelity_check.py` cases plus one 4K case,
            split into model-load / decode / OCR-inference / label-scan time.
-  crop   - `core/subtitle_detector.py`'s SubtitleDetectionWorker, one file
-           per reference project.
+  crop   - `core.detect.crop.detect_crop()` (what
+           `core.jobs.detect_jobs.CropJob` runs), one file per reference
+           project. NOTE: since plan 3B Task 6 only the detector call is
+           timed; the engine lease/build, which the old Qt worker had inside
+           its timed region, is outside it. Crop seconds are NOT comparable
+           with the Stage 2 crop baselines (see CROP_TIMING_NOTE).
   ranges - `core.detect.ranges.pipeline.analyse()` (what
-           `core/audio_analysis.py`'s AudioAnalysisWorker calls), cold (no
-           cache) and warm (cache present), one project run per project.
+           `core.jobs.detect_jobs.RangesJob` runs), cold (no cache) and warm
+           (cache present), one project run per project.
 
 Every suite skips cleanly when its media is absent, exactly like
 `tools/fidelity_check.py`, and none of them ever write into
@@ -94,8 +98,16 @@ def _fmt_ratio(before_s: float, after_s: float) -> str:
     return f"{1.0 / ratio:.2f}x SLOWER"
 
 
+CROP_TIMING_NOTE = (
+    "crop: since plan 3B Task 6 only detect_crop() is timed -- the engine lease and build sit "
+    "outside the timed region, where the old Qt worker had them inside it. Crop seconds are not "
+    "directly comparable with baselines recorded before that change."
+)
+
+
 def compare(before: dict, after: dict) -> str:
-    """Render a markdown before/after table.
+    """Render a markdown before/after table, with CROP_TIMING_NOTE beneath it
+    whenever the crop suite appears (its timed region changed in plan 3B).
 
     `before` and `after` are `{suite: {key: Measurement.as_dict()}}` trees
     (exactly what one suite run produces, NOT the full baseline-file
@@ -142,6 +154,8 @@ def compare(before: dict, after: dict) -> str:
                 f"| {label} | {_fmt_seconds(b.seconds)} | {_fmt_seconds(a.seconds)} | {change} |"
             )
 
+    if (before.get("crop") or after.get("crop")):
+        lines += ["", f"_{CROP_TIMING_NOTE}_"]
     return "\n".join(lines)
 
 
@@ -444,47 +458,39 @@ def _probe_duration_seconds(video: Path) -> float:
 
 
 def _run_crop_case(key: str, entry: dict) -> dict | None:
-    """Drives SubtitleDetectionWorker synchronously (no QThread) for one
-    file, timing internals directly rather than spinning a Qt event loop --
-    `_run()` is fully synchronous already, and pyqtSignal delivers a direct
-    (same-thread) connection's slot call immediately with no queued/event
-    -loop dispatch needed."""
-    from PyQt6.QtCore import QCoreApplication
-    from core import subtitle_detector
-    from core.subtitle_detector import SubtitleDetectionWorker
+    """One detect_crop() call on one file, inside a detection-engine lease --
+    the same shape core.jobs.detect_jobs.CropJob runs.
 
-    QCoreApplication.instance() or QCoreApplication([])
+    TIMED REGION CHANGED (plan 3B Task 6). Only detect_crop() is timed; the
+    lease and, on the first call, the engine build sit outside it. Until this
+    task, the suite drove the old Qt adapter's SubtitleDetectionWorker._run(),
+    which leased and built the engine INSIDE the timed region. Crop numbers
+    recorded from here on are therefore not directly comparable with the
+    Stage 2 crop baselines -- they are lower by whatever the lease and build
+    cost that run. Compare crop against a new baseline taken with this code.
+
+    The detector's own CropResult is what is measured, not what the app would
+    apply: a box that is not auto-applicable is still a measured detection,
+    and only the result knows how many probes it used (crop fetches probes
+    through core.detect.crop's own fetch layer, never Capture.read(), so
+    counting reads always reported 0).
+    """
+    from core.detect import crop as crop_module
+    from videocr import engine_registry
 
     video = entry["video"]
     duration = _probe_duration_seconds(video)
 
-    # The detector's own result, not the worker's file_detected signal: the
-    # worker withholds boxes that are not auto-applicable, which are still
-    # measured detections, and only the result knows how many probes it used
-    # (crop fetches probes through core.detect.crop's own fetch layer, never
-    # Capture.read(), so counting reads always reported 0).
-    results = []
-    orig_detect_crop = subtitle_detector.detect_crop
-
-    def recording_detect_crop(*a, **kw):
-        result = orig_detect_crop(*a, **kw)
-        results.append(result)
-        return result
-
-    subtitle_detector.detect_crop = recording_detect_crop
-    try:
-        worker = SubtitleDetectionWorker([(video.name, str(video), duration)])
+    with engine_registry.lease_detection_engine(None, True) as det_engine:
         t0 = time.perf_counter()
-        worker._run()
+        result = crop_module.detect_crop(str(video), duration, det_engine, consensus=[], settings=None,
+                                         cancel_check=None)
         elapsed = time.perf_counter() - t0
-    finally:
-        subtitle_detector.detect_crop = orig_detect_crop
 
-    if not results or results[-1].box is None:
+    if result is None or result.box is None:
         print(f"SKIP crop/{key}: detector did not resolve a crop for {video.name}", file=sys.stderr)
         return None
 
-    result = results[-1]
     cx, cy, cw, ch = result.box
     extra = {
         "probes": result.probes_used,
@@ -552,12 +558,16 @@ def _run_ranges_pass(project_dir: Path, filenames: list[str], cache_dir: Path) -
     fingerprint_s is the whole "Fingerprinting" phase's wall time (identity
     check + cache lookup + decode + fingerprint, whichever a file needs),
     and match_s is "Analyzing" + "Computing time ranges" together, timed via
-    analyse()'s own phase-change progress events -- the same events the real
-    AudioAnalysisWorker forwards as phase_changed.
+    analyse()'s own phase-change progress events -- the same events
+    core.jobs.detect_jobs.RangesJob forwards.
     """
-    from core.audio_analysis import DEFAULT_MIN_SEGMENT_SEC
     from core.detect.ranges.config import MatchConfig, RangesConfig
-    from core.detect.ranges.pipeline import DEFAULT_WORKERS, FileEntry, analyse
+    from core.detect.ranges.pipeline import (
+        DEFAULT_MIN_SEGMENT_SEC,
+        DEFAULT_WORKERS,
+        FileEntry,
+        analyse,
+    )
 
     entries = [FileEntry(name=name, path=str(project_dir / name)) for name in filenames]
     cfg = RangesConfig(match=MatchConfig(min_length_sec=DEFAULT_MIN_SEGMENT_SEC))
@@ -679,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         "git_sha": _git_sha(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "note": "machine shared with a concurrent GPU workload; absolute numbers are noisy, treat as relative baselines",
+        "crop_timing_note": CROP_TIMING_NOTE,
         "repeat": args.repeat,
         "suites": suites,
     }
