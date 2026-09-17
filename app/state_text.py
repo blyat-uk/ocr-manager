@@ -30,6 +30,7 @@ from collections.abc import Iterable
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
 from core.detect.flags import only_informational
+from core.jobs import apply as _apply
 from core.jobs.apply import brightness_is_stale
 from core.jobs.detect_jobs import proof_window as _proof_window
 from core.project.model import FileEntry, ReviewState, Source
@@ -364,6 +365,40 @@ def proof_window_clock(sample_time: float | None, duration: float) -> str | None
     except ValueError:
         return None
     return f"{clock(start)}–{clock(end)}"
+
+
+# --------------------------------------------------------------------------
+# Brightness flag copy (the Brightness tab's panel)
+# --------------------------------------------------------------------------
+
+# Each detector reason as one line of review copy. Keyed by the constants
+# themselves, never by a copy of their strings, so renaming a flag breaks the
+# build here instead of silently dropping a warning from the panel. An
+# unknown reason (a flag added without a line here) is shown as it is stored.
+BRIGHTNESS_FLAG_TEXT = {
+    _brightness.FLAG_NEEDS_CROP: "no crop to measure in",
+    _brightness.FLAG_RANGES_EMPTY: "the keep ranges hold no frames",
+    _brightness.FLAG_NO_TEXT: "no text found to measure",
+    _brightness.FLAG_THIN_EVIDENCE: "few samples held text",
+    _brightness.FLAG_COLOURED_TEXT: "coloured text",
+    _brightness.FLAG_NO_PLATEAU: "not verified",
+    _brightness.FLAG_NARROW_PLATEAU: "narrow safe range",
+    _brightness.FLAG_DIM_TEXT: "dim text on some frames",
+    _brightness.FLAG_NO_CLEAN_THRESHOLD: "no threshold silences the empty frames",
+    _brightness.FLAG_ESCALATE: "not verified",
+    _brightness.FLAG_CANCELLED: "detection was cancelled",
+    _apply.FLAG_DIFFERS_FROM_HINT: "differs from the value it was hinted with",
+}
+
+
+def brightness_flag_text(flagged: str | None) -> str:
+    """`entry.flags["brightness"]` (FLAG_* reasons joined by "+") as one
+    line, e.g. "narrow safe range · dim text on some frames". "" when
+    nothing is flagged. Repeats are collapsed: two reasons can share a
+    line ("not verified")."""
+    reasons = [BRIGHTNESS_FLAG_TEXT.get(reason, reason)
+               for reason in (flagged or "").split("+") if reason]
+    return " · ".join(dict.fromkeys(reasons))
 
 
 # --------------------------------------------------------------------------

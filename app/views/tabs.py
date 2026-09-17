@@ -7,6 +7,7 @@ order. Replacing one is a one-line change here.
 """
 from __future__ import annotations
 
+from app.views.brightness_view import BrightnessTab
 from app.views.crop_view import CropTab
 from app.views.stage import StageTab, placeholder_tabs
 
@@ -15,6 +16,6 @@ def evidence_tabs(controller) -> list[StageTab]:
     placeholders = {tab.title: tab for tab in placeholder_tabs(controller)}
     return [
         CropTab(controller),
-        placeholders["Brightness"],
+        BrightnessTab(controller),
         placeholders["Time ranges"],
     ]

@@ -720,9 +720,13 @@ def test_the_toolbar_is_mounted_in_the_stage_head_and_swaps_with_the_tab(qapp, f
         assert toolbar.parentWidget() is stage.head()
         for button in (crop_tab.envelope_button, crop_tab.fit_button):
             assert button.parentWidget() is toolbar
-        stage.set_current(1)                            # a PlaceholderTab: no toolbar
-        assert stage.current_toolbar() is None
+        brightness_toolbar = stage.tabs()[1].toolbar()   # Brightness has one too
+        stage.set_current(1)
+        assert stage.current_toolbar() is brightness_toolbar
         assert toolbar.isHidden()
+        stage.set_current(2)                            # a PlaceholderTab: no toolbar
+        assert stage.current_toolbar() is None
+        assert toolbar.isHidden() and brightness_toolbar.isHidden()
         stage.set_current(0)
         assert stage.current_toolbar() is toolbar
     finally:
