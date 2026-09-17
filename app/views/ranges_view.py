@@ -28,6 +28,14 @@ What it draws
     no `evidence["ranges"]` no block names -- the keep and skip spans, and
     every edit, still work from the stored ranges and the duration.
 
+    A stored range the timeline cannot place (unparseable times, or an end
+    before its start) is never redrawn as something else: `read_ranges`
+    leaves it out and hands back the text it is stored as, which the page
+    names in a warn line, because `ocr_kwargs.ocr_call_for` still hands OCR
+    exactly what is stored and the screen must not say otherwise. An edit
+    writes the ranges that are drawn, so it is also what drops such a range
+    -- deliberately, after the line has said what is wrong with it.
+
 Editing (edit mode only)
     A grip drag previews live and commits once on release, through
     `controller.set_time_ranges` (MANUAL), snapped to whole seconds and
@@ -57,13 +65,15 @@ from app.masking import speech_in_skips
 from app.state_text import format_duration
 from app.theme import tokens
 from app.views.inspector_sections import Section, note_label, small_button
-from app.widgets.base import Button, KvRow
+from app.widgets.base import Button, KvRow, repolish
 
 # --- copy ------------------------------------------------------------------
 
 NOTE_TEXT = ("Detected blocks come from audio fingerprints shared across the folder; the speech "
              "lane is computed per episode, so a post-credits scene can't be silently dropped.")
 WARNING_TEXT = "⚠ Speech at {start}–{end} falls inside the {kind} block"
+UNREADABLE_TEXT = "⚠ A stored time range could not be read ({values}) — fix it or use whole file"
+NO_DURATION_TEXT = "Duration not scanned yet — the timeline is drawn once the file has been read."
 EXTEND_TEXT = "extend keep →"
 ADD_TEXT = "+ add range"
 WHOLE_FILE_TEXT = "use whole file"
@@ -146,22 +156,46 @@ def parse_clock(text: str | None) -> float | None:
     return float(seconds)
 
 
-def read_keeps(entry, duration: float) -> list[tuple[float, float]]:
-    """The file's stored keep spans in seconds, clamped to [0, duration] and
-    in order. Empty means the whole file is kept -- both for `time_ranges`
-    None (never set) and for an empty MANUAL list ("use whole file")."""
+def read_ranges(entry, duration: float) -> tuple[list[tuple[float, float]], list[str]]:
+    """(the keep spans the timeline can place, the stored ranges it cannot).
+
+    The spans are in seconds, clamped to [0, duration], ordered and merged --
+    overlapping stored ranges would otherwise put the drawn boundaries out of
+    order, and a grip between two of them would snap backwards.
+
+    A range whose times cannot be parsed, or that ends before it starts, or
+    that falls entirely outside the file, is **not** placed: it is returned
+    as the text it is stored as, for the view to name. Reading such a range
+    as "0:00 → the end" would be the one thing this view must never do --
+    show something other than what the run will use, since `ocr_call_for`
+    still hands OCR exactly what is stored.
+
+    Empty and empty means the whole file is kept: `time_ranges` None (never
+    set) or an empty MANUAL list ("use whole file"). With no duration yet
+    nothing can be placed and nothing is blamed -- see NO_DURATION_TEXT."""
     ranges = getattr(entry, "time_ranges", None)
-    if entry is None or ranges is None or not ranges.ranges:
-        return []
-    keeps = []
+    if entry is None or ranges is None or not ranges.ranges or duration <= 0:
+        return [], []
+    keeps, unreadable = [], []
     for stored in ranges.ranges:
-        start = parse_clock(stored.start)
-        end = parse_clock(stored.end)
-        start = 0.0 if start is None else max(0.0, min(duration, start))
-        end = duration if end is None else max(0.0, min(duration, end))
-        if end > start:
-            keeps.append((start, end))
-    return sorted(keeps)
+        span = _stored_span(stored, duration)
+        if span is None:
+            unreadable.append(f"{stored.start or '0:00'} → {stored.end or 'end'}")
+        else:
+            keeps.append(span)
+    return _merged(keeps), unreadable
+
+
+def _stored_span(stored, duration: float) -> tuple[float, float] | None:
+    """One stored range as (start_sec, end_sec) inside the file, or None when
+    the timeline cannot place it (see `read_ranges`). None times are the open
+    start and the open end, which are placeable; unparseable text is not."""
+    start = 0.0 if stored.start is None else parse_clock(stored.start)
+    end = duration if stored.end is None else parse_clock(stored.end)
+    if start is None or end is None or end <= start:
+        return None
+    start, end = max(0.0, min(duration, start)), max(0.0, min(duration, end))
+    return (start, end) if end > start else None
 
 
 def complement(keeps, duration: float) -> list[tuple[float, float]]:
@@ -181,12 +215,23 @@ def store_ranges(keeps, duration: float) -> list[tuple[str | None, str | None]] 
     "H:MM:SS" strings, an open start for a range beginning at 0, an open end
     for one reaching the duration, and None for the whole file."""
     ranges = [(None if start <= 0 else format_duration(start),
-               None if end >= duration else format_duration(end))
+               None if _reaches_end(end, duration) else format_duration(end))
               for start, end in sorted(keeps)]
     return None if not ranges or ranges == [(None, None)] else ranges
 
 
-def extend_keep(keeps, span) -> list[tuple[float, float]]:
+def _reaches_end(end: float, duration: float) -> bool:
+    """Whether a keep range runs to the end of the file.
+
+    A duration is frames / fps and is stored fractional, while every boundary
+    the user can drag is a whole second, so `end >= duration` alone is
+    unreachable on most files: a range that reads as ending at the same clock
+    as the file does end there, as far as anything the user or the OCR run
+    can see, and is stored as the open end."""
+    return end >= duration > 0 or (duration > 0 and format_duration(end) == format_duration(duration))
+
+
+def with_extended_keep(keeps, span) -> list[tuple[float, float]]:
     """`keeps` with the range nearest `span` grown outward -- to whole
     seconds -- to cover it. The result is merged, so an extension that runs
     into the next range becomes one range."""
@@ -207,23 +252,29 @@ def extend_keep(keeps, span) -> list[tuple[float, float]]:
     return _merged([*keeps[:index], grown, *keeps[index + 1:]])
 
 
-def add_range(keeps, duration: float) -> list[tuple[float, float]]:
+def with_added_range(keeps, duration: float) -> list[tuple[float, float]]:
     """`keeps` plus a one-minute range in the middle of the largest skipped
     gap -- or the first minute of the file when the whole file is kept, as
     there is no gap to put it in. Centred rather than flush against the gap's
-    edge so the new range reads as its own block, with two grips of its
-    own."""
-    gaps = complement(keeps, duration) if keeps else [(0.0, duration)]
+    edge so the new range reads as its own block, with two grips of its own.
+
+    The new range stays inside its gap: rounding its start down to a whole
+    second could otherwise put it inside the keep before it, and a gap
+    narrower than MIN_SPAN cannot hold a range at all -- `keeps` comes back
+    untouched rather than growing a zero-length one."""
+    gaps = [gap for gap in (complement(keeps, duration) if keeps else [(0.0, duration)])
+            if gap[1] - gap[0] >= MIN_SPAN]
     if not gaps:
         return list(keeps)
     gap_start, gap_end = max(gaps, key=lambda gap: gap[1] - gap[0])
     if not keeps:
-        gap_end = min(gap_end, ADD_RANGE_SECONDS)     # "at the start"
-        length = gap_end - gap_start
-    else:
-        length = min(ADD_RANGE_SECONDS, gap_end - gap_start)
-    start = math.floor(gap_start + (gap_end - gap_start - length) / 2)
-    return sorted([*keeps, (float(start), float(start + length))])
+        gap_end = min(gap_end, gap_start + ADD_RANGE_SECONDS)     # "at the start"
+    length = min(ADD_RANGE_SECONDS, gap_end - gap_start)
+    start = max(math.floor(gap_start + (gap_end - gap_start - length) / 2), math.ceil(gap_start))
+    end = min(start + length, gap_end)
+    if end - start < MIN_SPAN:
+        return list(keeps)
+    return sorted([*keeps, (float(start), float(end))])
 
 
 def _merged(keeps) -> list[tuple[float, float]]:
@@ -236,6 +287,14 @@ def _merged(keeps) -> list[tuple[float, float]]:
     return merged
 
 
+def entry_of(controller, name: str | None):
+    """The selected file's entry, or None when nothing is selected or the
+    folder no longer holds it (the queue picks another file next)."""
+    if name is None or name not in controller.names():
+        return None
+    return controller.entry(name)
+
+
 def header_text(name: str, duration: float, others) -> str:
     """"ep01.mkv · 27:08 · other episodes 23:38 – 27:08" (ui-spec §3.3): the
     stage head's dim line for this tab, spaced around the dash as
@@ -246,7 +305,8 @@ def header_text(name: str, duration: float, others) -> str:
         parts.append(format_duration(duration))
     known = sorted(float(value) for value in others if value and float(value) > 0)
     if known:
-        parts.append(f"other episodes {format_duration(known[0])} – {format_duration(known[-1])}")
+        low, high = format_duration(known[0]), format_duration(known[-1])
+        parts.append(f"other episodes {low}" if low == high else f"other episodes {low} – {high}")
     return " · ".join(parts)
 
 
@@ -306,6 +366,7 @@ class Timeline(QWidget):
         self._file: str | None = None
         self._duration = 0.0
         self._keeps: list[tuple[float, float]] = []      # stored; [] = the whole file
+        self._unreadable: list[str] = []                 # ... and the stored ranges it could not place
         self._bounds: list[float] = []                   # the drawn boundaries, live during a drag
         self._blocks: list[dict] = []
         self._envelope: list[float] = []
@@ -313,6 +374,8 @@ class Timeline(QWidget):
         self._marks: list[float] = []
         self._drag: int | None = None
         self._position: float | None = None
+        self._warnings: list[SpeechWarning] = []
+        self._warnings_key: tuple | None = None
         self.setObjectName("Timeline")
         self.setFixedHeight(TIMELINE_HEIGHT)
         self.setMouseTracking(self.editable)
@@ -338,7 +401,7 @@ class Timeline(QWidget):
         audio = evidence.get("audio") or {}
         crop = evidence.get("crop") or {}
         self._duration = self._read_duration(entry, ranges)
-        self._keeps = read_keeps(entry, self._duration)
+        self._keeps, self._unreadable = read_ranges(entry, self._duration)
         if self._drag is None:                      # a drag owns the boundaries until it ends
             self._bounds = [value for span in self._drawn_keeps() for value in span]
         self._blocks = [block for block in (ranges.get("blocks") or []) if _block_span(block)]
@@ -351,8 +414,15 @@ class Timeline(QWidget):
         return self._duration
 
     def keeps(self) -> list[tuple[float, float]]:
-        """The stored keep spans; empty means the whole file is kept."""
+        """The stored keep spans; empty means the whole file is kept --
+        unless `unreadable()` is not, in which case something is stored that
+        could not be placed."""
         return list(self._keeps)
+
+    def unreadable(self) -> list[str]:
+        """The stored ranges the timeline could not place, as they are
+        stored ("10:00 → 2:00"). See `read_ranges`."""
+        return list(self._unreadable)
 
     def envelope(self) -> list[float]:
         return list(self._envelope)
@@ -362,6 +432,11 @@ class Timeline(QWidget):
 
     def sample_marks(self) -> list[float]:
         return list(self._marks)
+
+    def lane_label(self) -> str:
+        """"speech" -- but not in compact mode, which carries no label but a
+        block's kind (ruling B5)."""
+        return LANE_LABEL if self.editable else ""
 
     def position(self) -> float | None:
         """Where the timeline was last clicked, in seconds, or None."""
@@ -391,12 +466,20 @@ class Timeline(QWidget):
 
     def warnings(self) -> list[SpeechWarning]:
         """One per speech span the run would skip (`speech_in_skips`), each
-        clipped to the skipped span it falls in."""
-        skips = complement(self._drag_keeps(), self._duration)
-        if not skips or not self._speech:
-            return []
-        return [SpeechWarning(start, end, self._kind_at(start, end))
-                for start, end in speech_in_skips(self._speech, skips)]
+        clipped to the skipped span it falls in.
+
+        Cached on the state it was computed from: `paintEvent` asks for it on
+        every repaint (the lane colours those spans) and the tab asks again
+        for its warning rows, and the answer only changes when the speech or
+        the skipped spans do."""
+        skips = tuple(complement(self._drag_keeps(), self._duration))
+        key = (tuple(self._speech), skips)
+        if self._warnings_key != key:
+            self._warnings_key = key
+            self._warnings = ([] if not skips or not self._speech else
+                              [SpeechWarning(start, end, self._kind_at(start, end))
+                               for start, end in speech_in_skips(self._speech, skips)])
+        return list(self._warnings)
 
     def warn_spans(self) -> list[tuple[float, float]]:
         return [(warning.start, warning.end) for warning in self.warnings()]
@@ -437,12 +520,21 @@ class Timeline(QWidget):
     def _clamped(self, index: int, seconds: float) -> float:
         """A boundary snapped to a whole second and kept inside its
         neighbours and [0, duration], never closer than MIN_SPAN to either --
-        a zero-length range would be a range the user cannot see or grab."""
+        a zero-length range would be a range the user cannot see or grab.
+
+        The file's own end is a landing point of its own: a duration is
+        frames / fps and lands between whole seconds, so snapping alone could
+        never reach it and "to the end of the file" would be undraggable --
+        the last boundary would stop a fraction of a second short, leaving a
+        skip sliver too narrow to grab and an OCR run that ends early."""
+        last = index + 1 >= len(self._bounds)
         low = self._bounds[index - 1] + MIN_SPAN if index > 0 else 0.0
-        high = (self._bounds[index + 1] - MIN_SPAN if index + 1 < len(self._bounds)
-                else self._duration)
+        high = self._duration if last else self._bounds[index + 1] - MIN_SPAN
         snapped = round(float(seconds) / SNAP_SECONDS) * SNAP_SECONDS
-        return float(max(low, min(high, snapped)))
+        value = max(low, min(high, snapped))
+        if last and self._duration - value < SNAP_SECONDS:
+            value = self._duration
+        return float(value)
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -500,9 +592,7 @@ class Timeline(QWidget):
     # --- reading the model ------------------------------------------------
 
     def _entry(self):
-        if self._file is None or self._file not in self._controller.names():
-            return None
-        return self._controller.entry(self._file)
+        return entry_of(self._controller, self._file)
 
     @staticmethod
     def _read_duration(entry, ranges: dict) -> float:
@@ -667,11 +757,12 @@ class Timeline(QWidget):
             self._paint_speech(painter, rect, start, end, _alpha(tokens.BLUE, SPEECH_ALPHA))
         for start, end in self.warn_spans():
             self._paint_speech(painter, rect, start, end, _alpha(tokens.WARN, WARN_ALPHA))
-        painter.setFont(_font(tokens.FONT_SIZE_XS))
-        painter.setPen(QColor(tokens.DIM2))
-        painter.drawText(rect.adjusted(4, 0, 0, 0),
-                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                         LANE_LABEL)
+        if self.lane_label():
+            painter.setFont(_font(tokens.FONT_SIZE_XS))
+            painter.setPen(QColor(tokens.DIM2))
+            painter.drawText(rect.adjusted(4, 0, 0, 0),
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             self.lane_label())
         painter.restore()
         painter.setPen(QPen(QColor(tokens.LINE), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -845,16 +936,21 @@ class RangesInspectorPanel(Section):
         self.body.addWidget(self._buttons)
         self.body.addStretch(1)
 
-    def set_ranges(self, keeps, duration: float) -> None:
+    def set_ranges(self, keeps, duration: float, *, unreadable: bool = False) -> None:
         """One row per keep range; the whole file reads as one row with
-        nothing to remove."""
+        nothing to remove.
+
+        `unreadable`: the file stores a range the timeline could not place
+        (`read_ranges`), so "whole file" would be a lie -- there is something
+        stored, and the page's warn line names it."""
         values = [f"{format_duration(start)} → {format_duration(end)}" for start, end in keeps]
+        whole_file = duration > 0 and not unreadable
         for row in self._rows:
             self.body.removeWidget(row)
             row.setParent(None)              # a row left parented would paint over the buttons
             row.deleteLater()
         self._rows = []
-        for index, value in enumerate(values or ([WHOLE_FILE_VALUE] if duration > 0 else [])):
+        for index, value in enumerate(values or ([WHOLE_FILE_VALUE] if whole_file else [])):
             row = KeepRow(value, removable=bool(values))
             row.remove_requested.connect(lambda i=index: self.remove_requested.emit(i))
             self.body.insertWidget(index, row)
@@ -899,6 +995,10 @@ class RangesTab:
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(5)
         column.addWidget(self._rows_host)
+        # Why the timeline is not showing what the file stores: a range it
+        # could not place (warn), or a duration nothing has measured yet.
+        self.status = note_label("")
+        column.addWidget(self.status)
         self.note = note_label(NOTE_TEXT)
         column.addWidget(self.note)
         column.addStretch(1)
@@ -939,11 +1039,14 @@ class RangesTab:
     def refresh(self) -> None:
         entry = self._entry()
         self.timeline.refresh()
+        duration = self.timeline.duration()
+        unreadable = self.timeline.unreadable()
         self._page.setEnabled(entry is not None)
         self._header.setText("" if entry is None else header_text(
-            self._file, self.timeline.duration(), self._other_durations()))
+            self._file, duration, self._other_durations()))
         self._sync_warnings()
-        self.panel.set_ranges(self.timeline.keeps(), self.timeline.duration())
+        self._sync_status(entry, duration, unreadable)
+        self.panel.set_ranges(self.timeline.keeps(), duration, unreadable=bool(unreadable))
 
     # --- reading ----------------------------------------------------------
 
@@ -962,6 +1065,14 @@ class RangesTab:
     def extend_buttons(self) -> list[Button]:
         return [row.button for row in self._rows]
 
+    def status_text(self) -> str:
+        """The line under the warnings when the timeline is not showing what
+        the file stores, or "" when it is."""
+        return self.status.text() if not self.status.isHidden() else ""
+
+    def status_tone(self) -> str:
+        return self.status.property("tone") or ""
+
     # --- commands ---------------------------------------------------------
 
     def extend_keep(self, index: int) -> None:
@@ -969,11 +1080,11 @@ class RangesTab:
         the speech (ui-spec §3.6's "extend keep →")."""
         if 0 <= index < len(self._warnings):
             warning = self._warnings[index]
-            self.timeline.commit(extend_keep(self.timeline.keeps() or self._whole_file(),
-                                             (warning.start, warning.end)))
+            self.timeline.commit(with_extended_keep(self.timeline.keeps() or self._whole_file(),
+                                                    (warning.start, warning.end)))
 
     def add_range(self) -> None:
-        self.timeline.commit(add_range(self.timeline.keeps(), self.timeline.duration()))
+        self.timeline.commit(with_added_range(self.timeline.keeps(), self.timeline.duration()))
 
     def remove_range(self, index: int) -> None:
         keeps = self.timeline.keeps()
@@ -988,9 +1099,7 @@ class RangesTab:
     # --- internals --------------------------------------------------------
 
     def _entry(self):
-        if self._file is None or self._file not in self._controller.names():
-            return None
-        return self._controller.entry(self._file)
+        return entry_of(self._controller, self._file)
 
     def _whole_file(self) -> list[tuple[float, float]]:
         return [(0.0, self.timeline.duration())]
@@ -1012,3 +1121,21 @@ class RangesTab:
             self._rows_layout.addWidget(row)
             self._rows.append(row)
         self._rows_host.setVisible(bool(self._rows))
+
+    def _sync_status(self, entry, duration: float, unreadable: list[str]) -> None:
+        """Say why the timeline is not showing what the file stores -- an
+        unreadable stored range, or a duration nothing has measured yet
+        (a v1-migrated file whose metadata job has not landed reads as "no
+        ranges" otherwise). Nothing to say: the line goes."""
+        if entry is None:
+            text, tone = "", ""
+        elif unreadable:
+            text, tone = UNREADABLE_TEXT.format(values=", ".join(unreadable)), "warn"
+        elif duration <= 0:
+            text, tone = NO_DURATION_TEXT, ""
+        else:
+            text, tone = "", ""
+        self.status.setText(text)
+        self.status.setProperty("tone", tone)
+        repolish(self.status)
+        self.status.setVisible(bool(text))

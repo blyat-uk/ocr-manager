@@ -15,8 +15,18 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
 from app.controller import ProjectController
+from app.views import ranges_view
 from app.views.crop_view import CropTab
-from app.views.ranges_view import NOTE_TEXT, KeepRow, RangesTab, Timeline, WarningRow
+from app.views.ranges_view import (
+    NO_DURATION_TEXT,
+    NOTE_TEXT,
+    UNREADABLE_TEXT,
+    KeepRow,
+    RangesTab,
+    Timeline,
+    WarningRow,
+    with_added_range,
+)
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
 from core.project import Source, TimeRange, TimeRanges
@@ -24,7 +34,8 @@ from core.project.ocr_kwargs import ocr_call_for
 
 NAME = "ep01.mkv"
 OTHERS = ["ep02.mkv", "ep03.mkv"]
-DURATION = 1628.0                      # 27:08
+DURATION = 1628.0                      # 27:08 exactly ...
+FRACTIONAL = 1628.44                   # ... and as a real file has it: frames / fps
 INTRO_END = 153.0                      # 2:33
 OUTRO_START = 1385.0                   # 23:05
 OTHER_DURATIONS = {"ep02.mkv": 1418.0, "ep03.mkv": 1628.0}     # 23:38, 27:08
@@ -86,18 +97,31 @@ class Calls:
         return self.calls[-1]
 
 
+@pytest.fixture(params=[DURATION, FRACTIONAL], ids=["whole-second", "fractional"])
+def duration(request) -> float:
+    """Every test runs at both durations. A real one is frames / fps and
+    lands between whole seconds, which is exactly where "to the end of the
+    file" used to be unreachable: a boundary snapped to 1628 could never
+    equal a duration of 1628.44."""
+    return request.param
+
+
 @pytest.fixture
-def controller(qapp, fake_runner, tmp_project):
+def controller(qapp, fake_runner, tmp_project, duration):
     made = ProjectController(fake_runner, save_debounce_ms=10)
     made.open_folder(str(tmp_project([NAME, *OTHERS])))
+    made.entry(NAME).media.duration = duration
     yield made
     made.shutdown(timeout=0.5)
 
 
 def give_values(controller, name: str = NAME, *, keep=((INTRO_END, OUTRO_START),),
-                duration: float = DURATION, ranges=True, audio=True, crop=False) -> None:
+                duration: float | None = None, ranges=True, audio=True, crop=False) -> None:
+    """`duration=None` keeps whatever the `duration` fixture put on the file."""
     entry = controller.entry(name)
-    entry.media.duration = duration
+    if duration is not None:
+        entry.media.duration = duration
+    duration = entry.media.duration
     if keep is not None:
         entry.time_ranges = TimeRanges(
             [TimeRange(_clock(start), _clock(end)) for start, end in keep], Source.DETECTED)
@@ -195,33 +219,33 @@ def bare(controller):
     made.deleteLater()
 
 
-def test_time_maps_to_x_across_the_full_width_at_any_width(bare):
+def test_time_maps_to_x_across_the_full_width_at_any_width(bare, duration):
     timeline = bare
     for width in (800, 431):
         timeline.resize(width, 68)
         assert timeline.x_for(0.0) == pytest.approx(0.0)
-        assert timeline.x_for(DURATION) == pytest.approx(width)
-        assert timeline.x_for(DURATION / 2) == pytest.approx(width / 2)
-        assert timeline.time_at(width / 2) == pytest.approx(DURATION / 2)
+        assert timeline.x_for(duration) == pytest.approx(width)
+        assert timeline.x_for(duration / 2) == pytest.approx(width / 2)
+        assert timeline.time_at(width / 2) == pytest.approx(duration / 2)
         assert timeline.time_at(timeline.x_for(OUTRO_START)) == pytest.approx(OUTRO_START)
 
 
-def test_out_of_range_times_and_positions_clamp(bare):
+def test_out_of_range_times_and_positions_clamp(bare, duration):
     timeline = bare
     assert timeline.x_for(-40.0) == pytest.approx(0.0)
-    assert timeline.x_for(DURATION + 500) == pytest.approx(800.0)
+    assert timeline.x_for(duration + 500) == pytest.approx(800.0)
     assert timeline.time_at(-20.0) == pytest.approx(0.0)
-    assert timeline.time_at(9000.0) == pytest.approx(DURATION)
+    assert timeline.time_at(9000.0) == pytest.approx(duration)
 
 
 # --------------------------------------------------------------------------
 # Spans, labels and sub-lines
 # --------------------------------------------------------------------------
 
-def test_the_track_shows_the_intro_keep_and_outro_with_the_mockups_copy(tab):
+def test_the_track_shows_the_intro_keep_and_outro_with_the_mockups_copy(tab, duration):
     spans = tab.timeline.spans()
     assert [(span.start, span.end, span.keep) for span in spans] == [
-        (0.0, INTRO_END, False), (INTRO_END, OUTRO_START, True), (OUTRO_START, DURATION, False)]
+        (0.0, INTRO_END, False), (INTRO_END, OUTRO_START, True), (OUTRO_START, duration, False)]
     assert [span.label for span in spans] == [
         "INTRO · 0:00–2:33", "KEEP · 2:33–23:05", "OUTRO · 23:05–27:08"]
     assert [span.detail for span in spans] == [
@@ -256,16 +280,15 @@ def test_a_skip_span_with_no_block_is_still_drawn_and_labelled(controller):
     assert spans[0].detail == ""
 
 
-def test_a_whole_file_entry_with_no_evidence_is_one_keep_span_and_no_warnings(controller):
+def test_a_whole_file_entry_with_no_evidence_is_one_keep_span_and_no_warnings(controller, duration):
     entry = controller.entry(NAME)
-    entry.media.duration = DURATION
     entry.time_ranges = None
     made = RangesTab(controller)
     made.set_file(NAME)
     made.timeline.resize(800, 68)
     settle()
     spans = made.timeline.spans()
-    assert [(span.start, span.end, span.keep) for span in spans] == [(0.0, DURATION, True)]
+    assert [(span.start, span.end, span.keep) for span in spans] == [(0.0, duration, True)]
     assert spans[0].label == "KEEP · 0:00–27:08"
     assert made.timeline.speech_segments() == []
     assert made.timeline.envelope() == []
@@ -273,23 +296,77 @@ def test_a_whole_file_entry_with_no_evidence_is_one_keep_span_and_no_warnings(co
     assert made.inspector_panel().keep_rows() == [("Keep", "whole file")]
 
 
-def test_an_empty_manual_range_list_is_the_whole_file_too(controller):
+def test_an_empty_manual_range_list_is_the_whole_file_too(controller, duration):
     give_values(controller, keep=())
     made = RangesTab(controller)
     made.set_file(NAME)
     made.timeline.resize(800, 68)
     settle()
-    assert [(span.start, span.end) for span in made.timeline.spans()] == [(0.0, DURATION)]
+    assert [(span.start, span.end) for span in made.timeline.spans()] == [(0.0, duration)]
     assert made.timeline.spans()[0].keep
 
 
-def test_the_duration_falls_back_to_the_ranges_evidence(controller):
+def test_overlapping_stored_ranges_are_drawn_as_one_keep(controller):
+    """Sorting alone leaves the boundaries out of order, and a grip between
+    two of them snaps backwards."""
+    give_values(controller, keep=((INTRO_END, 700.0), (600.0, OUTRO_START)))
+    made = RangesTab(controller)
+    made.set_file(NAME)
+    settle()
+    assert made.timeline.keeps() == [(INTRO_END, OUTRO_START)]
+    assert made.timeline.grips() == [INTRO_END, OUTRO_START]
+    assert made.inspector_panel().keep_rows() == [("Keep", "2:33 → 23:05")]
+
+
+def test_a_stored_range_that_cannot_be_read_is_named_never_redrawn(controller):
+    """The one thing the timeline must not do is disagree with the run: an
+    unreadable range is left alone and said out loud, not quietly turned into
+    a range that starts at 0:00."""
+    give_values(controller, keep=None)
+    controller.entry(NAME).time_ranges = TimeRanges(
+        [TimeRange("nonsense", "10:00"), TimeRange("2:33", "23:05")], Source.MANUAL)
+    made = RangesTab(controller)
+    made.set_file(NAME)
+    settle()
+    assert made.timeline.keeps() == [(INTRO_END, OUTRO_START)]
+    assert made.status_text() == UNREADABLE_TEXT.format(values="nonsense → 10:00")
+    assert made.status_tone() == "warn"
+    assert made.inspector_panel().keep_rows() == [("Keep", "2:33 → 23:05")]
+
+
+def test_an_inverted_stored_range_is_named_too_and_is_not_whole_file(controller):
+    give_values(controller, keep=None)
+    controller.entry(NAME).time_ranges = TimeRanges([TimeRange("10:00", "2:00")], Source.MANUAL)
+    made = RangesTab(controller)
+    made.set_file(NAME)
+    settle()
+    assert made.timeline.keeps() == []
+    assert made.status_text() == UNREADABLE_TEXT.format(values="10:00 → 2:00")
+    assert made.inspector_panel().keep_rows() == []       # stored, but not "whole file"
+
+
+def test_a_readable_file_says_nothing(tab):
+    assert tab.status_text() == ""
+
+
+def test_without_a_duration_the_tab_says_so_rather_than_drawing_nothing(controller):
+    give_values(controller, ranges=False, audio=False)
+    controller.entry(NAME).media.duration = 0.0
+    made = RangesTab(controller)
+    made.set_file(NAME)
+    settle()
+    assert made.timeline.spans() == []
+    assert made.status_text() == NO_DURATION_TEXT
+    assert made.status_tone() == ""
+
+
+def test_the_duration_falls_back_to_the_ranges_evidence(controller, duration):
     give_values(controller)
     controller.entry(NAME).media.duration = 0.0
     made = RangesTab(controller)
     made.set_file(NAME)
     settle()
-    assert made.timeline.duration() == pytest.approx(DURATION)
+    assert made.timeline.duration() == pytest.approx(duration)
 
 
 # --------------------------------------------------------------------------
@@ -313,15 +390,32 @@ def test_a_grip_dragged_past_the_duration_stores_an_open_end(tab, controller):
     assert calls.calls == [(NAME, [("2:33", None)])]
 
 
+def test_a_keep_that_reaches_the_end_leaves_no_sliver(tab, controller, duration):
+    """A duration is frames / fps: a boundary snapped to whole seconds can
+    land just short of it, which would store a closed end, draw an
+    ungrabbable skip sliver and stop the run early."""
+    drag_grip(tab.timeline, OUTRO_START, 5_000.0)
+    assert [(span.start, span.end, span.keep) for span in tab.timeline.spans()] == [
+        (0.0, INTRO_END, False), (INTRO_END, duration, True)]
+    project = controller.project
+    assert ocr_call_for(project.files[NAME], project.folder, project.path).time_ranges == [("2:33", "")]
+
+
+def test_a_boundary_dragged_within_a_second_of_the_end_takes_the_end(tab, controller, duration):
+    calls = Calls(controller, "set_time_ranges")
+    drag_grip(tab.timeline, OUTRO_START, tab.timeline.x_for(duration - 0.4))
+    assert calls.calls == [(NAME, [("2:33", None)])]
+
+
 def test_a_grip_dragged_before_zero_stores_an_open_start(tab, controller):
     calls = Calls(controller, "set_time_ranges")
     drag_grip(tab.timeline, INTRO_END, -400.0)
     assert calls.calls == [(NAME, [(None, "23:05")])]
 
 
-def test_a_grip_is_clamped_by_its_neighbouring_boundary(tab, controller):
+def test_a_grip_is_clamped_by_its_neighbouring_boundary(tab, controller, duration):
     calls = Calls(controller, "set_time_ranges")
-    drag_grip(tab.timeline, INTRO_END, tab.timeline.x_for(DURATION))
+    drag_grip(tab.timeline, INTRO_END, tab.timeline.x_for(duration))
     assert calls.calls == [(NAME, [("23:04", "23:05")])]
 
 
@@ -421,6 +515,27 @@ def test_no_warning_row_when_every_speech_span_is_kept(controller):
     assert made.extend_buttons() == []
 
 
+def test_the_speech_in_skip_check_runs_once_per_state(tab, monkeypatch):
+    """`warnings()` is read from paintEvent as well as from the tab, so it
+    must not re-run the check on every repaint."""
+    original = ranges_view.speech_in_skips
+    calls: list[tuple] = []
+
+    def counted(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(ranges_view, "speech_in_skips", counted)
+    tab.timeline.warnings()
+    tab.timeline.warnings()
+    tab.timeline.grab()
+    assert calls == []                               # nothing has changed since the tab was built
+    tab.timeline.commit([(INTRO_END, 900.0)])        # a new state: checked once ...
+    tab.timeline.warnings()
+    tab.timeline.grab()
+    assert len(calls) == 1                           # ... and not again per repaint
+
+
 # --------------------------------------------------------------------------
 # The inspector panel
 # --------------------------------------------------------------------------
@@ -466,6 +581,17 @@ def test_add_range_puts_a_minute_in_the_largest_skip_gap(tab, controller):
     assert calls.calls == [(NAME, [("2:33", "23:05"), ("24:36", "25:36")])]
 
 
+def test_add_range_skips_a_gap_too_small_to_hold_a_range():
+    """The 0.4 s between these two keeps cannot hold a range at all: adding a
+    zero-length one there is worse than adding none."""
+    keeps = [(0.0, 100.0), (100.4, 200.0)]
+    assert with_added_range(keeps, 200.0) == keeps
+
+
+def test_add_range_never_starts_inside_the_keep_before_it():
+    assert with_added_range([(0.0, 2.5)], 40.0) == [(0.0, 2.5), (3.0, 40.0)]
+
+
 def test_add_range_on_a_whole_file_keeps_the_first_minute(controller):
     give_values(controller, keep=())
     made = RangesTab(controller)
@@ -490,6 +616,16 @@ def test_use_whole_file_commits_none(tab, controller):
 
 def test_the_header_names_the_file_its_duration_and_the_other_episodes(tab):
     assert tab.header_text() == "ep01.mkv · 27:08 · other episodes 23:38 – 27:08"
+
+
+def test_the_header_shows_one_known_duration_once(controller):
+    give_values(controller)
+    for other in OTHERS:
+        controller.entry(other).media.duration = 1418.0
+    made = RangesTab(controller)
+    made.set_file(NAME)
+    settle()
+    assert made.header_text() == "ep01.mkv · 27:08 · other episodes 23:38"
 
 
 def test_the_header_drops_the_other_episodes_when_none_is_known(controller):
@@ -536,6 +672,11 @@ def test_compact_mode_draws_the_same_spans_without_grips(compact):
     assert [span.keep for span in compact.spans()] == [False, True, False]
     assert compact.grips() == []
     assert compact.height() == 68
+
+
+def test_compact_mode_drops_the_lane_label(compact, tab):
+    assert tab.timeline.lane_label() == "speech"
+    assert compact.lane_label() == ""
 
 
 def test_compact_mode_marks_the_crop_samples(compact):
