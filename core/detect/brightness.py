@@ -603,13 +603,28 @@ def _strip_samples(times: list[float], strips: list[np.ndarray], polys_per_strip
     return [_strip_sample(times[i], strips[i], polys_per_strip[i], value) for i in order]
 
 
+def _gate_square(strip: np.ndarray) -> np.ndarray:
+    """The part of `strip` the OCR pass's gate looks at: its h x h centre
+    square, or the whole strip when it is narrower than it is tall (the gate
+    then slices it itself). Masking is per-pixel, so gate_fires(mask(
+    _gate_square(strip), t)) == gate_fires(mask(strip, t)) -- gate_floor()'s
+    crop, and pinned against whole-strip masking by the tests."""
+    h, w = strip.shape[:2]
+    x0 = (w - h) // 2
+    return strip[:, x0:x0 + h] if 0 <= x0 else strip
+
+
 def _clutter_curve(empty_strips: list[np.ndarray], thresholds) -> list[tuple[int, float]]:
     """(t, share of `empty_strips` whose strip masked at t trips the OCR
-    pass's gate) for each threshold; [] without empty strips."""
+    pass's gate) for each threshold; [] without empty strips. Only the gate's
+    centre square is masked (_gate_square): the same answer at about a
+    quarter of the cost (72 strips of 1344 x 54 at 32 thresholds: 0.21 s ->
+    0.06 s)."""
     if not empty_strips:
         return []
-    n = len(empty_strips)
-    return [(int(t), sum(ocr_view.gate_fires(ocr_view.mask(strip, t)) for strip in empty_strips) / n)
+    squares = [_gate_square(strip) for strip in empty_strips]
+    n = len(squares)
+    return [(int(t), sum(ocr_view.gate_fires(ocr_view.mask(square, t)) for square in squares) / n)
             for t in thresholds]
 
 

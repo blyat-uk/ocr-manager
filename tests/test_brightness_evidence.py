@@ -528,6 +528,35 @@ def test_background_level_is_the_mean_outside_glyph_pixels(bg):
     assert sample.background_level == bg
 
 
+def _boxed_text_strip(box_level=90):
+    """Rimless glyph cores (250) inside a box at `box_level` covering exactly
+    TEXT_POLY's filled pixels (its edge ring included), on an outer
+    background of BG."""
+    img = np.full((H, W, 3), BG, dtype=np.uint8)
+    img[8:47, 440:901] = box_level
+    for k in range(N_GLYPHS):
+        x0 = GLYPH_X0 + k * GLYPH_PITCH
+        img[GLYPH_Y0:GLYPH_Y1, x0:x0 + GLYPH_W] = 250
+    return img
+
+
+def test_background_level_counts_the_non_glyph_pixels_inside_the_polygon_too():
+    # Background is every pixel that is not a glyph pixel: the outer strip,
+    # the polygon's edge ring the erosion drops, and its non-glyph interior.
+    # Averaging only outside the polygon gives BG; only outside the eroded
+    # interior gives the outer strip plus the ring.
+    glyph = N_GLYPHS * (GLYPH_Y1 - GLYPH_Y0) * GLYPH_W      # 9000 pixels at 250
+    box = (47 - 8) * (901 - 440)                              # 17979 pixels TEXT_POLY fills
+    expected = ((H * W - box) * BG + (box - glyph) * 90) / (H * W - glyph)
+
+    sample = B._strip_sample(0.0, _boxed_text_strip(), [TEXT_POLY], 227)
+
+    assert sample.glyph_level == 250
+    assert sample.background_level == expected
+    assert expected not in (BG, ((H * W - box) * BG + (box - (47 - 10) * (901 - 442)) * 90)
+                            / (H * W - (47 - 10) * (901 - 442)))
+
+
 def test_an_empty_strips_background_level_is_the_whole_strip():
     strip = _ramp_strip(top=230)
     sample = B._strip_sample(0.0, strip, [], 227)
@@ -695,6 +724,47 @@ def test_coloured_text_gets_the_unverified_grid_over_its_empty_strips_only(monke
     assert result.clutter_curve == [(t, 1.0) for t in range(100, 256, 5)]
 
 
+def _clutter_strips(h, w, rng):
+    """Text-free strips of any shape: noise, a smooth diagonal ramp, and dark
+    specks and blocks."""
+    noise = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+    ramp = np.repeat(((np.linspace(0, 255, h)[:, None] + np.linspace(0, 255, w)[None, :]) / 2)
+                     .astype(np.uint8)[..., None], 3, axis=2)
+    specks = rng.integers(0, 60, (h, w, 3), dtype=np.uint8)
+    for _ in range(40):
+        y, x = int(rng.integers(0, h)), int(rng.integers(0, w))
+        specks[y:y + int(rng.integers(1, 8)), x:x + int(rng.integers(1, 12))] = int(rng.integers(120, 256))
+    return [noise, ramp, specks]
+
+
+@pytest.mark.parametrize("h, w", [(54, 1344), (53, 1344), (54, 1345), (108, 2688), (54, 55), (54, 54),
+                                  (54, 50), (54, 20), (100, 20), (7, 3)])
+def test_the_clutter_curve_matches_masking_the_whole_strip(h, w):
+    strips = _clutter_strips(h, w, np.random.default_rng(h * 10000 + w))
+    thresholds = list(range(0, 256, 3))
+
+    curve = B._clutter_curve(strips, thresholds)
+
+    assert curve == [(t, sum(OV.gate_fires(OV.mask(s, t)) for s in strips) / len(strips)) for t in thresholds]
+    assert len({share for _, share in curve}) > 1, "the sweep must see the gate both fire and stay quiet"
+
+
+@pytest.mark.parametrize("h, w, masked", [(54, 1344, (54, 54)), (53, 1345, (53, 53)), (54, 54, (54, 54)),
+                                          (54, 20, (54, 20))])
+def test_the_clutter_curve_masks_only_the_centre_square_the_gate_looks_at(monkeypatch, h, w, masked):
+    shapes = []
+    real_mask = OV.mask
+
+    def recording_mask(frame, t):
+        shapes.append(frame.shape[:2])
+        return real_mask(frame, t)
+
+    monkeypatch.setattr(OV, "mask", recording_mask)
+    B._clutter_curve(_clutter_strips(h, w, np.random.default_rng(0)), [100, 200])
+
+    assert shapes and set(shapes) == {masked}
+
+
 def test_no_empty_strips_means_an_empty_clutter_curve(monkeypatch):
     result, _ = _detect(monkeypatch, [_glyph_strip()])
     assert result.curve and result.clutter_curve == []
@@ -765,6 +835,7 @@ def _scene():
         _s(9.0, is_text=False, background_level=100.0, gate=True),
         _s(10.0, glyph_level=235, background_level=8.0),        # darkest scene behind text
         _s(11.0, is_text=False, background_level=1.0, gate=True),     # darker still, but no text
+        B.StripSample(0.5, True, None, 0.0, None, 2, (), None),       # a speck: no measurable glyphs
     ]
 
 
@@ -773,14 +844,23 @@ def test_tile_kinds():
 
 
 def test_choose_tiles_picks_each_kind():
-    assert choose_tiles(_scene(), 227) == {"dark": 10.0, "bright": 4.0, "thin": 5.0, "two_line": 3.0, "leaking": 8.0}
+    assert choose_tiles(_scene(), 227) == {"dark": 10.0, "bright": 4.0, "thin": 5.0, "two_line": 2.0, "leaking": 8.0}
+
+
+def test_two_line_is_the_earliest_multi_line_strip_whatever_its_glyph_level():
+    # A HUD boxed on its own row lowers a strip's glyph level; it must not
+    # make that strip the two-line tile.
+    strips = [_s(5.0, glyph_level=180, lines=2), _s(1.0, lines=1), _s(2.0, glyph_level=250, lines=3),
+              _s(3.0, glyph_level=200, lines=2)]
+    assert choose_tiles(strips, 227)["two_line"] == 2.0
 
 
 def test_the_dark_tile_is_the_darkest_scene_not_the_darkest_glyphs():
     # 1.0 has the lowest glyph level -- on the reference 1080p file that was a
     # HUD the detector boxed -- but 10.0 is the darkest scene behind text.
     tiles = choose_tiles(_scene(), 227)
-    assert tiles["dark"] == 10.0 and tiles["dark"] != min(_scene(), key=lambda s: s.glyph_level or 999).time
+    measured = [s for s in _scene() if s.glyph_level is not None]
+    assert tiles["dark"] == 10.0 and tiles["dark"] != min(measured, key=lambda s: s.glyph_level).time
 
 
 def test_choose_tiles_returns_kinds_in_tile_order():
@@ -800,17 +880,25 @@ def test_text_strips_are_never_leaking_and_empty_strips_never_text_tiles():
     (lambda: [_s(1.0), _s(2.0, background_level=30.0)], {"dark": 2.0, "bright": 1.0, "thin": 1.0}),
     (lambda: [_s(1.0, is_text=False, gate=False), _s(2.0, is_text=False, gate=False)], {}),
     (lambda: [_s(1.0, is_text=False, gate=True)], {"leaking": 1.0}),
-    # a text strip too small to split still has a background: dark and bright, never thin
-    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 1, (), None)], {"dark": 1.0, "bright": 1.0}),
-    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 2, (), None)], {"dark": 1.0, "bright": 1.0, "two_line": 1.0}),
+    # text strips whose glyphs could not be measured are no text tile at all
+    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 1, (), None)], {}),
+    (lambda: [B.StripSample(1.0, True, None, 50.0, None, 2, (), None)], {}),
 ])
 def test_kinds_without_a_candidate_are_omitted(make, expected):
     assert choose_tiles(make(), 227) == expected
 
 
-def test_a_multi_line_strip_without_a_glyph_level_is_chosen_only_when_nothing_better_exists():
-    strips = [B.StripSample(1.0, True, None, 50.0, None, 2, (), None), _s(2.0, glyph_level=250, lines=2)]
-    assert choose_tiles(strips, 227)["two_line"] == 2.0
+def test_strips_whose_glyphs_could_not_be_measured_are_never_text_tiles():
+    # Specks the detector boxed but too small to split (on a 1080p reference
+    # file, a starfield speck with no subtitle): each would otherwise win.
+    def speck(time, background_level, lines=1, stroke_px=None):
+        return B.StripSample(time, True, None, background_level, stroke_px, lines, (), None)
+
+    strips = [speck(0.1, 0.0, lines=2), speck(0.2, 255.0, lines=3),
+              speck(0.3, 50.0, stroke_px=0.01),     # inconsistent on purpose: the rule is glyph_level
+              _s(1.0, background_level=20.0, stroke_px=3.0), _s(2.0, background_level=90.0, lines=2, stroke_px=4.0)]
+
+    assert choose_tiles(strips, 227) == {"dark": 1.0, "bright": 2.0, "thin": 1.0, "two_line": 2.0}
 
 
 @pytest.mark.parametrize("kind, make", [
@@ -840,11 +928,23 @@ def test_tiles_from_a_real_detection_point_at_its_strips(monkeypatch):
     thin = _bar_strip(3)
     leak = _ramp_strip(top=230)
     plain = _glyph_strip()
+    # Detected specks too small to split, sampled first: the darkest scene with
+    # two rows of boxes, and the brightest scene.
+    dark_speck = _flat_strip(2)
+    dark_speck[21:24, 451:455] = dark_speck[31:34, 451:455] = 255
+    bright_speck = _flat_strip(200)
+    bright_speck[21:24, 451:455] = 255
     entries = [(plain, [TEXT_POLY]), (dark, [TEXT_POLY]), (two_line, [UPPER_LINE, LOWER_LINE]),
-               (bright_bg, [TEXT_POLY]), (thin, [TEXT_POLY])]
-    source = [plain] * 12 + [dark, two_line, bright_bg, thin] + [_flat_strip(), leak, _flat_strip(60), leak] * 2
+               (bright_bg, [TEXT_POLY]), (thin, [TEXT_POLY]),
+               (dark_speck, [TINY_POLY, TINY_POLY + np.float32([0, 10])]), (bright_speck, [TINY_POLY])]
+    source = ([dark_speck, bright_speck] + [plain] * 10 + [dark, two_line, bright_bg, thin]
+              + [_flat_strip(), leak, _flat_strip(60), leak] * 2)
 
     result, _ = _detect(monkeypatch, source, det=_PolyDet(entries))
     tiles = choose_tiles(result.strips, result.value)
+
+    specks = result.strips[:2]
+    assert [(s.is_text, s.glyph_level, s.lines) for s in specks] == [(True, None, 2), (True, None, 1)]
+    assert specks[0].background_level < 10 and specks[1].background_level > 100
 
     assert tiles == {"dark": 112.0, "bright": 114.0, "thin": 115.0, "two_line": 113.0, "leaking": 117.0}
