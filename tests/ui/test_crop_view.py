@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
-from app.views.crop_view import PAGE_MARGIN, DETECTED_TAG, CropCanvas, CropTab, SampleStrip
+from app.views.crop_view import DETECTED_TAG, PAGE_MARGIN, CropCanvas, CropTab, SampleStrip
 from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs

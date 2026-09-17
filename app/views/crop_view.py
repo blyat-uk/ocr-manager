@@ -913,9 +913,10 @@ class SampleStrip(QWidget):
         self._warned: set[int] = set()
         self._images: dict[int, QImage | None] = {}
         layout = QHBoxLayout(self)
-        # The 3 px on the sides and the bottom is clearance for the focus
-        # ring, which the row paints on its own edge (`_paint_focus_ring`).
-        layout.setContentsMargins(3, 9, 3, 3)
+        # Clearance on the sides and the bottom for the focus ring, which the
+        # row paints on its own edge (`_paint_focus_ring`) -- at the mockup's
+        # flush margins the ring cut through the "◀ ▶ arrow keys" hint.
+        layout.setContentsMargins(6, 9, 6, 4)
         layout.setSpacing(6)
         self._label = note_label("samples")
         self._label.setFixedWidth(self.LABEL_WIDTH)
