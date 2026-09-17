@@ -32,16 +32,20 @@ SECTIONS = ["What to extract", "OCR engine", "Labels", "Performance", "Auto-pilo
 ROW_KEYS = {
     "What to extract": ["Dialogue subtitles", "Positioned labels / nameplates"],
     "OCR engine": ["Language", "Confidence threshold", "Merge similar lines above", "Similar-frame threshold"],
-    "Labels": ["Minimum duration", "Maximum duration", "Confidence threshold", "Minimum confidence",
-               "Mask regions"],
+    # No "Confidence threshold": `label_conf_threshold` has no editor, see
+    # NOT_IN_THE_SHEET and app/views/folder_settings_fields.py.
+    "Labels": ["Minimum duration", "Maximum duration", "Minimum confidence", "Mask regions"],
     "Performance": ["Parallel files"],
     "Auto-pilot": ["Run detections when a folder opens", "Full brightness detection on the first",
                    "Minimum repeating segment", "Merge repeating silences", "Crop width (% of frame)",
                    "Crop vertical padding (% of frame height)", "Crop minimum height (% of frame height)",
                    "Subtitle band starts at (% from top)"],
 }
-# FolderSettings fields B9 does not list (the old app never exposed them either).
-NOT_IN_THE_SHEET = {"frames_to_skip", "use_gpu", "label_mask_crops"}
+# FolderSettings fields with no editor: B9 does not list frames_to_skip / use_gpu
+# (the old app never exposed them either), label_mask_crops is the read-only mask
+# count, and label_conf_threshold changes nothing -- videocr/label_scanner.py
+# stores it (line 153) but filters only on conf_threshold_min (lines 1474, 1586).
+NOT_IN_THE_SHEET = {"frames_to_skip", "use_gpu", "label_mask_crops", "label_conf_threshold"}
 
 
 # --------------------------------------------------------------------------
@@ -297,7 +301,7 @@ def test_editor_kinds_and_ranges(window):
     sheet = open_sheet(window)
     for field in ("dialogue_enabled", "labels_enabled", "autopilot_enabled", "merge_repeating_silences"):
         assert isinstance(sheet.editor(field), Toggle), field
-    for field in ("conf_threshold", "sim_threshold", "label_conf_threshold", "label_conf_threshold_min"):
+    for field in ("conf_threshold", "sim_threshold", "label_conf_threshold_min"):
         editor = sheet.editor(field)
         assert isinstance(editor, QSpinBox) and (editor.minimum(), editor.maximum()) == (0, 100), field
         assert editor.suffix() == " %"
@@ -345,7 +349,6 @@ ROUND_TRIPS = [
     ("similar_image", 0.45, 0.45, 1.25, 1.25),
     ("label_min_duration", 1.5, 1.5, 0.8, 0.8),
     ("label_max_duration", 7.5, 7.5, 4.0, 4.0),
-    ("label_conf_threshold", 90, 90, 93, 93),
     ("label_conf_threshold_min", 70, 70, 85, 85),
     ("ocr_parallel", 6, 6, 2, 2),
     ("autopilot_enabled", False, False, True, True),

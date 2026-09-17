@@ -6,9 +6,10 @@ rule as `inspector_sections.py`): `SECTIONS` is the whole of B9 -- every
 explanation and the editor it needs -- and `Section`/`SettingRow` are the
 `.sec` and `.kv` blocks it is laid out in (workbench-hifi figure 3).
 
-`FolderSettings` fields B9 does not name are deliberately absent:
-`frames_to_skip` and `use_gpu`, which no version of the app has ever
-exposed, keep their defaults.
+Three `FolderSettings` fields have no editor on purpose: `frames_to_skip`
+and `use_gpu`, which B9 does not name and no version of the app has ever
+exposed, and `label_conf_threshold`, which the label scanner ignores (see
+the comment on the Labels section). All three keep their stored values.
 """
 from __future__ import annotations
 
@@ -101,11 +102,14 @@ SECTIONS: tuple[tuple[str, tuple[Field, ...], str], ...] = (
               "a frame with fewer pixels changed than this is not read again",
               maximum=100, decimals=2, step=0.05, suffix=" %", integer=False),
     ), ""),
+    # B9 also lists a Labels "Confidence threshold (%)" for `label_conf_threshold`.
+    # It has no editor on purpose: `videocr/label_scanner.py` stores it (line 153)
+    # and never reads it again -- only `conf_threshold_min` filters readings
+    # (lines 1474 and 1586) -- so the control would change nothing. The model
+    # field, its migration and `ocr_kwargs` still carry it unchanged.
     (LABELS_SECTION, (
         _seconds("label_min_duration", "Minimum duration", "labels on screen for less time are dropped", maximum=120),
         _seconds("label_max_duration", "Maximum duration", "labels on screen for longer are dropped", maximum=120),
-        _percent("label_conf_threshold", "Confidence threshold",
-                 "not read by the current label scanner; the minimum below filters readings"),
         _percent("label_conf_threshold_min", "Minimum confidence", "label readings below this are discarded"),
     ), ""),
     ("Performance", (
@@ -131,6 +135,8 @@ SECTIONS: tuple[tuple[str, tuple[Field, ...], str], ...] = (
                  "text above this line is not taken for subtitles", percent=True),
     ), AUTOPILOT_NOTE),
 )
+
+
 # --------------------------------------------------------------------------
 # Editors
 # --------------------------------------------------------------------------
