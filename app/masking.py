@@ -37,7 +37,7 @@ from core.detect.brightness import DEFAULT_BRIGHTNESS, MIN_GLYPH_REGION_PIXELS
 
 __all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_T",
            "StripPixels",
-           "clip_boxes", "gate_fires", "mask"]
+           "clip_boxes", "gate_fires", "mask", "normalise_boxes"]
 
 MIN_T = 100                # the thresholds the curve spans; a subtitle threshold
 MAX_T = 255                # is never picked outside them (core/detect/brightness.py)
@@ -57,6 +57,16 @@ def mask(strip: np.ndarray, t: int) -> np.ndarray:
 def gate_fires(masked: np.ndarray) -> bool:
     """`core.detect.ocr_view.gate_fires`, resolved at call time."""
     return ocr_view.gate_fires(masked)
+
+
+def normalise_boxes(boxes) -> tuple[tuple[int, int, int, int], ...]:
+    """`boxes` as a tuple of (x, y, w, h) int tuples.
+
+    Evidence stores them as lists of ints (core/detect/brightness.py's
+    `to_evidence`), and a list never equals the tuple it was cached as -- so
+    everything that compares boxes (the StripPixels cache key) normalises
+    through here first, on both sides."""
+    return tuple(tuple(int(value) for value in box) for box in boxes or ())
 
 
 def clip_boxes(boxes, width: int, height: int) -> list[tuple[int, int, int, int]]:
@@ -85,7 +95,7 @@ class StripPixels:
     def __init__(self, strip: np.ndarray, boxes=()):
         self.strip = strip
         self.height, self.width = strip.shape[:2]
-        self.given_boxes = tuple(tuple(int(v) for v in box) for box in boxes or ())
+        self.given_boxes = normalise_boxes(boxes)
         self.boxes = clip_boxes(boxes, self.width, self.height)
         self._min_channel = strip.min(axis=2)
         self._split: int | None = None

@@ -662,33 +662,68 @@ def test_an_unmeasurable_tile_says_so_instead_of_claiming_success(loaded, contro
     assert not tile.is_bad()
 
 
-def test_a_pinned_tile_is_measured_over_the_whole_strip(loaded, controller, fake_runner):
-    """A pinned frame has no detector sample, so it has no boxes. It is the
-    tile the user added because they are worried about it, so it is split
-    over the whole strip rather than left unmeasurable."""
+def test_a_pinned_tile_without_a_sample_shows_pixels_but_claims_no_measurement(
+        loaded, controller, fake_runner):
+    """A pinned frame the detector never sampled has no boxes, so there is no
+    glyph region to measure -- and Otsu over the whole strip would find a
+    "split" in any gradient, then report 100% of that invention lost. The pin
+    is for LOOKING at a frame under the live mask, so the tile draws its
+    pixels and says only that."""
+    noise = np.clip(np.linspace(20, 120, STRIP_W)[None, :, None]
+                    + np.random.default_rng(5).integers(0, 40, (STRIP_H, STRIP_W, 1)),
+                    0, 255).astype(np.uint8).repeat(3, axis=2)
     loaded.pin_time(70.0)
     settle()
-    deliver(controller, fake_runner, strips={70.0: text_strip()})
+    deliver(controller, fake_runner, strips={70.0: noise})
     loaded.refresh()
     settle()
     pinned = tile_of(loaded, "pinned")
     assert pinned.has_pixels()
-    loaded.set_preview(190)
+    for t in (150, 190, 210, 230):
+        loaded.set_preview(t)
+        settle()
+        assert pinned.caption_right() == "pinned frame — not measured"
+        assert pinned.status_tone() == "dim"
+        assert not pinned.is_bad()
+        assert "%" not in pinned.caption_right()
+        assert pinned.drawn_pixels() is not None          # the mask is still live
+        assert pinned.lost_pixel_count() == 0
+
+
+def test_a_pinned_time_the_detector_sampled_is_measured_normally(controller, fake_runner):
+    """Pinning a time that IS a detector sample keeps its boxes, so the tile
+    measures like any other."""
+    extra = 70.0
+    give_values(controller, evidence=brightness_evidence(
+        strips=[sample(t) for t in (*TILE_TIMES.values(), extra)]))
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    made.pin_time(extra)
     settle()
-    assert pinned.caption_right() == "strokes solid"
-    loaded.set_preview(210)                      # the dim glyph rows go
+    deliver(controller, fake_runner, strips={**strips_for(), extra: text_strip()})
+    made.refresh()
+    made.set_preview(210)
     settle()
+    pinned = tile_of(made, "pinned")
     assert pinned.caption_right() == "50% of glyph pixels lost"
     assert pinned.is_bad()
+    made.page().close()
 
 
-def test_an_empty_pinned_strip_is_not_measurable(loaded, controller, fake_runner):
-    loaded.pin_time(80.0)
-    settle()
-    deliver(controller, fake_runner, strips={80.0: np.zeros((STRIP_H, STRIP_W, 3), np.uint8)})
+def test_unchanged_evidence_reuses_the_measured_strip(loaded):
+    """The glyph split is an Otsu pass per strip: a repaint must not redo it.
+    The cache key is the pixels AND the boxes, both normalised, or a list
+    from evidence never equals the tuple it was stored as."""
+    held = [loaded.strip_pixels(t) for t in TILE_TIMES.values()]
+    assert all(pixels is not None for pixels in held)
     loaded.refresh()
     settle()
-    assert tile_of(loaded, "pinned").caption_right() == "not measurable"
+    assert [loaded.strip_pixels(t) for t in TILE_TIMES.values()] == held
+    for pixels in held:
+        assert isinstance(pixels.given_boxes, tuple)
+        assert all(isinstance(box, tuple) for box in pixels.given_boxes)
 
 
 # --------------------------------------------------------------------------

@@ -67,6 +67,7 @@ from app.masking import (
     MAX_T,
     MIN_T,
     StripPixels,
+    normalise_boxes,
 )
 from app.state_text import brightness_flag_text, brightness_is_stale, clock
 from app.theme import tokens
@@ -90,6 +91,7 @@ CURVE_CAPTION = "■ OCR holds up"
 CLUTTER_CAPTION = "┅ background clutter still firing"
 NOT_VERIFIED = "not verified on this file"
 NOT_MEASURABLE = "not measurable"
+PINNED_UNMEASURED = "pinned frame — not measured"
 STALE_REDETECTING = "measured on an earlier crop — re-detecting"
 STALE_REDETECT = "measured on an earlier crop — re-detect to refresh"
 # Shown under it while the tiles and the curve describe the evidence's crop
@@ -170,6 +172,7 @@ class ZoomTile(QWidget):
         self._pixels: StripPixels | None = None
         self._is_text = True
         self._lines = 1
+        self._sampled = True
         self._image: QImage | None = None
         self._overlay: QImage | None = None
         self._target = QRectF()
@@ -181,10 +184,15 @@ class ZoomTile(QWidget):
 
     # --- state ------------------------------------------------------------
 
-    def set_sample(self, pixels: StripPixels | None, *, is_text: bool = True, lines: int = 1) -> None:
+    def set_sample(self, pixels: StripPixels | None, *, is_text: bool = True, lines: int = 1,
+                   sampled: bool = True) -> None:
+        """`sampled`: the detector measured this frame, so `is_text`, `lines`
+        and the boxes behind `pixels` describe it. False for a pinned time
+        the detector never looked at -- see `_status`."""
         self._pixels = pixels
         self._is_text = is_text
         self._lines = int(lines)
+        self._sampled = sampled
 
     def has_pixels(self) -> bool:
         return self._pixels is not None
@@ -270,6 +278,15 @@ class ZoomTile(QWidget):
         self.update()
 
     def _status(self, pixels: StripPixels, t: int) -> tuple[str, str]:
+        if not self._sampled:
+            # A pinned frame the detector never sampled: no boxes, so no
+            # glyph region, and Otsu over the whole strip would find a
+            # "split" in any gradient and then report 100% of that invention
+            # lost -- on the one tile the user added because they are worried
+            # about that frame. The pin is for LOOKING at it under the live
+            # mask, so the tile shows its pixels and claims nothing: no
+            # percentage, no ok tone, never a red border.
+            return PINNED_UNMEASURED, "dim"
         if not self._is_text:
             return ("background leaking", "warn") if pixels.gate(t) else ("clean", "ok")
         percent = pixels.lost_percent(t)
@@ -1094,7 +1111,7 @@ class BrightnessTab:
             if strip is None:
                 tile.set_sample(None)
                 continue
-            boxes = self._boxes_for(tile, sample, strip)
+            boxes = normalise_boxes(sample.get("boxes"))
             # Re-measured when the pixels OR the boxes change: a re-detection
             # can land new boxes on a strip that is still cached, and the
             # glyph split belongs to the pair, not to the pixels alone.
@@ -1102,27 +1119,8 @@ class BrightnessTab:
                 held = StripPixels(strip, boxes)
             pixels[tile.time] = held
             tile.set_sample(held, is_text=bool(sample.get("is_text", True)),
-                            lines=int(sample.get("lines") or 1))
+                            lines=int(sample.get("lines") or 1), sampled=bool(sample))
         self._pixels = pixels
-
-    @staticmethod
-    def _boxes_for(tile: ZoomTile, sample: dict, strip) -> tuple:
-        """The polygon boxes to split glyphs inside.
-
-        A pinned frame has no detector sample and so no boxes -- and it is
-        the one tile the user added because they are worried about it, so it
-        is split over the WHOLE strip rather than left unmeasurable. The
-        strip is the crop box: on a subtitle frame its text dominates, and
-        Otsu over it lands where it would inside a polygon. On a frame with
-        no text the split is noise and the glyph mask usually falls below the
-        detector's floor, which reads back as "not measurable" -- the honest
-        answer for a frame the detector never boxed.
-        """
-        boxes = sample.get("boxes") or ()
-        if boxes or tile.kind != "pinned":
-            return tuple(boxes)
-        height, width = strip.shape[:2]
-        return ((0, 0, width, height),)
 
     def _strip_width(self) -> int:
         for tile in self._tiles:
@@ -1329,6 +1327,10 @@ class BrightnessTab:
         if entry is None:
             return ""
         own = self._entry_box(entry)
+        # `own is None` (a file with no crop at all) says nothing here: the
+        # evidence box is then the only box there is, so there is nothing to
+        # disagree with. A MANUAL brightness whose crop was cleared would go
+        # unremarked, but no UI path clears a crop.
         describes_another_crop = own is not None and self._crop_box not in (None, own)
         if not (describes_another_crop or brightness_is_stale(entry)):
             return ""
@@ -1340,7 +1342,7 @@ class BrightnessTab:
         The warn line above it is about the stored value; a value can be
         stale while the evidence still describes the current crop, so the
         two are separate."""
-        own = self._entry_box(entry)
+        own = self._entry_box(entry)            # None: no crop to disagree with, see _stale_text
         return TILES_OTHER_CROP if own is not None and self._crop_box not in (None, own) else ""
 
     def _update_panel(self, entry, evidence, auto: int | None, stored: int | None) -> None:
