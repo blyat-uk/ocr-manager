@@ -2101,64 +2101,66 @@ class LabelScanner:
         even at nearby positions (e.g. multi-line disclaimers).
 
         The label kept (the longer of two duplicates, the earlier on a tie)
-        keeps its text and position, but its span becomes the union of its own
-        and every duplicate removed in its favour -- directly, or through a
-        label that was itself removed later. Which labels are duplicates and
-        which is kept is decided on the spans as they came in.
+        keeps its text and position, but takes the union of both spans at
+        once, so every later comparison sees the widened span: a label that
+        absorbed one duplicate also absorbs one it only now overlaps, and a
+        label removed later passes everything it absorbed on to the label kept
+        in its place. A widened label may only now overlap a label it was
+        compared with before, so the comparisons are repeated until a round
+        of them removes nothing. Widening only after every decision could
+        leave two survivors overlapping, which _merge_split_labels would then
+        join as one label with the text twice. The labels given are changed
+        in place.
         """
         if len(labels) < 2:
             return labels
 
         to_remove = set()
-        replaced_by = {}  # removed label index -> the label kept in its place then
 
-        for i, label_i in enumerate(labels):
-            if i in to_remove:
-                continue
-
-            for j, label_j in enumerate(labels):
-                if i >= j or j in to_remove:
+        removed_any = True
+        while removed_any:
+            removed_any = False
+            for i, label_i in enumerate(labels):
+                if i in to_remove:
                     continue
 
-                # Check time overlap first. Under half a frame is not an
-                # overlap: labels timed back to back can overlap by float
-                # noise (an end is a frame's PTS plus 1 / fps), or by under a
-                # millisecond where frame durations are rounded (23.976 fps
-                # in a millisecond time base).
-                overlap_start = max(label_i.start_pts, label_j.start_pts)
-                overlap_end = min(label_i.end_pts, label_j.end_pts)
-                if overlap_end - overlap_start < 0.5 / self.fps:
-                    continue
+                for j, label_j in enumerate(labels):
+                    if i >= j or j in to_remove:
+                        continue
 
-                # Must have similar text to be considered duplicates
-                if not self._texts_similar(label_i.text, label_j.text):
-                    continue
+                    # Check time overlap first. Under half a frame is not an
+                    # overlap: labels timed back to back can overlap by float
+                    # noise (an end is a frame's PTS plus 1 / fps), or by under
+                    # a millisecond where frame durations are rounded (23.976
+                    # fps in a millisecond time base).
+                    overlap_start = max(label_i.start_pts, label_j.start_pts)
+                    overlap_end = min(label_i.end_pts, label_j.end_pts)
+                    if overlap_end - overlap_start < 0.5 / self.fps:
+                        continue
 
-                # Check position proximity (within 10% of frame dimensions)
-                dx = abs(label_i.pos_x - label_j.pos_x)
-                dy = abs(label_i.pos_y - label_j.pos_y)
+                    # Must have similar text to be considered duplicates
+                    if not self._texts_similar(label_i.text, label_j.text):
+                        continue
 
-                if dx < self.width * 0.1 and dy < self.height * 0.1:
-                    # Keep the one with longer duration
-                    dur_i = label_i.end_pts - label_i.start_pts
-                    dur_j = label_j.end_pts - label_j.start_pts
-                    if dur_i >= dur_j:
-                        to_remove.add(j)
-                        replaced_by[j] = i
-                    else:
-                        to_remove.add(i)
-                        replaced_by[i] = j
-                        break
+                    # Check position proximity (within 10% of frame dimensions)
+                    dx = abs(label_i.pos_x - label_j.pos_x)
+                    dy = abs(label_i.pos_y - label_j.pos_y)
 
-        spans = {}
-        for removed in replaced_by:
-            kept = removed
-            while kept in replaced_by:
-                kept = replaced_by[kept]
-            start, end = spans.get(kept, (labels[kept].start_pts, labels[kept].end_pts))
-            spans[kept] = (min(start, labels[removed].start_pts), max(end, labels[removed].end_pts))
-        for kept, (start, end) in spans.items():
-            labels[kept].start_pts, labels[kept].end_pts = start, end
+                    if dx < self.width * 0.1 and dy < self.height * 0.1:
+                        # Keep the one with longer duration
+                        dur_i = label_i.end_pts - label_i.start_pts
+                        dur_j = label_j.end_pts - label_j.start_pts
+                        if dur_i >= dur_j:
+                            kept, removed = label_i, label_j
+                            to_remove.add(j)
+                        else:
+                            kept, removed = label_j, label_i
+                            to_remove.add(i)
+                        kept.start_pts = min(kept.start_pts, removed.start_pts)
+                        kept.end_pts = max(kept.end_pts, removed.end_pts)
+                        removed_any = True
+                        if removed is label_i:
+                            break
 
         return [l for i, l in enumerate(labels) if i not in to_remove]
 

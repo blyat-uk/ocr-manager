@@ -783,6 +783,53 @@ def test_a_removed_duplicate_extends_the_label_kept_to_both_spans(clip_for):
         assert spans(scanner._remove_duplicates([_label(1.0, 2.0), other])) == spans(before), other
 
 
+@pytest.mark.parametrize("order", list(itertools.permutations(range(3))), ids=lambda o: "-".join(map(str, o)))
+def test_a_chain_of_duplicates_comes_out_of_post_processing_as_one_label(clip_for, order):
+    """Three same-text labels at one position, each overlapping the next:
+    (1.0, 2.0), (1.9, 2.8), (2.3, 2.9). A label kept in place of a duplicate
+    takes the duplicate's span at once, so the later comparisons see it: the
+    first, widened to (1.0, 2.8), also removes the third. Widened only after
+    every decision, it would stay beside the third, overlapping it, and the
+    split-label merge after it would join the two as one label with the text
+    twice. Run through the post-processing scan() applies after phase 4."""
+    scanner = clip_for("video-start-0.021s-mkv").scanner()
+    spans = [(1.0, 2.0), (1.9, 2.8), (2.3, 2.9)]
+    labels = [_label(*spans[i]) for i in order]
+
+    labels = scanner._merge_adjacent_labels(scanner._merge_split_labels(scanner._remove_duplicates(labels)))
+
+    assert [(l.text, l.start_pts, l.end_pts) for l in labels] == [("第三十七集", 1.0, 2.9)]
+
+
+@pytest.mark.parametrize("shape", [
+    pytest.param([(1.0, 2.0), (1.9, 2.8), (2.3, 2.9)], id="each-overlapping-the-next"),
+    pytest.param([(1.0, 3.0), (1.5, 2.0), (2.5, 4.0)], id="one-inside-another"),
+])
+@pytest.mark.parametrize("order", list(itertools.permutations(range(3))), ids=lambda o: "-".join(map(str, o)))
+def test_labels_with_different_texts_are_left_alone_by_duplicate_removal(clip_for, shape, order):
+    """Duplicate removal only ever acts on similar texts, so for labels with
+    different texts it changes nothing -- not their spans, not which come
+    out -- and what post-processing makes of them is exactly what it makes
+    without that step (whatever _merge_split_labels then joins)."""
+    scanner = clip_for("video-start-0.021s-mkv").scanner()
+    texts = ["甲甲甲", "乙乙乙", "丙丙丙"]
+
+    def make():
+        return [_label(*shape[i], text=texts[i]) for i in order]
+
+    labels = make()
+    kept = scanner._remove_duplicates(labels)
+    assert len(kept) == len(labels) and all(a is b for a, b in zip(kept, labels))
+    assert [(l.start_pts, l.end_pts) for l in kept] == [shape[i] for i in order]
+
+    def result(labels):
+        return [(l.text, l.start_pts, l.end_pts, l.pos_x) for l in labels]
+
+    with_removal = scanner._merge_adjacent_labels(scanner._merge_split_labels(scanner._remove_duplicates(make())))
+    without = scanner._merge_adjacent_labels(scanner._merge_split_labels(make()))
+    assert result(with_removal) == result(without)
+
+
 @pytest.mark.parametrize("order", ["shorter-first", "longer-first"])
 def test_duplicates_with_different_spans_come_out_as_one_label_covering_both(clip_for, order):
     """Two segments at one position with the same text, read at overlapping
