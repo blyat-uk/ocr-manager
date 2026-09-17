@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 from core.detect import ocr_view
-from core.detect.brightness import DEFAULT_BRIGHTNESS
+from core.detect.brightness import DEFAULT_BRIGHTNESS, MIN_GLYPH_REGION_PIXELS
 
 __all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_T",
            "StripPixels",
@@ -43,7 +43,10 @@ MIN_T = 100                # the thresholds the curve spans; a subtitle threshol
 MAX_T = 255                # is never picked outside them (core/detect/brightness.py)
 LOST_ALERT_PERCENT = 10    # at or above this, a tile's status turns bad
 LOST_RISE_POINTS = 10      # a tile this far above its own baseline is losing strokes
-MIN_SPLIT_PIXELS = 16      # too few pixels inside the boxes to split: no glyph mask
+# Too few pixels inside the boxes to split. The detector's own floor
+# (core.detect.brightness.MIN_GLYPH_REGION_PIXELS), so a strip this view
+# calls unmeasurable is one the detector could not measure either.
+MIN_SPLIT_PIXELS = MIN_GLYPH_REGION_PIXELS
 
 
 def mask(strip: np.ndarray, t: int) -> np.ndarray:
@@ -82,6 +85,7 @@ class StripPixels:
     def __init__(self, strip: np.ndarray, boxes=()):
         self.strip = strip
         self.height, self.width = strip.shape[:2]
+        self.given_boxes = tuple(tuple(int(v) for v in box) for box in boxes or ())
         self.boxes = clip_boxes(boxes, self.width, self.height)
         self._min_channel = strip.min(axis=2)
         self._split: int | None = None

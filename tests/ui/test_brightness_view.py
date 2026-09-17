@@ -291,6 +291,34 @@ def test_dragging_the_context_window_pans_every_tile_equally(loaded):
     assert loaded.x_offset() == pytest.approx(after[0], abs=1)
 
 
+def test_focusing_another_tile_does_not_move_the_zoom_window(controller, fake_runner):
+    """The offset is fixed once the strips are laid out: hovering a tile whose
+    text sits elsewhere and then nudging the threshold must not make all six
+    jump."""
+    off_centre = [sample(TILE_TIMES["dark"]),
+                  sample(TILE_TIMES["bright"], boxes=((0, 8, 40, 24),))]
+    give_values(controller, evidence=brightness_evidence(
+        strips=off_centre, tiles={"dark": TILE_TIMES["dark"], "bright": TILE_TIMES["bright"]}))
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    deliver(controller, fake_runner)
+    made.refresh()
+    made.set_zoom("300%")
+    settle()
+    before = made.x_offset()
+    assert before > 0                            # centred on the dark tile's text
+
+    made.tiles()[1].focused.emit()               # its text starts at x 0
+    settle()
+    made.set_preview(215)
+    settle()
+    assert made.x_offset() == pytest.approx(before)
+    assert [tile.source_rect().x() for tile in made.tiles()] == [int(before)] * 2
+    made.page().close()
+
+
 def test_the_zoom_window_starts_centred_on_the_text(loaded):
     loaded.set_zoom("300%")
     settle()
@@ -439,6 +467,19 @@ def test_the_curve_carries_both_series_and_both_markers(loaded):
     assert curve.axis_texts() == ("100", "255")
 
 
+def test_the_clutter_caption_is_left_out_without_a_clutter_curve(controller):
+    give_values(controller, evidence=brightness_evidence(clutter=[]))
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    legend = made.curve.legend_texts()
+    assert "■ OCR holds up" in legend
+    assert "┅ background clutter still firing" not in legend
+    made.page().close()
+
+
 def test_an_empty_curve_says_it_was_not_verified(controller, fake_runner):
     give_values(controller, evidence=brightness_evidence(curve=[], clutter=[], plateau=None))
     made = BrightnessTab(controller)
@@ -448,6 +489,7 @@ def test_an_empty_curve_says_it_was_not_verified(controller, fake_runner):
     settle()
     assert made.curve.points() == []
     assert "not verified on this file" in made.curve.legend_texts()
+    assert "┅ background clutter still firing" not in made.curve.legend_texts()
     assert made.curve.marker_x()[1] is not None
     made.page().close()
 
@@ -604,7 +646,57 @@ def test_the_series_median_note_appears_once_three_files_have_brightness(control
     made.refresh()
     settle()
     assert made.panel.series_text() == "Series median brightness is 213 — this episode keeps its own."
+
+    controller.entry(NAME).brightness = None      # nothing of its own to keep
+    made.refresh()
+    settle()
+    assert made.panel.series_text() == ""
     made.page().close()
+
+
+def test_an_unmeasurable_tile_says_so_instead_of_claiming_success(loaded, controller,
+                                                                  fake_runner):
+    """A strip whose boxes hold too little to split has no lost %, so it has
+    nothing to report: it must not borrow the ok tone of "strokes solid"."""
+    give_values(controller, evidence=brightness_evidence(
+        strips=[sample(TILE_TIMES["dark"], boxes=((0, 0, 3, 2),))],
+        tiles={"dark": TILE_TIMES["dark"]}))
+    loaded.refresh()
+    settle()
+    tile = tile_of(loaded, "dark")
+    assert tile.has_pixels()
+    assert tile.caption_right() == "not measurable"
+    assert tile.status_tone() == "dim"
+    assert not tile.is_bad()
+
+
+def test_a_pinned_tile_is_measured_over_the_whole_strip(loaded, controller, fake_runner):
+    """A pinned frame has no detector sample, so it has no boxes. It is the
+    tile the user added because they are worried about it, so it is split
+    over the whole strip rather than left unmeasurable."""
+    loaded.pin_time(70.0)
+    settle()
+    deliver(controller, fake_runner, strips={70.0: text_strip()})
+    loaded.refresh()
+    settle()
+    pinned = tile_of(loaded, "pinned")
+    assert pinned.has_pixels()
+    loaded.set_preview(190)
+    settle()
+    assert pinned.caption_right() == "strokes solid"
+    loaded.set_preview(210)                      # the dim glyph rows go
+    settle()
+    assert pinned.caption_right() == "50% of glyph pixels lost"
+    assert pinned.is_bad()
+
+
+def test_an_empty_pinned_strip_is_not_measurable(loaded, controller, fake_runner):
+    loaded.pin_time(80.0)
+    settle()
+    deliver(controller, fake_runner, strips={80.0: np.zeros((STRIP_H, STRIP_W, 3), np.uint8)})
+    loaded.refresh()
+    settle()
+    assert tile_of(loaded, "pinned").caption_right() == "not measurable"
 
 
 # --------------------------------------------------------------------------
@@ -626,8 +718,42 @@ def test_set_file_requests_every_tile_strip(controller, fake_runner):
     made.page().close()
 
 
+def test_an_evidence_box_from_another_crop_is_described_instead_of_the_files_own(controller):
+    """The stored strips and their boxes were measured in the evidence crop's
+    pixel frame. Re-grabbing strips for the file's new box would pair new
+    pixels with boxes that no longer point at the text, so the view describes
+    the evidence box until a re-detection catches up -- and says so."""
+    give_values(controller, evidence=brightness_evidence(crop_box=BOX, value_crop_box=BOX))
+    controller.entry(NAME).crop = Crop(*OTHER_BOX, Source.DETECTED)
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.crop_box() == BOX                       # not OTHER_BOX
+    assert made.panel.stale_text() == "measured on an earlier crop — re-detect to refresh"
+    made.page().close()
+
+
+def test_a_manual_brightness_on_an_edited_crop_still_warns(controller):
+    """brightness_is_stale() only judges DETECTED/HINT values, but the tiles
+    are just as much from another frame when the value is MANUAL."""
+    give_values(controller, source=Source.MANUAL,
+                evidence=brightness_evidence(crop_box=BOX, value_crop_box=None))
+    controller.entry(NAME).crop = Crop(*OTHER_BOX, Source.MANUAL)
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.crop_box() == BOX
+    assert made.panel.stale_text() == "measured on an earlier crop — re-detect to refresh"
+    made.page().close()
+
+
 def test_a_crop_change_requests_the_strips_again_for_the_new_box(loaded, controller, fake_runner):
     calls = Calls(controller, "request_strips")
+    controller.entry(NAME).evidence["brightness"]["crop_box"] = list(OTHER_BOX)
     controller.set_crop(NAME, OTHER_BOX)
     loaded.refresh()
     settle()
@@ -673,6 +799,17 @@ def test_evidence_tabs_puts_the_brightness_tab_in_the_middle(controller):
     assert isinstance(tabs[1], BrightnessTab)
 
 
+def test_the_tab_does_not_refresh_itself_on_every_model_change(loaded, controller):
+    """`Stage` already calls refresh() on file_changed (app/views/stage.py).
+    A second connection here would re-mask all six tiles twice per edit."""
+    calls = []
+    original = loaded.refresh
+    loaded.refresh = lambda: (calls.append(1), original())[1]
+    controller.file_changed.emit(NAME)
+    settle()
+    assert calls == []
+
+
 def test_no_file_clears_the_view(loaded):
     loaded.set_file(None)
     settle()
@@ -712,6 +849,7 @@ def test_fifty_threshold_changes_redraw_six_tiles_quickly(controller, fake_runne
     made.set_zoom("300%")
     settle()
     assert len(made.tiles()) == 6
+    assert all(tile.has_pixels() for tile in made.tiles()), "the strips never loaded"
 
     started = time_mod.perf_counter()
     for step in range(50):

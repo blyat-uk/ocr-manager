@@ -69,6 +69,7 @@ from app.masking import (
     StripPixels,
 )
 from app.state_text import (
+    brightness_flag_text,
     brightness_is_stale,
     clock,
     series_median_brightness,
@@ -94,27 +95,10 @@ CURVE_HINT = "drag anywhere — every tile redraws in under a millisecond"
 CURVE_CAPTION = "■ OCR holds up"
 CLUTTER_CAPTION = "┅ background clutter still firing"
 NOT_VERIFIED = "not verified on this file"
+NOT_MEASURABLE = "not measurable"
 STALE_REDETECTING = "measured on an earlier crop — re-detecting"
 STALE_REDETECT = "measured on an earlier crop — re-detect to refresh"
 NO_VALUE = "—"
-
-# `flagged` reasons (core/detect/brightness.py's FLAG_* constants, and
-# core/jobs/apply.py's FLAG_DIFFERS_FROM_HINT) as one line of review copy.
-# Kept as literals: this module may not import core.
-FLAG_TEXT = {
-    "needs-crop": "no crop to measure in",
-    "ranges-empty?": "the keep ranges hold no frames",
-    "no-text": "no text found to measure",
-    "thin-evidence?": "few samples held text",
-    "coloured-text?": "coloured text",
-    "no-plateau?": "not verified",
-    "narrow-plateau?": "narrow safe range",
-    "dim-text?": "dim text on some frames",
-    "no-clean-threshold": "no threshold silences the empty frames",
-    "escalate": "not verified",
-    "cancelled": "detection was cancelled",
-    "differs-from-hint?": "differs from the value it was hinted with",
-}
 
 # --- geometry (the literal CSS of tabs-hifi.html figure 1) ------------------
 
@@ -291,7 +275,14 @@ class ZoomTile(QWidget):
         if not self._is_text:
             return ("background leaking", "warn") if pixels.gate(t) else ("clean", "ok")
         percent = pixels.lost_percent(t)
-        if percent is not None and percent >= LOST_ALERT_PERCENT:
+        if percent is None:
+            # No glyph mask: no boxes, fewer pixels inside them than the
+            # detector's own Otsu floor, or a single level. Nothing was
+            # measured, so nothing may be claimed -- "strokes solid" here
+            # would be a success message about a measurement that never
+            # happened, on exactly the frames least worth trusting.
+            return NOT_MEASURABLE, "dim"
+        if percent >= LOST_ALERT_PERCENT:
             return f"{_round_half_up(percent)}% of glyph pixels lost", "bad"
         if self._lines >= 2:
             return "both lines kept", "ok"
@@ -581,7 +572,9 @@ class ThresholdCurve(QWidget):
         return str(MIN_T), str(MAX_T)
 
     def legend_texts(self) -> list[str]:
-        texts = [CURVE_CAPTION, CLUTTER_CAPTION] if self._curve else [NOT_VERIFIED]
+        texts = [CURVE_CAPTION] if self._curve else [NOT_VERIFIED]
+        if self._clutter:
+            texts.append(CLUTTER_CAPTION)       # no curve, no caption for it
         if self._value is not None:
             texts.append(f"▲ {self._value} yours")
         if self._auto is not None:
@@ -589,7 +582,9 @@ class ThresholdCurve(QWidget):
         return texts
 
     def _legend_tones(self) -> list[str]:
-        tones = [tokens.DIM2] if not self._curve else [tokens.OK, tokens.WARN]
+        tones = [tokens.OK] if self._curve else [tokens.DIM2]
+        if self._clutter:
+            tones.append(tokens.WARN)
         if self._value is not None:
             tones.append(tokens.ACC)
         if self._auto is not None:
@@ -775,7 +770,7 @@ class BrightnessTab:
         self._focused = 0
         self._zoom = DEFAULT_PRESET
         self._offset = 0.0
-        self._offset_pinned = False          # True once the user has panned this file
+        self._offset_ready = False           # the default offset has been measured on real pixels
         self._resize_pending = False
         self._lost_on = True
         self._masked_on = True
@@ -793,8 +788,11 @@ class BrightnessTab:
         self.panel = BrightnessInspectorPanel()
         self.panel.use_auto.connect(self._commit_auto)
         self.panel.keep_yours.connect(self._commit_preview)
+        # Only strips_ready: `Stage` (app/views/stage.py) already calls
+        # refresh() on file_changed for every tab it hosts, and a second
+        # connection here would re-mask all six tiles twice per edit. A tab
+        # mounted outside a Stage calls refresh() itself.
         controller.strips_ready.connect(self._on_strips_ready)
-        controller.file_changed.connect(self._on_file_changed)
 
     # --- construction -----------------------------------------------------
 
@@ -869,7 +867,7 @@ class BrightnessTab:
 
     def set_file(self, name: str | None) -> None:
         self._file = name
-        self._offset, self._offset_pinned = 0.0, False
+        self._offset, self._offset_ready = 0.0, False
         self.refresh()
 
     def refresh(self) -> None:
@@ -992,20 +990,35 @@ class BrightnessTab:
         return self._controller.entry(self._file)
 
     @staticmethod
-    def _box_for(entry, evidence) -> tuple[int, int, int, int] | None:
-        """The crop box the strips are grabbed with.
+    def _entry_box(entry) -> tuple[int, int, int, int] | None:
+        crop = None if entry is None else entry.crop
+        return None if crop is None else (crop.x, crop.y, crop.width, crop.height)
 
-        The file's own crop: `core/jobs/apply.py` only stores a brightness
-        result whose `crop_box` IS the file's crop, so a stored
-        `evidence["crop_box"]` is that same box until the user edits the crop
-        -- after which the file's crop is the newer one and the only box
-        whose pixels are worth showing. The evidence box is the fallback for
-        a file whose crop was cleared but whose evidence survived."""
-        if entry is not None and entry.crop is not None:
-            crop = entry.crop
-            return (crop.x, crop.y, crop.width, crop.height)
+    @classmethod
+    def _box_for(cls, entry, evidence) -> tuple[int, int, int, int] | None:
+        """The crop box the tiles and the curve describe -- the box the
+        strips are grabbed with.
+
+        **`evidence["crop_box"]` wins whenever it differs from the file's
+        crop.** Everything measured about a tile comes from two places that
+        have to agree: the pixels (re-grabbed now, for whatever box is asked
+        for) and `evidence["strips"][].boxes`, which are in the pixel frame
+        of the crop the detection ran on. Asking for the file's new box after
+        a crop edit would pair fresh pixels with boxes that no longer point
+        at the text, and the glyph split, the lost % and the red tint would
+        then be measured over a region that may hold no text at all. Nothing
+        about the stored evidence describes the new box, so the view keeps
+        showing the frame the evidence is in and says so (`_stale_text`),
+        until a re-detection replaces the evidence.
+
+        `core/jobs/apply.py` only ever stores a result whose `crop_box` IS
+        the file's crop, so the two agree in the ordinary case and this
+        chooses nothing. With no evidence box at all, the file's own crop is
+        the only candidate."""
         box = evidence.get("crop_box")
-        return None if box is None else tuple(int(value) for value in box)
+        if box is not None:
+            return tuple(int(value) for value in box)
+        return cls._entry_box(entry)
 
     def _auto(self) -> int | None:
         entry = self._entry()
@@ -1081,12 +1094,35 @@ class BrightnessTab:
             if strip is None:
                 tile.set_sample(None)
                 continue
-            if held is None or held.strip is not strip:
-                held = StripPixels(strip, sample.get("boxes") or ())
+            boxes = self._boxes_for(tile, sample, strip)
+            # Re-measured when the pixels OR the boxes change: a re-detection
+            # can land new boxes on a strip that is still cached, and the
+            # glyph split belongs to the pair, not to the pixels alone.
+            if held is None or held.strip is not strip or held.given_boxes != boxes:
+                held = StripPixels(strip, boxes)
             pixels[tile.time] = held
             tile.set_sample(held, is_text=bool(sample.get("is_text", True)),
                             lines=int(sample.get("lines") or 1))
         self._pixels = pixels
+
+    @staticmethod
+    def _boxes_for(tile: ZoomTile, sample: dict, strip) -> tuple:
+        """The polygon boxes to split glyphs inside.
+
+        A pinned frame has no detector sample and so no boxes -- and it is
+        the one tile the user added because they are worried about it, so it
+        is split over the WHOLE strip rather than left unmeasurable. The
+        strip is the crop box: on a subtitle frame its text dominates, and
+        Otsu over it lands where it would inside a polygon. On a frame with
+        no text the split is noise and the glyph mask usually falls below the
+        detector's floor, which reads back as "not measurable" -- the honest
+        answer for a frame the detector never boxed.
+        """
+        boxes = sample.get("boxes") or ()
+        if boxes or tile.kind != "pinned":
+            return tuple(boxes)
+        height, width = strip.shape[:2]
+        return ((0, 0, width, height),)
 
     def _strip_width(self) -> int:
         for tile in self._tiles:
@@ -1120,7 +1156,7 @@ class BrightnessTab:
             self._render_context()
 
     def _on_panned(self, offset: float) -> None:
-        self._offset_pinned = True
+        self._offset_ready = True
         self._offset = self._clamp_offset(offset)
         self._render()
 
@@ -1129,16 +1165,16 @@ class BrightnessTab:
 
     def _default_offset(self) -> float:
         """Where the zoom window sits before the user pans: centred on the
-        focused strip's text. A 1344 px strip at 300% shows about 90 px, and
-        its left edge -- where an offset of 0 lands -- is empty on every
-        subtitle frame there is."""
+        text of the first tile that has any. A 1344 px strip at 300% shows
+        about 90 px, and its left edge -- where an offset of 0 lands -- is
+        empty on every subtitle frame there is."""
         width = self._strip_width()
         if not width:
             return 0.0
         centre = width / 2
-        focused = self._tiles[self._focused] if self._focused < len(self._tiles) else None
-        held = None if focused is None else self._pixels.get(focused.time)
-        if held is not None and held.boxes:
+        held = next((self._pixels[tile.time] for tile in self._tiles
+                     if tile.has_pixels() and self._pixels[tile.time].boxes), None)
+        if held is not None:
             left = min(box[0] for box in held.boxes)
             right = max(box[0] + box[2] for box in held.boxes)
             centre = (left + right) / 2
@@ -1154,8 +1190,14 @@ class BrightnessTab:
 
     def _render(self) -> None:
         zoom = self.zoom_factor()
-        self._offset = (self._clamp_offset(self._offset) if self._offset_pinned
-                        else self._default_offset())
+        # Measured once, from the first tile that has pixels, and then left
+        # alone: recomputing it per render would move every tile whenever the
+        # focus moved to a tile whose text sits somewhere else.
+        if self._offset_ready:
+            self._offset = self._clamp_offset(self._offset)
+        else:
+            self._offset = self._default_offset()
+            self._offset_ready = bool(self._strip_width())
         for tile in self._tiles:
             tile.render(zoom, self._offset, self._preview,
                         masked=self._masked_on, lost=self._lost_on)
@@ -1187,10 +1229,6 @@ class BrightnessTab:
         self._measure(evidence, evidence.get("value"))
         self._render()
         self._refresh_panel()
-
-    def _on_file_changed(self, name: str) -> None:
-        if name == self._file:
-            self.refresh()
 
     # --- the note's facts -------------------------------------------------
 
@@ -1271,24 +1309,39 @@ class BrightnessTab:
 
     @staticmethod
     def _flag_text(evidence) -> str:
-        flagged = evidence.get("flagged") or ""
-        reasons = [FLAG_TEXT.get(reason, reason) for reason in flagged.split("+") if reason]
-        return " · ".join(dict.fromkeys(reasons))
+        return brightness_flag_text(evidence.get("flagged"))
 
     def _stale_text(self, entry) -> str:
-        """"…re-detecting" while a brightness measurement for the file is
-        still to come -- queued, running, or held by auto-pilot behind the
-        folder's ranges analysis (`pending_detectors`, not
-        `running_detectors`: a job that has not started yet is still on its
-        way) -- and "…re-detect to refresh" when nothing is coming."""
-        if entry is None or not brightness_is_stale(entry):
+        """The warning that what is on screen was measured on another crop.
+
+        Two ways that happens, and both must say so. `brightness_is_stale`
+        is the model's own rule: the stored VALUE was measured on a crop the
+        file no longer has -- but it only judges DETECTED/HINT values, so a
+        MANUAL brightness never trips it. The other is this view's: the
+        evidence the tiles and the curve describe (`_box_for`) is not the
+        file's crop, whatever the value's source.
+
+        "…re-detecting" while a brightness measurement for the file is still
+        to come -- queued, running, or held by auto-pilot behind the folder's
+        ranges analysis (`pending_detectors`, not `running_detectors`: a job
+        that has not started yet is still on its way) -- and "…re-detect to
+        refresh" when nothing is coming."""
+        if entry is None:
+            return ""
+        own = self._entry_box(entry)
+        describes_another_crop = own is not None and self._crop_box not in (None, own)
+        if not (describes_another_crop or brightness_is_stale(entry)):
             return ""
         pending = self._controller.pending_detectors().get(entry.name, frozenset())
         return STALE_REDETECTING if "brightness" in pending else STALE_REDETECT
 
-    def _series_text(self) -> str:
+    def _series_text(self, entry) -> str:
         """The series-median sentence, shared with the inspector's Detected
-        note (`app/state_text.py`)."""
+        note (`app/state_text.py`). Only for a file that has a brightness of
+        its own -- "this episode keeps its own" says nothing about a file
+        with no value yet."""
+        if entry is None or entry.brightness is None:
+            return ""
         controller = self._controller
         names = controller.names() if controller.project is not None else []
         return series_median_note(series_median_brightness(controller.entry(name) for name in names))
@@ -1298,7 +1351,7 @@ class BrightnessTab:
                              note=self._note_text(auto, stored),
                              flags=self._flag_text(evidence),
                              stale=self._stale_text(entry),
-                             series=self._series_text() if entry is not None else "")
+                             series=self._series_text(entry))
 
     def _refresh_panel(self) -> None:
         entry = self._entry()
