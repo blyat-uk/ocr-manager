@@ -166,7 +166,7 @@ def to_json(project: Project) -> dict:
             "skipped": entry.skipped,
             "sample_time": entry.sample_time,
             "flags": dict(entry.flags),
-            "evidence": entry.evidence,
+            "evidence": dict(entry.evidence),
         }
 
     return {

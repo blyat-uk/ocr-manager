@@ -323,3 +323,16 @@ def test_to_json_folder_includes_label_mask_crops_as_lists(tmp_path):
     project = _fully_populated_project(tmp_path)
     payload = to_json(project)
     assert payload["folder"]["label_mask_crops"] == [[1, 2, 3, 4], [5, 6, 7, 8]]
+
+
+def test_to_json_evidence_is_copied_mutating_payload_does_not_mutate_model(tmp_path):
+    project = _fully_populated_project(tmp_path)
+    payload = to_json(project)
+
+    payload["files"]["a.mkv"]["evidence"]["new_key"] = {"whatever": True}
+    del payload["files"]["a.mkv"]["evidence"]["crop"]
+
+    assert project.files["a.mkv"].evidence == {
+        "crop": {"score": 0.9},
+        "brightness": {"plateau": [200, 220]},
+    }

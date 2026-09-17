@@ -227,6 +227,53 @@ def test_migrate_global_time_range_both_empty_yields_no_ranges():
     assert project.files["vid.mkv"].time_ranges is None
 
 
+def test_migrate_per_file_range_entry_both_empty_is_dropped():
+    """A per-file `time_ranges` list entry whose start AND end are both
+    empty must not become a TimeRange(None, None) -- dropped instead, same
+    as the global.time_range both-empty case above.
+    """
+    data = {
+        "files": {
+            "vid.mkv": {
+                "time_ranges": [
+                    {"start": "01:00", "end": "02:00"},
+                    {"start": "", "end": ""},
+                ],
+            },
+        },
+    }
+    project = migrate_v1(data, "/tmp/proj", ["vid.mkv"])
+    entry = project.files["vid.mkv"]
+
+    assert entry.time_ranges.ranges == [TimeRange(start="01:00", end="02:00")]
+    assert entry.time_ranges.source == Source.IMPORTED
+
+
+def test_migrate_per_file_range_list_all_entries_empty_yields_no_ranges():
+    data = {
+        "files": {
+            "vid.mkv": {
+                "time_ranges": [
+                    {"start": "", "end": ""},
+                    {"start": None, "end": None},
+                ],
+            },
+        },
+    }
+    project = migrate_v1(data, "/tmp/proj", ["vid.mkv"])
+    assert project.files["vid.mkv"].time_ranges is None
+
+
+def test_migrate_legacy_time_start_end_both_empty_yields_no_ranges():
+    data = {
+        "files": {
+            "vid.mkv": {"time_start": "", "time_end": ""},
+        },
+    }
+    project = migrate_v1(data, "/tmp/proj", ["vid.mkv"])
+    assert project.files["vid.mkv"].time_ranges is None
+
+
 def test_migrate_drops_vanished_files_and_adds_new_globals_only():
     data = {
         "version": 1,
@@ -329,6 +376,44 @@ def test_migrate_review_reviewed_when_labels_only_and_brightness_set_without_cro
     entry = project.files["vid.mkv"]
     assert entry.crop is None
     assert entry.brightness is not None
+    assert entry.review == ReviewState.REVIEWED
+
+
+def test_migrate_resolution_and_duration_only_entry_fills_in_from_globals_and_is_reviewed():
+    """A v1 file entry that only has cached `resolution`/`duration` (no own
+    crop/brightness) must still pick up the global crop/brightness as
+    IMPORTED, keep its own media, and land REVIEWED -- same rule as any
+    other file whose crop/brightness come entirely from globals.
+    """
+    data = {
+        "version": 1,
+        "global": {
+            "crop": {"x": 10, "y": 20, "width": 100, "height": 30},
+            "brightness": 215,
+        },
+        "files": {
+            "vid.mkv": {
+                "resolution": {"width": 1920, "height": 1080},
+                "duration": 600.0,
+            },
+        },
+    }
+    project = migrate_v1(data, "/tmp/proj", ["vid.mkv"])
+    entry = project.files["vid.mkv"]
+
+    assert entry.crop.x == 10
+    assert entry.crop.y == 20
+    assert entry.crop.width == 100
+    assert entry.crop.height == 30
+    assert entry.crop.source == Source.IMPORTED
+
+    assert entry.brightness.value == 215
+    assert entry.brightness.source == Source.IMPORTED
+
+    assert entry.media.width == 1920
+    assert entry.media.height == 1080
+    assert entry.media.duration == 600.0
+
     assert entry.review == ReviewState.REVIEWED
 
 

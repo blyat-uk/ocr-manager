@@ -174,24 +174,33 @@ def _migrate_brightness(v1_entry: dict, global_brightness) -> Brightness | None:
     return None
 
 
-def _one_range(start, end) -> TimeRanges:
-    return TimeRanges(ranges=[TimeRange(start=start or None, end=end or None)], source=Source.IMPORTED)
+def _one_range(start, end) -> TimeRange | None:
+    # A range whose start AND end are both empty/None carries no
+    # information -- drop it rather than emitting TimeRange(None, None),
+    # consistent with the global.time_range both-empty case below.
+    if not start and not end:
+        return None
+    return TimeRange(start=start or None, end=end or None)
 
 
 def _migrate_time_ranges(v1_entry: dict, global_time_range: dict | None) -> TimeRanges | None:
     own = v1_entry.get("time_ranges")
     if isinstance(own, list) and len(own) > 0:
-        ranges = [TimeRange(start=r.get("start") or None, end=r.get("end") or None) for r in own]
-        return TimeRanges(ranges=ranges, source=Source.IMPORTED)
+        ranges = [r for r in (_one_range(o.get("start"), o.get("end")) for o in own) if r is not None]
+        if ranges:
+            return TimeRanges(ranges=ranges, source=Source.IMPORTED)
+        return None
 
     if "time_start" in v1_entry or "time_end" in v1_entry:
-        return _one_range(v1_entry.get("time_start"), v1_entry.get("time_end"))
+        one = _one_range(v1_entry.get("time_start"), v1_entry.get("time_end"))
+        if one is not None:
+            return TimeRanges(ranges=[one], source=Source.IMPORTED)
+        return None
 
     if global_time_range:
-        start = global_time_range.get("start")
-        end = global_time_range.get("end")
-        if start or end:
-            return _one_range(start, end)
+        one = _one_range(global_time_range.get("start"), global_time_range.get("end"))
+        if one is not None:
+            return TimeRanges(ranges=[one], source=Source.IMPORTED)
 
     return None
 
