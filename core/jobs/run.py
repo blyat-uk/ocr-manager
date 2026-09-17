@@ -67,9 +67,19 @@ Events (JobEvent.type; key and kind are "run")
                          emitted only when the phase or its percent changes
                          (videocr reports every frame)
     "run_subtitle"       file=name, result=(start, end, text)
+    "run_file_log"       file=name, message=one log text for the file's log, as
+                         today's OCRWorker wrote it (each ends with a newline):
+                         "Starting OCR: <name>"; with several ranges, one
+                         "Range <i>/<n>: <start> - <end or 'end'>" per range
+                         before OCR starts; then one of "OCR cancelled.",
+                         "QA: <d> dialogues, <f> fixed, <r> deduped" followed
+                         by "OCR completed successfully.", "OCR failed: <error>"
+                         followed by the traceback, or "OCR failed: no
+                         subtitles produced" (today's worker called that a
+                         success; the run reports it failed)
     "run_file_finished"  file=name, result={"ok": bool, "lines": int, "error": str}
     "log"                a failed file's traceback
-    Per file, always: started, then progress/subtitle events, then finished.
+    Per file, always: started, then log/progress/subtitle events, then finished.
 """
 from __future__ import annotations
 
@@ -78,6 +88,7 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -248,37 +259,49 @@ class RunJob:
     def _run_file(self, ctx: JobContext, run_file: RunFile,
                   cancel_event: threading.Event) -> tuple[str, str]:
         name = run_file.name
-        final = os.path.join(self.project_dir, "chi", _output_name(name))
+        final = os.path.join(self.project_dir, "chi", output_name(name))
         partial = final + PARTIAL_SUFFIX
         ctx.emit("run_file_started", file=name)
+
+        def file_log(text: str) -> None:
+            ctx.emit("run_file_log", file=name, message=text)
+
+        file_log(f"Starting OCR: {name}\n")
         lines = 0
         try:
             _remove(partial)     # a leftover of an interrupted run is not this run's output
-            self._ocr(ctx, run_file, partial, cancel_event)
+            self._ocr(ctx, run_file, partial, cancel_event, file_log)
             if cancel_event.is_set():
+                file_log("OCR cancelled.\n")
                 _remove(partial)
                 status, error = _CANCELLED, ERROR_CANCELLED
             elif os.path.exists(partial):
-                _qafix.process_file(partial)
+                stats = _qafix.process_file(partial)
+                file_log(f"QA: {stats.dialogue_lines} dialogues, {stats.fixed_lines} fixed, "
+                         f"{stats.duplicates_removed} deduped\n")
                 counted = _count_dialogue_lines(partial)    # the bytes the replace installs
                 os.replace(partial, final)
                 lines = counted
                 status, error = _OK, ""
+                file_log("OCR completed successfully.\n")
             else:
                 status, error = _FAILED, ERROR_NO_SUBTITLES
+                file_log(f"OCR failed: {ERROR_NO_SUBTITLES}\n")
         except Exception as exc:  # noqa: BLE001 - one file's failure must not stop the others
             status, error = _FAILED, _first_line(exc)
+            traceback_text = _format_traceback(exc)
+            file_log(f"OCR failed: {_message(exc)}\n{traceback_text}")
             try:
                 _remove(partial)
             except Exception as cleanup:  # noqa: BLE001
                 ctx.log(f"{name}: could not delete {partial}: {_first_line(cleanup)}")
-            ctx.log(f"{name}: failed\n{_format_traceback(exc)}")
+            ctx.log(f"{name}: failed\n{traceback_text}")
         ctx.emit("run_file_finished", file=name,
                  result={"ok": status == _OK, "lines": lines, "error": error})
         return status, error
 
     def _ocr(self, ctx: JobContext, run_file: RunFile, partial: str,
-             cancel_event: threading.Event) -> None:
+             cancel_event: threading.Event, file_log: Callable[[str], None]) -> None:
         name = run_file.name
         kwargs = copy.deepcopy(run_file.call.kwargs)
         time_ranges = list(run_file.call.time_ranges)
@@ -298,6 +321,8 @@ class RunJob:
                 cancel_event=cancel_event,
             )
         else:
+            for index, (start, end) in enumerate(time_ranges):
+                file_log(f"Range {index + 1}/{len(time_ranges)}: {start} - {end or 'end'}\n")
             text = _api.get_subtitles(
                 **kwargs,
                 time_ranges=time_ranges,
@@ -310,16 +335,26 @@ class RunJob:
                     f.write(text)
 
 
-def _output_name(name: str) -> str:
-    """The file a video's run writes into chi/: <stem>.ass, stem as today's OCRWorker took it."""
-    return Path(name).stem + ".ass"
+def output_name(video_name: str) -> str:
+    """The file a video's run writes into chi/: "<stem>.ass", the stem as
+    today's OCRWorker took it (pathlib's, so "a.b.mkv" gives "a.b.ass")."""
+    return Path(video_name).stem + ".ass"
+
+
+def _message(exc: BaseException) -> str:
+    """str(exc), as today's worker put it in "OCR failed: ..."; the type name
+    when that fails."""
+    try:
+        return str(exc)
+    except Exception:  # noqa: BLE001 - an exception whose __str__ itself raises
+        return type(exc).__name__
 
 
 def _refuse_shared_outputs(files: list[RunFile]) -> None:
     """ValueError naming every group of files that would write the same chi/ output."""
     by_output: dict[str, list[str]] = {}
     for run_file in files:
-        by_output.setdefault(_output_name(run_file.name), []).append(run_file.name)
+        by_output.setdefault(output_name(run_file.name), []).append(run_file.name)
     collisions = []
     for output, names in sorted(by_output.items()):
         if len(names) > 1:

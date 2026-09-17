@@ -177,6 +177,7 @@ class FakeQa:
     def __init__(self, monkeypatch):
         self.calls: list[SimpleNamespace] = []
         self.raise_for: dict[str, Exception] = {}
+        self.stats = QAStats()
         monkeypatch.setattr(ass_qafix, "process_file", self)
 
     def __call__(self, *args, **kwargs):
@@ -190,7 +191,7 @@ class FakeQa:
             raise error
         with open(path, "a", encoding="utf-8") as f:
             f.write(QA_LINE)
-        return QAStats()
+        return self.stats
 
 
 @pytest.fixture
@@ -856,15 +857,117 @@ def test_events_per_file_are_emitted_in_order(tmp_path, ocr, qa):
         got = [(e.type, e.progress, e.message, e.result) for e in events.of(name)]
         assert got == [
             ("run_file_started", None, "", None),
+            ("run_file_log", None, f"Starting OCR: {name}\n", None),
             ("run_file_progress", 0.0, "Extracting dialogue", None),
             ("run_subtitle", None, "", (1.0, 1.5, f"字幕 {name}")),
             ("run_file_progress", 1.0, "Extracting dialogue", None),
             ("run_file_progress", 0.0, "Extracting labels", None),
             ("run_file_progress", 0.4, "Extracting labels", None),
             ("run_subtitle", None, "", (3.25, 4.0, "标签")),
+            ("run_file_log", None, "QA: 0 dialogues, 0 fixed, 0 deduped\n", None),
+            ("run_file_log", None, "OCR completed successfully.\n", None),
             ("run_file_finished", None, "", {"ok": True, "lines": 3, "error": ""}),
         ]
     assert {(e.key, e.kind) for e in events.events} == {("run", "run")}
+
+
+def file_log(events: Collector, name: str) -> list[str]:
+    return [e.message for e in events.of(name) if e.type == "run_file_log"]
+
+
+def test_a_file_logs_what_todays_worker_logs_on_success(tmp_path, ocr, qa):
+    qa.stats = QAStats(dialogue_lines=12, fixed_lines=3, duplicates_removed=2)
+    _, events = run_now(tmp_path, [run_file(tmp_path, "a b.mp4")])
+    assert file_log(events, "a b.mp4") == [
+        "Starting OCR: a b.mp4\n",
+        "QA: 12 dialogues, 3 fixed, 2 deduped\n",
+        "OCR completed successfully.\n",
+    ]
+
+
+def test_the_qa_line_reports_the_real_qa_stats(tmp_path, ocr):
+    project = tmp_path / "project"
+    project.mkdir()
+    messy = (HEADER
+             + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,字幕\n"
+             + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,字幕\n")
+    ocr.hooks["a.mp4"] = lambda kwargs: messy
+    expected = tmp_path / "expected.ass"
+    expected.write_text(messy, encoding="utf-8")
+    stats = REAL_PROCESS_FILE(str(expected))
+
+    _, events = run_now(project, [run_file(project, "a.mp4")])
+
+    assert stats.duplicates_removed > 0
+    assert file_log(events, "a.mp4")[1] == (
+        f"QA: {stats.dialogue_lines} dialogues, {stats.fixed_lines} fixed, {stats.duplicates_removed} deduped\n")
+
+
+@pytest.mark.parametrize("ranges, lines", [
+    (None, []),
+    ([("02:33", "21:20")], []),                                      # one range: no range lines, as today
+    ([("02:33", "21:20"), ("22:00", None)], ["Range 1/2: 02:33 - 21:20\n", "Range 2/2: 22:00 - end\n"]),
+    ([(None, "1:00"), ("2:00", "3:00"), ("4:00", None)],
+     ["Range 1/3: 0:00 - 1:00\n", "Range 2/3: 2:00 - 3:00\n", "Range 3/3: 4:00 - end\n"]),
+])
+def test_several_ranges_log_one_line_per_range_before_ocr_starts(tmp_path, ocr, qa, ranges, lines):
+    _, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4", ranges)])
+    assert file_log(events, "a.mp4") == (["Starting OCR: a.mp4\n"] + lines
+                                         + ["QA: 0 dialogues, 0 fixed, 0 deduped\n", "OCR completed successfully.\n"])
+    types = [(e.type, e.message) for e in events.of("a.mp4")]
+    first_progress = next(i for i, (t, _) in enumerate(types) if t == "run_file_progress")
+    assert [m for t, m in types[:first_progress] if t == "run_file_log"] == ["Starting OCR: a.mp4\n"] + lines
+
+
+def test_a_stopped_file_logs_ocr_cancelled(tmp_path, ocr, qa):
+    entered = threading.Event()
+    ocr.hooks["a.mp4"] = blocking_until_cancelled(entered, produce=ass_text("partial"))
+    ctx, events = make_ctx()
+    running = Running(RunJob(str(tmp_path), [run_file(tmp_path, "a.mp4")], 1), ctx)
+    assert entered.wait(WAIT)
+    ctx.cancel_event.set()
+    running.join()
+    assert file_log(events, "a.mp4") == ["Starting OCR: a.mp4\n", "OCR cancelled.\n"]
+    assert events.of("a.mp4")[-1].type == "run_file_finished"
+
+
+def test_a_failed_file_logs_the_error_and_its_traceback(tmp_path, ocr, qa):
+    def explode(kwargs):
+        raise RuntimeError("decoder exploded\nat frame 12")
+
+    ocr.hooks["a.mp4"] = explode
+    _, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
+
+    starting, failed = file_log(events, "a.mp4")
+    assert starting == "Starting OCR: a.mp4\n"
+    assert failed.startswith("OCR failed: decoder exploded\nat frame 12\nTraceback (most recent call last):\n")
+    assert failed.endswith("RuntimeError: decoder exploded\nat frame 12\n")
+    assert events.of("a.mp4")[-1].type == "run_file_finished"
+    assert any(e.type == "log" and "Traceback" in e.message for e in events.events)    # still logged as before
+
+
+def test_a_qa_failure_logs_no_qa_line(tmp_path, ocr, qa):
+    qa.raise_for["a.ass.partial"] = ValueError("bad ass")
+    _, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
+    log = file_log(events, "a.mp4")
+    assert [line.split("\n")[0] for line in log] == ["Starting OCR: a.mp4", "OCR failed: bad ass"]
+
+
+def test_a_file_that_produced_nothing_logs_the_failure(tmp_path, ocr, qa):
+    ocr.hooks["a.mp4"] = lambda kwargs: ""
+    _, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4", [("0:00", "1:00"), ("2:00", "3:00")])])
+    assert file_log(events, "a.mp4")[-1] == "OCR failed: no subtitles produced\n"
+
+
+def test_output_name_is_the_file_a_run_writes_into_chi(tmp_path, ocr, qa):
+    from core.jobs.run import output_name
+
+    assert output_name("ZS2_-_11_[1080p]TXHBR.mp4") == "ZS2_-_11_[1080p]TXHBR.ass"
+    assert output_name("a.b.mkv") == "a.b.ass"
+    assert output_name("第一集.mp4") == "第一集.ass"
+    names = ["a.b.mkv", "第一集.mp4"]
+    run_now(tmp_path, [run_file(tmp_path, name) for name in names])
+    assert sorted(os.listdir(tmp_path / "chi")) == sorted(output_name(name) for name in names)
 
 
 def test_progress_is_a_fraction_clamped_to_0_1(tmp_path, ocr, qa):
