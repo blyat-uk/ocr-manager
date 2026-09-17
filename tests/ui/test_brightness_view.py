@@ -234,6 +234,27 @@ def test_tiles_follow_the_detectors_kind_order_and_end_with_the_pin_tile(loaded)
     assert loaded.grid_widgets()[-1] is loaded.pin_tile()
 
 
+def test_the_pin_tile_is_on_screen_before_any_brightness_evidence_lands(controller):
+    """The state of every file until brightness detection lands, and the
+    permanent state of a file whose detection found no text strips: no tiles
+    at all. The pin tile -- the one thing the user can still do here -- must
+    be IN the grid, not merely in `grid_widgets()`: `_sync_tiles` used to add
+    it only when the tile plan changed, and an empty plan never changes."""
+    give_values(controller, evidence=None)
+    made = BrightnessTab(controller)
+    page = made.page()
+    page.resize(880, 620)
+    page.show()
+    made.set_file(NAME)
+    settle()
+    assert made.tiles() == []
+    pin = made.pin_tile()
+    assert pin.parent() is not None, "the pin tile was never parented into a layout"
+    assert pin.isVisible(), "the tiles area is an empty black rectangle"
+    assert page.rect().contains(pin.geometry()), "the pin tile is not inside the page"
+    page.close()
+
+
 def test_a_kind_the_detector_did_not_choose_is_skipped(controller, fake_runner):
     tiles = {"dark": 10.0, "leaking": 50.0}
     give_values(controller, evidence=brightness_evidence(tiles=tiles))

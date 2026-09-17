@@ -869,6 +869,12 @@ class BrightnessTab:
             self._grid.setColumnStretch(index, 1)
         self.pin_tile_widget = PinTile()
         self.pin_tile_widget.clicked.connect(self._on_pin_clicked)
+        # In the grid from the start, not only when `_sync_tiles` rebuilds
+        # it: a file with no brightness evidence has an empty tile plan, the
+        # plan never changes, and the tab would be a black rectangle with no
+        # way in -- exactly the file (FLAG_NO_TEXT) a user most wants to pin
+        # a frame on. `_sync_tiles` repositions it after the real tiles.
+        self._grid.addWidget(self.pin_tile_widget, 0, 0)
         column.addWidget(self._grid_host, 1)
 
         header_hint = QLabel(CURVE_HINT)
