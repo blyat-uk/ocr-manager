@@ -380,6 +380,8 @@ class Inspector(QWidget):
         kinds = self._edited.get(name, set()) if name is not None else set()
         self.offer.set_targets({kind: len(self._controller.hint_targets(name, kind))
                                 for kind in HINT_KINDS if kind in kinds})
+        # "re-detecting {n} files…" counts distinct FILES, not jobs: a file
+        # covered by both this file's crop and brightness hints counts once.
         targets = {target for (source, _kind), files in self._redetecting.items()
                    if source == name for target in files}
         self.offer.set_redetecting(len(targets))

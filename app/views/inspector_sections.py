@@ -29,11 +29,18 @@ from app.state_text import (
     ranges_caption,
     ranges_text,
 )
+from app.theme import tokens
 from app.widgets.base import Button, ConfBar, KvRow, SectionHeader, repolish
 
 PROOF_LINES_SHOWN = 6             # more recognised lines than this hide behind "show all"
 PULSE_MS = 1400
 PULSE_LOW_OPACITY = 0.35
+
+SECTION_MARGIN_X = 12             # `.sec` padding, left and right
+BUTTON_SM_CHROME = 18             # `.btn.sm`: 8 px padding and a 1 px border each side
+# What a `.btn.sm` label may measure inside a section of the inspector column
+# before the column has to grow and clip (the 1 px is the inspector's border).
+BUTTON_TEXT_BUDGET = tokens.INSPECTOR_WIDTH - 1 - 2 * SECTION_MARGIN_X - BUTTON_SM_CHROME
 
 VALUES_NOTE = "Values belong to this file."
 SHOW_ALL_TEXT = "show all"
@@ -42,19 +49,56 @@ NO_LINES_TEXT = "No subtitles recognised in this window — check crop and brigh
 RUNNING_TEXT = "running on {window}…"
 RUNNING_UNKNOWN_TEXT = "running…"            # defensive: run_proof refuses an unknown duration
 HINT_TEXT = "↻ re-detect the other {count} using this {what} as a hint"
-HINT_WRAP_AT = " using "                     # see hint_text()
 REDETECTING_TEXT = "re-detecting {count} files…"
 HINT_KINDS = ("crop", "brightness")          # the two kinds ruling C3 offers, in inspector order
 
 
-def hint_text(count: int, what: str, *, wrapped: bool = False) -> str:
-    """ui-spec §3.7's hint button label. `wrapped` breaks it over two lines,
-    which is how it is shown: one line of it is wider than the whole 322 px
-    inspector, and the mockup's `.btn` (inline-flex, no `white-space`) wraps
-    the same way inside the column. A QPushButton renders the newline but
-    never inserts one itself."""
-    text = HINT_TEXT.format(count=count, what=what)
-    return text.replace(HINT_WRAP_AT, "\nusing ", 1) if wrapped else text
+def hint_text(count: int, what: str) -> str:
+    """ui-spec §3.7's hint button label, verbatim and on one line. What the
+    button shows is this text wrapped to the column (see `wrap_to_width`)."""
+    return HINT_TEXT.format(count=count, what=what)
+
+
+def _greedy_wrap(text: str, metrics, width: int) -> list[str]:
+    """`text` broken at spaces so no line measures wider than `width` in
+    `metrics`' font. Greedy, like every word wrap: a word too wide on its own
+    still gets its line."""
+    lines: list[str] = []
+    line = ""
+    for word in text.split(" "):
+        candidate = f"{line} {word}" if line else word
+        if line and metrics.horizontalAdvance(candidate) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
+
+
+def wrap_to_width(text: str, metrics, width: int) -> str:
+    """`text` wrapped to `width` and joined by newlines, which a QPushButton
+    paints (it never breaks a line itself).
+
+    Measuring, rather than breaking the copy at a hard-coded word, is what
+    keeps the label a single verbatim string: reword it and it wraps wherever
+    it then has to, instead of quietly wrapping in the wrong place or not at
+    all. A wrapped label is balanced afterwards -- re-wrapped to the narrowest
+    width that still fills the same number of lines -- so the last line is
+    never left holding one word, as CSS `text-wrap: balance` does it."""
+    lines = _greedy_wrap(text, metrics, width)
+    if len(lines) > 1:
+        low = max(metrics.horizontalAdvance(word) for word in text.split(" "))
+        high = width
+        while low < high:                          # the narrowest width with as few lines
+            middle = (low + high) // 2
+            if len(_greedy_wrap(text, metrics, middle)) <= len(lines):
+                high = middle
+            else:
+                low = middle + 1
+        lines = _greedy_wrap(text, metrics, low)
+    return "\n".join(lines)
 
 
 def small_button(text: str, variant: str = "default") -> Button:
@@ -80,7 +124,7 @@ class Section(QWidget):
         self.setObjectName("InspectorSection")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(12, 10, 12, 10)
+        self.body.setContentsMargins(SECTION_MARGIN_X, 10, SECTION_MARGIN_X, 10)
         self.body.setSpacing(0)
 
 
@@ -328,7 +372,7 @@ class ChangeOffer(Section):
         self.body.addSpacing(7)
         self.hint_buttons: dict[str, Button] = {}
         for what in HINT_KINDS:
-            button = small_button(hint_text(0, what, wrapped=True))
+            button = small_button("")
             button.clicked.connect(lambda _checked=False, kind=what: self.hint_requested.emit(kind))
             self.hint_buttons[what] = button
             self.body.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -348,7 +392,8 @@ class ChangeOffer(Section):
         for what, button in self.hint_buttons.items():
             count = counts.get(what)
             button.setVisible(count is not None)
-            button.setText(hint_text(count or 0, what, wrapped=True))
+            button.setText(wrap_to_width(hint_text(count or 0, what), button.fontMetrics(),
+                                         BUTTON_TEXT_BUDGET))
             button.setEnabled(bool(count))
         offering = bool(counts)
         self.note_label.setVisible(offering)

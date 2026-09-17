@@ -9,6 +9,7 @@ ProofOcrJob or detection job would, then drains them with
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QSettings, Qt
@@ -18,13 +19,17 @@ from PyQt6.QtWidgets import QApplication
 from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.state_text import series_median_brightness
+from app.theme import tokens
 from app.views.inspector_sections import (
+    BUTTON_TEXT_BUDGET,
     NO_LINES_TEXT,
     PROOF_LINES_SHOWN,
+    SECTION_MARGIN_X,
     SHOW_ALL_TEXT,
     STALE_TEXT,
     VALUES_NOTE,
     hint_text,
+    wrap_to_width,
 )
 from core.detect.brightness import BrightnessResult
 from core.detect.crop import CropResult
@@ -166,6 +171,11 @@ def activate(window: MainWindow) -> None:
     window.show()
     window.activateWindow()
     assert wait_for(lambda: QApplication.activeWindow() is window)
+
+
+def unwrapped(button) -> str:
+    """A hint button's label with its wrap undone: the verbatim copy."""
+    return button.text().replace("\n", " ")
 
 
 def finish_proof(window, fake_runner, name: str, lines=(), seconds: float = 4.1,
@@ -348,13 +358,13 @@ def test_the_offer_appears_only_after_a_manual_edit_with_one_button_per_kind(win
     assert not inspector.offer_section.isHidden()
     assert not inspector.hint_buttons["crop"].isHidden()
     assert hint_text(4, "crop") == "↻ re-detect the other 4 using this crop as a hint"
-    assert inspector.hint_buttons["crop"].text() == hint_text(4, "crop", wrapped=True)
+    assert unwrapped(inspector.hint_buttons["crop"]) == hint_text(4, "crop")
     assert inspector.hint_buttons["brightness"].isHidden()
 
     controller.set_brightness(name, 214)
     assert not inspector.hint_buttons["brightness"].isHidden()
     assert hint_text(4, "brightness") == "↻ re-detect the other 4 using this brightness as a hint"
-    assert inspector.hint_buttons["brightness"].text() == hint_text(4, "brightness", wrapped=True)
+    assert unwrapped(inspector.hint_buttons["brightness"]) == hint_text(4, "brightness")
 
     inspector.hint_buttons["crop"].click()
     assert hints.calls == [(name, "crop")]
@@ -390,8 +400,8 @@ def test_the_counts_are_the_files_the_re_detect_would_submit(make_window):
     controller.set_brightness(name, 214)
     assert controller.hint_targets(name, "crop") == [NAMES[4]]
     assert controller.hint_targets(name, "brightness") == [NAMES[4]]
-    assert inspector.hint_buttons["crop"].text() == hint_text(1, "crop", wrapped=True)
-    assert inspector.hint_buttons["brightness"].text() == hint_text(1, "brightness", wrapped=True)
+    assert unwrapped(inspector.hint_buttons["crop"]) == hint_text(1, "crop")
+    assert unwrapped(inspector.hint_buttons["brightness"]) == hint_text(1, "brightness")
 
 
 def test_a_hint_button_with_nothing_to_re_detect_is_disabled(make_window):
@@ -399,8 +409,41 @@ def test_a_hint_button_with_nothing_to_re_detect_is_disabled(make_window):
     controller, inspector = window.controller, window.inspector
     controller.set_crop(NAMES[0], (290, 780, 1340, 60))
     assert not inspector.offer_section.isHidden()
-    assert inspector.hint_buttons["crop"].text() == hint_text(0, "crop", wrapped=True)
+    assert unwrapped(inspector.hint_buttons["crop"]) == hint_text(0, "crop")
     assert not inspector.hint_buttons["crop"].isEnabled()
+
+
+def test_the_hint_buttons_wrap_instead_of_widening_the_column(window):
+    """The one-line copy is wider than the whole 322 px inspector, which used
+    to push the scroll content out and clip every section. It is measured and
+    wrapped, so the section -- and with it the column -- still fits."""
+    controller, inspector = window.controller, window.inspector
+    name = NAMES[0]
+    controller.set_crop(name, (290, 780, 1340, 60))
+    controller.set_brightness(name, 214)
+    settle()
+
+    limit = tokens.INSPECTOR_WIDTH - 1 - 2 * SECTION_MARGIN_X          # the inspector's 1 px border
+    for what, button in inspector.hint_buttons.items():
+        assert button.fontMetrics().horizontalAdvance(hint_text(4, what)) > BUTTON_TEXT_BUDGET or \
+            "\n" not in button.text()                                  # only wrapped when it must be
+        for line in button.text().split("\n"):
+            assert button.fontMetrics().horizontalAdvance(line) <= BUTTON_TEXT_BUDGET
+        assert button.sizeHint().width() <= limit
+    assert inspector.offer_section.minimumSizeHint().width() <= tokens.INSPECTOR_WIDTH - 1
+    assert inspector.minimumSizeHint().width() <= tokens.INSPECTOR_WIDTH
+
+
+def test_wrap_to_width_keeps_the_words_and_balances_the_lines(window):
+    metrics = window.inspector.hint_buttons["crop"].fontMetrics()
+    text = hint_text(4, "brightness")
+    wrapped = wrap_to_width(text, metrics, BUTTON_TEXT_BUDGET)
+    assert wrapped.replace("\n", " ") == text                          # nothing added or lost
+    lines = wrapped.split("\n")
+    assert len(lines) == 2
+    assert all(metrics.horizontalAdvance(line) <= BUTTON_TEXT_BUDGET for line in lines)
+    assert len(lines[-1].split(" ")) > 1                               # no single-word last line
+    assert wrap_to_width("short enough", metrics, BUTTON_TEXT_BUDGET) == "short enough"
 
 
 def test_apply_to_this_file_only_hides_the_offer(window):
@@ -526,3 +569,83 @@ def test_the_series_median_note_needs_three_measured_files(make_window):
     window = make_window(entries)
     assert series_median_brightness(entries) is None
     assert window.inspector.detected_note.text() == VALUES_NOTE
+
+
+# --------------------------------------------------------------------------
+# Files vanishing, the folder closing
+# --------------------------------------------------------------------------
+
+def vanish(controller, name: str) -> None:
+    """Delete `name` from the folder and let the folder watcher notice."""
+    (Path(controller.project.path) / name).unlink()
+    assert wait_for(lambda: name not in controller.names())
+    settle()
+
+
+def test_a_vanished_target_leaves_no_trace_and_the_rest_hold_the_line(window, fake_runner):
+    controller, inspector = window.controller, window.inspector
+    name, victim = NAMES[0], NAMES[2]
+    controller.set_crop(name, (290, 780, 1340, 60))
+    targets = controller.hint_targets(name, "crop")
+    assert victim in targets
+    inspector.hint_buttons["crop"].click()
+    assert inspector.offer_status.text() == f"re-detecting {len(targets)} files…"
+
+    vanish(controller, victim)
+
+    for book in (inspector._seen, inspector._edited, inspector._proof_keys, inspector._stale_proofs):
+        assert victim not in book
+    assert all(victim not in files for files in inspector._redetecting.values())
+    assert inspector.offer_status.text() == f"re-detecting {len(targets) - 1} files…"
+
+    for target in [name for name in targets if name != victim]:
+        submission = fake_runner.last("crop", target)
+        fake_runner.finish(submission, crop_result(submission))
+        controller.drain_events()
+    assert inspector.offer_status.isHidden()
+    assert inspector.offer_section.isHidden()
+
+
+def test_a_vanished_source_file_takes_its_offer_and_its_line_with_it(window, fake_runner):
+    controller, inspector = window.controller, window.inspector
+    name = NAMES[0]
+    controller.set_crop(name, (290, 780, 1340, 60))
+    controller.set_brightness(name, 214)                 # an offer still standing for the other kind
+    inspector.proof_button.click()
+    finish_proof(window, fake_runner, name, LINES[:2])
+    controller.set_time_ranges(name, [("02:33", "23:05")])   # ... and a stale proof
+    inspector.hint_buttons["crop"].click()
+    assert not inspector.offer_status.isHidden()
+    assert not inspector.hint_buttons["brightness"].isHidden()
+
+    vanish(controller, name)
+
+    for book in (inspector._seen, inspector._edited, inspector._proof_keys, inspector._stale_proofs):
+        assert name not in book
+    assert all(source != name for source, _kind in inspector._redetecting)
+    assert inspector.current_file() != name              # the queue moved on
+    assert inspector.offer_section.isHidden()            # the file it belonged to is gone
+    assert inspector.proof_texts() == []
+
+
+def test_closing_the_folder_forgets_the_session(window, fake_runner):
+    controller, inspector = window.controller, window.inspector
+    name = NAMES[0]
+    controller.set_crop(name, (290, 780, 1340, 60))
+    inspector.hint_buttons["crop"].click()
+    inspector.proof_button.click()
+    finish_proof(window, fake_runner, name, LINES[:2])
+    controller.set_brightness(name, 214)                 # the proof is stale, the offer stands again
+    assert inspector._edited and inspector._proof_keys and inspector._stale_proofs and inspector._redetecting
+
+    controller.close_folder()
+    settle()
+
+    assert inspector._seen == {}
+    assert inspector._edited == {}
+    assert inspector._proof_keys == {}
+    assert inspector._stale_proofs == set()
+    assert inspector._redetecting == {}
+    assert inspector.current_file() is None
+    assert inspector.offer_section.isHidden()
+    assert inspector.proof_texts() == []
