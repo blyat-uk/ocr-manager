@@ -822,7 +822,11 @@ class ProjectController(QObject):
                 self._emit_thumbnails.append(result.file)
             return
         if isinstance(result, MetadataResult):
-            rules.apply_metadata(project, result)
+            # The frame size may cut a crop stored before it was known: that
+            # is a crop change like any other (re-measure what was measured
+            # on the old box, drop the strips grabbed with it).
+            for name in rules.apply_metadata(project, result):
+                self._crop_box_changed(name)
             touched = [result.file]
         elif isinstance(result, CropJobResult):
             rules.apply_crop(project, result)

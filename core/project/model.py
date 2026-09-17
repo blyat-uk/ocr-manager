@@ -3,9 +3,15 @@
 This module has no PyQt6 dependency by design: it is the shared model used
 by the pipeline, the store (`core/project/store.py`), migration
 (`core/project/migrate.py`) and, eventually, the Stage 3 window.
+
+`clamp_crop_box` lives here rather than in a view because a stored crop the
+file's frame cannot hold is a fidelity bug, not a drawing mistake: see its
+docstring.
 """
 from dataclasses import dataclass, field
 from enum import Enum
+
+MIN_CROP_SIDE = 8        # video pixels; app/views/crop_view.py's CropCanvas.MIN_BOX
 
 
 class ReviewState(str, Enum):
@@ -29,6 +35,43 @@ class Crop:
     width: int
     height: int
     source: Source
+
+
+def frame_size_known(media: "Media") -> bool:
+    """Whether the file's frame size has been scanned (the metadata job ran).
+    Until it is, no crop can be checked against it."""
+    return media.width > 0 and media.height > 0
+
+
+def clamp_crop_box(box, frame_size, minimum: int = MIN_CROP_SIDE) -> tuple[int, int, int, int]:
+    """`box` (x, y, width, height) as the frame can actually hold it: inside
+    (0, 0, width, height), and at least `minimum` on each side unless the
+    frame itself is smaller.
+
+    Every path that stores a crop goes through this, because the OCR pass
+    clamps too and does it differently: `videocr.video.infer_crop_region`
+    keeps the origin and NARROWS the box, or drops it entirely when a side
+    clamps to zero (the run then reads only the bottom third of the frame).
+    Either way the run would read a region the stored value does not name
+    and the user never reviewed. A box this returns survives that clamp
+    unchanged -- pinned by
+    tests/test_ocr_kwargs.py::test_a_stored_crop_is_the_region_videocr_slices.
+
+    A frame size that is not known yet (a zero side: the metadata job has
+    not run) leaves `box` alone -- there is nothing to clamp against. The
+    value is re-checked when the size arrives (`core.jobs.apply.apply_metadata`).
+    """
+    frame_width, frame_height = int(frame_size[0]), int(frame_size[1])
+    x, y, width, height = (int(value) for value in box)
+    if frame_width <= 0 or frame_height <= 0:
+        return (x, y, width, height)
+    width = _clamp(width, min(minimum, frame_width), frame_width)
+    height = _clamp(height, min(minimum, frame_height), frame_height)
+    return (_clamp(x, 0, frame_width - width), _clamp(y, 0, frame_height - height), width, height)
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
 
 
 @dataclass

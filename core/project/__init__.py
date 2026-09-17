@@ -5,6 +5,7 @@ model used by the pipeline, the store, migration and the Stage 3 window.
 """
 from core.project.migrate import migrate_v1
 from core.project.model import (
+    MIN_CROP_SIDE,
     Brightness,
     Crop,
     FileEntry,
@@ -15,6 +16,8 @@ from core.project.model import (
     Source,
     TimeRange,
     TimeRanges,
+    clamp_crop_box,
+    frame_size_known,
 )
 from core.project.ocr_kwargs import DEFAULT_BRIGHTNESS, OcrCall, ocr_call_for
 from core.project.store import (
@@ -30,6 +33,7 @@ from core.project.store import (
 )
 
 __all__ = [
+    "MIN_CROP_SIDE",
     "Brightness",
     "Crop",
     "FileEntry",
@@ -40,6 +44,8 @@ __all__ = [
     "Source",
     "TimeRange",
     "TimeRanges",
+    "clamp_crop_box",
+    "frame_size_known",
     "CONFIG_FILENAME",
     "VIDEO_EXTENSIONS",
     "UnsupportedProjectVersion",

@@ -69,14 +69,21 @@ def _is_detected_value(value) -> bool:
 
 
 def _flag_blocks_detected_value(entry: FileEntry, name: str, value) -> bool:
-    """Mirrors core.jobs.apply's `_is_detected(value) and _blocking(entry,
-    name)`, the ONLY test apply.py uses to decide a stored flag counts
-    against a field. `entry.flags[name]` is never cleared when a flagged
-    DETECTED/HINT value is accepted as MANUAL (mark_reviewed keeps the flag
-    string -- see its own docstring: "its evidence and flag stay stored"),
-    so a leftover blocking flag on a MANUAL/IMPORTED value must NOT count
-    here, or a badge would keep warning about a value the user already
-    accepted."""
+    """Mirrors core.jobs.apply's `_counts_flagged`, the ONLY test apply.py
+    uses to decide a stored flag counts against a field. `entry.flags[name]`
+    is never cleared when a flagged DETECTED/HINT value is accepted as MANUAL
+    (mark_reviewed keeps the flag string -- see its own docstring: "its
+    evidence and flag stay stored"), so a leftover blocking flag on a
+    MANUAL/IMPORTED value must NOT count here, or a badge would keep warning
+    about a value the user already accepted.
+
+    apply.SOURCE_INDEPENDENT_FLAGS are the exception: they describe the
+    stored value (a crop cut to fit the frame, a brightness pasted for a crop
+    this file cannot hold), not a detection, so they count whoever set it --
+    and mark_reviewed does drop them."""
+    reasons = set((entry.flags.get(name) or "").split("+"))
+    if reasons & _apply.SOURCE_INDEPENDENT_FLAGS.get(name, frozenset()):
+        return True
     return _is_detected_value(value) and _flag_blocks(entry.flags.get(name), _INFORMATIONAL_FLAGS[name])
 
 
@@ -388,6 +395,7 @@ BRIGHTNESS_FLAG_TEXT = {
     _brightness.FLAG_ESCALATE: "not verified",
     _brightness.FLAG_CANCELLED: "detection was cancelled",
     _apply.FLAG_DIFFERS_FROM_HINT: "differs from the value it was hinted with",
+    _apply.FLAG_BRIGHTNESS_OTHER_CROP: "measured for a crop this file cannot hold",
 }
 
 
@@ -490,6 +498,7 @@ _CROP_FLAG_TEXT = {
     _crop.FLAG_OUTLIER_DISCARDED: "one odd frame dropped",
     _crop.FLAG_CANCELLED: "stopped early",
     _crop.FLAG_UNKNOWN_REJECTION: "no box could be built",
+    _apply.FLAG_CROP_CLAMPED: "larger than the frame — cut to fit",
 }
 
 

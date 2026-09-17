@@ -1704,3 +1704,107 @@ def test_requesting_frames_for_an_unknown_file_is_refused(make_controller, tmp_p
         controller.request_frames("nope.mkv", [10.0])
     with pytest.raises(KeyError):
         controller.request_strips("nope.mkv", BOX, [10.0])
+
+
+# --------------------------------------------------------------------------
+# A stored crop is one the file's frame can hold
+# --------------------------------------------------------------------------
+
+SMALL_BOX = (0, 665, 1280, 55)            # BOX's band as a 1280x720 frame holds it
+
+
+def _unscanned(names):
+    """Entries with no media at all: the metadata job has not run."""
+    entries = [make_entry(name, brightness=205) for name in names]
+    for entry in entries:
+        entry.media = Media()
+    return entries
+
+
+def test_set_crop_clamps_to_the_files_frame(make_controller, fake_runner, tmp_project):
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    names = ["ep01.mkv"]
+    entries = [make_entry(name, brightness=205) for name in names]
+    entries[0].media = Media(1280, 720, DURATION, 23.976)
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    controller.set_crop("ep01.mkv", (288, 784, 1344, 55))
+    entry = controller.entry("ep01.mkv")
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == SMALL_BOX
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+    assert badge_for(entry, running_detectors=set(), done=False, run_state=None)[0] == "check crop"
+
+
+def test_pasting_across_resolutions_fits_the_target_and_doubts_the_brightness(
+        make_controller, fake_runner, tmp_project):
+    from core.jobs.apply import FLAG_BRIGHTNESS_OTHER_CROP, FLAG_CROP_CLAMPED
+
+    names = ["ep01.mkv", "ep02.mkv"]
+    entries = [make_entry("ep01.mkv", crop=(288, 784, 1344, 55), brightness=190),
+               make_entry("ep02.mkv")]
+    entries[1].media = Media(1280, 720, DURATION, 23.976)          # the 720p target
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    controller.copy_settings("ep01.mkv")
+    assert controller.paste_settings("ep02.mkv") is True
+    target = controller.entry("ep02.mkv")
+    assert (target.crop.x, target.crop.y, target.crop.width, target.crop.height) == SMALL_BOX
+    assert FLAG_CROP_CLAMPED in target.flags["crop"]
+    assert target.brightness == Brightness(190, Source.MANUAL)
+    assert FLAG_BRIGHTNESS_OTHER_CROP in target.flags["brightness"]
+    assert target.review == ReviewState.FLAGGED
+    assert badge_for(target, running_detectors=set(), done=False,
+                     run_state=None)[0] == "check crop + brightness"
+
+
+def test_a_crop_edited_before_the_metadata_lands_is_cut_when_it_arrives(
+        make_controller, fake_runner, tmp_project):
+    """The crop canvas has to assume a frame size until the metadata job
+    reports one; whatever it assumed, the stored box is re-checked here."""
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    names = ["ep01.mkv"]
+    folder = tmp_project(names, config=v2_config(_unscanned(names), autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    controller.set_crop("ep01.mkv", (288, 784, 1344, 55))          # drawn against a guessed 1920x1080
+    entry = controller.entry("ep01.mkv")
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == (288, 784, 1344, 55)
+    assert not (entry.flags.get("crop") or "")                     # nothing to check it against yet
+    controller.mark_reviewed("ep01.mkv")
+    assert entry.review == ReviewState.REVIEWED
+
+    changed = Spy(controller.file_changed)
+    metadata = fake_runner.last("metadata", "ep01.mkv")
+    fake_runner.finish(metadata, MetadataResult("ep01.mkv", 1280, 720, DURATION, 23.976))
+    controller.drain_events()
+
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == SMALL_BOX
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+    assert entry.review == ReviewState.FLAGGED
+    assert "ep01.mkv" in changed.firsts
+
+
+def test_metadata_that_fits_the_stored_crop_changes_nothing(make_controller, fake_runner, tmp_project):
+    names = ["ep01.mkv"]
+    entries = _unscanned(names)
+    entries[0].crop = Crop(*BOX, Source.MANUAL)
+    entries[0].brightness = Brightness(205, Source.MANUAL)
+    entries[0].review = ReviewState.REVIEWED
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    metadata = fake_runner.last("metadata", "ep01.mkv")
+    fake_runner.finish(metadata, MetadataResult("ep01.mkv", 1920, 1080, DURATION, 23.976))
+    controller.drain_events()
+
+    entry = controller.entry("ep01.mkv")
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == BOX
+    assert entry.review == ReviewState.REVIEWED
