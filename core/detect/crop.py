@@ -284,6 +284,51 @@ BLOCKING_FLAGS = frozenset({
 })
 
 
+# CropSample.lines: two boxes sit on the same text row when their vertical
+# extents overlap by at least this fraction of the smaller box's height.
+TEXT_ROW_MIN_OVERLAP_FRAC = 0.5
+
+
+@dataclass(frozen=True)
+class CropSample:
+    """One analysed probe frame, as evidence for reviewing a CropResult.
+
+    `time`: the entry of CropResult.sample_pts this frame was recorded under
+    (same position, same value) -- re-fetch it with grab_frames().
+    `boxes`: (x, y, w, h) of every text polygon detect_crop() accepted on
+    this frame -- score >= DT_SCORE_THRESHOLD and centre inside the band its
+    round judged (the bottom-band cutoff; the whole frame on the full-frame
+    retry) -- in the source frame's native pixels like CropResult.box, NOT in
+    the cropped, downscaled band grab_frames() returns. Rounded like
+    CropResult.envelope, sorted by (y, x). Empty when nothing was accepted.
+    `kept`: this frame contributed to the kept union (the frames `agreed`
+    counts and `hit_pts` lists). Decided per frame, not per time: the
+    full-frame retry re-probes times the bottom-band rounds already probed,
+    and only the retry's frame at such a time is kept, although the time is
+    in hit_pts.
+    `lines`: distinct text rows among `boxes` (see _count_text_rows()), 0
+    when there are none.
+    """
+
+    time: float
+    boxes: tuple[tuple[int, int, int, int], ...]
+    kept: bool
+    lines: int
+
+    def to_evidence(self) -> dict:
+        """JSON-able: {"time", "boxes" (lists), "kept", "lines"}."""
+        return {
+            "time": float(self.time),
+            "boxes": [[int(v) for v in box] for box in self.boxes],
+            "kept": bool(self.kept),
+            "lines": int(self.lines),
+        }
+
+
+def _int_list(values) -> list[int] | None:
+    return None if values is None else [int(v) for v in values]
+
+
 @dataclass
 class CropResult:
     """One file's crop detection.
@@ -327,6 +372,25 @@ class CropResult:
     # detect_crop() -- lets callers convert `box` into (y_frac, h_frac)
     # without a second, redundant dimension probe of their own.
     frame_size: tuple[int, int] | None = None
+    # One CropSample per sample_pts entry, same order: what each analysed
+    # frame showed and whether it contributed -- evidence for review only;
+    # nothing above is derived from it.
+    samples: list[CropSample] = field(default_factory=list)
+
+    def to_evidence(self) -> dict:
+        """The result as JSON-able evidence for review: box, envelope,
+        agreed, probes_used, flagged, hit_pts, frame_size, and samples as
+        dicts (CropSample.to_evidence()). Tuples become lists."""
+        return {
+            "box": _int_list(self.box),
+            "envelope": _int_list(self.envelope),
+            "agreed": int(self.agreed),
+            "probes_used": int(self.probes_used),
+            "flagged": self.flagged,
+            "hit_pts": [float(t) for t in self.hit_pts],
+            "frame_size": _int_list(self.frame_size),
+            "samples": [sample.to_evidence() for sample in self.samples],
+        }
 
     @property
     def auto_applicable(self) -> bool:
@@ -1525,6 +1589,95 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     return polys_per_frame, sample_pts, raw_hits, frame_times
 
 
+# --------------------------------------------------------------------------
+# Evidence (CropResult.samples) -- read-only over what detection already
+# decided; nothing here feeds back into the box, flags or times.
+# --------------------------------------------------------------------------
+
+def _count_text_rows(boxes) -> int:
+    """Distinct text rows among (x, y, w, h) boxes. Two boxes share a row
+    when their vertical extents overlap by at least
+    TEXT_ROW_MIN_OVERLAP_FRAC of the smaller box's height; rows chain, so a
+    box sharing a row with each of two others joins all three."""
+    row_of = list(range(len(boxes)))
+
+    def row(i: int) -> int:
+        while row_of[i] != i:
+            i = row_of[i]
+        return i
+
+    for i, (_xi, yi, _wi, hi) in enumerate(boxes):
+        for j in range(i + 1, len(boxes)):
+            _xj, yj, _wj, hj = boxes[j]
+            overlap = min(yi + hi, yj + hj) - max(yi, yj)
+            if overlap >= TEXT_ROW_MIN_OVERLAP_FRAC * min(hi, hj):
+                row_of[row(j)] = row(i)
+    return sum(1 for i in range(len(boxes)) if row(i) == i)
+
+
+def _accepted_boxes(polys, frame_h: float, cutoff_frac: float) -> tuple[tuple[int, int, int, int], ...]:
+    """(x, y, w, h) of each of one frame's polygons that the union accepts
+    (see CropSample.boxes), sorted by (y, x). Each polygon goes through
+    _per_frame_extents() itself, so a box is shown exactly when the
+    aggregation counts that polygon. `polys` already passed the score
+    threshold and are full-frame (see _run_round()).
+
+    A polygon that cannot be parsed or rounded is left out rather than
+    raised: evidence must never fail a detection whose result stands."""
+    boxes = []
+    for poly in polys:
+        try:
+            extent = _per_frame_extents([[poly]], frame_h, cutoff_frac)[0]
+            if extent is not None:
+                min_x, min_y, max_x, max_y = extent
+                boxes.append((int(round(min_x)), int(round(min_y)),
+                              int(round(max_x - min_x)), int(round(max_y - min_y))))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return tuple(sorted(boxes, key=lambda b: (b[1], b[0], b[2], b[3])))
+
+
+def _frame_of_sample(sample_times: list[float], frame_times: list[float]) -> dict[int, int]:
+    """For one _run_round() call: which analysed frame (index into its
+    polys_per_frame / frame_times) each recorded sample (index into its
+    sample_pts) is. Both lists are in probing order; frame_times has one
+    entry per frame the engine answered, so it equals sample_times unless
+    the engine returned fewer results than frames. Matched in order, so a
+    sample the engine did not answer gets no frame instead of the next
+    sample's."""
+    frame_of_sample: dict[int, int] = {}
+    i = 0
+    for j, t in enumerate(frame_times):
+        while i < len(sample_times) and sample_times[i] != t:
+            i += 1
+        if i == len(sample_times):
+            break
+        frame_of_sample[i] = j
+        i += 1
+    return frame_of_sample
+
+
+def _crop_samples(rounds: list[tuple[list[float], list, list[float], bool]], frame_h: float,
+                  band_cutoff_frac: float, kept_idx: list[int]) -> list[CropSample]:
+    """CropResult.samples from every _run_round() call detect_crop() made,
+    in order, each as (sample_pts, polys_per_frame, frame_times, full-frame
+    retry?). Each round's frames are judged against the band that round
+    probed: the whole frame for the full-frame retry, `band_cutoff_frac`
+    otherwise. `kept_idx` indexes the LAST round's frames, the only ones the
+    union was built from."""
+    samples: list[CropSample] = []
+    for k, (sample_times, polys_per_frame, frame_times, full_frame) in enumerate(rounds):
+        cutoff_frac = 0.0 if full_frame else band_cutoff_frac
+        kept_frames = set(kept_idx) if k == len(rounds) - 1 else set()
+        frame_of_sample = _frame_of_sample(sample_times, frame_times[:len(polys_per_frame)])
+        for i, t in enumerate(sample_times):
+            j = frame_of_sample.get(i)
+            boxes = () if j is None else _accepted_boxes(polys_per_frame[j], frame_h, cutoff_frac)
+            samples.append(CropSample(time=t, boxes=boxes, kept=j is not None and j in kept_frames,
+                                      lines=_count_text_rows(boxes)))
+    return samples
+
+
 def detect_crop(video_path: str, duration_sec: float, det_engine,
                  consensus: list[tuple[float, float]] | None = None,
                  settings: dict | None = None,
@@ -1614,6 +1767,9 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     # container holds several decoded reference frames.
     fetcher = _open_frame_fetcher(video_path, known_dims)
     used_full_frame_retry = False
+    # Every round's (sample_pts, polys_per_frame, frame_times, full-frame
+    # retry?), for CropResult.samples only.
+    rounds: list[tuple[list[float], list, list[float], bool]] = []
     try:
         polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
@@ -1621,6 +1777,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
             cancel_check=cancel_check, fetcher=fetcher, transfer=transfer,
         )
         sample_pts.extend(used)
+        rounds.append((used, polys_per_frame, frame_times, False))
         # Checked (and reused, not re-polled) once per round, right after that
         # round returns: cancel_check() cutting a round short is a real,
         # distinct reason a round found little or nothing -- composed
@@ -1644,6 +1801,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                 transfer=transfer,
             )
             sample_pts.extend(used)
+            rounds.append((used, polys_per_frame, frame_times, False))
             flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
             cancelled = _is_cancelled(cancel_check)
             if cancelled:
@@ -1663,6 +1821,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                 transfer=transfer,
             )
             sample_pts.extend(used)
+            rounds.append((used, polys_per_frame, frame_times, True))
             flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
             used_full_frame_retry = True
             if _is_cancelled(cancel_check):
@@ -1748,6 +1907,11 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         )
         flagged = _compose_flag(flagged, FLAG_UNKNOWN_REJECTION)
 
+    # Evidence only, built once every field above is final.
+    samples = _crop_samples(
+        rounds, orig_h, float((settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)), kept_idx,
+    )
+
     return CropResult(
         box=box,
         sample_pts=sample_pts,
@@ -1757,4 +1921,5 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         flagged=flagged,
         hit_pts=hit_pts,
         frame_size=frame_size,
+        samples=samples,
     )

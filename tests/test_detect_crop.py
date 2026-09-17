@@ -675,12 +675,20 @@ def test_hit_pts_reflects_a_real_hit_after_a_fallback_round(monkeypatch):
     assert result.frame_size == (1920, 1080)
 
 
-def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, cancel_check=None):
+def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, cancel_check=None,
+                            real_geometry=False, **detect_kwargs):
     """Shared plumbing for the end-to-end box=None/flag tests below: drives
     the real detect_crop() orchestration with vad.probe_times(),
     _probe_source() and _grab_frames_with_times() faked out, and
     `predict_fn(t) -> (scores, polys)` controlling what the engine "sees"
-    at each probed timestamp."""
+    at each probed timestamp.
+
+    By default the fake grab reports identity geometry, so the polys
+    `predict_fn` returns are already full-frame pixels. `real_geometry=True`
+    reports the crop/scale geometry a real grab of that round's band uses
+    instead (_crop_geometry()), so the polys are in the grabbed band's
+    downscaled coordinates and detect_crop() has to map them back.
+    `detect_kwargs` (consensus, settings) go to detect_crop() as given."""
     monkeypatch.setattr(crop, "_probe_source", lambda video_path: (1920, 1080, None))
     monkeypatch.setattr(
         crop.vad, "probe_times",
@@ -693,6 +701,8 @@ def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, c
         last_chunk_times[:] = times
         pairs = [(t, np.zeros((4, 4, 3), dtype=np.uint8)) for t in times]
         geometry = (1920, 1080, 1920, 1080, 0, 0, 1920, 1080)
+        if real_geometry:
+            geometry = (1920, 1080) + crop._crop_geometry(1920, 1080, band_frac, target_height)
         return pairs, geometry
 
     class FakeEngine:
@@ -705,7 +715,7 @@ def _detect_crop_with_fakes(monkeypatch, vad_times, predict_fn, duration=60.0, c
 
     monkeypatch.setattr(crop, "_grab_frames_with_times", fake_grab_frames_with_times)
 
-    return crop.detect_crop("dummy.mp4", duration, FakeEngine(), cancel_check=cancel_check)
+    return crop.detect_crop("dummy.mp4", duration, FakeEngine(), cancel_check=cancel_check, **detect_kwargs)
 
 
 def _detect_crop_with_mocked_rounds(monkeypatch, round_outcomes, vad_times=None, duration=60.0,
