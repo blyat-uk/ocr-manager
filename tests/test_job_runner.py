@@ -784,3 +784,47 @@ def test_shutdown_called_from_inside_a_job_leaves_its_own_thread_out():
 
     assert terminal is not None
     assert (terminal.type, terminal.result) == ("finished", True)
+
+
+# --- identity ------------------------------------------------------------------
+
+def test_a_jobs_identity_cannot_be_rewritten_through_its_context(h):
+    gate = h.gate()
+    refused = set()
+
+    def body(ctx):
+        for name, value in (("key", "mutated"), ("kind", "other"),
+                            ("file", "other.mp4"), ("job_id", 999)):
+            try:
+                setattr(ctx, name, value)
+            except AttributeError:
+                refused.add(name)
+        gate.wait(WAIT)
+        return "first"
+
+    first = FakeJob("k", Lane.CPU, file="a.mp4", body=body)
+    h.runner.submit(first)
+    assert first.ran.wait(WAIT)
+    follow_up = FakeJob("k", Lane.CPU, body=lambda ctx: "second")
+    unrelated = FakeJob("mutated", Lane.CPU, body=lambda ctx: "unrelated")
+    h.runner.submit(follow_up)
+    h.runner.submit(unrelated)
+
+    assert h.rec.wait_terminal("mutated").result == "unrelated"  # not gated by "k"
+    assert not follow_up.ran.wait(QUIET)                            # gated by "k"
+    gate.set()
+    second = h.rec.wait_terminal("k", count=2)                     # "k" was released
+    assert second is not None and second.result == "second"
+
+    assert refused == {"key", "kind", "file", "job_id"}
+    first_id = h.rec.of("k")[0].job_id
+    first_events = [e for e in h.rec.of("k") if e.job_id == first_id]
+    assert [e.type for e in first_events] == ["queued", "started", "finished"]
+    assert {(e.kind, e.file) for e in first_events} == {("test", "a.mp4")}
+
+
+def test_event_fields_after_file_are_keyword_only():
+    with pytest.raises(TypeError):
+        JobEvent("progress", "k", "test", None, 0.5)
+    event = JobEvent("progress", "k", "test", None, progress=0.5)
+    assert (event.job_id, event.progress) == (0, 0.5)

@@ -62,7 +62,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from enum import Enum
 from typing import Protocol
 
@@ -81,6 +81,7 @@ class JobEvent:
     key: str
     kind: str
     file: str | None
+    _: KW_ONLY                         # everything below is keyword-only
     job_id: int = 0                    # one per submit, on every event of that instance (0: context outside a runner)
     progress: float | None = None      # 0..1 for "progress"
     message: str = ""                  # progress text, log line, or failure summary
@@ -157,10 +158,10 @@ class JobContext:
     def __init__(self, key: str = "", kind: str = "", file: str | None = None,
                  on_event: Callable[[JobEvent], None] | None = None, *,
                  job_id: int = 0) -> None:
-        self.key = key
-        self.kind = kind
-        self.file = file
-        self.job_id = job_id
+        self._key = key
+        self._kind = kind
+        self._file = file
+        self._job_id = job_id
         self.cancel_event: threading.Event = _CancelEvent()
         self._on_event = on_event
         # Serialises this job's events (helper threads may emit concurrently)
@@ -168,6 +169,24 @@ class JobContext:
         # listener may emit for the same job.
         self._emit_lock = threading.RLock()
         self._closed = False
+
+    # Identity is fixed at submit: read-only, so a job cannot re-label its
+    # events or detach itself from the runner's bookkeeping.
+    @property
+    def key(self) -> str:
+        return self._key
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    @property
+    def file(self) -> str | None:
+        return self._file
+
+    @property
+    def job_id(self) -> int:
+        return self._job_id
 
     def cancelled(self) -> bool:
         """True once cancellation has been requested (and marks it seen)."""
@@ -227,17 +246,16 @@ class Job(Protocol):
 
 @dataclass(eq=False)
 class _Entry:
-    """One submitted job instance. Its identity (key, kind, file, job_id) was
-    captured into `ctx` at submit; lifecycle events never read the job live."""
+    """One submitted job instance. Its identity is captured here at submit
+    (and read-only on `ctx`); the runner never reads the job's attributes again."""
     job: Job
     lane: Lane
     priority: int
     seq: int
+    key: str
+    kind: str
+    file: str | None
     ctx: JobContext
-
-    @property
-    def key(self) -> str:
-        return self.ctx.key
 
 
 class JobRunner:
@@ -308,7 +326,7 @@ class JobRunner:
             if seq is None:
                 seq = next(self._seq)
             ctx = JobContext(key, kind, file, self._on_event, job_id=next(self._job_ids))
-            entry = _Entry(job, lane, priority, seq, ctx)
+            entry = _Entry(job, lane, priority, seq, key, kind, file, ctx)
             heapq.heappush(self._heaps[lane], (-priority, seq, entry))
             self._queued_by_key[key] = entry
             # Delivered under the lock, so no worker can start this job (and
@@ -387,9 +405,9 @@ class JobRunner:
         reach `on_event` after shutdown has returned. After shutdown, submit
         raises RuntimeError.
 
-        Called from a worker thread (inside a job or a worker-side listener),
-        that thread cannot join itself and is left out of the result. Never
-        call it from a "queued"/"cancelled" listener: it stalls until timeout.
+        Called from a job (on its worker thread), that thread cannot join
+        itself and is left out of the result. Never call it from `on_event`
+        (see the listener contract).
         """
         with self._lock:
             self._closed = True
