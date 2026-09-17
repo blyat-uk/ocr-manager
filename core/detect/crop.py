@@ -1335,6 +1335,27 @@ def _consistent_with_consensus(y_frac: float, h_frac: float,
     return True
 
 
+def consistent_with_consensus(box: tuple[int, int, int, int], frame_size: tuple[int, int],
+                              consensus: list[tuple[float, float]]) -> bool:
+    """Whether a finished crop `box` agrees with `consensus` under the rule
+    detect_crop() applies before consensus may relax its convergence stop
+    (_consistent_with_consensus(): height within CONSENSUS_MAX_HEIGHT_RATIO
+    of the series median both ways, top within CONSENSUS_Y_DEVIATION_FRAC).
+
+    `box` is (x, y, w, h) in the native pixels of a frame `frame_size`
+    (width, height), as CropResult.box / CropResult.frame_size give them;
+    `consensus` holds (y_frac, h_frac) entries, as detect_crop() takes them.
+    For judging a result after the fact, e.g. a hint re-detection against
+    its hint (core.jobs.apply). detect_crop() itself does not call this: it
+    checks its raw union, so detection is unchanged. Raises ValueError
+    without a frame height.
+    """
+    _width, height = frame_size
+    if not height or height <= 0:
+        raise ValueError(f"frame_size {frame_size!r} has no height")
+    return _consistent_with_consensus(box[1] / height, box[3] / height, list(consensus))
+
+
 def _spread_order(times: list[float]) -> list[float]:
     """Reorder timestamps by greedy farthest-point sampling: the earliest
     entries visited are maximally spread apart, rather than adjacent in
