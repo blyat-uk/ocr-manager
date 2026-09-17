@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from core.project.model import FolderSettings, ReviewState, Source, TimeRange
+from core.project.model import FolderSettings, ReviewState, Source, TimeRange, TimeRanges
 from core.project.migrate import migrate_v1
 from core.project.store import to_json
 
@@ -456,3 +456,97 @@ def test_migrate_files_insertion_order_is_sorted():
     data = {"version": 1, "files": {}}
     project = migrate_v1(data, "/tmp/proj", ["c.mkv", "a.mkv", "b.mkv"])
     assert list(project.files.keys()) == ["a.mkv", "b.mkv", "c.mkv"]
+
+
+# --- F1: a migrated reviewed file keeps whole-file OCR ----------------------
+
+
+def _slay_without_ranges() -> dict:
+    """The Slay fixture as a folder whose user never set time ranges: no
+    per-file ranges and no global time_range."""
+    data = _load_fixture("slay.json")
+    data["global"].pop("time_range", None)
+    for entry in data["files"].values():
+        entry.pop("time_ranges", None)
+    return data
+
+
+def _ranges_result(names):
+    from core.detect.ranges.pipeline import Block, RangesAnalysis
+    from core.jobs.detect_jobs import RangesJobResult
+
+    return RangesJobResult(RangesAnalysis(
+        keep={name: [("1:30", "23:00")] for name in names},
+        blocks={name: [Block(0.0, 90.0, "intro", len(names), 0.9)] for name in names},
+        durations={name: 1500.0 for name in names},
+    ))
+
+
+def test_migrate_reviewed_file_without_ranges_gets_imported_whole_file():
+    project = migrate_v1(_slay_without_ranges(), "/tmp/slay", SLAY_NAMES)
+
+    for name in SLAY_NAMES:
+        entry = project.files[name]
+        assert entry.review == ReviewState.REVIEWED
+        assert entry.time_ranges == TimeRanges([], Source.IMPORTED)
+
+
+def test_migrate_reviewed_whole_file_survives_a_ranges_result():
+    from core.jobs.apply import apply_ranges, recompute_all
+    from core.project.ocr_kwargs import ocr_call_for
+
+    project = migrate_v1(_slay_without_ranges(), "/tmp/slay", SLAY_NAMES)
+
+    apply_ranges(project, _ranges_result(SLAY_NAMES))
+    recompute_all(project, pending={}, ranges_pending=False)
+
+    for name in SLAY_NAMES:
+        entry = project.files[name]
+        assert entry.review == ReviewState.REVIEWED
+        assert entry.time_ranges == TimeRanges([], Source.IMPORTED)
+        assert ocr_call_for(entry, project.folder, "/tmp/slay").time_ranges == []
+        assert entry.evidence["ranges"]["blocks"]      # the analysis is still kept as evidence
+
+
+def test_migrate_not_reviewed_file_without_ranges_stays_open_to_detection():
+    from core.jobs.apply import apply_ranges
+
+    data = {
+        "global": {"brightness": 220, "dialogue_enabled": True, "labels_enabled": False},
+        "files": {
+            "a.mp4": {"crop": {"x": 1, "y": 800, "width": 1000, "height": 60}},   # reviewed
+            "b.mp4": {},                                                           # no crop: pending
+        },
+    }
+    project = migrate_v1(data, "/tmp/proj", ["a.mp4", "b.mp4"])
+    assert project.files["a.mp4"].review == ReviewState.REVIEWED
+    assert project.files["a.mp4"].time_ranges == TimeRanges([], Source.IMPORTED)
+    assert project.files["b.mp4"].review == ReviewState.PENDING
+    assert project.files["b.mp4"].time_ranges is None
+
+    apply_ranges(project, _ranges_result(["a.mp4", "b.mp4"]))
+
+    assert project.files["a.mp4"].time_ranges == TimeRanges([], Source.IMPORTED)
+    assert project.files["b.mp4"].time_ranges == TimeRanges([TimeRange("1:30", "23:00")], Source.DETECTED)
+
+
+def test_migrate_reviewed_file_keeps_its_own_imported_ranges():
+    """Only a MISSING range becomes the whole file; imported ranges stay."""
+    project = migrate_v1(_load_fixture("slay.json"), "/tmp/slay", SLAY_NAMES)
+    entry = project.files["ZS2_-_11_[1080p]TXHBR.mp4"]
+    assert entry.time_ranges == TimeRanges([TimeRange("02:33", "21:20")], Source.IMPORTED)
+
+
+def test_migrate_reviewed_whole_file_round_trips_through_the_store(tmp_path):
+    from core.project.store import load_project, save_project
+
+    (tmp_path / ".ocr.json").write_text(json.dumps(_slay_without_ranges()), encoding="utf-8")
+    for name in SLAY_NAMES:
+        (tmp_path / name).write_bytes(b"")
+
+    save_project(load_project(str(tmp_path)))
+    reloaded = load_project(str(tmp_path))
+
+    for name in SLAY_NAMES:
+        assert reloaded.files[name].time_ranges == TimeRanges([], Source.IMPORTED)
+        assert reloaded.files[name].review == ReviewState.REVIEWED

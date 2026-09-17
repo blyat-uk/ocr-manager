@@ -376,11 +376,17 @@ class CropResult:
     # frame showed and whether it contributed -- evidence for review only;
     # nothing above is derived from it.
     samples: list[CropSample] = field(default_factory=list)
+    # The bottom_half_cutoff the kept samples were judged with, and `box` was
+    # built with: the settings' band (default BOTTOM_HALF_CUTOFF), or 0.0 after
+    # the full-frame retry. Re-running aggregate_box over the samples ("fit to
+    # all samples") must use it. Evidence for review only, like `samples`;
+    # None for a result detect_crop() did not build.
+    cutoff_frac: float | None = None
 
     def to_evidence(self) -> dict:
         """The result as JSON-able evidence for review: box, envelope,
-        agreed, probes_used, flagged, hit_pts, frame_size, and samples as
-        dicts (CropSample.to_evidence()). Tuples become lists."""
+        agreed, probes_used, flagged, hit_pts, frame_size, samples as dicts
+        (CropSample.to_evidence()) and cutoff_frac. Tuples become lists."""
         return {
             "box": _int_list(self.box),
             "envelope": _int_list(self.envelope),
@@ -390,6 +396,7 @@ class CropResult:
             "hit_pts": [float(t) for t in self.hit_pts],
             "frame_size": _int_list(self.frame_size),
             "samples": [sample.to_evidence() for sample in self.samples],
+            "cutoff_frac": None if self.cutoff_frac is None else float(self.cutoff_frac),
         }
 
     @property
@@ -1777,7 +1784,8 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         # Cancelled before a single probe: say so, and nothing else --
         # falling through would compose no-speech onto a file that was
         # never listened to.
-        return CropResult(box=None, flagged=FLAG_CANCELLED, frame_size=frame_size)
+        return CropResult(box=None, flagged=FLAG_CANCELLED, frame_size=frame_size,
+                          cutoff_frac=float((settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)))
     speech_probing_available = bool(times)
     if not speech_probing_available:
         times = _uniform_probe_times(duration_sec)
@@ -1943,4 +1951,5 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         hit_pts=hit_pts,
         frame_size=frame_size,
         samples=samples,
+        cutoff_frac=cutoff_frac,
     )

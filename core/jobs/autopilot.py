@@ -40,6 +40,13 @@ Crop consensus (crop_consensus)
     redetect() is not part of the chain: it is submitted at once, with the
     pool as it stands. Hint re-detects use the hint consensus (CropJob).
 
+Hint re-detects (ruling C3)
+    redetect_others_with_crop_hint / _brightness_hint submit jobs for exactly
+    hint_targets(source, what): the other files, not skipped, whose target
+    value detection may still write (None, DETECTED or HINT), with that
+    detection enabled by the extraction toggles (brightness also needs a
+    crop). MANUAL and IMPORTED values are never re-measured for a hint.
+
 Brightness waits for ranges
     detect_brightness samples inside the file's keep ranges, so no brightness
     job is submitted while ranges_pending() (a ranges analysis is queued or
@@ -192,6 +199,14 @@ def _time_ranges(entry: FileEntry) -> list[tuple[str | None, str | None]] | None
     return [(r.start, r.end) for r in entry.time_ranges.ranges]
 
 
+def _crop_hint(entry: FileEntry) -> tuple[float, float] | None:
+    """(y_frac, h_frac) of the file's crop, or None without a crop or a known media height."""
+    height = entry.media.height
+    if entry.crop is None or not height or height <= 0:
+        return None
+    return (entry.crop.y / height, entry.crop.height / height)
+
+
 def _crop_wanted(folder: FolderSettings, entry: FileEntry) -> bool:
     """An auto-fill crop is wanted: the file has none and the folder is not
     labels-only."""
@@ -254,7 +269,10 @@ class AutoPilot:
     After a user edit changes a file's crop (set_manual_crop, paste_settings):
     on_crop_changed(file). After a folder change: apply_folder_change(project,
     old, new), then on_folder_changed(old, new). After files appear:
-    on_files_added(names). Calling on_crop_changed after an applied crop
+    on_files_added(names). After reconcile_files removed entries: cancel the
+    removed files' jobs (runner.cancel_where on job.file), then
+    on_files_removed(names); their cancelled events are drained like any
+    other. Calling on_crop_changed after an applied crop
     result is harmless: on_job_event already did the same, and a brightness
     job already measuring the file's current box is not submitted again.
 
@@ -278,8 +296,10 @@ class AutoPilot:
         self._redetect_superseded: dict[str, int] = {}   # re-detected file -> highest job_id of a
                                                          # non-current crop event since the re-detect
         self._scheduled: set[str] = set()         # files the folder schedule covers (metadata -> everything)
+        self._readded: set[str] = set()           # files added back while jobs for their old entry were outstanding
         self._thumbnail_times: dict[str, float] = {}
         self._ranges_done = False
+        self._ranges_files: tuple[str, ...] = ()   # the files of the newest ranges analysis submitted
         self._tier: dict[str, object] = {}        # full-tier file -> plateau | None | _UNRESOLVED
         self._waiting: set[str] = set()           # files waiting for the tier to close
         self._tier_closed = False
@@ -295,17 +315,60 @@ class AutoPilot:
 
     def on_files_added(self, names: list[str]) -> None:
         """Schedule the added files (metadata and thumbnails always) and, when
-        autopilot_enabled, their detections and the ranges analysis again."""
+        autopilot_enabled, their detections and the ranges analysis again. A
+        file added back while jobs of its removed entry are still outstanding
+        is scheduled again, as here (without another ranges analysis), when
+        the last outstanding job for it ends; until then it is pending "crop"
+        when it needs one."""
         project = self._project()
         wanted = set(names)
         added = [name for name in project.files if name in wanted]
         for name in added:
+            if self._file_outstanding(name):
+                # Jobs of the removed entry still count, so the checks below
+                # would skip what they cover. Schedule it again once they end.
+                self._readded.add(name)
             self._thumbnail_times.pop(name, None)          # a file that came back has no thumbnail
             self._scan_metadata(project, name)
         if project.folder.autopilot_enabled:
             self._schedule_ranges(project, force=True)      # before any brightness: it waits for ranges
         for name in added:
             self._schedule_file(project, name)
+        self._settle_tier(project)
+
+    def on_files_removed(self, names: list[str]) -> None:
+        """Forget files that left the project: they leave the crop chain, the
+        full tier and the tier's waiting files; their deferred crops,
+        brightness requests (waiting for the ranges or submitted), re-detect
+        intents and thumbnail times are dropped. Their outstanding
+        submissions stay counted until their terminal events arrive (the
+        owner cancels those jobs), but pending() no longer reports them.
+        When the outstanding ranges analysis covers a removed file, a fresh
+        analysis of the remaining files supersedes it if ranges are still
+        wanted (>= 2 files, some file's ranges open to detection); otherwise
+        no new analysis is submitted and ranges are not needed. The chain
+        and the tier then move on (a waiting file takes a removed tier
+        file's place)."""
+        project = self._project()
+        removed = [name for name in names if name not in project.files]
+        if not removed:
+            return
+        for name in removed:
+            self._readded.discard(name)
+            self._crop_chain.discard(name)
+            self._deferred_crops.pop(name, None)
+            self._drop_redetect(name)
+            self._scheduled.discard(name)
+            self._thumbnail_times.pop(name, None)
+            self._brightness_requests.pop(name, None)
+            self._ranges_waits.pop(name, None)
+            self._tier.pop(name, None)
+            self._waiting.discard(name)
+        if self._crop_active in removed:
+            self._crop_active = None
+        if self.ranges_pending() and not set(removed).isdisjoint(self._ranges_files):
+            self._schedule_ranges(project, force=True)
+        self._advance_crop_chain(project)
         self._settle_tier(project)
 
     def on_job_event(self, event: JobEvent) -> None:
@@ -330,6 +393,7 @@ class AutoPilot:
                 # Remember it, so the key's last crop event can tell whether it
                 # is the re-detect's own job (the newest has the highest job_id).
                 self._redetect_superseded[file] = max(self._redetect_superseded.get(file, 0), event.job_id)
+            self._schedule_readded(self._project(), file)
             return
         project = self._project()
         if kind == "metadata":
@@ -343,6 +407,7 @@ class AutoPilot:
             if event.type != "cancelled":
                 self._ranges_done = True
             self._release_ranges_waits(project)
+        self._schedule_readded(project, file)
         self._settle_tier(project)
 
     def redetect(self, file: str) -> None:
@@ -361,36 +426,69 @@ class AutoPilot:
         self._submit_crop(project, file, boost=True)
         self._settle_tier(project)
 
-    def redetect_others_with_crop_hint(self, source_file: str) -> None:
-        """Re-detect every other file's crop with the consensus seeded from
-        `source_file`'s crop (ruling C3). Needs that crop and its media height."""
+    def hint_targets(self, source_file: str, what: str) -> list[str]:
+        """The files a hint re-detect from `source_file` submits jobs for, in
+        name order; `what` is "crop" or "brightness" (ValueError otherwise).
+
+        Every other file that is not skipped, whose target value is None or
+        DETECTED/HINT (detection can never write MANUAL or IMPORTED values,
+        so re-measuring them would only replace their evidence), and for
+        which that detection is enabled: crop unless the folder is
+        labels-only, brightness only while dialogue is extracted, and only
+        for files with a crop to measure on. Empty when `source_file` cannot
+        seed the hint: not in the project, no crop or no media height (crop),
+        no brightness (brightness)."""
+        if what not in ("crop", "brightness"):
+            raise ValueError(f"hint re-detects are for 'crop' or 'brightness', not {what!r}")
         project = self._project()
+        folder = project.folder
         source = project.files.get(source_file)
-        if source is None or source.crop is None or project.folder.labels_only:
+        if source is None:
+            return []
+        if what == "crop":
+            if folder.labels_only or _crop_hint(source) is None:
+                return []
+        elif not folder.dialogue_enabled or source.brightness is None:
+            return []
+        targets = []
+        for name, entry in project.files.items():
+            if name == source_file or entry.skipped:
+                continue
+            value = entry.crop if what == "crop" else entry.brightness
+            if value is not None and value.source not in DETECTION_SOURCES:
+                continue
+            if what == "brightness" and entry.crop is None:
+                continue
+            targets.append(name)
+        return targets
+
+    def redetect_others_with_crop_hint(self, source_file: str) -> None:
+        """Re-detect the crop of every file in hint_targets(source_file,
+        "crop") with the consensus seeded from `source_file`'s crop (ruling
+        C3)."""
+        project = self._project()
+        targets = self.hint_targets(source_file, "crop")
+        if not targets:
             return
-        height = source.media.height
-        if not height or height <= 0:
-            return
-        hint = (source.crop.y / height, source.crop.height / height)
-        for name in project.files:
-            if name != source_file:
-                self._crop_chain.discard(name)
-                self._drop_redetect(name)                  # this crop job supersedes a re-detect's
-                self._submit_crop(project, name, hint=hint, boost=True)
+        hint = _crop_hint(project.files[source_file])
+        for name in targets:
+            self._crop_chain.discard(name)
+            self._drop_redetect(name)                      # this crop job supersedes a re-detect's
+            self._submit_crop(project, name, hint=hint, boost=True)
         self._settle_tier(project)
 
     def redetect_others_with_brightness_hint(self, source_file: str) -> None:
-        """Full brightness detection on every other file with a crop, checked
-        against `source_file`'s value (ruling C3)."""
+        """Full brightness detection on every file in
+        hint_targets(source_file, "brightness"), checked against
+        `source_file`'s value (ruling C3)."""
         project = self._project()
-        source = project.files.get(source_file)
-        if source is None or source.brightness is None or not project.folder.dialogue_enabled:
+        targets = self.hint_targets(source_file, "brightness")
+        if not targets:
             return
-        value = int(source.brightness.value)
-        for name, entry in project.files.items():
-            if name != source_file and entry.crop is not None:
-                self._submit_brightness(project, name, _crop_box(entry), plateau=None, hint_value=value,
-                                        priority=PRIORITY["brightness"] + REDETECT_BOOST, explicit=True)
+        value = int(project.files[source_file].brightness.value)
+        for name in targets:
+            self._submit_brightness(project, name, _crop_box(project.files[name]), plateau=None, hint_value=value,
+                                    priority=PRIORITY["brightness"] + REDETECT_BOOST, explicit=True)
         self._settle_tier(project)
 
     def on_crop_changed(self, file: str) -> None:
@@ -457,7 +555,7 @@ class AutoPilot:
         folder = project.folder
         pending: dict[str, set[str]] = {}
         for kind, file in self._identity.values():
-            if file is not None:
+            if file is not None and file in project.files:     # not a removed file's job still ending
                 pending.setdefault(file, set()).add(kind)
         for name, entry in project.files.items():
             kinds = pending.get(name, set())
@@ -498,6 +596,23 @@ class AutoPilot:
 
     def _is_outstanding(self, kind: str, file: str) -> bool:
         return self._outstanding.get(f"{kind}:{file}", 0) > 0
+
+    def _file_outstanding(self, name: str) -> bool:
+        """Any submission for the file is outstanding."""
+        return any(file == name for _kind, file in self._identity.values())
+
+    def _schedule_readded(self, project: Project, name: str | None) -> None:
+        """A file added back while jobs for it were outstanding: once the last
+        of them has ended, schedule it as on_files_added would (without
+        another ranges analysis)."""
+        if name not in self._readded or self._file_outstanding(name):
+            return
+        self._readded.discard(name)
+        if name not in project.files:
+            return
+        self._scan_metadata(project, name)
+        self._schedule_file(project, name)
+        self._settle_tier(project)
 
     def _submit(self, job, priority: int) -> None:
         job.priority = int(priority)
@@ -569,6 +684,7 @@ class AutoPilot:
         if not force and (self._ranges_done or self.ranges_pending()):
             return
         self._submit(RangesJob(project.path, names, project.folder), PRIORITY["ranges"])
+        self._ranges_files = tuple(names)
 
     def _submit_crop(self, project: Project, name: str, *, hint: tuple[float, float] | None = None,
                      boost: bool = False) -> None:
@@ -782,12 +898,15 @@ class AutoPilot:
         return name in self._waiting and _brightness_unmeasured(entry)
 
     def _crop_pending(self, project: Project, name: str, entry: FileEntry) -> bool:
-        """A crop detection is outstanding, waits in the auto-fill chain, or
-        will follow outstanding metadata."""
+        """A crop detection is outstanding, waits in the auto-fill chain, will
+        follow outstanding metadata, or will be scheduled for a file added back
+        once its old jobs end."""
         folder = project.folder
         if self._is_outstanding("crop", name):
             return True
         if name in self._crop_chain and _crop_wanted(folder, entry):
+            return True
+        if name in self._readded and self._detects_automatically(folder, name) and _crop_wanted(folder, entry):
             return True
         if not self._is_outstanding("metadata", name):
             return False

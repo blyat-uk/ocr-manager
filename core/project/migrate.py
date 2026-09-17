@@ -244,6 +244,12 @@ def migrate_v1(data: dict, project_dir: str, video_names: list[str]) -> Project:
         review = ReviewState.PENDING
         if (crop is not None or folder.labels_only) and brightness is not None:
             review = ReviewState.REVIEWED
+            if time_ranges is None:
+                # The user accepted this file in the old app, which OCRed the
+                # whole file. Keep that choice: IMPORTED whole file (never
+                # overwritten by detection; ocr_call_for maps [] to the whole
+                # file), not None, which a ranges result would fill.
+                time_ranges = TimeRanges(ranges=[], source=Source.IMPORTED)
 
         files[name] = FileEntry(
             name=name,

@@ -472,7 +472,9 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
        beside a blocking flag on a required detected or hinted value: see the
        module docstring.)
     3. PENDING while a required detector is pending for a field holding a
-       detected or hinted value, or while the folder's ranges are pending.
+       detected or hinted value, or while the folder's ranges are pending
+       and the file's time_ranges may still be written by them (None,
+       DETECTED or HINT; MANUAL and IMPORTED ranges never wait).
     4. FLAGGED when a required field's value is detected or hinted and its
        stored flags include a reason that is not informational for that
        detector ("differs-from-hint?" and unknown reasons block). Flags beside
@@ -486,8 +488,8 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
     if entry.review == ReviewState.REVIEWED:
         return ReviewState.REVIEWED
     blocked = any(_is_detected(getattr(entry, name)) and _blocking(entry, name) for name in required)
-    if ranges_pending or any(name in detections_pending and _is_detected(getattr(entry, name))
-                             for name in required):
+    if (ranges_pending and _detection_may_write(entry.time_ranges)) or any(
+            name in detections_pending and _is_detected(getattr(entry, name)) for name in required):
         return ReviewState.PENDING
     if blocked:
         return ReviewState.FLAGGED

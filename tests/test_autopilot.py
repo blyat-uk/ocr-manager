@@ -36,6 +36,8 @@ from core.jobs.apply import (
 )
 from core.jobs.autopilot import (
     DETECTION_KINDS,
+    PRIORITY,
+    REDETECT_BOOST,
     AutoPilot,
     crop_consensus,
     intersect_plateaus,
@@ -43,6 +45,7 @@ from core.jobs.autopilot import (
     is_detection_job,
 )
 from core.jobs.detect_jobs import (
+    PROOF_PRIORITY,
     AudioProfileJob,
     AudioProfileResult,
     BrightnessJob,
@@ -1024,8 +1027,8 @@ def test_hint_redetects_seed_every_other_file_from_the_edited_file(tmp_path):
     files["a.mkv"].crop = Crop(0, 972, 1920, 54, Source.MANUAL)
     files["a.mkv"].brightness = Brightness(215, Source.MANUAL)
     files["b.mkv"].crop = Crop(*BOX, Source.DETECTED)
-    files["c.mkv"].crop = Crop(*OTHER_BOX, Source.IMPORTED)
-    files["c.mkv"].brightness = Brightness(209, Source.IMPORTED)
+    files["c.mkv"].crop = Crop(*OTHER_BOX, Source.HINT)             # detection may replace both values
+    files["c.mkv"].brightness = Brightness(209, Source.DETECTED)     # (the user's are not targets, F2)
     owner = Owner(project)
     hint = (972 / 1080, 54 / 1080)
 
@@ -1050,6 +1053,116 @@ def test_hint_redetects_seed_every_other_file_from_the_edited_file(tmp_path):
         assert sub.job.crop_box == box and sub.job.priority == 12
 
 
+def _hint_folder(tmp_path) -> Project:
+    """a is the edited file (MANUAL crop and brightness); every other file
+    shows one reason to be, or not to be, a hint target."""
+    names = ["a.mkv", "b-none.mkv", "c-detected.mkv", "d-hint.mkv", "e-manual.mkv", "f-imported.mkv",
+             "g-skipped.mkv", "h-no-media.mkv"]
+    project = _project(tmp_path, names)
+    files = project.files
+    for name in names[:-1]:
+        _media(files[name])
+    files["a.mkv"].crop = Crop(0, 972, 1920, 54, Source.MANUAL)
+    files["a.mkv"].brightness = Brightness(215, Source.MANUAL)
+    files["c-detected.mkv"].crop = Crop(*BOX, Source.DETECTED)
+    files["c-detected.mkv"].brightness = Brightness(200, Source.DETECTED)
+    files["d-hint.mkv"].crop = Crop(*BOX, Source.HINT)
+    files["d-hint.mkv"].brightness = Brightness(200, Source.HINT)
+    files["e-manual.mkv"].crop = Crop(*BOX, Source.MANUAL)
+    files["e-manual.mkv"].brightness = Brightness(200, Source.MANUAL)
+    files["f-imported.mkv"].crop = Crop(*BOX, Source.IMPORTED)
+    files["f-imported.mkv"].brightness = Brightness(200, Source.IMPORTED)
+    files["g-skipped.mkv"].crop = Crop(*BOX, Source.DETECTED)
+    files["g-skipped.mkv"].skipped = True
+    return project
+
+
+def test_crop_hint_targets_are_the_other_unskipped_files_detection_may_write(tmp_path):
+    owner = Owner(_hint_folder(tmp_path))
+    assert owner.autopilot.hint_targets("a.mkv", "crop") == [
+        "b-none.mkv", "c-detected.mkv", "d-hint.mkv", "h-no-media.mkv"]
+
+
+def test_brightness_hint_targets_are_the_other_unskipped_files_with_a_crop_detection_may_write(tmp_path):
+    project = _hint_folder(tmp_path)
+    project.files["b-none.mkv"].crop = Crop(*BOX, Source.MANUAL)     # a crop to measure on; no brightness
+    owner = Owner(project)
+    # h has no crop to measure brightness on; e and f hold the user's values; g is skipped.
+    assert owner.autopilot.hint_targets("a.mkv", "brightness") == ["b-none.mkv", "c-detected.mkv", "d-hint.mkv"]
+
+
+def test_crop_manual_brightness_detected_is_a_brightness_target_only(tmp_path):
+    project = _hint_folder(tmp_path)
+    project.files["e-manual.mkv"].brightness = Brightness(200, Source.DETECTED)
+    owner = Owner(project)
+    assert "e-manual.mkv" not in owner.autopilot.hint_targets("a.mkv", "crop")
+    assert "e-manual.mkv" in owner.autopilot.hint_targets("a.mkv", "brightness")
+
+
+@pytest.mark.parametrize("folder, crop_targets, brightness_targets", [
+    (FolderSettings(dialogue_enabled=True, labels_enabled=False), True, True),
+    (FolderSettings(dialogue_enabled=True, labels_enabled=True), True, True),
+    (FolderSettings(dialogue_enabled=False, labels_enabled=True), False, False),    # labels-only
+])
+def test_hint_targets_follow_the_extraction_toggles(tmp_path, folder, crop_targets, brightness_targets):
+    project = _hint_folder(tmp_path)
+    project.folder = folder
+    owner = Owner(project)
+    assert bool(owner.autopilot.hint_targets("a.mkv", "crop")) is crop_targets
+    assert bool(owner.autopilot.hint_targets("a.mkv", "brightness")) is brightness_targets
+
+
+def test_hint_targets_are_empty_when_the_source_cannot_seed_a_hint(tmp_path):
+    project = _hint_folder(tmp_path)
+    owner = Owner(project)
+    assert owner.autopilot.hint_targets("missing.mkv", "crop") == []
+    assert owner.autopilot.hint_targets("missing.mkv", "brightness") == []
+    project.files["a.mkv"].media = Media()                            # crop hint needs the media height
+    assert owner.autopilot.hint_targets("a.mkv", "crop") == []
+    project.files["a.mkv"].crop = None
+    project.files["a.mkv"].brightness = None
+    assert owner.autopilot.hint_targets("a.mkv", "brightness") == []
+    with pytest.raises(ValueError):
+        owner.autopilot.hint_targets("a.mkv", "ranges")
+
+
+def test_the_crop_hint_redetect_submits_exactly_its_hint_targets(tmp_path):
+    owner = Owner(_hint_folder(tmp_path))
+    targets = owner.autopilot.hint_targets("a.mkv", "crop")
+    owner.autopilot.redetect_others_with_crop_hint("a.mkv")
+    submitted = owner.take()
+    assert [s.job.file for s in submitted] == targets
+    assert pairs(submitted)[-1] == ("metadata", "h-no-media.mkv")      # its crop follows the metadata
+    assert all(s.job.hint is not None for s in of_kind(submitted, "crop"))
+
+
+def test_the_brightness_hint_redetect_submits_exactly_its_hint_targets(tmp_path):
+    owner = Owner(_hint_folder(tmp_path))
+    targets = owner.autopilot.hint_targets("a.mkv", "brightness")
+    owner.autopilot.redetect_others_with_brightness_hint("a.mkv")
+    submitted = owner.take()
+    assert pairs(submitted) == [("brightness", name) for name in targets]
+    assert all(s.job.hint_value == 215 for s in submitted)
+
+
+@pytest.mark.parametrize("what", ["crop", "brightness"])
+def test_the_hint_redetects_submit_what_hint_targets_returns(tmp_path, monkeypatch, what):
+    owner = Owner(_hint_folder(tmp_path))
+    calls = []
+
+    def only_d(source_file, kind):
+        calls.append((source_file, kind))
+        return ["d-hint.mkv"]
+
+    monkeypatch.setattr(owner.autopilot, "hint_targets", only_d)
+    if what == "crop":
+        owner.autopilot.redetect_others_with_crop_hint("a.mkv")
+    else:
+        owner.autopilot.redetect_others_with_brightness_hint("a.mkv")
+    assert calls == [("a.mkv", what)]
+    assert pairs(owner.take()) == [(what, "d-hint.mkv")]
+
+
 def test_hint_redetects_need_a_value_to_seed_from(tmp_path):
     project = _project(tmp_path, ["a.mkv", "b.mkv"])
     for entry in project.files.values():
@@ -1060,6 +1173,22 @@ def test_hint_redetects_need_a_value_to_seed_from(tmp_path):
     owner.autopilot.redetect_others_with_brightness_hint("a.mkv")
     owner.autopilot.redetect_others_with_crop_hint("missing.mkv")
     assert owner.take() == []
+
+
+def test_the_proof_outranks_every_auto_pilot_priority(tmp_path):
+    """F4: "T" must not wait behind a batch of boosted re-detects."""
+    assert PROOF_PRIORITY > max(PRIORITY.values()) + REDETECT_BOOST
+    project = _hint_folder(tmp_path)
+    project.files["b-none.mkv"].crop = Crop(*BOX, Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.redetect("h-no-media.mkv")                        # boosted metadata first
+    owner.autopilot.on_open()
+    owner.autopilot.redetect("c-detected.mkv")
+    owner.autopilot.redetect_others_with_crop_hint("a.mkv")
+    owner.autopilot.redetect_others_with_brightness_hint("a.mkv")
+    priorities = [s.job.priority for s in owner.take()]
+    assert max(priorities) == max(PRIORITY.values()) + REDETECT_BOOST
+    assert all(priority < PROOF_PRIORITY for priority in priorities)
 
 
 # --------------------------------------------------------------------------
@@ -1406,6 +1535,304 @@ def test_turning_autopilot_on_schedules_detections_and_off_schedules_nothing(tmp
     project.folder = replace(project.folder, autopilot_enabled=False, labels_enabled=False)
     owner.autopilot.on_folder_changed(old, project.folder)
     assert owner.take() == []
+
+
+# --------------------------------------------------------------------------
+# Removed files (F9)
+# --------------------------------------------------------------------------
+
+def _remove(owner: Owner, names: list[str]) -> None:
+    """What the owner does after reconcile_files removed entries: the entries
+    are gone, then on_files_removed (the owner also cancels their jobs; the
+    tests deliver those cancellations explicitly)."""
+    for name in names:
+        del owner.project.files[name]
+    owner.autopilot.on_files_removed(names)
+    owner.recompute()
+
+
+def _chain_folder(tmp_path, names) -> Project:
+    project = _project(tmp_path, names)
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.sample_time = 300.0
+        entry.time_ranges = TimeRanges([], Source.MANUAL)
+    return project
+
+
+def test_removing_the_file_whose_crop_runs_moves_the_chain_on(tmp_path):
+    owner = Owner(_chain_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"]))
+    owner.autopilot.on_open()
+    (crop_a,) = of_kind(owner.take(), "crop")
+    assert crop_a.job.file == "a.mkv"
+
+    _remove(owner, ["a.mkv"])
+    assert pairs(owner.take()) == [("crop", "b.mkv")]
+    assert "a.mkv" not in owner.autopilot.pending()
+
+    owner.deliver(crop_a, None, type="cancelled")              # the owner cancelled a's job
+    assert owner.take() == []                                  # b's crop is still the active one
+    assert sorted(owner.autopilot.pending()) == ["b.mkv", "c.mkv"]
+
+
+def test_a_removed_file_waiting_in_the_chain_is_never_detected(tmp_path):
+    owner = Owner(_chain_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"]))
+    owner.autopilot.on_open()
+    (crop_a,) = of_kind(owner.take(), "crop")
+    _remove(owner, ["b.mkv"])
+    assert owner.take() == []
+    owner.deliver(crop_a, crop_done(crop_a))
+    assert pairs(of_kind(owner.take(), "crop")) == [("crop", "c.mkv")]
+
+
+def test_removing_a_full_tier_file_promotes_the_first_waiting_file(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], FolderSettings(brightness_full_detect_files=1))
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (full_a,) = of_kind(owner.take(), "brightness")
+
+    _remove(owner, ["a.mkv"])
+    (full_b,) = owner.take()
+    assert (full_b.job.kind, full_b.job.file, full_b.job.folder_plateau) == ("brightness", "b.mkv", None)
+    assert owner.deliver(full_a, None, type="cancelled") is True
+    assert owner.take() == []
+
+    owner.deliver(full_b, brightness_done(full_b, plateau=(190, 230)))
+    (cheap_c,) = owner.take()
+    assert (cheap_c.job.file, cheap_c.job.folder_plateau) == ("c.mkv", (190, 230))
+
+
+def test_a_removed_tier_file_that_reported_leaves_the_folder_plateau(tmp_path):
+    names = ["a.mkv", "b.mkv", "c.mkv", "d.mkv"]
+    project = _ready_folder(tmp_path, names, FolderSettings(brightness_full_detect_files=2))
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    full_a, full_b = of_kind(owner.take(), "brightness")
+    owner.deliver(full_a, brightness_done(full_a, plateau=(190, 230)))
+    assert owner.take() == []
+
+    _remove(owner, ["a.mkv"])
+    (full_c,) = owner.take()                                   # c takes a's place in the tier
+    assert (full_c.job.file, full_c.job.folder_plateau) == ("c.mkv", None)
+    owner.deliver(full_b, brightness_done(full_b, plateau=(200, 240)))
+    owner.deliver(full_c, brightness_done(full_c, plateau=(195, 235)))
+    (cheap_d,) = owner.take()
+    assert (cheap_d.job.file, cheap_d.job.folder_plateau) == ("d.mkv", (200, 235))
+
+
+def test_a_file_removed_while_its_request_waits_for_ranges_does_not_get_it_when_it_returns(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], open_ranges=True)
+    project.files["a.mkv"].brightness = Brightness(215, Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (ranges,) = of_kind(owner.take(), "ranges")
+    owner.autopilot.redetect_others_with_brightness_hint("a.mkv")       # b and c wait for the ranges
+    assert owner.take() == []
+
+    _remove(owner, ["c.mkv"])
+    (fresh,) = of_kind(owner.take(), "ranges")
+    project.files["c.mkv"] = _media(FileEntry(name="c.mkv", crop=Crop(*BOX, Source.DETECTED),
+                                              brightness=Brightness(209, Source.MANUAL),
+                                              time_ranges=TimeRanges([], Source.MANUAL)))
+    project.files["c.mkv"].evidence["audio"] = {}
+    project.files["c.mkv"].sample_time = 300.0
+    owner.autopilot.on_files_added(["c.mkv"])
+    (again,) = of_kind(owner.take(), "ranges")
+    owner.deliver(ranges, ranges_done(ranges))
+    owner.deliver(fresh, None, type="cancelled")
+    owner.deliver(again, ranges_done(again))
+    released = of_kind(owner.take(), "brightness")
+    assert [(s.job.file, s.job.hint_value) for s in released] == [("b.mkv", 215)]
+
+
+def test_a_removed_files_brightness_waiting_for_ranges_is_dropped(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], open_ranges=True)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (ranges,) = of_kind(owner.take(), "ranges")
+    assert "brightness" in owner.autopilot.pending()["c.mkv"]
+
+    _remove(owner, ["c.mkv"])
+    (fresh,) = owner.take()
+    assert (fresh.job.kind, list(fresh.job.files)) == ("ranges", ["a.mkv", "b.mkv"])
+    assert owner.deliver(ranges, ranges_done(ranges, keep={"a.mkv": [("01:00", "20:00")]})) is False
+    assert project.files["a.mkv"].time_ranges is None           # the superseded analysis is not applied
+    assert owner.take() == [] and owner.autopilot.ranges_pending() is True
+
+    assert owner.deliver(fresh, ranges_done(fresh)) is True
+    assert pairs(owner.take()) == [("brightness", "a.mkv"), ("brightness", "b.mkv")]
+
+
+def test_removing_a_file_leaves_fewer_than_two_ranges_are_not_analysed_again(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv"], open_ranges=True)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (ranges,) = of_kind(owner.take(), "ranges")
+
+    _remove(owner, ["b.mkv"])
+    assert owner.take() == []
+    assert owner.deliver(ranges, ranges_done(ranges)) is True
+    assert pairs(owner.take()) == [("brightness", "a.mkv")]
+
+
+def test_removing_a_file_after_the_ranges_ended_submits_no_analysis(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv", "c.mkv"], open_ranges=True)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (ranges,) = of_kind(owner.take(), "ranges")
+    owner.deliver(ranges, ranges_done(ranges))
+    owner.take()
+    _remove(owner, ["c.mkv"])
+    assert of_kind(owner.take(), "ranges") == []
+
+
+def test_a_removed_files_redetect_intent_is_dropped(tmp_path):
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv"])
+    owner = Owner(project)
+    owner.autopilot.redetect("a.mkv")
+    (crop,) = owner.take()
+    _remove(owner, ["a.mkv"])
+    project.files["a.mkv"] = _media(FileEntry(name="a.mkv", crop=Crop(*BOX, Source.DETECTED),
+                                              brightness=Brightness(209, Source.MANUAL)))
+    project.files = dict(sorted(project.files.items()))
+    owner.deliver(crop, crop_done(crop))                       # a came back; its old re-detect is gone
+    assert of_kind(owner.take(), "brightness") == []
+
+
+def test_pending_empties_once_the_removed_files_jobs_end(tmp_path):
+    names = ["a.mkv", "b.mkv", "c.mkv"]
+    owner = Owner(_project(tmp_path, names, FolderSettings(brightness_full_detect_files=1)))
+    owner.autopilot.on_open()
+    opened = owner.take()
+    assert set(owner.autopilot.pending()) == set(names)
+
+    _remove(owner, names)
+    assert owner.autopilot.pending() == {}
+    assert owner.take() == []                                  # fewer than two files: no fresh analysis
+    for sub in opened:
+        owner.deliver(sub, None, type="cancelled")
+    assert owner.take() == []
+    assert owner.autopilot.pending() == {}
+    assert owner.autopilot.ranges_pending() is False
+
+
+def _readd(owner: Owner, name: str) -> None:
+    """The file comes back: reconcile_files gives it a fresh entry, then on_files_added."""
+    owner.project.files[name] = FileEntry(name=name)
+    owner.project.files = dict(sorted(owner.project.files.items()))
+    owner.autopilot.on_files_added([name])
+    owner.recompute()
+
+
+def _assert_waiting(owner: Owner, name: str) -> None:
+    assert owner.state(name) == ReviewState.PENDING
+    assert "crop" in owner.autopilot.pending()[name]
+
+
+def test_a_file_readded_while_its_metadata_is_outstanding_is_scheduled_when_that_job_ends(tmp_path):
+    owner = Owner(_project(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    (meta_a,) = [s for s in owner.take() if (s.job.kind, s.job.file) == ("metadata", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    _readd(owner, "a.mkv")
+    assert pairs(owner.take()) == [("ranges", None)]            # metadata:a.mkv is still outstanding
+    _assert_waiting(owner, "a.mkv")
+
+    owner.deliver(meta_a, None, type="cancelled")               # the owner cancelled it at removal
+    (meta_again,) = owner.take()
+    assert (meta_again.job.kind, meta_again.job.file) == ("metadata", "a.mkv")
+    _assert_waiting(owner, "a.mkv")
+    owner.deliver(meta_again, metadata_done(meta_again))
+    assert ("crop", "a.mkv") in pairs(owner.take())
+
+
+def test_a_file_readded_while_its_crop_is_outstanding_is_scheduled_when_its_last_job_ends(tmp_path):
+    owner = Owner(_chain_folder(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    opened = owner.take()
+    old_a = [s for s in opened if s.job.file == "a.mkv"]
+    assert sorted(pairs(old_a)) == [("crop", "a.mkv"), ("thumbnail", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    (crop_b,) = owner.take()
+    _readd(owner, "a.mkv")
+    (metadata,) = of_kind(owner.take(), "metadata")
+    owner.deliver(metadata, metadata_done(metadata))
+    side = owner.take()
+    assert sorted(pairs(side)) == [("audio_profile", "a.mkv"), ("thumbnail", "a.mkv")]   # crop:a.mkv outstanding
+    _assert_waiting(owner, "a.mkv")
+
+    for sub in old_a:                                           # the owner cancelled them at removal
+        owner.deliver(sub, None, type="cancelled")
+    assert owner.take() == []                                   # a's new thumbnail and audio are still outstanding
+    _assert_waiting(owner, "a.mkv")
+    finish_side_jobs(owner, side)
+    assert owner.take() == []                                   # a waits in the chain behind b's crop
+    _assert_waiting(owner, "a.mkv")
+    owner.deliver(crop_b, crop_done(crop_b))
+    crops = of_kind(owner.take(), "crop")
+    assert pairs(crops) == [("crop", "a.mkv")] and crops[0].job.hint is None
+
+
+def test_a_readded_file_is_scheduled_when_its_last_job_ends_without_being_current(tmp_path):
+    """The last old job is a brightness job superseded by a request waiting for
+    the ranges (not current); that request is later dropped, so nothing else
+    would ever schedule the file's audio profile."""
+    project = _ready_folder(tmp_path, ["a.mkv", "b.mkv"], open_ranges=True)
+    del project.files["a.mkv"].evidence["audio"]
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    opened = owner.take()
+    (ranges,) = of_kind(opened, "ranges")
+    owner.deliver(ranges, ranges_done(ranges))
+    (bright_a,) = [s for s in owner.take() if s.job.file == "a.mkv"]
+    old_audio = [s for s in opened if (s.job.kind, s.job.file) == ("audio_profile", "a.mkv")]
+    old_thumbnail = [s for s in opened if (s.job.kind, s.job.file) == ("thumbnail", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    _readd(owner, "a.mkv")
+    added = owner.take()
+    (metadata,) = of_kind(added, "metadata")
+    owner.deliver(metadata, metadata_done(metadata))
+    after_metadata = owner.take()
+    assert of_kind(after_metadata, "audio_profile") == []           # the old audio job is outstanding
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("a.mkv")                           # waits for the new ranges analysis
+    assert of_kind(owner.take(), "brightness") == []
+    for sub in old_audio + old_thumbnail + after_metadata:
+        owner.deliver(sub, None, type="cancelled")
+    assert owner.deliver(bright_a, None, type="cancelled") is False    # the last old job: not current
+    set_manual_brightness(project, "a.mkv", 215)                       # the waiting request will be dropped
+    (again,) = of_kind(added, "ranges")
+    owner.deliver(again, ranges_done(again))
+    submitted = owner.take()
+    assert ("audio_profile", "a.mkv") in pairs(submitted)
+    assert of_kind(submitted, "brightness") == []
+
+
+def test_a_file_readded_once_its_jobs_ended_is_scheduled_at_once(tmp_path):
+    owner = Owner(_project(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    (meta_a,) = [s for s in owner.take() if (s.job.kind, s.job.file) == ("metadata", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    owner.deliver(meta_a, None, type="cancelled")
+    _readd(owner, "a.mkv")
+    submitted = owner.take()
+    assert pairs(submitted) == [("metadata", "a.mkv"), ("ranges", None)]
+    owner.deliver(submitted[0], metadata_done(submitted[0]))
+    owner.take()
+    assert len(of_kind(owner.runner.submissions, "metadata")) == 3      # a, b, and a once more: never twice
+
+
+def test_a_readded_file_removed_again_is_not_scheduled(tmp_path):
+    owner = Owner(_project(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    (meta_a,) = [s for s in owner.take() if (s.job.kind, s.job.file) == ("metadata", "a.mkv")]
+    _remove(owner, ["a.mkv"])
+    _readd(owner, "a.mkv")
+    _remove(owner, ["a.mkv"])
+    owner.take()
+    owner.deliver(meta_a, None, type="cancelled")
+    assert of_kind(owner.take(), "metadata") == []
+    assert "a.mkv" not in owner.autopilot.pending()
 
 
 def test_autopilot_module_imports_no_qt():

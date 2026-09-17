@@ -273,6 +273,36 @@ def test_speech_in_skips_handles_multiple_blocks_independently():
     assert result == [(5.0, 10.0), (50.0, 55.0)]
 
 
+@pytest.mark.parametrize("as_spans", [
+    lambda blocks: [(b.start_sec, b.end_sec) for b in blocks],                 # skip spans (tuples)
+    lambda blocks: [[b.start_sec, b.end_sec] for b in blocks],                 # JSON-loaded spans (lists)
+    lambda blocks: ((b.start_sec, b.end_sec) for b in blocks),                 # any iterable, even a generator
+    lambda blocks: [{"start_sec": b.start_sec, "end_sec": b.end_sec, "kind": b.kind,
+                     "matched_files": b.matched_files, "score": b.score} for b in blocks],   # evidence dicts
+])
+def test_speech_in_skips_accepts_spans_and_evidence_blocks_like_blocks(as_spans):
+    blocks = [
+        pl.Block(0.0, 10.0, "intro", 1, 1.0),
+        pl.Block(50.0, 60.0, "outro", 1, 1.0),
+    ]
+    speech = [(5.0, 55.0), (58.5, 59.0)]
+    expected = ap.speech_in_skips(speech, blocks, min_overlap_sec=2.0)
+    assert expected == [(5.0, 10.0), (50.0, 55.0)]
+    assert ap.speech_in_skips(speech, as_spans(blocks), min_overlap_sec=2.0) == expected
+
+
+def test_speech_in_skips_mixes_blocks_and_spans_and_takes_json_speech():
+    speech = [[5.0, 55.0]]                                                     # evidence["audio"]["speech"]
+    skips = [pl.Block(0.0, 10.0, "intro", 1, 1.0), (50.0, 60.0)]
+    assert ap.speech_in_skips(speech, skips, min_overlap_sec=2.0) == [(5.0, 10.0), (50.0, 55.0)]
+
+
+@pytest.mark.parametrize("bad", [[(1.0,)], [(1.0, 2.0, 3.0)], [{"start_sec": 1.0}], [None], [1.0]])
+def test_speech_in_skips_refuses_what_is_not_a_span(bad):
+    with pytest.raises((TypeError, ValueError)):
+        ap.speech_in_skips([(0.0, 10.0)], bad)
+
+
 # ===========================================================================
 # Optional: real-project equivalence (slow, needs_media)
 # ===========================================================================
