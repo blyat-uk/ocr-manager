@@ -97,10 +97,15 @@ class FakeRunner:
 
     It runs nothing. submit() records the job with a job_id (1, 2, ... like
     the real runner) and delivers "queued" synchronously, as the real runner
-    does; cancel/cancel_where/pause/resume/shutdown are recorded. The test
-    delivers every other event with emit/start/progress/finish, which call
-    the controller's listener exactly as a worker thread would (the listener
-    only enqueues; the controller drains on its timer or drain_events()).
+    does. Like the real runner, a submit replaces a queued (not yet started)
+    job with the same key: that job gets "cancelled" (result None) first. A
+    started job with the same key is left alone. cancel/cancel_where/pause/
+    resume/shutdown are only recorded. The test delivers every other event
+    with emit/start/progress/finish, which call the controller's listener
+    exactly as a worker thread would (the listener only enqueues; the
+    controller drains on its timer or drain_events()). Events after a job's
+    terminal event are refused (the real runner drops them), so a test cannot
+    rely on a sequence that never happens.
     """
 
     def __init__(self):
@@ -115,6 +120,7 @@ class FakeRunner:
         self.closed = False
         self._ids = itertools.count(1)
         self._started: set[int] = set()
+        self._ended: set[int] = set()
 
     # --- the JobRunner surface ------------------------------------------------
 
@@ -126,6 +132,9 @@ class FakeRunner:
     def submit(self, job) -> None:
         if self.closed:
             raise RuntimeError("JobRunner has been shut down")
+        for queued in self.queued():
+            if queued.job.key == job.key:
+                self.emit(queued, "cancelled", result=None)
         submission = Submission(job, next(self._ids))
         self.submissions.append(submission)
         self.emit(submission, "queued")
@@ -150,6 +159,10 @@ class FakeRunner:
     # --- test side --------------------------------------------------------------
 
     def emit(self, submission: Submission, event_type: str, **fields) -> None:
+        assert submission.job_id not in self._ended, \
+            f"{event_type!r} after the terminal event of {submission.job.key} (job {submission.job_id})"
+        if event_type in TERMINAL:
+            self._ended.add(submission.job_id)
         job = submission.job
         file = fields.pop("file", job.file)
         self.on_event(JobEvent(event_type, job.key, job.kind, file, job_id=submission.job_id, **fields))
@@ -168,6 +181,13 @@ class FakeRunner:
         assert event_type in TERMINAL
         self.start(submission)
         self.emit(submission, event_type, result=result, **fields)
+
+    def queued(self) -> list[Submission]:
+        """Submissions neither started nor ended."""
+        return [s for s in self.submissions if s.job_id not in self._started and s.job_id not in self._ended]
+
+    def ended(self, submission: Submission) -> bool:
+        return submission.job_id in self._ended
 
     def of_kind(self, kind: str, file: str | None = None) -> list[Submission]:
         return [s for s in self.submissions

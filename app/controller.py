@@ -19,9 +19,11 @@ Events
       4. recompute_all(project, pending=..., ranges_pending=...);
       5. signals, and a debounced save.
     Proof and run events have their own branches. Events of any other kind
-    are logged to "Pipeline". A failed detection is logged, never retried:
-    re-detect is the user's retry. The controller never submits an auto-pilot
-    kind itself: AutoPilot counts every submission per key.
+    are logged to "Pipeline". A failed detection is logged under "Detections",
+    never retried: re-detect is the user's retry. An apply that raises is
+    logged to "Pipeline" and steps 3-4 still run, so the key never stays
+    outstanding. The controller never submits an auto-pilot kind itself:
+    AutoPilot counts every submission per key.
 
 Sessions
     One runner lives as long as the controller. Closing a folder cancels its
@@ -61,6 +63,7 @@ import os
 import queue
 import subprocess
 import time
+import traceback
 from collections.abc import Callable
 
 import numpy as np
@@ -69,7 +72,7 @@ from PyQt6.QtGui import QImage
 
 from app.activity import TERMINAL_EVENTS, ActivitySnapshot, ActivityTracker
 from app.folder_watch import OUTPUT_DIR, FolderWatch
-from app.logbook import PIPELINE_LOG, LogBook
+from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
 from core.jobs import apply as rules
@@ -132,6 +135,13 @@ def _box(crop) -> tuple[int, int, int, int] | None:
     return None if crop is None else (crop.x, crop.y, crop.width, crop.height)
 
 
+def _same_folder(first: str, second: str) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return os.path.realpath(first) == os.path.realpath(second)
+
+
 def _non_empty_file(path: str) -> bool:
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -152,7 +162,7 @@ class ProjectController(QObject):
     run_changed = pyqtSignal()                  # run started/progress/finished/paused
     run_subtitle = pyqtSignal(str, float, float, str)
     log_appended = pyqtSignal(str, str)         # key ("Pipeline" or filename), text
-    logs_cleared = pyqtSignal()                 # a run started: logs restart, as today
+    logs_cleared = pyqtSignal()                 # logs restarted (a run start keeps "Detections"): re-read log_keys()
     save_failed = pyqtSignal(str)               # message; the values stay in memory
 
     def __init__(self, runner_factory: Callable[[Callable[[JobEvent], None]], JobRunner] = default_runner_factory,
@@ -187,6 +197,7 @@ class ProjectController(QObject):
         self._thumbnails: dict[str, QImage] = {}
         self._proof_results: dict[str, ProofResult] = {}
         self._proof_outstanding: dict[str, int] = {}
+        self._proof_stale: dict[str, int] = {}          # proofs of removed entries, still to end: never reported
         self._clipboard: dict | None = None
         self._done: set[str] = set()
         self._user_paused = False
@@ -209,18 +220,21 @@ class ProjectController(QObject):
     # --- lifecycle ------------------------------------------------------------------
 
     def open_folder(self, path: str) -> None:
-        """Open `path`, closing the open folder first. When its `.ocr.json`
-        has a version this app cannot read, UnsupportedProjectVersion is
-        raised and nothing is opened, closed or saved."""
+        """Open `path`. It is loaded first: when its `.ocr.json` has a version
+        this app cannot read, UnsupportedProjectVersion is raised and the open
+        folder stays open, untouched (not even saved). Only after a successful
+        load is the open folder closed (and saved) and the new one installed;
+        reopening the open folder reads it again after that save, so no edit
+        is lost."""
         self._check_alive()
         path = os.path.abspath(os.fspath(path))
         if not os.path.isdir(path):
             raise NotADirectoryError(path)
-        if self._project is not None:
-            self._drain_all()
-            self._save_now()                # it may be this very folder: load what was edited
         project = store.load_project(path)
+        reopening = self._project is not None and _same_folder(self._project.path, path)
         self.close_folder()
+        if reopening:
+            project = store.load_project(path)
         self._project = project
         self._autopilot = AutoPilot(self._runner, self._current_project)
         self._refresh_done(notify=False)
@@ -514,7 +528,7 @@ class ProjectController(QObject):
         self._run_job = job
         self._run_stop_requested = False
         self._run = RunTracker(names, folder.ocr_parallel, time.monotonic())
-        self._clear_logs()
+        self._clear_logs(keep=(DETECTIONS_LOG,))
         self._emit_run = True
         self._flush()
 
@@ -605,11 +619,15 @@ class ProjectController(QObject):
         autopilot = self._autopilot
         current = autopilot.is_current(event)           # 1. before anything consumes the submission
         if current:
-            self._apply_result(event.result)            # 2. a superseded result is dropped
+            try:
+                self._apply_result(event.result)        # 2. a superseded result is dropped
+            except Exception:                           # the key must still be released below
+                logger.exception("could not apply the result of %s", event.key)
+                self._log(PIPELINE_LOG, f"Could not apply the result of {event.key}:\n{traceback.format_exc()}")
         autopilot.on_job_event(event)                   # 3. after the apply
         self._recompute()                               # 4.
         if event.type == "failed":
-            self._log(event.file or PIPELINE_LOG, f"{event.kind} failed: {event.message}\n{event.error}")
+            self._log(DETECTIONS_LOG, f"{event.file or 'folder'}: {event.kind} failed: {event.message}\n{event.error}")
 
     def _apply_result(self, result) -> None:
         project = self._project
@@ -650,7 +668,14 @@ class ProjectController(QObject):
         if event.type not in TERMINAL_EVENTS:
             return
         if event.type == "failed":
-            self._log(name or PIPELINE_LOG, f"proof failed: {event.message}\n{event.error}")
+            self._log(DETECTIONS_LOG, f"{name}: proof failed: {event.message}\n{event.error}")
+        stale = self._proof_stale.get(name, 0)
+        if stale:                                       # the proof of a removed entry (it ends before any newer one)
+            if stale > 1:
+                self._proof_stale[name] = stale - 1
+            else:
+                del self._proof_stale[name]
+            return
         count = self._proof_outstanding.get(name, 0)
         if count <= 0:
             return
@@ -781,8 +806,9 @@ class ProjectController(QObject):
                 self.file_changed.emit(name)
             for name in dict.fromkeys(thumbnails):
                 self.thumbnail_ready.emit(name)
-        for name in dict.fromkeys(proofs):
-            self.proof_finished.emit(name)
+            for name in dict.fromkeys(proofs):
+                if name in project.files:
+                    self.proof_finished.emit(name)
         if activity:
             self.activity_changed.emit()
         if run:
@@ -795,8 +821,8 @@ class ProjectController(QObject):
         if text:
             self.log_appended.emit(key, text)
 
-    def _clear_logs(self) -> None:
-        self._logs.clear()
+    def _clear_logs(self, keep: tuple[str, ...] = ()) -> None:
+        self._logs.clear(keep)
         self.logs_cleared.emit()
 
     # --- saving -----------------------------------------------------------------------------
@@ -845,6 +871,9 @@ class ProjectController(QObject):
         for name in removed:
             self._thumbnails.pop(name, None)
             self._proof_results.pop(name, None)
+            outstanding = self._proof_outstanding.pop(name, 0)
+            if outstanding:
+                self._proof_stale[name] = self._proof_stale.get(name, 0) + outstanding
         if removed:
             autopilot.on_files_removed(removed)
         if added:

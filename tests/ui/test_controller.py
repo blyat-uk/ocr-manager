@@ -226,11 +226,15 @@ def test_open_migrates_a_v1_project_and_starts_autopilot(make_controller, fake_r
 
 
 def test_open_refuses_an_unsupported_version_without_touching_anything(make_controller, fake_runner, tmp_project):
-    good = tmp_project(["ep01.mkv"])
+    good = tmp_project(["ep01.mkv"], config=manual_config(["ep01.mkv"]))
     bad = tmp_project(["ep01.mkv"], config={"version": 99, "files": {}})
     bad_text = (bad / ".ocr.json").read_text(encoding="utf-8")
-    controller = make_controller()
+    controller = make_controller(save_debounce_ms=60_000)
     controller.open_folder(str(good))
+    controller.set_brightness("ep01.mkv", 150)                 # an edit waiting for its debounced save
+    good_config = good / ".ocr.json"
+    good_bytes, good_mtime = good_config.read_bytes(), good_config.stat().st_mtime_ns
+    project = controller.project
     closed = Spy(controller.project_closed)
     opened = Spy(controller.project_opened)
     submitted = len(fake_runner.submissions)
@@ -238,12 +242,29 @@ def test_open_refuses_an_unsupported_version_without_touching_anything(make_cont
     with pytest.raises(UnsupportedProjectVersion):
         controller.open_folder(str(bad))
 
-    assert controller.project.path == str(good)          # the open project stays open
+    assert controller.project is project and project.path == str(good)     # still open
+    assert controller.entry("ep01.mkv").brightness.value == 150
+    assert good_config.read_bytes() == good_bytes and good_config.stat().st_mtime_ns == good_mtime
     assert closed.calls == [] and opened.calls == []
     assert len(fake_runner.submissions) == submitted
     controller.shutdown()
+    assert saved(good)["files"]["ep01.mkv"]["brightness"]["value"] == 150
     assert (bad / ".ocr.json").read_text(encoding="utf-8") == bad_text
     assert sorted(p.name for p in bad.iterdir()) == [".ocr.json", "ep01.mkv"]
+
+
+def test_reopening_the_open_folder_keeps_unsaved_edits(make_controller, fake_runner, tmp_project):
+    folder = tmp_project(["ep01.mkv"], config=manual_config(["ep01.mkv"]))
+    controller = make_controller(save_debounce_ms=60_000)
+    controller.open_folder(str(folder))
+    old = controller.project
+    controller.set_brightness("ep01.mkv", 150)
+
+    controller.open_folder(str(folder))
+
+    assert controller.project is not old
+    assert controller.entry("ep01.mkv").brightness == Brightness(150, Source.MANUAL)
+    assert saved(folder)["files"]["ep01.mkv"]["brightness"]["value"] == 150
 
 
 def test_open_on_an_unsupported_version_with_nothing_open(make_controller, fake_runner, tmp_project):
@@ -350,9 +371,10 @@ def test_a_superseded_crop_result_is_not_applied(make_controller, fake_runner, t
     controller = make_controller()
     controller.open_folder(str(folder))
     first = fake_runner.last("crop", name)
+    fake_runner.start(first)                                   # running: a re-detect waits behind it
     controller.redetect(name)
     second = fake_runner.last("crop", name)
-    assert second.job_id != first.job_id
+    assert second.job_id != first.job_id and not fake_runner.ended(first)
 
     fake_runner.finish(first, crop_result(first, OTHER_BOX))
     controller.drain_events()
@@ -361,6 +383,31 @@ def test_a_superseded_crop_result_is_not_applied(make_controller, fake_runner, t
     fake_runner.finish(second, crop_result(second, BOX))
     controller.drain_events()
     assert controller.entry(name).crop == Crop(*BOX, Source.DETECTED)
+
+
+def test_a_redetect_replacing_a_queued_crop_leaves_nothing_outstanding(make_controller, fake_runner, tmp_project):
+    name = "ep01.mkv"
+    folder = tmp_project([name], config=v2_config([make_entry(name, review=ReviewState.PENDING)]))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    first = fake_runner.last("crop", name)
+
+    controller.redetect(name)                                  # the queued crop is replaced: "cancelled" at once
+    second = fake_runner.last("crop", name)
+    assert fake_runner.ended(first) and not fake_runner.ended(second)
+    controller.drain_events()
+    assert controller.entry(name).crop is None
+    assert "crop" in controller._autopilot.pending()[name]    # the replacement is still outstanding
+
+    fake_runner.finish(second, crop_result(second, BOX))
+    controller.drain_events()
+    entry = controller.entry(name)
+    assert entry.crop == Crop(*BOX, Source.DETECTED)
+    assert "crop" not in controller._autopilot.pending().get(name, set())
+    brightness = fake_runner.last("brightness", name)          # the chain moved on
+    fake_runner.finish(brightness, brightness_result(brightness))
+    controller.drain_events()
+    assert entry.review == ReviewState.PROPOSED
 
 
 def test_a_failed_detection_is_logged_and_not_retried(make_controller, fake_runner, tmp_project):
@@ -376,8 +423,64 @@ def test_a_failed_detection_is_logged_and_not_retried(make_controller, fake_runn
 
     assert fake_runner.of_kind("crop", name) == [crop]
     assert controller.entry(name).review == ReviewState.FLAGGED
-    assert any(key == name and "decoder exploded" in text for key, text in logs.calls)
-    assert "decoder exploded" in controller.log_text(name)
+    assert any(key == "Detections" and "ep01.mkv: crop failed: decoder exploded" in text for key, text in logs.calls)
+    assert "Traceback: decoder exploded" in controller.log_text("Detections")
+
+
+def test_a_run_start_keeps_the_detection_failures_log(make_controller, fake_runner, tmp_project, notifications):
+    names = ["ep01.mkv", "ep02.mkv"]
+    entries = [make_entry("ep01.mkv", review=ReviewState.PENDING),
+               make_entry("ep02.mkv", crop=BOX, brightness=209, review=ReviewState.REVIEWED)]
+    folder = tmp_project(names, config=v2_config(entries))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    crop = fake_runner.last("crop", "ep01.mkv")
+    fake_runner.finish(crop, None, "failed", message="decoder exploded", error="Traceback: decoder exploded\n")
+    controller.drain_events()
+    controller.start_run(["ep02.mkv"])
+    run = fake_runner.last("run")
+    fake_runner.emit(run, "run_file_log", file="ep02.mkv", message="Starting OCR: ep02.mkv\n")
+    fake_runner.emit(run, "log", message="run note")
+    controller.drain_events()
+    assert controller.log_keys() == ["Pipeline", "Detections", "ep02.mkv"]
+    cleared = Spy(controller.logs_cleared)
+
+    controller.stop_run()
+    fake_runner.finish(run, RunSummary([], {}, ["ep02.mkv"], 1.0), "cancelled")
+    controller.drain_events()
+    controller.start_run(["ep02.mkv"])                          # a new run: logs restart, except Detections
+
+    assert cleared.calls == [()]
+    assert controller.log_keys() == ["Detections"]
+    assert "ep01.mkv: crop failed: decoder exploded" in controller.log_text("Detections")
+    assert controller.log_text("ep02.mkv") == "" and controller.log_text("Pipeline") == ""
+
+
+def test_an_apply_that_raises_still_releases_the_job(make_controller, fake_runner, tmp_project, monkeypatch):
+    name = "ep01.mkv"
+    folder = tmp_project([name], config=v2_config([make_entry(name, review=ReviewState.PENDING)]))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    crop = fake_runner.last("crop", name)
+    original = apply_mod.apply_crop
+
+    def broken(project, result):
+        raise RuntimeError("apply exploded")
+
+    monkeypatch.setattr(apply_mod, "apply_crop", broken)
+    fake_runner.finish(crop, crop_result(crop, OTHER_BOX))
+    controller.drain_events()
+
+    assert "RuntimeError: apply exploded" in controller.log_text("Pipeline")
+    assert "crop" not in controller._autopilot.pending().get(name, set())    # on_job_event still ran
+    assert controller.entry(name).review == ReviewState.FLAGGED               # and the recompute
+
+    monkeypatch.setattr(apply_mod, "apply_crop", original)
+    controller.redetect(name)
+    again = fake_runner.last("crop", name)
+    fake_runner.finish(again, crop_result(again, BOX))
+    controller.drain_events()
+    assert controller.entry(name).crop == Crop(*BOX, Source.DETECTED)      # current, not "superseded"
 
 
 def test_events_of_a_closed_folder_are_ignored(make_controller, fake_runner, tmp_project):
@@ -388,6 +491,7 @@ def test_events_of_a_closed_folder_are_ignored(make_controller, fake_runner, tmp
     controller = make_controller()
     controller.open_folder(str(first))
     old_crop = fake_runner.last("crop", name)
+    fake_runner.start(old_crop)                                # still running when the folder closes
     closed = Spy(controller.project_closed)
 
     controller.open_folder(str(second))
@@ -1102,6 +1206,64 @@ def test_watcher_changes_wait_for_the_run_to_end(make_controller, fake_runner, t
     assert "ep03.mkv" in controller.names()
 
 
+def test_a_removed_files_proof_is_never_reported(make_controller, fake_runner, tmp_project):
+    names = ["ep01.mkv", "ep02.mkv"]
+    folder = tmp_project(names, config=manual_config(names, autopilot_enabled=False))
+    controller = make_controller(watch_debounce_ms=20)
+    controller.open_folder(str(folder))
+    finished = Spy(controller.proof_finished)
+    controller.run_proof("ep02.mkv")
+    old_proof = fake_runner.last("proof", "ep02.mkv")
+    fake_runner.start(old_proof)
+
+    (folder / "ep02.mkv").unlink()
+    assert wait_for(lambda: "ep02.mkv" not in controller.names(), WAIT_MS)
+    assert not controller.proof_pending("ep02.mkv")
+
+    (folder / "ep02.mkv").write_bytes(b"placeholder video")    # the same name comes back
+    assert wait_for(lambda: "ep02.mkv" in controller.names(), WAIT_MS)
+    metadata = fake_runner.last("metadata", "ep02.mkv")
+    fake_runner.finish(metadata, MetadataResult("ep02.mkv", 1920, 1080, DURATION, 23.976))
+    controller.drain_events()
+    controller.run_proof("ep02.mkv")
+    new_proof = fake_runner.last("proof", "ep02.mkv")
+    stale = ProofResult("ep02.mkv", (560.0, 590.0), [(561.0, 562.0, "old")], 1.0)
+    fake_runner.finish(old_proof, stale)                       # the removed entry's proof ends first
+    controller.drain_events()
+    assert finished.calls == [] and controller.proof_result("ep02.mkv") is None
+    assert controller.proof_pending("ep02.mkv")
+
+    fresh = ProofResult("ep02.mkv", (560.0, 590.0), [(561.0, 562.0, "new")], 1.0)
+    fake_runner.finish(new_proof, fresh)
+    controller.drain_events()
+    assert finished.calls == [("ep02.mkv",)] and controller.proof_result("ep02.mkv") == fresh
+
+
+def test_a_proof_ending_in_the_batch_that_removes_its_file_emits_nothing(
+        make_controller, fake_runner, tmp_project, notifications):
+    names = ["ep01.mkv", "ep02.mkv"]
+    folder = tmp_project(names, config=manual_config(names, autopilot_enabled=False))
+    controller = make_controller(watch_debounce_ms=20)
+    controller.open_folder(str(folder))
+    finished = Spy(controller.proof_finished)
+    controller.start_run(["ep01.mkv"])
+    run = fake_runner.last("run")
+    controller.run_proof("ep02.mkv")                           # a proof runs during a run (ruling C4)
+    proof = fake_runner.last("proof", "ep02.mkv")
+    (folder / "ep02.mkv").unlink()                             # ignored while the run is on
+    QTest.qWait(100)
+    assert "ep02.mkv" in controller.names()
+
+    # One drain: the proof ends while ep02 is still listed, then the run's end reconciles it away.
+    fake_runner.finish(proof, ProofResult("ep02.mkv", (560.0, 590.0), [], 1.0))
+    run_to_end(fake_runner, run, RunSummary(["ep01.mkv"], {}, [], 1.0))
+    controller.drain_events()
+
+    assert "ep02.mkv" not in controller.names()
+    assert finished.calls == [] and controller.proof_result("ep02.mkv") is None
+    assert not controller.proof_pending("ep02.mkv")
+
+
 # --------------------------------------------------------------------------
 # Lifecycle
 # --------------------------------------------------------------------------
@@ -1179,7 +1341,10 @@ def test_logbook_caps_each_key_like_todays_log_store():
     assert book.append("a.mkv", "line") == "line\n"
     book.append("Pipeline", "x" * (LOG_LIMIT + 10))
     assert len(book.text("Pipeline")) == LOG_LIMIT
-    assert book.keys() == ["a.mkv", "Pipeline"]
+    book.append("Detections", "b.mkv: crop failed")
+    assert book.keys() == ["Pipeline", "Detections", "a.mkv"]
+    book.clear(keep=("Detections",))
+    assert book.keys() == ["Detections"] and book.text("a.mkv") == ""
 
 
 def test_default_runner_factory_builds_a_job_runner_with_two_cpu_workers():

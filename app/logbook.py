@@ -1,10 +1,15 @@
-"""Log text per key ("Pipeline" or a file name), as today's core/log_store.py
-kept it: appended text, the oldest text dropped past LOG_LIMIT characters per
-key. Qt-free and pure; the controller emits log_appended for each append.
+"""Log text per key, as today's core/log_store.py kept it: appended text, the
+oldest text dropped past LOG_LIMIT characters per key. Keys: "Pipeline" (the
+run and the controller), "Detections" (failed detection and proof jobs: they
+are not retried, so this is their only record and a run start keeps it) and
+file names (a run's per-file lines). Qt-free and pure; the controller emits
+log_appended for each append.
 """
 from __future__ import annotations
 
 PIPELINE_LOG = "Pipeline"
+DETECTIONS_LOG = "Detections"
+FIRST_KEYS = (PIPELINE_LOG, DETECTIONS_LOG)
 LOG_LIMIT = 512_000
 
 
@@ -23,11 +28,15 @@ class LogBook:
         return text
 
     def keys(self) -> list[str]:
-        """Keys in the order they first got text."""
-        return list(self._logs)
+        """"Pipeline", then "Detections", then the other keys in the order
+        they first got text."""
+        first = [key for key in FIRST_KEYS if key in self._logs]
+        return first + [key for key in self._logs if key not in FIRST_KEYS]
 
     def text(self, key: str) -> str:
         return self._logs.get(key, "")
 
-    def clear(self) -> None:
-        self._logs.clear()
+    def clear(self, keep: tuple[str, ...] = ()) -> None:
+        """Forget every key except those in `keep`."""
+        for key in [key for key in self._logs if key not in keep]:
+            del self._logs[key]
