@@ -30,15 +30,22 @@ Hints
 
 Review
     compute_review_state() is the only place a file's state is derived.
-    REVIEWED is the one stored decision: it is set by the user
-    (mark_reviewed, set_manual_*, paste_settings), but it never hides a
-    required value that is missing or stale, nor a blocking flag on a
-    detected or hinted value. An apply clears it when it changes a value (a
-    detected or hinted value the file was reviewed with, a stale brightness,
-    or an empty field detection fills: the user never saw that value) or
-    stores a blocking flag for a required field holding no value or a
-    detected/hinted one. The user's own values are never changed by
-    detection, so they never clear it.
+    REVIEWED is the one stored decision, and it never hides a required value
+    that is missing or stale. It is never stored beside a blocking flag on a
+    required detected or hinted value either, by construction:
+    - mark_reviewed(True) is explicit acceptance: every required detected or
+      hinted value carrying a blocking flag becomes MANUAL (detection never
+      overwrites it again; its evidence and flag stay stored), then REVIEWED.
+    - set_manual_* and paste_settings write MANUAL values and set REVIEWED
+      only when no required field still holds a detected or hinted value with
+      a blocking flag; otherwise they leave the review state unchanged (the
+      file stays FLAGGED until the user accepts or edits that field).
+    - An apply clears REVIEWED when it changes a value (a detected or hinted
+      value the file was reviewed with, a stale brightness, or an empty field
+      detection fills: the user never saw that value) or stores a blocking
+      flag for a required field holding no value or a detected/hinted one.
+    The user's own values are never changed by detection, so they never
+    clear it.
     Flags describe detection results. A blocking flag counts against a file
     only while the field holds a detected or hinted value (or none): a
     detection that was not applied over the user's value is kept as evidence
@@ -49,6 +56,8 @@ Review
     non-reviewed file's real state.
 """
 from __future__ import annotations
+
+from dataclasses import replace
 
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
@@ -298,35 +307,63 @@ def apply_audio_profile(project: Project, r: AudioProfileResult | None) -> None:
 # User edits
 # --------------------------------------------------------------------------
 
+def _flagged_detected_fields(project: Project, entry: FileEntry) -> list[str]:
+    """Required fields holding a detected or hinted value with a blocking flag."""
+    return [name for name in _required(project.folder)
+            if _is_detected(getattr(entry, name)) and _blocking(entry, name)]
+
+
+def _review_after_edit(project: Project, entry: FileEntry) -> None:
+    """An edit reviews the file only when no required field is left holding a
+    flagged detected or hinted value; otherwise the state is left as it was."""
+    if not _flagged_detected_fields(project, entry):
+        entry.review = ReviewState.REVIEWED
+
+
 def set_manual_crop(project: Project, file: str, box: tuple[int, int, int, int]) -> None:
+    """MANUAL crop; REVIEWED unless another required field is still flagged."""
     entry = project.files[file]
     entry.crop = Crop(*_crop_tuple(box), Source.MANUAL)
-    entry.review = ReviewState.REVIEWED
+    _review_after_edit(project, entry)
 
 
 def set_manual_brightness(project: Project, file: str, value: int) -> None:
+    """MANUAL brightness; REVIEWED unless another required field is still flagged."""
     entry = project.files[file]
     entry.brightness = Brightness(int(value), Source.MANUAL)
-    entry.review = ReviewState.REVIEWED
+    _review_after_edit(project, entry)
 
 
 def set_manual_time_ranges(project: Project, file: str,
                            ranges: list[tuple[str | None, str | None]] | None) -> None:
     """None (or []) is the whole file. It is stored as TimeRanges([], MANUAL),
     not as None, so that detection cannot replace the user's choice.
-    ocr_call_for maps both to [] (the whole file)."""
+    ocr_call_for maps both to [] (the whole file). REVIEWED unless a required
+    field is still flagged."""
     entry = project.files[file]
     entry.time_ranges = TimeRanges([TimeRange(start, end) for start, end in (ranges or [])], Source.MANUAL)
-    entry.review = ReviewState.REVIEWED
+    _review_after_edit(project, entry)
 
 
 def mark_reviewed(project: Project, file: str, reviewed: bool = True) -> None:
-    """Mark a file reviewed, or clear the mark (PENDING until recompute_all)."""
+    """Mark a file reviewed, or clear the mark (PENDING until recompute_all).
+
+    Marking is explicit acceptance: every required detected or hinted value
+    carrying a blocking flag becomes MANUAL first, so detection never
+    overwrites the value the user accepted; its evidence and flag strings
+    stay stored. A stale brightness (measured on another crop) is not
+    accepted: it counts as missing, and the file stays FLAGGED or PENDING
+    until it is measured again or edited. Clearing the mark reverts nothing."""
     entry = project.files[file]
-    if reviewed:
-        entry.review = ReviewState.REVIEWED
-    elif entry.review == ReviewState.REVIEWED:
-        entry.review = ReviewState.PENDING
+    if not reviewed:
+        if entry.review == ReviewState.REVIEWED:
+            entry.review = ReviewState.PENDING
+        return
+    for name in _flagged_detected_fields(project, entry):
+        if not _counts_as_missing(entry, name):
+            value = getattr(entry, name)
+            setattr(entry, name, replace(value, source=Source.MANUAL))
+    entry.review = ReviewState.REVIEWED
 
 
 def set_skipped(project: Project, file: str, skipped: bool) -> None:
@@ -349,16 +386,23 @@ def copy_settings(project: Project, source: str) -> dict:
 
 def paste_settings(project: Project, target: str, clip: dict) -> None:
     """Apply every value the clip has (key present and not None) to `target`
-    as MANUAL, and mark the target REVIEWED. A clip with nothing in it
-    changes nothing."""
-    if target not in project.files:
-        raise KeyError(target)
+    as MANUAL, then mark the target REVIEWED unless a required field it did
+    not replace still holds a flagged detected or hinted value. A clip with
+    nothing in it changes nothing."""
+    entry = project.files[target]
+    pasted = False
     if clip.get("crop") is not None:
-        set_manual_crop(project, target, clip["crop"])
+        entry.crop = Crop(*_crop_tuple(clip["crop"]), Source.MANUAL)
+        pasted = True
     if clip.get("brightness") is not None:
-        set_manual_brightness(project, target, clip["brightness"])
+        entry.brightness = Brightness(int(clip["brightness"]), Source.MANUAL)
+        pasted = True
     if clip.get("time_ranges") is not None:
-        set_manual_time_ranges(project, target, clip["time_ranges"])
+        entry.time_ranges = TimeRanges([TimeRange(start, end) for start, end in clip["time_ranges"]],
+                                       Source.MANUAL)
+        pasted = True
+    if pasted:
+        _review_after_edit(project, entry)
 
 
 # --------------------------------------------------------------------------
@@ -373,9 +417,9 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
     1. Each required field, crop first: a missing value (None, or a stale
        brightness, see brightness_is_stale) makes the file PENDING if that
        field's detector is pending, else FLAGGED. REVIEWED never hides it.
-    2. REVIEWED if the user reviewed the file, unless a required detected or
-       hinted value carries a blocking flag (see 4): REVIEWED never hides that
-       either.
+    2. REVIEWED if the user reviewed the file. (The API never stores REVIEWED
+       beside a blocking flag on a required detected or hinted value: see the
+       module docstring.)
     3. PENDING while a required detector is pending for a field holding a
        detected or hinted value, or while the folder's ranges are pending.
     4. FLAGGED when a required field's value is detected or hinted and its
@@ -388,9 +432,9 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
     for name in required:
         if _counts_as_missing(entry, name):
             return ReviewState.PENDING if name in detections_pending else ReviewState.FLAGGED
-    blocked = any(_is_detected(getattr(entry, name)) and _blocking(entry, name) for name in required)
-    if entry.review == ReviewState.REVIEWED and not blocked:
+    if entry.review == ReviewState.REVIEWED:
         return ReviewState.REVIEWED
+    blocked = any(_is_detected(getattr(entry, name)) and _blocking(entry, name) for name in required)
     if ranges_pending or any(name in detections_pending and _is_detected(getattr(entry, name))
                              for name in required):
         return ReviewState.PENDING
