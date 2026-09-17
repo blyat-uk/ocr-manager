@@ -44,7 +44,7 @@ labelled, with a panel row naming both.
 
 Views import no `core` module (tests/ui/test_main_window.py), so the two
 pure detector helpers this view needs -- `crop.aggregate_box` and
-`ocr_view.mask` -- are reached through `app.state_text`.
+`ocr_view.mask` -- are reached through `app.masking`.
 """
 from __future__ import annotations
 
@@ -63,7 +63,8 @@ from PyQt6.QtWidgets import (
 )
 
 from app.imaging import bgr_to_qimage
-from app.state_text import aggregate_crop_box, clock, crop_caption, mask_region
+from app.masking import aggregate_crop_box, mask_region
+from app.state_text import clock, crop_caption
 from app.theme import tokens
 from app.views.inspector_sections import Section, note_label
 from app.views.thumbnail import GRADIENT_DEGREES, GRADIENT_END_STOP, css_gradient

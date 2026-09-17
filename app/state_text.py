@@ -29,7 +29,6 @@ from collections.abc import Iterable
 
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
-from core.detect import ocr_view as _ocr_view
 from core.detect.flags import only_informational
 from core.jobs.apply import brightness_is_stale
 from core.jobs.detect_jobs import proof_window as _proof_window
@@ -433,43 +432,3 @@ def can_mark_reviewed(entry: FileEntry) -> bool:
     the file is still PENDING: its detections have not finished, so there is
     nothing settled to accept yet."""
     return not is_pending(entry)
-
-
-# --------------------------------------------------------------------------
-# Pure detector helpers the review views need (plan 3C)
-# --------------------------------------------------------------------------
-# `app/views/*.py` may import no core module at all (tests/ui/
-# test_main_window.py's test_views_import_no_core_modules), so the two
-# Qt-free, pure detector helpers the crop view needs are reached through
-# this module -- already the app's one Qt-free bridge into core/detect.
-# Both call through the module objects (`_crop.` / `_ocr_view.`) rather
-# than a bound name, so a test may monkeypatch `core.detect.crop.
-# aggregate_box` / `core.detect.ocr_view.mask` and see the call.
-
-def _rectangle(box) -> list[tuple[int, int]]:
-    """(x, y, width, height) as the four corner points of its rectangle --
-    the polygon shape `aggregate_box` reads."""
-    x, y, width, height = (int(value) for value in box)
-    return [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
-
-
-def aggregate_crop_box(boxes_per_sample, frame_size, settings: dict | None = None,
-                       sample_times=None) -> tuple[int, int, int, int] | None:
-    """`core.detect.crop.aggregate_box` over one list of (x, y, w, h) boxes
-    per sampled frame ("fit to all samples").
-
-    `settings` mirrors the folder's detector settings and must carry the
-    `bottom_half_cutoff` the detection itself used (`evidence["crop"]
-    ["cutoff_frac"]`, 0.0 after a full-frame retry) -- judging the samples
-    with another band would keep or drop different text than the box being
-    replaced. None when there is nothing to build a box from."""
-    polygons = [[_rectangle(box) for box in boxes] for boxes in boxes_per_sample]
-    box = _crop.aggregate_box(polygons, tuple(int(value) for value in frame_size), settings=settings,
-                              sample_times=None if sample_times is None else [float(t) for t in sample_times])
-    return None if box is None else tuple(int(value) for value in box)
-
-
-def mask_region(region, threshold: int):
-    """`core.detect.ocr_view.mask`: the OCR pass's brightness filter over a
-    BGR region -- keep the pixels whose every channel is >= `threshold`."""
-    return _ocr_view.mask(region, int(threshold))

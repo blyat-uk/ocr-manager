@@ -22,6 +22,7 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QWidget
 
+from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.views.crop_view import CropTab
@@ -758,6 +759,57 @@ def test_a_tab_without_a_toolbar_attribute_still_works(qapp, fake_runner):
     finally:
         stage.deleteLater()
         controller.shutdown(timeout=0.5)
+
+
+# --------------------------------------------------------------------------
+# The core bridge (app/masking.py)
+# --------------------------------------------------------------------------
+
+def test_masking_turns_boxes_into_polygons_for_the_detector(monkeypatch):
+    calls = []
+
+    def spy(polys, frame_size, band_frac=0.55, settings=None, sample_times=None):
+        calls.append((polys, frame_size, settings, sample_times))
+        return [200, 700, 1500, 90]
+
+    monkeypatch.setattr(crop_mod, "aggregate_box", spy)
+    box = masking.aggregate_crop_box([((10, 20, 30, 40),), ()], (1920, 888),
+                                     {"bottom_half_cutoff": 0.0}, [1.0, 2.0])
+    polys, frame_size, settings, times = calls[0]
+    assert polys == [[[(10, 20), (40, 20), (40, 60), (10, 60)]], []]
+    assert frame_size == (1920, 888) and settings == {"bottom_half_cutoff": 0.0}
+    assert times == [1.0, 2.0]
+    assert box == (200, 700, 1500, 90)          # tuples of ints, whatever the detector returned
+
+
+def test_masking_passes_none_through(monkeypatch):
+    monkeypatch.setattr(crop_mod, "aggregate_box", lambda *args, **kwargs: None)
+    assert masking.aggregate_crop_box([], (1920, 888)) is None
+
+
+def test_masking_masks_a_region_with_the_ocr_pass_filter():
+    region = np.zeros((4, 4, 3), np.uint8)
+    region[1, 1] = 240
+    masked = masking.mask_region(region, 230)
+    assert masked[1, 1].tolist() == [240, 240, 240]
+    assert masked[0, 0].tolist() == [0, 0, 0]
+
+
+def test_masking_dispatches_through_the_module_so_spies_see_it(monkeypatch):
+    """The wrappers must not bind `mask` at import time, or monkeypatching
+    `core.detect.ocr_view.mask` would miss the call."""
+    seen = []
+    monkeypatch.setattr(ocr_view, "mask", lambda region, threshold: seen.append(threshold) or region)
+    masking.mask_region(np.zeros((2, 2, 3), np.uint8), 211)
+    assert seen == [211]
+
+
+def test_state_text_no_longer_carries_the_detector_wrappers():
+    """`app/state_text.py` stays pure badge and caption text."""
+    from app import state_text
+
+    assert not hasattr(state_text, "mask_region")
+    assert not hasattr(state_text, "aggregate_crop_box")
 
 
 def test_the_crop_view_never_reaches_for_ocr_strips():
