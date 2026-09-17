@@ -230,8 +230,7 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
     bound, forward to the last frame before the forward bound. Backward, every
     frame in the bracket is analysed; forward, frames are analysed until the
     first without the label. A frame at or after an adjacent segment's bound
-    belongs to the later segment, the scan's own last frame included, as long
-    as the bound lies between the two segments' readings.
+    belongs to the later segment, the scan's own last frame included.
 
     Returns a namespace: start and end times; the frames detection runs on, in
     order; the display-time seeks made; and, per side, the frames the 0.2 s
@@ -263,7 +262,7 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
         if i not in shown:
             break
         start = i
-    if bound is not None and present >= bound and clip.pts[start] < bound - tol:
+    if bound is not None and clip.pts[start] < bound - tol:
         start += 1  # the scan's frame began before the bound: it is the earlier segment's
 
     high = last_reading + scanner.TIMING_SCAN_MAX_DURATION
@@ -276,7 +275,7 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
     present, got.scanned_end, got.absent_after = _bracket(clip, samples, last_reading)
     got.seeks += n + 1
     got.start = clip.pts[start]
-    if bound is not None and present <= bound and clip.pts[got.scanned_end] >= bound - tol:
+    if bound is not None and clip.pts[got.scanned_end] >= bound - tol:
         # The scan's frame begins at the bound: it is the later segment's, and
         # this label ends where that frame replaces the one before it.
         got.end = clip.pts[got.scanned_end]
@@ -526,7 +525,8 @@ def test_back_to_back_labels_at_one_position_share_no_frame_and_lose_no_span(cli
 def test_remove_duplicates_ignores_an_overlap_under_half_a_frame_but_not_a_real_one(clip_for):
     """Labels timed back to back can overlap by float noise, since an end is a
     frame's PTS plus 1 / fps, or by under a millisecond where frame durations
-    are rounded. That is no overlap; half a frame or more still is."""
+    are rounded. That is no overlap; half a frame or more still is (and the
+    label kept then covers both, see the test below)."""
     clip = clip_for("video-start-0.021s-mkv")
     scanner = clip.scanner()
     frame = 1.0 / scanner.fps
@@ -541,8 +541,9 @@ def test_remove_duplicates_ignores_an_overlap_under_half_a_frame_but_not_a_real_
     assert 1.086 + frame > 1.126  # float noise: the frame at 1.086 ends a little after the one at 1.126 starts
     assert kept((0.5, 1.086 + frame), (1.126, 2.5)) == [(0.5, 1.086 + frame), (1.126, 2.5)]
     assert kept((0.8, 1.3 + 0.4 * frame), (1.3, 2.5)) == [(0.8, 1.3 + 0.4 * frame), (1.3, 2.5)]
-    assert kept((0.8, 1.3 + 0.75 * frame), (1.3, 2.5)) == [(1.3, 2.5)], "the shorter of two labels overlapping by 3/4 frame"
-    assert kept((0.8, 1.3 + 1.5 * frame), (1.3, 2.5)) == [(1.3, 2.5)]
+    # Duplicates: one label, the longer, covering both.
+    assert kept((0.8, 1.3 + 0.75 * frame), (1.3, 2.5)) == [(0.8, 2.5)], "two labels overlapping by 3/4 frame"
+    assert kept((0.8, 1.3 + 1.5 * frame), (1.3, 2.5)) == [(0.8, 2.5)]
     assert kept((1.0, 3.0), (1.5, 2.5)) == [(1.0, 3.0)]
     assert len(scanner._remove_duplicates([label(1.0, 3.0), label(1.5, 2.5, "乙乙乙乙")])) == 2
 
@@ -600,30 +601,154 @@ def test_a_segment_elsewhere_between_them_in_time_does_not_separate_same_positio
 
 
 @pytest.mark.parametrize("clip_id", _matrix(BOUNDARY_CLIPS, fast={"video-start-0.021s-mkv", "offset-h264"}))
-def test_segments_whose_readings_overlap_keep_those_boundaries_on_their_readings(clip_for, monkeypatch, clip_id):
-    """The earlier segment's last reading comes after the later one's first,
-    so the bound between them lies inside both and neither scan toward it can
-    take a step. That bound is not between the readings: each of those two
-    boundaries stays on the frame on screen at its reading (the start is not
-    moved to the bound, and neither frame is handed to the other segment),
-    while the outer two are refined as usual."""
+def test_segments_whose_readings_overlap_do_not_bound_each_other(clip_for, monkeypatch, clip_id):
+    """The earlier segment's last reading comes after the later one's first:
+    both were read at once, so no bound between them can separate them (a
+    midpoint would lie inside both). Neither bounds the other, and each is
+    refined as if alone."""
     clip = clip_for(clip_id)
     scanner = clip.scanner()
     shown = set(range(10, 71))
     earlier = clip.segment(clip.pts[15], clip.pts[40], "甲")
     later = clip.segment(clip.pts[30], clip.pts[60], "乙乙乙乙")
-    bound = (earlier["end_pts"] + later["start_pts"]) / 2
-    assert later["start_pts"] < bound < earlier["end_pts"]
     detector = _LabelOn(clip, shown)
 
     labels, seeks = _run(clip, scanner, [later, earlier], detector, monkeypatch)
 
     assert [(l.text, l.start_pts, l.end_pts) for l in labels] == [
-        ("乙乙乙乙", clip.pts[30], clip.end_time(70)), ("甲", clip.pts[10], clip.end_time(40))]
-    want_later = _expected(clip, scanner, shown, later, lower_bound=bound)
-    want_earlier = _expected(clip, scanner, shown, earlier, upper_bound=bound)
+        ("乙乙乙乙", clip.pts[10], clip.end_time(70)), ("甲", clip.pts[10], clip.end_time(70))]
+    want_later = _expected(clip, scanner, shown, later)
+    want_earlier = _expected(clip, scanner, shown, earlier)
     assert detector.calls == want_later.analysed + want_earlier.analysed
     assert seeks == want_later.seeks + want_earlier.seeks
+
+
+CORNER_BOX = np.array([[0, 0], [40, 0], [40, 20], [0, 20]], dtype=np.float32)
+
+
+def _lost_and_shared(clip, labels, whole):
+    """(seconds of `whole` no label covers, frames two labels both claim,
+    labels reaching outside `whole`), for the labels at the region box. A
+    label claims a frame whose PTS lies in [start, end), half a frame of
+    float noise allowed."""
+    half = 0.5 / clip.fps
+    spans = sorted((l.start_pts, l.end_pts) for l in labels if l.text != "角")
+    t, lost = whole[0], 0.0
+    for a, b in spans:
+        lost += max(0.0, a - t)
+        t = max(t, b)
+    lost += max(0.0, whole[1] - t)
+    claimed = [{i for i, p in enumerate(clip.pts) if a - half <= p < b - half} for a, b in spans]
+    shared = sorted({i for x in range(len(claimed)) for y in range(x) for i in claimed[x] & claimed[y]})
+    outside = [(a, b) for a, b in spans if a < whole[0] - 1e-9 or b > whole[1] + 1e-9]
+    return lost, shared, outside
+
+
+def _orders(a, b, clip, elsewhere_reading):
+    x = dict(clip.segment(*elsewhere_reading, "角"), box=CORNER_BOX)
+    return {"earlier-first": [a, b], "later-first": [b, a], "elsewhere-between": [a, x, b]}
+
+
+@pytest.mark.parametrize("clip_id,shapes", _matrix(
+    [(c, "all-shapes") for c in BOUNDARY_CLIPS + [MS_CLIP]]
+    + [(c, "some-shapes") for c in ("video-start-0.021s-mkv", MS_CLIP)],
+    fast={"video-start-0.021s-mkv-some-shapes", f"{MS_CLIP}-some-shapes"}))
+def test_same_position_segments_read_at_once_lose_no_span_in_any_list_order(clip_for, clip_id, shapes):
+    """Two segments at one position whose readings overlap -- by 0.05-1.0 s,
+    or true duplicates read over (nearly) the same time -- with the label
+    found on every frame 5-95, through phase 4 and scan()'s post-processing,
+    listed earlier first, later first, and with a segment at another
+    position listed between them. With the same text or not, the labels at
+    that position cover exactly the label's frames: none is lost, none is
+    claimed twice, and nothing lies outside them. The fast cases run every
+    duplicate shape, and the overlapping ones after one of the two frames."""
+    clip = clip_for(clip_id)
+    shown = range(5, 96)
+    whole = (clip.pts[shown[0]], clip.end_time(shown[-1]))
+    every = shapes == "all-shapes"
+    cases = []
+    for frame in ((40, 41) if every else (41,)):
+        for phase in (0.0, 0.5):
+            last_reading = clip.pts[frame] + phase / clip.fps
+            for overlap in (0.05, 0.2, 0.5, 1.0):
+                for earlier_len, later_len in ((1.2, 0.6), (0.6, 1.2)):
+                    first_reading = last_reading - overlap
+                    for texts in (("第三十七集", "第三十七集"), ("甲", "乙乙乙乙")):
+                        a = clip.segment(last_reading - earlier_len, last_reading, texts[0])
+                        b = clip.segment(first_reading, first_reading + later_len, texts[1])
+                        cases.append((f"overlap {overlap} s, lengths {earlier_len}/{later_len}, {texts[1]}", a, b,
+                                      (first_reading, last_reading)))
+    start = clip.pts[30]
+    for shift_first in (0.0, 0.1, 0.5):
+        for shift_last in (0.0, -0.1, -0.5):
+            a = clip.segment(start + shift_first, start + 2.0, "第三十七集")
+            b = clip.segment(start, start + 2.0 + shift_last, "第三十七集")
+            cases.append((f"duplicates {shift_first}/{shift_last}", a, b, (start + 0.5, start + 1.0)))
+    failures = []
+    for name, a, b, elsewhere_reading in cases:
+        for order, segments in _orders(a, b, clip, elsewhere_reading).items():
+            labels = _scan_segments(clip.scanner(), segments, _LabelOn(clip, shown, elsewhere_nothing=True))
+            lost, shared, outside = _lost_and_shared(clip, labels, whole)
+            if lost > 1e-9 or shared or outside:
+                failures.append((name, order, round(lost, 3), shared[:3], outside,
+                                 [(l.text, round(l.start_pts, 3), round(l.end_pts, 3)) for l in labels]))
+    assert len(cases) == (2 if every else 1) * 2 * 4 * 2 * 2 + 9
+    assert not failures, f"{len(failures)} of {3 * len(cases)} (case, order, lost s, shared frames, outside, labels): {failures[:6]}"
+
+
+def _label(start, end, text="第三十七集", pos_x=160, bbox_x_min=0.0):
+    return LabelResult(start_pts=start, end_pts=end, text=text, pos_x=pos_x, pos_y=200,
+                       bbox_x_min=bbox_x_min, bbox_y_min=0.0, bbox_x_max=319.0, bbox_y_max=160.0)
+
+
+def test_a_removed_duplicate_extends_the_label_kept_to_both_spans(clip_for):
+    """_remove_duplicates keeps the same label as before (the longer, the
+    earlier on a tie) with its own text and position, but its span becomes
+    the union of every duplicate it took the place of, directly or through a
+    label that was itself removed later. Labels that are not duplicates keep
+    their spans."""
+    scanner = clip_for("video-start-0.021s-mkv").scanner()
+
+    def spans(labels):
+        return [(l.text, l.pos_x, l.bbox_x_min, l.start_pts, l.end_pts) for l in labels]
+
+    shorter_first = [_label(1.0, 2.0, pos_x=150, bbox_x_min=5.0), _label(1.5, 3.5, pos_x=160)]
+    assert spans(scanner._remove_duplicates(shorter_first)) == [("第三十七集", 160, 0.0, 1.0, 3.5)]
+    longer_first = [_label(1.5, 3.5, pos_x=160), _label(1.0, 2.0, pos_x=150, bbox_x_min=5.0)]
+    assert spans(scanner._remove_duplicates(longer_first)) == [("第三十七集", 160, 0.0, 1.0, 3.5)]
+    tie = [_label(1.0, 2.0, pos_x=150), _label(1.5, 2.5, pos_x=160)]
+    assert spans(scanner._remove_duplicates(tie)) == [("第三十七集", 150, 0.0, 1.0, 2.5)]
+    # 0 is replaced by 1, and 1 by 2: 2 covers all three.
+    chain = [_label(1.0, 2.0), _label(1.5, 2.6, pos_x=161), _label(2.4, 5.0, pos_x=162)]
+    assert spans(scanner._remove_duplicates(chain)) == [("第三十七集", 162, 0.0, 1.0, 5.0)]
+
+    # Not duplicates: both kept as they came (compared with fresh copies, as
+    # _remove_duplicates may change the labels it is given).
+    for other in (_label(1.5, 3.5, text="乙乙乙乙"), _label(1.5, 3.5, pos_x=300), _label(2.0, 3.5)):
+        before = [_label(1.0, 2.0), LabelResult(**vars(other))]
+        assert spans(scanner._remove_duplicates([_label(1.0, 2.0), other])) == spans(before), other
+
+
+@pytest.mark.parametrize("order", ["shorter-first", "longer-first"])
+def test_duplicates_with_different_spans_come_out_as_one_label_covering_both(clip_for, order):
+    """Two segments at one position with the same text, read at overlapping
+    times. With a 0.6 s scan limit their refined spans differ (each reaches
+    0.6 s past its own readings), and scan() must return one label covering
+    both, not only the longer."""
+    clip = clip_for("video-start-0.021s-mkv")
+    scanner = clip.scanner()
+    scanner.TIMING_SCAN_MAX_DURATION = 0.6
+    shown = set(range(5, 96))
+    shorter = clip.segment(clip.pts[25], clip.pts[30], "第三十七集")
+    longer = clip.segment(clip.pts[28], clip.pts[50], "第三十七集")
+    want = [_expected(clip, scanner, shown, s) for s in (shorter, longer)]
+    assert want[0].start < want[1].start and want[0].end < want[1].end
+    assert want[0].end - want[0].start < want[1].end - want[1].start
+    segments = [shorter, longer] if order == "shorter-first" else [longer, shorter]
+
+    labels = _scan_segments(scanner, segments, _LabelOn(clip, shown))
+
+    assert [(l.start_pts, l.end_pts) for l in labels] == [(want[0].start, want[1].end)]
 
 
 @pytest.mark.parametrize("clip_id", _matrix(BOUNDARY_CLIPS, fast={"video-start-0.021s-mkv", "offset-h264"}))

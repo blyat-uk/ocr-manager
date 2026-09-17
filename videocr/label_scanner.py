@@ -42,7 +42,8 @@ class _ScanBracket:
     absent_pts: PTS of the frame analysed at `absent` (None with it).
     limit: the time the scan could not pass: its duration cap, or the bound
         from an adjacent segment at the same position.
-    bound: that adjacent segment's bound when it is the limit, else None.
+    bound: that adjacent segment's bound when it is the limit, else None. It
+        lies strictly between the two segments' readings (_phase4_find_timing).
     """
 
     present: float
@@ -1844,16 +1845,19 @@ class LabelScanner:
         -- and before P are read in order after one display-time seek, and
         each is analysed. The start is the earliest of them from which every
         frame up to P shows the label, or P itself if the frame just before P
-        does not. So the start never leaves the bracket, and a frame
-        detection misses can only stop it later: at worst on P, where the
-        scan put it.
+        does not. A frame detection misses can only stop it later: at worst on
+        P, where the scan put it.
 
         A frame whose PTS is at or after the bound between two segments at the
         same position belongs to the later one, P included: if P began before
         this segment's bound, the start is the frame after P, where the
-        earlier segment's end stops (_refine_end). That holds for a bound
-        between the two segments' readings; one after this segment's first
-        reading (readings that overlap in time) leaves P as it is.
+        earlier segment's end stops (_refine_end). That is the one start
+        outside the bracket: one frame after the frame the scan found the
+        label on, so at most one frame (P's own duration) past `present`, the
+        scan's last present sample -- P is on screen at `present`, so the
+        frame after it begins within P's duration of it. It moves there
+        because P began before the bound, and so belongs to the earlier
+        segment.
 
         P is only known as the last frame whose PTS is at most `present` (the
         frame seek_to_display_time finds), so a frame is analysed once the
@@ -1870,9 +1874,7 @@ class LabelScanner:
             def in_bracket(pts):
                 return pts > bracket.absent_pts
         else:
-            # A bound from overlapping readings can lie after `present`; then
-            # no frame is in the bracket, and reading from `present` finds P.
-            seek_to = min(bracket.limit, bracket.present)
+            seek_to = bracket.limit
 
             def in_bracket(pts):
                 return pts >= bracket.limit - DISPLAY_TIME_TOLERANCE
@@ -1920,7 +1922,7 @@ class LabelScanner:
         if run_start is not None:
             return run_start
         bound = bracket.bound
-        if bound is not None and bound <= bracket.present and p_pts < bound - DISPLAY_TIME_TOLERANCE:
+        if bound is not None and p_pts < bound - DISPLAY_TIME_TOLERANCE:
             # P began before the bound: it is the earlier segment's frame.
             return next_pts if next_pts is not None else p_pts + 1.0 / self.fps
         return p_pts
@@ -1944,9 +1946,7 @@ class LabelScanner:
         this segment's bound (the scan's last sample was on the bound, in the
         first moment of P), the label is last on the frame before P, and ends
         where P replaces it, at P's PTS -- where the later segment's start
-        begins (_refine_start). That holds for a bound between the two
-        segments' readings; one before this segment's last reading
-        (readings that overlap in time) leaves P as it is.
+        begins (_refine_start).
 
         If P cannot be read, the end is that of the frame the scan analysed
         there (see _scan_end).
@@ -1966,7 +1966,7 @@ class LabelScanner:
 
         last_pts = cap.get_last_pts()
         bound = bracket.bound
-        if bound is not None and bound >= bracket.present and last_pts >= bound - DISPLAY_TIME_TOLERANCE:
+        if bound is not None and last_pts >= bound - DISPLAY_TIME_TOLERANCE:
             return last_pts
         while True:
             ret, frame = cap.read()
@@ -2006,7 +2006,10 @@ class LabelScanner:
         adjacent segments as the boundary: a segment's neighbours are the
         segments at the same position (overlapping boxes) just before and just
         after it in time, wherever they are in the list, which phase 3 builds
-        in cluster order, not time order.
+        in cluster order, not time order. A segment whose readings overlap this
+        one's (it was read while this one was) is not a neighbour: no midpoint
+        could separate the two, and bounding them would cut both short. So a
+        bound always lies strictly between the two segments' readings.
 
         Returns list of LabelResult.
         """
@@ -2037,11 +2040,13 @@ class LabelScanner:
                 lower_bound = None
                 upper_bound = None
                 prev = next((segments[j] for j in reversed(in_time[:rank[li]])
-                             if self._boxes_overlap(box, segments[j]["box"])), None)
+                             if segments[j]["end_pts"] < start_pts
+                             and self._boxes_overlap(box, segments[j]["box"])), None)
                 if prev is not None:
                     lower_bound = (prev["end_pts"] + start_pts) / 2
                 nxt = next((segments[j] for j in in_time[rank[li] + 1:]
-                            if self._boxes_overlap(box, segments[j]["box"])), None)
+                            if segments[j]["start_pts"] > end_pts
+                            and self._boxes_overlap(box, segments[j]["box"])), None)
                 if nxt is not None:
                     upper_bound = (end_pts + nxt["start_pts"]) / 2
 
@@ -2093,11 +2098,18 @@ class LabelScanner:
 
         Requires text similarity for all merges — different text means different labels,
         even at nearby positions (e.g. multi-line disclaimers).
+
+        The label kept (the longer of two duplicates, the earlier on a tie)
+        keeps its text and position, but its span becomes the union of its own
+        and every duplicate removed in its favour -- directly, or through a
+        label that was itself removed later. Which labels are duplicates and
+        which is kept is decided on the spans as they came in.
         """
         if len(labels) < 2:
             return labels
 
         to_remove = set()
+        replaced_by = {}  # removed label index -> the label kept in its place then
 
         for i, label_i in enumerate(labels):
             if i in to_remove:
@@ -2131,9 +2143,21 @@ class LabelScanner:
                     dur_j = label_j.end_pts - label_j.start_pts
                     if dur_i >= dur_j:
                         to_remove.add(j)
+                        replaced_by[j] = i
                     else:
                         to_remove.add(i)
+                        replaced_by[i] = j
                         break
+
+        spans = {}
+        for removed in replaced_by:
+            kept = removed
+            while kept in replaced_by:
+                kept = replaced_by[kept]
+            start, end = spans.get(kept, (labels[kept].start_pts, labels[kept].end_pts))
+            spans[kept] = (min(start, labels[removed].start_pts), max(end, labels[removed].end_pts))
+        for kept, (start, end) in spans.items():
+            labels[kept].start_pts, labels[kept].end_pts = start, end
 
         return [l for i, l in enumerate(labels) if i not in to_remove]
 
