@@ -20,6 +20,7 @@ from core.project.ocr_kwargs import DEFAULT_BRIGHTNESS, OcrCall, ocr_call_for
 from core.project.store import (
     CONFIG_FILENAME,
     VIDEO_EXTENSIONS,
+    UnsupportedProjectVersion,
     from_json,
     list_video_files,
     load_project,
@@ -41,6 +42,7 @@ __all__ = [
     "TimeRanges",
     "CONFIG_FILENAME",
     "VIDEO_EXTENSIONS",
+    "UnsupportedProjectVersion",
     "DEFAULT_BRIGHTNESS",
     "OcrCall",
     "ocr_call_for",

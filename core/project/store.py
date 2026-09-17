@@ -1,9 +1,26 @@
 """Project JSON store: v2 `.ocr.json` read/write, v1 migration dispatch,
 and reconciliation against the video files actually on disk.
+
+Reading `.ocr.json` (load_project)
+    - no file: a fresh project;
+    - "version" missing or 1: migrated from v1 (migrate_v1);
+    - "version" 2: from_json;
+    - any other version (an integer other than 1 or 2, or not an integer,
+      e.g. "2", 2.0 or true): UnsupportedProjectVersion is raised and the
+      file is left untouched; save_project never writes over such a file;
+    - unreadable or invalid JSON, JSON that is not an object, or a file the
+      reader cannot convert (a bad enum value, a missing required key, a
+      section of the wrong type): logged as a warning, renamed to
+      `.ocr.json.corrupt-<unix time>`, and a fresh project is started.
+
+Writing
+    Every file is written atomically: to `<name>.tmp` in the same directory,
+    flushed and fsynced, then os.replace()d onto `<name>`.
 """
 import copy
 import json
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -26,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = (".mkv", ".mp4")
 CONFIG_FILENAME = ".ocr.json"
+SUPPORTED_VERSIONS = (1, 2)       # 1 (or no version): migrated; 2: current
+
+
+class UnsupportedProjectVersion(Exception):
+    """`.ocr.json` has a version this app cannot read (newer, or not an
+    integer). The file is left untouched."""
+
+    def __init__(self, path: str, version):
+        super().__init__(f"{path} has unsupported project version {version!r}")
+        self.path = path
+        self.version = version
+
+
+class _CorruptProject(Exception):
+    """The file parsed as JSON but is not a project this reader can convert."""
+
+
+# Errors a malformed but parseable project file raises while it is converted.
+_CONVERSION_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexError)
 
 
 def list_video_files(project_dir: str) -> list[str]:
@@ -49,9 +85,18 @@ def load_project(project_dir: str) -> Project:
     project: Project
     if config_path.exists():
         try:
-            raw = config_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as exc:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise _CorruptProject(f"top level is {type(data).__name__}, not an object")
+            version = _config_version(data, config_path)
+            try:
+                if version == 2:
+                    project = from_json(data, str(directory))
+                else:
+                    project = migrate_v1(data, str(directory), video_names)
+            except _CONVERSION_ERRORS as exc:
+                raise _CorruptProject(f"{type(exc).__name__}: {exc}") from exc
+        except (OSError, ValueError, _CorruptProject) as exc:      # JSONDecodeError/UnicodeDecodeError are ValueErrors
             logger.warning(
                 "Corrupt %s in %s (%s) -- renaming and starting a fresh project",
                 CONFIG_FILENAME, project_dir, exc,
@@ -62,12 +107,6 @@ def load_project(project_dir: str) -> Project:
             except OSError:
                 logger.warning("Could not rename corrupt config %s", config_path)
             project = Project(path=str(directory), folder=FolderSettings(), files={})
-        else:
-            version = data.get("version")
-            if version == 2:
-                project = from_json(data, str(directory))
-            else:
-                project = migrate_v1(data, str(directory), video_names)
     else:
         project = Project(path=str(directory), folder=FolderSettings(), files={})
 
@@ -75,22 +114,58 @@ def load_project(project_dir: str) -> Project:
     return project
 
 
+def _config_version(data: dict, config_path: Path) -> int:
+    """1 (no version, or 1) or 2; UnsupportedProjectVersion otherwise."""
+    version = data.get("version", 1)
+    if type(version) is not int or version not in SUPPORTED_VERSIONS:   # bool, float, str are not versions
+        raise UnsupportedProjectVersion(str(config_path), version)
+    return version
+
+
+def _refuse_unsupported_existing(config_path: Path) -> None:
+    """Raise UnsupportedProjectVersion when `config_path` holds a project of a
+    version this app cannot read; anything else (no file, unreadable,
+    corrupt, v1, v2) may be written over."""
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict):
+        _config_version(data, config_path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` (UTF-8) to `path` atomically: `<path>.tmp` in the same
+    directory, flushed and fsynced, then os.replace() onto `path`. The
+    temporary file is removed when anything fails."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_project(project: Project) -> None:
     directory = Path(project.path)
     config_path = directory / CONFIG_FILENAME
     backup_path = directory / f"{CONFIG_FILENAME}.v1.bak"
-    tmp_path = directory / f"{CONFIG_FILENAME}.tmp"
+
+    _refuse_unsupported_existing(config_path)
 
     if project.migrated_from_v1:
         if not backup_path.exists() and config_path.exists():
             shutil.copy2(config_path, backup_path)
         project.migrated_from_v1 = False
 
-    tmp_path.write_text(
-        json.dumps(to_json(project), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(config_path)
+    _atomic_write_text(config_path, json.dumps(to_json(project), ensure_ascii=False, indent=2))
 
 
 def reconcile_files(project: Project, video_names: list[str]) -> tuple[list[str], list[str]]:
@@ -177,9 +252,21 @@ def to_json(project: Project) -> dict:
     }
 
 
+def _object(value, what: str) -> dict:
+    """`value` when it is a JSON object, {} when it is missing (None)."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"{what} is {type(value).__name__}, not an object")
+    return value
+
+
 def from_json(data: dict, project_dir: str) -> Project:
+    """The Project a v2 dict describes. Raises KeyError, TypeError or
+    ValueError (load_project's corrupt path) when a required key is missing,
+    an enum value is unknown or a section is not an object."""
     defaults = FolderSettings()
-    folder_data = data.get("folder") or {}
+    folder_data = _object(data.get("folder"), "folder")
 
     folder = FolderSettings(
         dialogue_enabled=folder_data.get("dialogue_enabled", defaults.dialogue_enabled),
@@ -215,7 +302,9 @@ def from_json(data: dict, project_dir: str) -> Project:
     )
 
     files: dict[str, FileEntry] = {}
-    for name, fd in (data.get("files") or {}).items():
+    for name, fd in _object(data.get("files"), "files").items():
+        if not isinstance(fd, dict):
+            raise TypeError(f"files[{name!r}] is {type(fd).__name__}, not an object")
         crop_d = fd.get("crop")
         crop = None
         if crop_d:

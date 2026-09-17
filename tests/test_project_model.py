@@ -384,3 +384,132 @@ def test_from_json_deep_copies_evidence_so_caller_held_input_cant_alias_model(tm
     evidence_in["new_key"] = "leak"
 
     assert project.files["a.mkv"].evidence == {"crop": {"score": 0.5}}
+
+
+# --- F6: store robustness ---------------------------------------------------
+
+
+def _write_config(tmp_path: Path, data) -> bytes:
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    (tmp_path / ".ocr.json").write_bytes(raw)
+    return raw
+
+
+def _assert_corrupt_path_taken(tmp_path: Path, raw: bytes, project: Project) -> None:
+    assert not (tmp_path / ".ocr.json").exists()
+    (corrupt,) = list(tmp_path.glob(".ocr.json.corrupt-*"))
+    assert corrupt.read_bytes() == raw
+    assert project.migrated_from_v1 is False
+    assert project.folder == FolderSettings()
+    assert list(project.files) == ["vid.mkv"]
+    assert project.files["vid.mkv"] == FileEntry(name="vid.mkv")
+
+
+@pytest.mark.parametrize("data", [[1, 2], "a string", None, 42])
+def test_load_project_json_that_is_not_an_object_takes_the_corrupt_path(tmp_path, caplog, data):
+    raw = _write_config(tmp_path, data)
+    _touch(tmp_path / "vid.mkv")
+    with caplog.at_level(logging.WARNING):
+        project = load_project(str(tmp_path))
+    _assert_corrupt_path_taken(tmp_path, raw, project)
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+@pytest.mark.parametrize("entry", [
+    {"review": "bogus"},
+    {"crop": {"x": 1, "y": 2, "width": 3, "height": 4, "source": "bogus"}},
+    {"brightness": {"value": 200, "source": "guessed"}},
+    {"time_ranges": {"ranges": [], "source": 7}},
+    {"crop": {"y": 2, "width": 3, "height": 4, "source": "manual"}},       # no x
+    {"brightness": {"source": "manual"}},                                  # no value
+    {"time_ranges": {"ranges": [{"start": "01:00", "end": None}]}},       # no source
+    "not an entry",
+    None,
+])
+def test_load_project_v2_with_a_bad_enum_or_missing_key_takes_the_corrupt_path(tmp_path, entry):
+    raw = _write_config(tmp_path, {"version": 2, "folder": {}, "files": {"vid.mkv": entry}})
+    _touch(tmp_path / "vid.mkv")
+    project = load_project(str(tmp_path))
+    _assert_corrupt_path_taken(tmp_path, raw, project)
+
+
+@pytest.mark.parametrize("data", [
+    {"version": 2, "folder": [], "files": {}},
+    {"version": 2, "folder": {}, "files": []},
+    {"version": 2, "folder": {"label_mask_crops": 5}, "files": {}},
+])
+def test_load_project_v2_with_malformed_sections_takes_the_corrupt_path(tmp_path, data):
+    raw = _write_config(tmp_path, data)
+    _touch(tmp_path / "vid.mkv")
+    project = load_project(str(tmp_path))
+    _assert_corrupt_path_taken(tmp_path, raw, project)
+
+
+@pytest.mark.parametrize("version", [3, 17, "2", 2.0, 1.5, True, [2], {"major": 2}, 0, -1])
+def test_load_project_unsupported_version_raises_and_leaves_the_file_untouched(tmp_path, version):
+    from core.project.store import UnsupportedProjectVersion
+
+    raw = _write_config(tmp_path, {"version": version, "folder": {}, "files": {}})
+    _touch(tmp_path / "vid.mkv")
+
+    with pytest.raises(UnsupportedProjectVersion) as info:
+        load_project(str(tmp_path))
+
+    assert info.value.version == version
+    assert (tmp_path / ".ocr.json").read_bytes() == raw
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".ocr.json", "vid.mkv"]
+
+
+def test_save_project_never_overwrites_an_unsupported_version(tmp_path):
+    from core.project.store import UnsupportedProjectVersion
+
+    raw = _write_config(tmp_path, {"version": 3, "folder": {}, "files": {"vid.mkv": {"something": "new"}}})
+    _touch(tmp_path / "vid.mkv")
+    project = Project(path=str(tmp_path), folder=FolderSettings(),
+                      files={"vid.mkv": FileEntry(name="vid.mkv", evidence={"crop": {"box": [1, 2, 3, 4]}})})
+
+    with pytest.raises(UnsupportedProjectVersion):
+        save_project(project)
+
+    assert (tmp_path / ".ocr.json").read_bytes() == raw
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".ocr.json", "vid.mkv"]
+
+
+def test_unsupported_project_version_is_exported():
+    import core.project as package
+    from core.project.store import UnsupportedProjectVersion
+
+    assert package.UnsupportedProjectVersion is UnsupportedProjectVersion
+    assert issubclass(UnsupportedProjectVersion, Exception)
+
+
+def test_save_project_fsyncs_every_file_before_replacing_it(tmp_path, monkeypatch):
+    import os
+
+    import core.project.store as store
+
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        calls.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        calls.append(("replace", str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store.os, "fsync", fsync)
+    monkeypatch.setattr(store.os, "replace", replace)
+    _touch(tmp_path / "vid.mkv")
+    project = Project(path=str(tmp_path), folder=FolderSettings(),
+                      files={"vid.mkv": FileEntry(name="vid.mkv", evidence={"crop": {"box": [1, 2, 3, 4]}})})
+
+    save_project(project)
+
+    replaces = [call for call in calls if call[0] == "replace"]
+    assert {Path(dst).name for _, _, dst in replaces} >= {".ocr.json"}
+    for index, call in enumerate(calls):
+        if call[0] == "replace":
+            assert calls[index - 1] == ("fsync", call[1])      # that temp file was synced just before
+    assert not list(tmp_path.rglob("*.tmp"))
