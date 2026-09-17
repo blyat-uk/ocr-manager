@@ -827,29 +827,32 @@ def test_the_crop_view_never_reaches_for_ocr_strips():
 # Fix round 1
 # --------------------------------------------------------------------------
 
-def test_a_typed_x_beyond_the_frame_is_clamped_before_it_is_stored(make_tab):
+def test_a_typed_x_keeps_its_value_and_the_width_gives_way(make_tab):
     """A stored crop the frame cannot hold is a fidelity bug: videocr slices
     frame[y:y+h, x:x+w] and numpy clips silently, so the OCR pass would read
-    a narrower band than the box says."""
+    a narrower band than the box says. x is the only field this changes, so
+    x is what survives and the width shrinks to fit beside it."""
     harness = make_tab()
     panel = harness.tab.panel
-    panel.set_spin_values(600, BOX[2], BOX[1], BOX[3])
+    panel.set_spin_values(600, BOX[2], BOX[1], BOX[3])      # BOX[2] is already the width
     panel.flush()
-    clamped = (FRAME_SIZE[0] - BOX[2], BOX[1], BOX[2], BOX[3])
-    assert harness.crop() == clamped
-    assert harness.tab.canvas.box() == clamped
-    assert panel.spin_values() == clamped
+    resolved = (600, BOX[1], FRAME_SIZE[0] - 600, BOX[3])
+    assert harness.crop() == resolved
+    assert harness.tab.canvas.box() == resolved
+    assert panel.spin_values() == resolved
 
 
-def test_a_typed_width_beyond_the_right_edge_is_clamped(make_tab):
+def test_a_typed_width_that_does_not_fit_moves_x_rather_than_losing_the_width(make_tab):
+    """Last-edited-wins: `set_spin_values` types the width after the x, so
+    the width is the value the user meant and x gives way."""
     harness = make_tab()
     panel = harness.tab.panel
     panel.set_spin_values(BOX[0], 1800, BOX[1], BOX[3])
     panel.flush()
-    clamped = (BOX[0], BOX[1], FRAME_SIZE[0] - BOX[0], BOX[3])
-    assert harness.crop() == clamped
-    assert harness.tab.canvas.box() == clamped
-    assert panel.spin_values() == clamped
+    resolved = (FRAME_SIZE[0] - 1800, BOX[1], 1800, BOX[3])
+    assert harness.crop() == resolved
+    assert harness.tab.canvas.box() == resolved
+    assert panel.spin_values() == resolved
 
 
 def test_typed_pairs_always_store_exactly_what_is_shown_inside_the_frame(make_tab):
@@ -998,3 +1001,73 @@ def test_closing_the_window_flushes_a_pending_nudge(qapp, fake_runner, tmp_proje
     finally:
         window.deleteLater()
         controller.shutdown(timeout=0.5)
+
+
+# --------------------------------------------------------------------------
+# Fix round 2 -- last-edited-wins instead of coupled spin ranges
+# --------------------------------------------------------------------------
+
+FULL_WIDTH_BOX = (0, 0, FRAME_SIZE[0], 60)
+
+
+def test_typing_x_then_a_width_that_fits_stores_exactly_what_was_typed(make_tab):
+    """1000 + 100 fits in 1920, so neither field may be touched."""
+    harness = make_tab(crop=FULL_WIDTH_BOX)
+    panel = harness.tab.panel
+    panel.x_row.first.setValue(1000)
+    panel.x_row.second.setValue(100)
+    panel.flush()
+    assert harness.crop() == (1000, 0, 100, 60)
+    assert harness.tab.canvas.box() == (1000, 0, 100, 60)
+    assert panel.spin_values() == (1000, 0, 100, 60)
+
+
+def test_the_x_field_takes_a_value_with_no_prior_width_edit(make_tab):
+    """With the width still full-frame, X was unusable: its maximum was
+    derived from the width, so no nonzero digit was accepted."""
+    harness = make_tab(crop=FULL_WIDTH_BOX)
+    panel = harness.tab.panel
+    panel.x_row.first.setValue(1000)
+    assert panel.x_row.first.value() == 1000          # the field accepts it in the first place
+    panel.flush()
+    assert harness.crop() == (1000, 0, FRAME_SIZE[0] - 1000, 60)
+    assert panel.spin_values() == (1000, 0, FRAME_SIZE[0] - 1000, 60)
+
+
+def test_a_typed_origin_that_leaves_no_room_is_clamped_itself(make_tab):
+    """The partner can only shrink to MIN_BOX, so the typed field gives way
+    -- and the panel simply shows the result."""
+    harness = make_tab(crop=FULL_WIDTH_BOX)
+    panel = harness.tab.panel
+    panel.x_row.first.setValue(FRAME_SIZE[0] - 4)
+    panel.flush()
+    biggest = FRAME_SIZE[0] - CropCanvas.MIN_BOX
+    assert harness.crop() == (biggest, 0, CropCanvas.MIN_BOX, 60)
+    assert panel.spin_values() == (biggest, 0, CropCanvas.MIN_BOX, 60)
+
+
+def test_the_last_typed_field_survives_whenever_the_frame_can_hold_it(make_tab):
+    harness = make_tab()
+    panel = harness.tab.panel
+    frame_width, frame_height = FRAME_SIZE
+    rng = random.Random(20260918)
+    for _ in range(24):
+        harness.controller.set_crop(harness.name, BOX)
+        harness.tab.refresh()
+        horizontal = rng.random() < 0.5
+        row, extent = (panel.x_row, frame_width) if horizontal else (panel.y_row, frame_height)
+        origin_field = rng.random() < 0.5
+        assert row.first.maximum() == extent - CropCanvas.MIN_BOX     # independent ranges:
+        assert row.second.maximum() == extent                          # neither follows the other
+        spin = row.first if origin_field else row.second
+        spin.setValue(rng.randrange(-400, extent + 600))
+        typed = spin.value()                          # what the field itself accepted
+        panel.flush()
+        stored = harness.crop()
+        assert stored == harness.tab.canvas.box() == panel.spin_values()
+        x, y, box_width, box_height = stored
+        assert 0 <= x and 0 <= y
+        assert x + box_width <= frame_width and y + box_height <= frame_height
+        assert box_width >= CropCanvas.MIN_BOX and box_height >= CropCanvas.MIN_BOX
+        origin, size = (x, box_width) if horizontal else (y, box_height)
+        assert (origin if origin_field else size) == typed      # the typed field survived

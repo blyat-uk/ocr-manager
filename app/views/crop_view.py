@@ -963,11 +963,21 @@ class _SpinPair(QWidget):
     """A kv row whose value is two spin boxes -- an origin and a size, as
     "X / width" and "Y / height".
 
-    The two maxima are coupled to each other, so the pair cannot express a
-    box that runs off the frame: the origin reaches at most `extent - size`
-    and the size at most `extent - origin`, re-derived after every change.
-    `CropTab._commit_box` clamps as well -- this is what stops the spin
-    boxes from showing a value that would then be clamped under the user."""
+    The two ranges are independent (origin 0..extent-minimum, size
+    minimum..extent), so either field always accepts any value the frame
+    could hold. Deriving one maximum from the other's current value would
+    make the pair unusable in one order: with the width still full-frame the
+    X field could accept nothing but 0, and the user would have to know to
+    shrink the width first.
+
+    The pair is reconciled instead at commit time, by `resolved()`, on a
+    last-edited-wins rule: the field just typed keeps its value and the
+    partner shrinks to fit. Only when the partner cannot shrink that far
+    (it is already at `minimum`) does the typed field give way -- and the
+    panel then simply shows the result, since `CropTab.refresh` repaints
+    both spin boxes and the canvas from the stored box."""
+
+    ORIGIN, SIZE = "origin", "size"
 
     edited = pyqtSignal()
 
@@ -993,13 +1003,17 @@ class _SpinPair(QWidget):
                 f"border: 1px solid {tokens.LINE2}; border-radius: {tokens.RADIUS_XS}px; "
                 f"padding: 1px 4px; font-size: {tokens.FONT_SIZE_BODY}px; }}"
                 f"QSpinBox:focus {{ border-color: {tokens.ACC}; }}")
-            spin.valueChanged.connect(self._on_changed)
             layout.addWidget(spin)
+        self.first.valueChanged.connect(lambda _value: self._on_changed(self.ORIGIN))
+        self.second.valueChanged.connect(lambda _value: self._on_changed(self.SIZE))
         self._syncing = False
         self._extent = 1
         self._minimum = 0
+        self._last: str | None = None
 
     def values(self) -> tuple[int, int]:
+        """What the two spin boxes read, which need not fit the frame --
+        `resolved()` is the pair as it would be stored."""
         return (self.first.value(), self.second.value())
 
     def set_limits(self, extent: int, minimum: int) -> None:
@@ -1007,33 +1021,41 @@ class _SpinPair(QWidget):
         the size may be."""
         self._extent = max(0, int(extent))
         self._minimum = max(0, int(minimum))
-        self._couple()
-
-    def _couple(self) -> None:
-        """Each maximum from the other's value, twice: setting the size's
-        range may clamp it, and the origin's range follows the clamped
-        size."""
         self._syncing = True
-        self.second.setRange(self._minimum, max(self._minimum, self._extent - self.first.value()))
-        self.first.setRange(0, max(0, self._extent - self.second.value()))
-        self.second.setRange(self._minimum, max(self._minimum, self._extent - self.first.value()))
+        self.first.setRange(0, max(0, self._extent - self._minimum))
+        self.second.setRange(self._minimum, max(self._minimum, self._extent))
         self._syncing = False
 
+    def resolved(self) -> tuple[int, int]:
+        """(origin, size) as the frame can hold them, the field the user
+        typed last keeping its value (see the class docstring)."""
+        origin, size = self.values()
+        extent, minimum = self._extent, self._minimum
+        size = _clamp(size, minimum, max(minimum, extent))
+        origin = _clamp(origin, 0, max(0, extent))
+        if origin + size <= extent:
+            return origin, size
+        if self._last == self.ORIGIN:
+            origin = min(origin, max(0, extent - minimum))
+            size = max(minimum, extent - origin)
+            return min(origin, max(0, extent - size)), size
+        # The size was typed last, or neither was (a programmatic sync): the
+        # size is kept and the origin gives way, as `clamp_box` does.
+        return max(0, extent - size), size
+
     def set_values(self, first: int, second: int) -> None:
-        """Show a box without committing: the ranges open up first, so a
-        value is never clipped by the limits the old box left behind."""
+        """Show a box without committing. It claims no authorship, so a
+        later `resolved()` still credits whichever field the user typed."""
         self._syncing = True
-        self.first.setRange(0, self._extent)
-        self.second.setRange(self._minimum, max(self._minimum, self._extent))
         self.first.setValue(int(first))
         self.second.setValue(int(second))
         self._syncing = False
-        self._couple()
+        self._last = None
 
-    def _on_changed(self, _value: int) -> None:
+    def _on_changed(self, field: str) -> None:
         if self._syncing:
             return
-        self._couple()
+        self._last = field
         self.edited.emit()
 
 
@@ -1179,7 +1201,8 @@ class CropInspectorPanel(Section):
         self._commit.start()
 
     def _emit_box(self) -> None:
-        x, y, width, height = self.spin_values()
+        x, width = self.x_row.resolved()
+        y, height = self.y_row.resolved()
         self.box_edited.emit((x, y, width, height))
 
 
