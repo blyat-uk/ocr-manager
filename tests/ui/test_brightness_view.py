@@ -630,27 +630,19 @@ def test_a_brightness_measured_on_an_earlier_crop_warns(controller):
     made.page().close()
 
 
-def test_the_series_median_note_appears_once_three_files_have_brightness(controller):
-    """The note is app.state_text's (shared with the inspector, plan 3C Task
-    5); this only checks the panel asks for it. With 209 on this file the
-    four values are 209, 218, 213, 230 -- median_low 213."""
+def test_the_panel_leaves_the_series_median_to_the_inspector(controller):
+    """The cross-file summary belongs to the inspector's Detected section
+    (ruling B4, ui-spec §3.7), which shows it once. This panel is about this
+    episode's own threshold and never repeats it."""
     give_values(controller, evidence=brightness_evidence())
+    for name, value in zip(OTHERS, (218, 213, 230), strict=True):
+        controller.entry(name).brightness = Brightness(value, Source.DETECTED)
     made = BrightnessTab(controller)
     made.page().resize(880, 620)
     made.page().show()
     made.set_file(NAME)
     settle()
-    assert made.panel.series_text() == ""            # only this file has a brightness
-    for name, value in zip(OTHERS, (218, 213, 230), strict=True):
-        controller.entry(name).brightness = Brightness(value, Source.DETECTED)
-    made.refresh()
-    settle()
-    assert made.panel.series_text() == "Series median brightness is 213 — this episode keeps its own."
-
-    controller.entry(NAME).brightness = None      # nothing of its own to keep
-    made.refresh()
-    settle()
-    assert made.panel.series_text() == ""
+    assert not any("Series median" in note for note in made.panel.notes())
     made.page().close()
 
 
@@ -732,6 +724,38 @@ def test_an_evidence_box_from_another_crop_is_described_instead_of_the_files_own
     settle()
     assert made.crop_box() == BOX                       # not OTHER_BOX
     assert made.panel.stale_text() == "measured on an earlier crop — re-detect to refresh"
+    made.page().close()
+
+
+def test_the_panel_says_the_tiles_are_of_the_other_crop(controller):
+    """The warn line is about the stored value; this one is about what is on
+    screen. Only while the tiles really are of another crop."""
+    give_values(controller, evidence=brightness_evidence(crop_box=BOX, value_crop_box=BOX))
+    controller.entry(NAME).crop = Crop(*OTHER_BOX, Source.DETECTED)
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.crop_box() == BOX
+    assert made.panel.crop_note_text() == "the tiles and curve show that crop, not the file's current one"
+    assert made.panel.crop_note_text() in made.panel.notes()
+    made.page().close()
+
+
+def test_a_value_stale_on_its_own_does_not_claim_the_tiles_are_elsewhere(controller):
+    """evidence["crop_box"] IS the file's crop here -- only the stored value
+    was measured on an older one -- so the tiles are of what the user sees."""
+    give_values(controller, box=OTHER_BOX,
+                evidence=brightness_evidence(crop_box=OTHER_BOX, value_crop_box=BOX))
+    controller.entry(NAME).crop = Crop(*OTHER_BOX, Source.DETECTED)
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.panel.stale_text() == "measured on an earlier crop — re-detect to refresh"
+    assert made.panel.crop_note_text() == ""
     made.page().close()
 
 

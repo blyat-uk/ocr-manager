@@ -68,13 +68,7 @@ from app.masking import (
     MIN_T,
     StripPixels,
 )
-from app.state_text import (
-    brightness_flag_text,
-    brightness_is_stale,
-    clock,
-    series_median_brightness,
-    series_median_note,
-)
+from app.state_text import brightness_flag_text, brightness_is_stale, clock
 from app.theme import tokens
 from app.views.inspector_sections import note_label, small_button
 from app.widgets.base import Button, KvRow, SectionHeader
@@ -98,6 +92,10 @@ NOT_VERIFIED = "not verified on this file"
 NOT_MEASURABLE = "not measurable"
 STALE_REDETECTING = "measured on an earlier crop — re-detecting"
 STALE_REDETECT = "measured on an earlier crop — re-detect to refresh"
+# Shown under it while the tiles and the curve describe the evidence's crop
+# rather than the file's own (see BrightnessTab._box_for): the warn line
+# above is about the stored VALUE, this one about what is on screen.
+TILES_OTHER_CROP = "the tiles and curve show that crop, not the file's current one"
 NO_VALUE = "—"
 
 # --- geometry (the literal CSS of tabs-hifi.html figure 1) ------------------
@@ -704,9 +702,9 @@ class BrightnessInspectorPanel(QWidget):
         self.stale_label.setProperty("tone", "warn")
         self.flag_label = note_label()
         self.flag_label.setProperty("tone", "warn")
+        self.crop_note = note_label()
         self.note = note_label()
-        self.series_label = note_label()
-        for label in (self.stale_label, self.flag_label, self.note, self.series_label):
+        for label in (self.stale_label, self.crop_note, self.flag_label, self.note):
             column.addWidget(label)
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 3, 0, 0)
@@ -722,11 +720,11 @@ class BrightnessInspectorPanel(QWidget):
         column.addStretch(1)
 
     def set_state(self, *, auto: int | None, value: int | None, note: str, flags: str,
-                  stale: str, series: str) -> None:
+                  stale: str, crop_note: str) -> None:
         self.auto_row.set_value(NO_VALUE if auto is None else str(auto))
         self.yours_row.set_value(NO_VALUE if value is None else str(value), tone="acc")
-        for label, text in ((self.stale_label, stale), (self.flag_label, flags),
-                            (self.note, note), (self.series_label, series)):
+        for label, text in ((self.stale_label, stale), (self.crop_note, crop_note),
+                            (self.flag_label, flags), (self.note, note)):
             label.setText(text)
             label.setVisible(bool(text))
         self.use_button.setText("use" if auto is None else f"use {auto}")
@@ -735,9 +733,11 @@ class BrightnessInspectorPanel(QWidget):
         self.keep_button.setEnabled(value is not None)
 
     def notes(self) -> list[str]:
-        """Every note line on show, top to bottom."""
-        return [label.text() for label in (self.stale_label, self.flag_label, self.note,
-                                           self.series_label) if label.text()]
+        """Every note line on show, top to bottom. The series median is NOT
+        among them: the cross-file summary belongs to the inspector's
+        Detected section (ruling B4, ui-spec §3.7), which shows it once."""
+        return [label.text() for label in (self.stale_label, self.crop_note,
+                                           self.flag_label, self.note) if label.text()]
 
     def flag_text(self) -> str:
         return self.flag_label.text()
@@ -745,8 +745,8 @@ class BrightnessInspectorPanel(QWidget):
     def stale_text(self) -> str:
         return self.stale_label.text()
 
-    def series_text(self) -> str:
-        return self.series_label.text()
+    def crop_note_text(self) -> str:
+        return self.crop_note.text()
 
 
 # --------------------------------------------------------------------------
@@ -1335,23 +1335,20 @@ class BrightnessTab:
         pending = self._controller.pending_detectors().get(entry.name, frozenset())
         return STALE_REDETECTING if "brightness" in pending else STALE_REDETECT
 
-    def _series_text(self, entry) -> str:
-        """The series-median sentence, shared with the inspector's Detected
-        note (`app/state_text.py`). Only for a file that has a brightness of
-        its own -- "this episode keeps its own" says nothing about a file
-        with no value yet."""
-        if entry is None or entry.brightness is None:
-            return ""
-        controller = self._controller
-        names = controller.names() if controller.project is not None else []
-        return series_median_note(series_median_brightness(controller.entry(name) for name in names))
+    def _crop_note_text(self, entry) -> str:
+        """One line saying the tiles are not of the crop the file has now.
+        The warn line above it is about the stored value; a value can be
+        stale while the evidence still describes the current crop, so the
+        two are separate."""
+        own = self._entry_box(entry)
+        return TILES_OTHER_CROP if own is not None and self._crop_box not in (None, own) else ""
 
     def _update_panel(self, entry, evidence, auto: int | None, stored: int | None) -> None:
         self.panel.set_state(auto=auto, value=None if entry is None else self._preview,
                              note=self._note_text(auto, stored),
                              flags=self._flag_text(evidence),
                              stale=self._stale_text(entry),
-                             series=self._series_text(entry))
+                             crop_note=self._crop_note_text(entry))
 
     def _refresh_panel(self) -> None:
         entry = self._entry()
