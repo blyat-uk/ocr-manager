@@ -25,12 +25,14 @@ start, a zero start, HEVC in MP4 (seeks that land after their target) and
 23.976 fps (a 0.2 s step is not a whole number of frames).
 """
 import logging
+import re
 import subprocess
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from videocr.label_scanner import _ScanBracket
+from videocr.label_scanner import LabelResult, _ScanBracket
 from videocr.pyav_adapter import PyAVCapture
 from test_label_frame_identity import (
     CLIPS,
@@ -52,6 +54,11 @@ from test_label_frame_identity import (
 # frame's timestamp, so the frame after it comes two frame durations later.
 GAP_CLIP = "dropped-frame-h264"
 GAP_AFTER = 69
+
+# 23.976 fps in MKV's millisecond time base: frame durations are rounded to
+# 41 or 42 ms, so a frame's PTS plus 1 / fps can pass the next frame's PTS.
+MS_CLIP = "zero-start-h264-23.976fps-mkv"
+EXTRA_CLIPS = {MS_CLIP: ("mkv", "yuv420p", "libx264", "24000/1001", [])}
 
 BOUNDARY_CLIPS = [
     "video-start-0.021s-mkv",
@@ -80,6 +87,7 @@ class _Clip:
             if roi.shape[0] > probe.SCAN_HEIGHT:
                 roi, _ = probe._downscale(roi, probe.SCAN_HEIGHT)
             key = self.key(roi)
+            self.region_input_shape = roi.shape
             assert key not in self.frame_of_input, (
                 f"frames {self.frame_of_input.get(key)} and {i} give detection the same input")
             self.frame_of_input[key] = i
@@ -96,9 +104,9 @@ class _Clip:
     def key(image):
         return image.shape, image.tobytes()
 
-    def segment(self, first_reading, last_reading):
+    def segment(self, first_reading, last_reading, text="label"):
         """A segment as phase 3 hands it over, read at these times."""
-        return {"box": self.box, "text": "label", "confidence": 1.0,
+        return {"box": self.box, "text": text, "confidence": 1.0,
                 "start_pts": first_reading, "end_pts": last_reading}
 
     def end_time(self, i):
@@ -109,21 +117,32 @@ class _Clip:
 class _LabelOn:
     """Finds the label -- one box covering the whole detection input -- on the
     frames in `shown` and nowhere else, and records which frame each call
-    analysed."""
+    analysed. With `elsewhere_nothing`, an input cut around some other box
+    finds nothing (and is not recorded) instead of failing the test."""
 
-    def __init__(self, clip, shown):
+    def __init__(self, clip, shown, elsewhere_nothing=False):
         self.clip = clip
         self.shown = set(shown)
+        self.elsewhere_nothing = elsewhere_nothing
         self.calls = []
 
     def predict(self, image):
         i = self.clip.frame_of_input.get(self.clip.key(image))
+        if i is None and self.elsewhere_nothing and image.shape != self.clip.region_input_shape:
+            return []
         assert i is not None, "detection was given an input that is not any frame's detection input"
         self.calls.append(i)
         if i not in self.shown:
             return []
         h, w = image.shape[:2]
         return [{"dt_polys": [[[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]]}]
+
+
+def _ffmpeg_has_option(name):
+    """Whether this ffmpeg lists `-name` among its options (as "-name <arg>"
+    or "-name[:<stream_spec>] <arg>")."""
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-h", "full"], capture_output=True, text=True).stdout
+    return re.search(rf"^-{re.escape(name)}[\s\[]", out, re.MULTILINE) is not None
 
 
 @pytest.fixture(scope="module")
@@ -133,6 +152,10 @@ def clip_for(tmp_path_factory):
 
     def get(clip_id):
         if clip_id == GAP_CLIP:
+            if not _have_encoder("libx264"):
+                pytest.skip(f"libx264 encoder not available for {clip_id}")
+            if not _ffmpeg_has_option("fps_mode"):
+                pytest.skip(f"this ffmpeg has no -fps_mode, needed to keep {clip_id}'s timestamp gap")
             if clip_id not in made:
                 path = root / f"{clip_id}.mp4"
                 subprocess.run(
@@ -143,7 +166,7 @@ def clip_for(tmp_path_factory):
                     check=True, capture_output=True)
                 made[clip_id] = _Clip(path)
             return made[clip_id]
-        ext, pix_fmt, codec, rate, extra = CLIPS[clip_id]
+        ext, pix_fmt, codec, rate, extra = EXTRA_CLIPS.get(clip_id) or CLIPS[clip_id]
         if not _have_encoder(codec):
             pytest.skip(f"{codec} encoder not available for {clip_id}")
         if clip_id not in made:
@@ -163,7 +186,7 @@ def _scan(clip, scanner, shown, discovery, direction, bound, skipped):
     consecutive samples without the label; a time whose seek runs out of
     retries (`skipped`) is passed over without counting as an absence.
 
-    Returns ([(frame index, shows the label)] per sample analysed, seeks made).
+    Returns ([(time, frame index, shows the label)] per sample analysed, seeks made).
     """
     step = scanner.TIMING_SCAN_INTERVAL
     samples, seeks, absent_run = [], 0, 0
@@ -176,7 +199,7 @@ def _scan(clip, scanner, shown, discovery, direction, bound, skipped):
         i = _on_screen(clip.reference, t, clip.fps)
         if i is None:
             break
-        samples.append((i, i in shown))
+        samples.append((t, i, i in shown))
         absent_run = 0 if i in shown else absent_run + 1
         if absent_run == 2:
             break
@@ -185,15 +208,16 @@ def _scan(clip, scanner, shown, discovery, direction, bound, skipped):
 
 
 def _bracket(clip, samples, discovery):
-    """(frame at the last sample showing the label -- the discovery time's
-    frame if none did --, first frame after it without the label or None)."""
-    last_shown, first_absent = _on_screen(clip.reference, discovery, clip.fps), None
-    for i, shows in samples:
+    """(last sample time showing the label -- the discovery time if none did
+    --, the frame on screen then, first frame after it without the label or
+    None)."""
+    present, first_absent = discovery, None
+    for t, i, shows in samples:
         if shows:
-            last_shown, first_absent = i, None
+            present, first_absent = t, None
         elif first_absent is None:
             first_absent = i
-    return last_shown, first_absent
+    return present, _on_screen(clip.reference, present, clip.fps), first_absent
 
 
 def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None, skipped=lambda t: False):
@@ -205,7 +229,9 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
     reaches the bound instead: back to the first frame at or after the backward
     bound, forward to the last frame before the forward bound. Backward, every
     frame in the bracket is analysed; forward, frames are analysed until the
-    first without the label.
+    first without the label. A frame at or after an adjacent segment's bound
+    belongs to the later segment, the scan's own last frame included, as long
+    as the bound lies between the two segments' readings.
 
     Returns a namespace: start and end times; the frames detection runs on, in
     order; the display-time seeks made; and, per side, the frames the 0.2 s
@@ -221,12 +247,13 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
         got.analysed.append(mid)  # the reference box
 
     low = max(0, first_reading - scanner.TIMING_SCAN_MAX_DURATION)
+    bound = lower_bound if lower_bound is not None and lower_bound >= low else None
     if lower_bound is not None:
         low = max(low, lower_bound)
     samples, n = _scan(clip, scanner, shown, first_reading, -1, low, skipped)
-    got.backward = [i for i, _ in samples]
+    got.backward = [i for _, i, _ in samples]
     got.analysed += got.backward
-    got.scanned_start, got.absent_before = _bracket(clip, samples, first_reading)
+    present, got.scanned_start, got.absent_before = _bracket(clip, samples, first_reading)
     inside = [i for i in range(got.scanned_start)
               if (i > got.absent_before if got.absent_before is not None else clip.pts[i] >= low - tol)]
     got.analysed += inside
@@ -236,15 +263,24 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
         if i not in shown:
             break
         start = i
+    if bound is not None and present >= bound and clip.pts[start] < bound - tol:
+        start += 1  # the scan's frame began before the bound: it is the earlier segment's
 
     high = last_reading + scanner.TIMING_SCAN_MAX_DURATION
+    bound = upper_bound if upper_bound is not None and upper_bound <= high else None
     if upper_bound is not None:
         high = min(high, upper_bound)
     samples, n = _scan(clip, scanner, shown, last_reading, 1, high, skipped)
-    got.forward = [i for i, _ in samples]
+    got.forward = [i for _, i, _ in samples]
     got.analysed += got.forward
-    got.scanned_end, got.absent_after = _bracket(clip, samples, last_reading)
+    present, got.scanned_end, got.absent_after = _bracket(clip, samples, last_reading)
     got.seeks += n + 1
+    got.start = clip.pts[start]
+    if bound is not None and present <= bound and clip.pts[got.scanned_end] >= bound - tol:
+        # The scan's frame begins at the bound: it is the later segment's, and
+        # this label ends where that frame replaces the one before it.
+        got.end = clip.pts[got.scanned_end]
+        return got
     end = got.scanned_end
     for i in range(got.scanned_end + 1, len(clip.pts)):
         if (i >= got.absent_after) if got.absent_after is not None else (clip.pts[i] >= high - tol):
@@ -253,7 +289,7 @@ def _expected(clip, scanner, shown, segment, lower_bound=None, upper_bound=None,
         if i not in shown:
             break
         end = i
-    got.start, got.end = clip.pts[start], clip.end_time(end)
+    got.end = clip.end_time(end)
     return got
 
 
@@ -409,7 +445,7 @@ def test_back_to_back_segments_never_refine_across_their_bound(clip_for, monkeyp
     first = clip.segment(clip.pts[25], clip.pts[45])
     second = clip.segment(clip.pts[second_reading], clip.pts[70])
     bound = (first["end_pts"] + second["start_pts"]) / 2
-    before = max(i for i, p in enumerate(clip.pts) if p < bound - ON_SCREEN_TOLERANCE)
+    before = _before_bound(clip, bound)
     detector = _LabelOn(clip, shown)
 
     labels, seeks = _run(clip, scanner, [first, second], detector, monkeypatch)
@@ -422,32 +458,170 @@ def test_back_to_back_segments_never_refine_across_their_bound(clip_for, monkeyp
     assert seeks == want_first.seeks + want_second.seeks
 
 
+def _before_bound(clip, bound):
+    """The last frame that begins before `bound`: the earlier segment's last."""
+    return max(i for i, p in enumerate(clip.pts) if p < bound - ON_SCREEN_TOLERANCE)
+
+
+def _scan_segments(scanner, segments, detector):
+    """scan() with phases 1-3 standing in for `segments`, so phase 4 and all of
+    scan()'s post-processing run on them (container start 0)."""
+    scanner._phase1_find_text_frames = lambda *a, **k: [(0, 0.0, [])]
+    scanner._batch_ocr_text_frames = lambda text_frames, *a, **k: text_frames
+    scanner._phase2_group_by_position = lambda *a, **k: [None]
+    scanner._phase3_ocr_and_segment = lambda *a, **k: [dict(s) for s in segments]
+    return scanner.scan(detector, None, "", "", 0.0)
+
+
+# The earlier segment's last reading on four frame phases; the later segment's
+# first reading 0.20-1.00 s after it. Gaps that are multiples of 0.4 s put the
+# bound on a sample of both scans, and on a frame where readings are frames.
+SWEEP_LAST_READINGS = [(40, 0.0), (41, 0.5), (42, 0.0), (43, 0.5)]
+SWEEP_GAPS = {
+    "every-0.01s": [g / 100 for g in range(20, 101)],
+    "around-0.4s-and-0.8s": [g / 100 for g in list(range(20, 101, 7)) + list(range(36, 46)) + list(range(76, 86))],
+}
+
+
+@pytest.mark.parametrize("clip_id,gaps", _matrix(
+    [(c, g) for c in BOUNDARY_CLIPS + [MS_CLIP] for g in SWEEP_GAPS],
+    fast={"video-start-0.021s-mkv-around-0.4s-and-0.8s", f"{MS_CLIP}-around-0.4s-and-0.8s"}))
+def test_back_to_back_labels_at_one_position_share_no_frame_and_lose_no_span(clip_for, clip_id, gaps):
+    """Two segments at one position with the label found on every frame from 5
+    to 95, through phase 4 and scan()'s post-processing. The bound between
+    them is the only thing that tells them apart, and every frame belongs to
+    exactly one side of it: with different texts the two labels share no
+    frame and together cover the whole run; with the same text they come out
+    as one label covering the whole run (an overlap would make them
+    "duplicates" and drop one)."""
+    clip = clip_for(clip_id)
+    shown = range(5, 96)
+    half = 0.5 / clip.fps
+    whole = (clip.pts[shown[0]], clip.end_time(shown[-1]))
+    failures, checked = [], 0
+    for frame, offset in SWEEP_LAST_READINGS:
+        for gap in SWEEP_GAPS[gaps]:
+            last_reading = clip.pts[frame] + offset
+            second_reading = last_reading + gap
+            for texts in (("甲", "乙乙乙乙"), ("第三十七集", "第三十七集")):
+                segments = [clip.segment(clip.pts[20], last_reading, texts[0]),
+                            clip.segment(second_reading, second_reading + 0.6, texts[1])]
+                labels = _scan_segments(clip.scanner(), segments, _LabelOn(clip, shown))
+                spans = sorted((l.start_pts, l.end_pts) for l in labels)
+                checked += 1
+                if texts[0] == texts[1]:
+                    if spans != [whole]:
+                        failures.append((frame, offset, gap, texts[0], spans))
+                    continue
+                claimed = [{i for i, p in enumerate(clip.pts) if a - half <= p < b - half} for a, b in spans]
+                if (len(spans) != 2 or claimed[0] & claimed[1] or claimed[0] | claimed[1] != set(shown)
+                        or (spans[0][0], spans[1][1]) != whole):
+                    failures.append((frame, offset, gap, "shared " + str(sorted(claimed[0] & claimed[1]))
+                                     if len(spans) == 2 else "", spans))
+    assert checked == 2 * len(SWEEP_LAST_READINGS) * len(SWEEP_GAPS[gaps])
+    assert not failures, (f"{len(failures)} of {checked} back-to-back pairs (last reading frame, offset, gap, "
+                          f"texts or shared frames, labels): {failures[:8]}")
+
+
+def test_remove_duplicates_ignores_an_overlap_under_half_a_frame_but_not_a_real_one(clip_for):
+    """Labels timed back to back can overlap by float noise, since an end is a
+    frame's PTS plus 1 / fps, or by under a millisecond where frame durations
+    are rounded. That is no overlap; half a frame or more still is."""
+    clip = clip_for("video-start-0.021s-mkv")
+    scanner = clip.scanner()
+    frame = 1.0 / scanner.fps
+
+    def label(start, end, text="第三十七集"):
+        return LabelResult(start_pts=start, end_pts=end, text=text, pos_x=160, pos_y=200,
+                           bbox_x_min=0.0, bbox_y_min=0.0, bbox_x_max=319.0, bbox_y_max=160.0)
+
+    def kept(a, b):
+        return [(l.start_pts, l.end_pts) for l in scanner._remove_duplicates([label(*a), label(*b)])]
+
+    assert 1.086 + frame > 1.126  # float noise: the frame at 1.086 ends a little after the one at 1.126 starts
+    assert kept((0.5, 1.086 + frame), (1.126, 2.5)) == [(0.5, 1.086 + frame), (1.126, 2.5)]
+    assert kept((0.8, 1.3 + 0.4 * frame), (1.3, 2.5)) == [(0.8, 1.3 + 0.4 * frame), (1.3, 2.5)]
+    assert kept((0.8, 1.3 + 0.75 * frame), (1.3, 2.5)) == [(1.3, 2.5)], "the shorter of two labels overlapping by 3/4 frame"
+    assert kept((0.8, 1.3 + 1.5 * frame), (1.3, 2.5)) == [(1.3, 2.5)]
+    assert kept((1.0, 3.0), (1.5, 2.5)) == [(1.0, 3.0)]
+    assert len(scanner._remove_duplicates([label(1.0, 3.0), label(1.5, 2.5, "乙乙乙乙")])) == 2
+
+
 @pytest.mark.parametrize("clip_id", _matrix(BOUNDARY_CLIPS, fast={"video-start-0.021s-mkv", "offset-h264"}))
-def test_segments_out_of_time_order_keep_the_scan_result_where_their_bound_is_behind_the_reading(
-        clip_for, monkeypatch, clip_id):
-    """Phase 3 does not hand segments over in time order, and phase 4 bounds
-    each by its neighbour in the list at the same position. With the later
-    label listed first, the bound between them (the midpoint of the later
-    label's last reading and the earlier label's first) lies after the
-    earlier label's first reading and before the later label's last, so
-    neither of those scans can take a step. Refinement must not move either
-    boundary past its reading: each stays on the frame on screen at it, while
-    the other two boundaries are refined as usual."""
+def test_bounds_come_from_the_neighbours_in_time_at_the_same_position(clip_for, monkeypatch, clip_id):
+    """Phase 3 hands segments over in cluster order, not time order. Each
+    segment is bounded by the segment just before it and just after it in
+    time at the same position, wherever those are in the list. The label is
+    found on every frame 10-85, so the bounds alone split it three ways."""
     clip = clip_for(clip_id)
     scanner = clip.scanner()
-    later, earlier = range(60, 81), range(10, 31)
-    shown = set(later) | set(earlier)
-    segments = [clip.segment(clip.pts[65], clip.pts[75]), clip.segment(clip.pts[15], clip.pts[25])]
-    bound = (segments[0]["end_pts"] + segments[1]["start_pts"]) / 2
-    assert segments[1]["start_pts"] < bound < segments[0]["end_pts"]
+    shown = set(range(10, 86))
+    first = clip.segment(clip.pts[15], clip.pts[20], "甲")
+    second = clip.segment(clip.pts[45], clip.pts[50], "乙乙")
+    third = clip.segment(clip.pts[75], clip.pts[80], "丙丙丙")
+    one_two = (first["end_pts"] + second["start_pts"]) / 2
+    two_three = (second["end_pts"] + third["start_pts"]) / 2
     detector = _LabelOn(clip, shown)
 
-    labels, seeks = _run(clip, scanner, segments, detector, monkeypatch)
+    labels, seeks = _run(clip, scanner, [third, first, second], detector, monkeypatch)
 
-    assert [(l.start_pts, l.end_pts) for l in labels] == [
-        (clip.pts[60], clip.end_time(75)), (clip.pts[15], clip.end_time(30))]
-    want_later = _expected(clip, scanner, shown, segments[0], upper_bound=bound)
-    want_earlier = _expected(clip, scanner, shown, segments[1], lower_bound=bound)
+    assert [(l.text, l.start_pts, l.end_pts) for l in labels] == [
+        ("丙丙丙", clip.pts[_before_bound(clip, two_three) + 1], clip.end_time(85)),
+        ("甲", clip.pts[10], clip.end_time(_before_bound(clip, one_two))),
+        ("乙乙", clip.pts[_before_bound(clip, one_two) + 1], clip.end_time(_before_bound(clip, two_three)))]
+    want = [_expected(clip, scanner, shown, third, lower_bound=two_three),
+            _expected(clip, scanner, shown, first, upper_bound=one_two),
+            _expected(clip, scanner, shown, second, lower_bound=one_two, upper_bound=two_three)]
+    assert detector.calls == [i for w in want for i in w.analysed]
+    assert seeks == sum(w.seeks for w in want)
+
+
+@pytest.mark.parametrize("clip_id", _matrix(BOUNDARY_CLIPS, fast={"video-start-0.021s-mkv"}))
+def test_a_segment_elsewhere_between_them_in_time_does_not_separate_same_position_neighbours(
+        clip_for, monkeypatch, clip_id):
+    """A segment at another position (a small box in the corner, never found)
+    read between two segments at the same position is not their neighbour:
+    the bound between those two still applies to both."""
+    clip = clip_for(clip_id)
+    scanner = clip.scanner()
+    shown = set(range(10, 71))
+    corner = np.array([[0, 0], [40, 0], [40, 20], [0, 20]], dtype=np.float32)
+    assert not scanner._boxes_overlap(clip.box, corner)
+    first = clip.segment(clip.pts[15], clip.pts[20], "甲")
+    elsewhere = dict(clip.segment(clip.pts[30], clip.pts[35], "角"), box=corner)
+    second = clip.segment(clip.pts[45], clip.pts[50], "乙乙")
+    bound = (first["end_pts"] + second["start_pts"]) / 2
+
+    labels = scanner._phase4_find_timing([second, elsewhere, first], _LabelOn(clip, shown, elsewhere_nothing=True))
+
+    by_text = {l.text: (l.start_pts, l.end_pts) for l in labels}
+    assert by_text["甲"] == (clip.pts[10], clip.end_time(_before_bound(clip, bound)))
+    assert by_text["乙乙"] == (clip.pts[_before_bound(clip, bound) + 1], clip.end_time(70))
+
+
+@pytest.mark.parametrize("clip_id", _matrix(BOUNDARY_CLIPS, fast={"video-start-0.021s-mkv", "offset-h264"}))
+def test_segments_whose_readings_overlap_keep_those_boundaries_on_their_readings(clip_for, monkeypatch, clip_id):
+    """The earlier segment's last reading comes after the later one's first,
+    so the bound between them lies inside both and neither scan toward it can
+    take a step. That bound is not between the readings: each of those two
+    boundaries stays on the frame on screen at its reading (the start is not
+    moved to the bound, and neither frame is handed to the other segment),
+    while the outer two are refined as usual."""
+    clip = clip_for(clip_id)
+    scanner = clip.scanner()
+    shown = set(range(10, 71))
+    earlier = clip.segment(clip.pts[15], clip.pts[40], "甲")
+    later = clip.segment(clip.pts[30], clip.pts[60], "乙乙乙乙")
+    bound = (earlier["end_pts"] + later["start_pts"]) / 2
+    assert later["start_pts"] < bound < earlier["end_pts"]
+    detector = _LabelOn(clip, shown)
+
+    labels, seeks = _run(clip, scanner, [later, earlier], detector, monkeypatch)
+
+    assert [(l.text, l.start_pts, l.end_pts) for l in labels] == [
+        ("乙乙乙乙", clip.pts[30], clip.end_time(70)), ("甲", clip.pts[10], clip.end_time(40))]
+    want_later = _expected(clip, scanner, shown, later, lower_bound=bound)
+    want_earlier = _expected(clip, scanner, shown, earlier, upper_bound=bound)
     assert detector.calls == want_later.analysed + want_earlier.analysed
     assert seeks == want_later.seeks + want_earlier.seeks
 
@@ -514,11 +688,42 @@ def test_duration_limits_apply_to_the_refined_boundaries(clip_for, monkeypatch):
     assert dropped == [], "a label 1.56 s long was kept with a 1.4 s maximum"
 
 
-def test_a_boundary_stays_where_the_scan_left_it_when_its_frame_cannot_be_read(clip_for):
-    """If the frame on screen at the scan's last present time is never read,
-    there is nothing to extend from, and the boundary is the scan's time. A
-    start whose last present time is on the last frame is still refined up to
-    it (the stream ends right after that frame)."""
+def _bracket_of(present, limit, present_pts=None, absent=None, absent_pts=None, bound=None):
+    return _ScanBracket(present=present, present_pts=present_pts, absent=absent, absent_pts=absent_pts,
+                        limit=limit, bound=bound)
+
+
+def test_a_start_whose_bracket_cannot_be_read_stays_on_the_scan_frame(clip_for, monkeypatch, caplog):
+    """The one seek refinement makes that the scan did not make before is to a
+    bound before the first reading. If it runs out of retries, the start is
+    the frame on screen at the reading, read from there -- a frame's PTS, as
+    every label time is -- and the frames before it stay unrefined."""
+    clip = clip_for("video-start-0.021s-mkv")
+    scanner = clip.scanner()
+    first = clip.segment(clip.pts[25], clip.pts[45])
+    second = clip.segment(clip.pts[52] + 0.01, clip.pts[70])  # read between two frames
+    bound = (first["end_pts"] + second["start_pts"]) / 2
+    caplog.set_level(logging.WARNING, logger="videocr.pyav_adapter")
+    exhausting = _ExhaustingSeeks(monkeypatch, lambda t: abs(t - bound) < 1e-9)
+    shown = range(20, 81)
+
+    labels = scanner._phase4_find_timing([first, second], _LabelOn(clip, shown))
+
+    assert [result for t, result in exhausting.calls if abs(t - bound) < 1e-9] == [False]
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+    assert [(l.start_pts, l.end_pts) for l in labels] == [
+        (clip.pts[20], clip.end_time(_before_bound(clip, bound))), (clip.pts[52], clip.end_time(80))]
+
+
+def test_a_boundary_stays_where_the_scan_left_it_when_its_frame_cannot_be_read(clip_for, monkeypatch):
+    """If the frame on screen at the scan's last present time cannot be read,
+    there is nothing to extend from, and the boundary is the frame the scan
+    analysed there (its PTS, or its PTS + 1 / fps for an end). Unreachable in
+    practice: that frame was read before, by the scan or, for a reading's
+    time, by phase 3, with the same deterministic seek. For a reading's time
+    the scan has no frame PTS, and the boundary is that time. A start whose
+    last present time is on the last frame is still refined up to it (the
+    stream ends right after that frame)."""
     clip = clip_for("offset-h264")
     scanner = clip.scanner()
     fps = clip.fps
@@ -526,9 +731,31 @@ def test_a_boundary_stays_where_the_scan_left_it_when_its_frame_cannot_be_read(c
     detector = _LabelOn(clip, range(len(clip.pts)))
     with PyAVCapture(str(clip.path)) as cap:
         assert scanner._refine_end(cap, detector, clip.box, clip.box,
-                                   _ScanBracket(past_end, None, None, past_end + 5.0)) == past_end
+                                   _bracket_of(past_end, past_end + 5.0)) == past_end
         assert scanner._refine_start(cap, detector, clip.box, clip.box,
-                                     _ScanBracket(past_end, None, None, clip.pts[90])) == past_end
+                                     _bracket_of(past_end, clip.pts[90])) == past_end
+        # With the frame PTS the scan read there, that frame's PTS and end.
+        assert scanner._refine_start(cap, detector, clip.box, clip.box,
+                                     _bracket_of(past_end, clip.pts[90], present_pts=clip.pts[97])) == clip.pts[97]
+        assert scanner._refine_end(cap, detector, clip.box, clip.box,
+                                   _bracket_of(past_end, past_end + 5.0, present_pts=clip.pts[97])) == clip.end_time(97)
         on_last_frame = clip.pts[-1] + 0.5 / fps
         assert scanner._refine_start(cap, detector, clip.box, clip.box,
-                                     _ScanBracket(on_last_frame, None, None, clip.pts[95])) == clip.pts[95]
+                                     _bracket_of(on_last_frame, clip.pts[95])) == clip.pts[95]
+
+    # The scan's own last present sample, whose seek fails the second time.
+    clip = clip_for("video-start-0.021s-mkv")
+    scanner = clip.scanner()
+    segment = clip.segment(clip.pts[40], clip.pts[60])
+    step = scanner.TIMING_SCAN_INTERVAL
+    sample = segment["end_pts"] + step
+    seen = []
+
+    def second_seek_at_sample(t):
+        seen.append(abs(t - sample) < 1e-9)
+        return seen[-1] and seen.count(True) == 2
+
+    _ExhaustingSeeks(monkeypatch, second_seek_at_sample)
+    (label,) = scanner._phase4_find_timing([segment], _LabelOn(clip, range(31, 70)))
+    assert seen.count(True) == 2
+    assert (label.start_pts, label.end_pts) == (clip.pts[31], clip.end_time(65))
