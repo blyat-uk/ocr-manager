@@ -24,9 +24,10 @@ Engines (ruling A1)
 Fidelity
     Detectors get exactly the documented arguments and nothing else.
     ProofOcrJob passes ocr_call_for(entry, folder, project_dir).kwargs
-    unchanged, adding only time_ranges (one 30 s window),
-    subtitle_callback and cancel_event, none of which changes what the OCR
-    pass reads.
+    unchanged, adding only time_ranges (one 30 s window) and cancel_event,
+    neither of which changes what the OCR pass reads. Its lines are parsed
+    from the ASS text get_subtitles returns, i.e. what a run would write
+    before QA, labels included.
 
 Cancellation convention: a cancelled job returns None
     A job whose work was cut short by a cancel request returns None. It never
@@ -55,6 +56,7 @@ from typing import TYPE_CHECKING
 
 import cv2
 
+from core.ass_qafix import ASS_TAG_RE
 from core.detect import audio_profile as _audio_profile
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
@@ -69,6 +71,7 @@ from core.project.ocr_kwargs import ocr_call_for
 from videocr import api as _api
 from videocr import engine_registry
 from videocr import pyav_adapter as _pyav_adapter
+from videocr import utils as _videocr_utils
 
 if TYPE_CHECKING:
     import numpy as np
@@ -118,6 +121,8 @@ class BrightnessJobResult:
     result: BrightnessResult
     tiles: dict[str, float]              # tiles.choose_tiles(result.strips, result.value)
     hint_value: int | None               # the edited file's value this re-detection checks against
+    crop_box: tuple[int, int, int, int] | None   # the crop the result was measured with; apply drops it
+                                                 # when the file's crop is no longer this box
 
 
 @dataclass(frozen=True)
@@ -135,7 +140,8 @@ class AudioProfileResult:
 class ProofResult:
     file: str
     window: tuple[float, float]                 # seconds; OCR ran on format_mss() of each end
-    lines: list[tuple[float, float, str]]       # (start, end, text) from get_subtitles' subtitle_callback
+    lines: list[tuple[float, float, str]]       # (start s, end s, text) of every Dialogue line get_subtitles
+                                                # returned, in document order (see proof_lines)
     seconds: float                              # wall time of the OCR call
 
 
@@ -322,7 +328,8 @@ class BrightnessJob:
     `folder_plateau` selects the cheap path. A hint re-detection
     (`hint_value`) always runs full detection (ruling C3), so passing both is
     refused. The "differs-from-hint?" flag is added when the result is
-    applied, not here.
+    applied, not here. The result carries the crop box it was measured with,
+    so a result that arrives after the crop changed is dropped on apply.
     """
 
     kind = "brightness"
@@ -354,7 +361,7 @@ class BrightnessJob:
         if detector_cancelled(result.flagged):
             return None
         tiles = _tiles.choose_tiles(result.strips, result.value)
-        return BrightnessJobResult(self.file, result, tiles, self.hint_value)
+        return BrightnessJobResult(self.file, result, tiles, self.hint_value, self.crop_box)
 
 
 def proof_window(sample_time: float | None, duration: float) -> tuple[float, float]:
@@ -374,6 +381,22 @@ def proof_window(sample_time: float | None, duration: float) -> tuple[float, flo
     return start, start + PROOF_WINDOW_SEC
 
 
+def proof_lines(ass: str) -> list[tuple[float, float, str]]:
+    """(start seconds, end seconds, text) of every Dialogue line in `ass`, in
+    document order: dialogue and positioned labels alike. Timestamps and
+    fields are parsed by videocr.utils.parse_ass_dialogue_line; override tags
+    ({\\pos(...)} and the like, core.ass_qafix.ASS_TAG_RE) are removed and
+    \\N becomes a newline. Empty text (no Dialogue lines) gives []."""
+    lines = []
+    for raw in ass.split("\n"):                    # not splitlines(): OCR text may hold other separators
+        parsed = _videocr_utils.parse_ass_dialogue_line(raw.rstrip("\r"))
+        if parsed is None:
+            continue
+        text = ASS_TAG_RE.sub("", parsed["text"]).replace("\\N", "\n")
+        lines.append((parsed["start_seconds"], parsed["end_seconds"], text))
+    return lines
+
+
 def format_mss(seconds: float) -> str:
     """"M:SS" for a time-range string, truncated to whole seconds (a preview
     window; minutes may exceed 59, which get_frame_index reads correctly)."""
@@ -387,8 +410,8 @@ class ProofOcrJob:
     The call (ocr_call_for) and the window are resolved at construction, so
     edits made after the user asked for the proof do not change it. The
     file's own time ranges are ignored: the window is the only range. Lines
-    come from get_subtitles' subtitle_callback, which the dialogue pass
-    feeds; a labels-only folder's proof therefore has no lines.
+    are parsed from the ASS text get_subtitles returns (proof_lines), so they
+    are what a run would write before QA, labels-only folders included.
     """
 
     kind = "proof"
@@ -403,15 +426,10 @@ class ProofOcrJob:
         self._kwargs = copy.deepcopy(ocr_call_for(entry, folder, project_dir).kwargs)
 
     def run(self, ctx: JobContext) -> ProofResult | None:
-        lines: list[tuple[float, float, str]] = []
-
-        def collect(start, end, text) -> None:
-            lines.append((float(start), float(end), str(text)))
-
         started = time.perf_counter()
-        _api.get_subtitles(**copy.deepcopy(self._kwargs), time_ranges=[self.time_range],
-                           subtitle_callback=collect, cancel_event=ctx.cancel_event)
+        ass = _api.get_subtitles(**copy.deepcopy(self._kwargs), time_ranges=[self.time_range],
+                                 cancel_event=ctx.cancel_event)
         seconds = time.perf_counter() - started
         if ctx.cancelled():
             return None
-        return ProofResult(self.file, self.window, lines, seconds)
+        return ProofResult(self.file, self.window, proof_lines(ass or ""), seconds)

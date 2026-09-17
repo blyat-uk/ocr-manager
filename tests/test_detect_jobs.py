@@ -96,6 +96,7 @@ from core.project import (
     to_json,
 )
 from videocr import api, engine_registry
+from videocr import utils as vc_utils
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -152,16 +153,19 @@ def _crop_job_result(file="a.mp4", hint=None, **kwargs) -> CropJobResult:
     return CropJobResult(file=file, result=_crop_result(**kwargs), hint=hint)
 
 
-def _brightness_job_result(file="a.mp4", hint_value=None, **kwargs) -> BrightnessJobResult:
+def _brightness_job_result(file="a.mp4", hint_value=None, crop_box=NEW_BOX, **kwargs) -> BrightnessJobResult:
+    """A brightness result measured with `crop_box` (the crop the entry under
+    test must still have for the result to apply)."""
     result = _brightness_result(**kwargs)
     return BrightnessJobResult(file=file, result=result, tiles=choose_tiles(result.strips, result.value),
-                               hint_value=hint_value)
+                               hint_value=hint_value, crop_box=crop_box)
 
 
 def _complete(entry: FileEntry) -> None:
     """Give an entry both required values from detection, so only the field
-    under test decides its review state."""
-    entry.crop = Crop(*OLD_BOX, Source.DETECTED)
+    under test decides its review state. The crop is the one brightness
+    results are measured with by default."""
+    entry.crop = Crop(*NEW_BOX, Source.DETECTED)
     entry.brightness = Brightness(OTHER_BRIGHTNESS, Source.DETECTED)
 
 
@@ -332,15 +336,45 @@ def test_the_same_detected_value_again_keeps_the_file_reviewed():
     assert entry.review == ReviewState.REVIEWED
 
 
-def test_a_value_filling_an_empty_field_keeps_the_file_reviewed():
-    """The ruling un-reviews only when the previous value's source was
-    detected/hint; an empty field has no previous value."""
+def _fill_crop(project):
+    apply_crop(project, _crop_job_result())
+    return project.files["a.mp4"].crop
+
+
+def _fill_brightness(project):
+    apply_brightness(project, _brightness_job_result())
+    return project.files["a.mp4"].brightness
+
+
+def _fill_ranges(project):
+    apply_ranges(project, _ranges_result({"a.mp4": [(None, "01:30")]}))
+    return project.files["a.mp4"].time_ranges
+
+
+@pytest.mark.parametrize("field, fill", [
+    ("crop", _fill_crop), ("brightness", _fill_brightness), ("time_ranges", _fill_ranges)])
+def test_detection_filling_an_empty_field_un_reviews_the_file(field, fill):
+    """The user never saw a value that detection put into an empty field."""
     project = _project()
     entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.MANUAL)
     entry.brightness = Brightness(200, Source.MANUAL)
+    entry.time_ranges = TimeRanges([TimeRange("01:00", None)], Source.MANUAL)
+    setattr(entry, field, None)
     entry.review = ReviewState.REVIEWED
-    apply_crop(project, _crop_job_result())
-    assert entry.crop == Crop(*NEW_BOX, Source.DETECTED)
+
+    assert fill(project) is not None
+
+    assert entry.review != ReviewState.REVIEWED
+    assert _state(project, "a.mp4") == ReviewState.PROPOSED
+
+
+def test_whole_file_detected_into_an_empty_ranges_field_changes_nothing_and_keeps_review():
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.review = ReviewState.REVIEWED
+    apply_ranges(project, _ranges_result({}))
+    assert entry.time_ranges is None
     assert entry.review == ReviewState.REVIEWED
 
 
@@ -355,8 +389,11 @@ def test_a_reviewed_file_with_the_users_values_stays_reviewed_after_every_detect
 
     apply_crop(project, _crop_job_result())
     apply_crop(project, _crop_job_result(flagged="low-agreement"))
-    apply_brightness(project, _brightness_job_result())
-    apply_brightness(project, _brightness_job_result(value=180, plateau=(170, 200), hint_value=250))
+    apply_brightness(project, _brightness_job_result(crop_box=OLD_BOX))
+    assert "brightness" in entry.evidence            # applied (not dropped as stale), value untouched
+    apply_brightness(project, _brightness_job_result(value=180, plateau=(170, 200), hint_value=250,
+                                                     crop_box=OLD_BOX))
+    assert entry.flags["brightness"] == FLAG_DIFFERS_FROM_HINT
     apply_ranges(project, RangesJobResult(RangesAnalysis(
         keep={"a.mp4": [(None, "01:30"), ("03:00", None)]}, blocks={}, durations={"a.mp4": 1418.0})))
     apply_ranges(project, RangesJobResult(RangesAnalysis(keep={}, blocks={}, durations={"a.mp4": 1418.0})))
@@ -382,6 +419,7 @@ def test_a_reviewed_file_with_the_users_values_stays_reviewed_after_every_detect
 def test_apply_brightness_writes_only_over_an_empty_detected_or_hinted_value(prior_source, overwritten):
     project = _project()
     entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.DETECTED)
     if prior_source is not None:
         entry.brightness = Brightness(OTHER_BRIGHTNESS, prior_source)
     r = _brightness_job_result()
@@ -399,6 +437,7 @@ def test_apply_brightness_writes_only_over_an_empty_detected_or_hinted_value(pri
 
 def test_brightness_with_only_the_informational_flag_is_written():
     project = _project()
+    project.files["a.mp4"].crop = Crop(*NEW_BOX, Source.DETECTED)
     apply_brightness(project, _brightness_job_result(flagged="no-clean-threshold"))
     entry = project.files["a.mp4"]
     assert entry.brightness == Brightness(NEW_BRIGHTNESS, Source.DETECTED)
@@ -424,6 +463,7 @@ def test_brightness_that_is_not_auto_applicable_is_stored_as_evidence_only(flagg
 
 def test_an_escalating_cheap_result_does_not_fill_an_empty_brightness():
     project = _project()
+    project.files["a.mp4"].crop = Crop(*NEW_BOX, Source.DETECTED)
     apply_brightness(project, _brightness_job_result(value=240, plateau=None, flagged="escalate"))
     entry = project.files["a.mp4"]
     assert entry.brightness is None
@@ -461,9 +501,74 @@ def test_a_verified_value_outside_the_hint_is_written_and_flagged():
     entry = project.files["a.mp4"]
     entry.crop = Crop(*NEW_BOX, Source.DETECTED)
     apply_brightness(project, _brightness_job_result(value=210, plateau=(180, 230), hint_value=245))
-    assert entry.brightness == Brightness(210, Source.DETECTED)
+    assert entry.brightness == Brightness(210, Source.HINT)
     assert entry.flags["brightness"] == FLAG_DIFFERS_FROM_HINT
     assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+@pytest.mark.parametrize("hint_value, source", [(None, Source.DETECTED), (200, Source.HINT)])
+@pytest.mark.parametrize("prior_source", [None, Source.DETECTED, Source.HINT])
+def test_a_hint_driven_brightness_is_written_with_source_hint(hint_value, source, prior_source):
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.MANUAL)
+    if prior_source is not None:
+        entry.brightness = Brightness(OTHER_BRIGHTNESS, prior_source)
+    apply_brightness(project, _brightness_job_result(hint_value=hint_value))
+    assert entry.brightness == Brightness(NEW_BRIGHTNESS, source)
+
+
+@pytest.mark.parametrize("source", [Source.MANUAL, Source.IMPORTED])
+def test_a_hint_driven_brightness_never_overwrites_the_users_value(source):
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.MANUAL)
+    entry.brightness = Brightness(OTHER_BRIGHTNESS, source)
+    apply_brightness(project, _brightness_job_result(hint_value=200))
+    assert entry.brightness == Brightness(OTHER_BRIGHTNESS, source)
+
+
+# --- stale results (ruling 1) ---------------------------------------------------------
+
+@pytest.mark.parametrize("current_crop", [
+    None,                                               # crop cleared (or never set) meanwhile
+    Crop(*OLD_BOX, Source.MANUAL),                      # the user edited the crop while the job ran
+    Crop(288, 786, 1344, 54, Source.DETECTED),          # re-detected one row taller
+])
+@pytest.mark.parametrize("hint_value", [None, 250])
+def test_a_brightness_result_measured_on_another_crop_is_dropped_entirely(current_crop, hint_value):
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = current_crop
+    entry.brightness = Brightness(OTHER_BRIGHTNESS, Source.DETECTED)
+    entry.flags = {"brightness": "escalate"}
+    entry.evidence = {"brightness": {"value": OTHER_BRIGHTNESS}}
+    entry.review = ReviewState.REVIEWED
+    before = to_json(project)
+
+    apply_brightness(project, _brightness_job_result(crop_box=NEW_BOX, hint_value=hint_value))
+
+    assert to_json(project) == before
+
+
+@pytest.mark.parametrize("current_crop", [None, Crop(*NEW_BOX, Source.DETECTED)])
+def test_a_brightness_result_measured_without_a_crop_is_dropped(current_crop):
+    project = _project()
+    project.files["a.mp4"].crop = current_crop
+    before = to_json(project)
+    apply_brightness(project, _brightness_job_result(value=230, plateau=None, flagged="needs-crop", strips=[],
+                                                     crop_box=None))
+    assert to_json(project) == before
+
+
+@pytest.mark.parametrize("source", [Source.DETECTED, Source.HINT, Source.MANUAL, Source.IMPORTED])
+def test_a_brightness_result_applies_when_the_crop_coordinates_still_match(source):
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, source)
+    apply_brightness(project, _brightness_job_result(crop_box=NEW_BOX))
+    assert entry.brightness == Brightness(NEW_BRIGHTNESS, Source.DETECTED)
+    assert "brightness" in entry.evidence
 
 
 def test_a_changed_detected_brightness_un_reviews_the_file():
@@ -603,6 +708,7 @@ def test_apply_crop_ignores_a_result_the_detector_marked_cancelled(flagged):
 
 def test_apply_brightness_ignores_a_result_the_detector_marked_cancelled():
     project = _project()
+    project.files["a.mp4"].crop = Crop(*NEW_BOX, Source.DETECTED)    # measured on the current crop: not stale
     before = to_json(project)
     apply_brightness(project, _brightness_job_result(value=230, plateau=None, flagged="cancelled", strips=[]))
     assert to_json(project) == before
@@ -703,11 +809,46 @@ def test_a_file_with_both_values_and_clean_flags_is_proposed():
     assert _review(entry) == ReviewState.PROPOSED
 
 
-def test_a_manual_value_with_a_blocking_detection_flag_is_still_flagged():
+@pytest.mark.parametrize("detector, flag", [("crop", "low-agreement"), ("brightness", "escalate"),
+                                            ("brightness", FLAG_DIFFERS_FROM_HINT)])
+@pytest.mark.parametrize("source, expected", [
+    (Source.DETECTED, ReviewState.FLAGGED),
+    (Source.HINT, ReviewState.FLAGGED),
+    (Source.MANUAL, ReviewState.PROPOSED),
+    (Source.IMPORTED, ReviewState.PROPOSED),
+])
+def test_a_blocking_flag_counts_only_against_a_detected_or_hinted_value(detector, flag, source, expected):
     entry = _ready_entry()
-    entry.crop = Crop(*OLD_BOX, Source.IMPORTED)
-    entry.flags["crop"] = "low-agreement"
+    getattr(entry, detector).source = source
+    entry.flags[detector] = flag
+    assert _review(entry) == expected
+
+
+@pytest.mark.parametrize("detector", ["crop", "brightness"])
+def test_a_blocking_flag_on_a_missing_value_still_flags(detector):
+    entry = _ready_entry()
+    setattr(entry, detector, None)
+    entry.flags[detector] = "low-agreement" if detector == "crop" else "escalate"
     assert _review(entry) == ReviewState.FLAGGED
+
+
+@pytest.mark.parametrize("source", [Source.MANUAL, Source.IMPORTED])
+def test_a_rejected_detection_over_the_users_values_is_stored_but_does_not_flag(source):
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*OLD_BOX, source)
+    entry.brightness = Brightness(OTHER_BRIGHTNESS, source)
+
+    apply_crop(project, _crop_job_result(flagged="low-agreement"))
+    apply_brightness(project, _brightness_job_result(value=180, plateau=(170, 200), flagged="dim-text?",
+                                                     hint_value=250, crop_box=OLD_BOX))
+
+    assert entry.crop == Crop(*OLD_BOX, source)
+    assert entry.brightness == Brightness(OTHER_BRIGHTNESS, source)
+    assert entry.flags == {"crop": "low-agreement", "brightness": "dim-text?+" + FLAG_DIFFERS_FROM_HINT}
+    assert entry.evidence["crop"]["flagged"] == "low-agreement"
+    assert entry.evidence["brightness"]["flagged"] == "dim-text?"
+    assert _state(project, "a.mp4") == ReviewState.PROPOSED
 
 
 def test_labels_only_requires_neither_crop_nor_brightness():
@@ -776,13 +917,26 @@ def test_manual_whole_file_ocrs_the_whole_file_and_survives_detection():
     assert entry.time_ranges.source == Source.MANUAL
 
 
+def test_an_empty_manual_range_list_is_the_whole_file_for_ocr(tmp_path):
+    entry = FileEntry(name="a.mp4", time_ranges=TimeRanges([], Source.MANUAL))
+    folder = FolderSettings()
+    assert ocr_call_for(entry, folder, PROJECT_DIR).time_ranges == []
+    assert ocr_call_for(entry, folder, PROJECT_DIR) == ocr_call_for(FileEntry(name="a.mp4"), folder, PROJECT_DIR)
+
+    project = Project(path=str(tmp_path), folder=folder, files={"a.mp4": entry})
+    restored = from_json(json.loads(json.dumps(to_json(project))), str(tmp_path)).files["a.mp4"]
+    assert restored.time_ranges == TimeRanges([], Source.MANUAL)
+    assert ocr_call_for(restored, folder, PROJECT_DIR).time_ranges == []
+
+
 def test_manual_values_are_never_overwritten_by_detection():
     project = _project()
     set_manual_crop(project, "a.mp4", OLD_BOX)
     set_manual_brightness(project, "a.mp4", OTHER_BRIGHTNESS)
     apply_crop(project, _crop_job_result())
-    apply_brightness(project, _brightness_job_result())
+    apply_brightness(project, _brightness_job_result(crop_box=OLD_BOX))
     entry = project.files["a.mp4"]
+    assert "crop" in entry.evidence and "brightness" in entry.evidence
     assert entry.crop == Crop(*OLD_BOX, Source.MANUAL)
     assert entry.brightness == Brightness(OTHER_BRIGHTNESS, Source.MANUAL)
     assert entry.review == ReviewState.REVIEWED
@@ -1096,6 +1250,7 @@ def test_brightness_job_calls_detect_brightness_with_the_documented_arguments(mo
     assert out.tiles == choose_tiles(result.strips, result.value)
     assert out.tiles
     assert out.hint_value is None
+    assert out.crop_box == NEW_BOX
     assert _idle(engine_registry._idle_detection_engines) == fake_engines["det"]
     assert _idle(engine_registry._idle_ocr_engines) == fake_engines["ocr"]
 
@@ -1108,6 +1263,36 @@ def test_a_brightness_hint_runs_full_detection_and_rides_on_the_result(monkeypat
     assert fake.calls[0]["folder_plateau"] is None
     assert fake.calls[0]["time_ranges"] is None
     assert out.hint_value == 250
+
+
+@pytest.mark.parametrize("crop_box", [NEW_BOX, None])
+def test_a_brightness_job_result_carries_the_crop_box_it_measured_with(monkeypatch, fake_engines, crop_box):
+    monkeypatch.setattr(brightness_mod, "detect_brightness",
+                        Recording(brightness_mod.detect_brightness, returns=_brightness_result()))
+    box = None if crop_box is None else list(crop_box)
+    job = BrightnessJob(PROJECT_DIR, "a.mp4", box, None, FolderSettings())
+    if box is not None:
+        box[0] = 0                                     # captured at construction
+    assert job.run(_ctx(job)).crop_box == crop_box
+
+
+def test_a_crop_edited_while_brightness_ran_drops_the_brightness_result(monkeypatch, fake_engines):
+    monkeypatch.setattr(brightness_mod, "detect_brightness",
+                        Recording(brightness_mod.detect_brightness, returns=_brightness_result()))
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.DETECTED)
+    job = BrightnessJob(PROJECT_DIR, "a.mp4", (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height),
+                        None, project.folder)
+    out = job.run(_ctx(job))
+
+    set_manual_crop(project, "a.mp4", OLD_BOX)         # the user edits the crop while the job runs
+    before = to_json(project)
+    apply_brightness(project, out)
+
+    assert to_json(project) == before
+    assert entry.brightness is None
+    assert "brightness" not in entry.evidence and "brightness" not in entry.flags
 
 
 def test_a_brightness_hint_with_a_folder_plateau_is_refused():
@@ -1299,6 +1484,14 @@ def test_proof_window(sample_time, duration, window, strings):
     assert (format_mss(start), format_mss(end)) == strings
 
 
+def _dialogue_ass(*lines) -> str:
+    """ASS text as the dialogue pass writes it (videocr.utils' own formatters)."""
+    return vc_utils.format_ass_header(1920, 1080) + "".join(
+        vc_utils.format_ass_dialogue(vc_utils.get_ass_timestamp_from_seconds(start),
+                                     vc_utils.get_ass_timestamp_from_seconds(end), text)
+        for start, end, text in lines)
+
+
 @pytest.mark.parametrize("duration", [0.0, -1.0])
 def test_a_proof_needs_the_files_duration(duration):
     with pytest.raises(ValueError):
@@ -1310,12 +1503,8 @@ def test_proof_job_runs_the_files_exact_ocr_call_on_one_window(monkeypatch):
     folder = FolderSettings(label_mask_crops=[(1, 2, 3, 4)], use_gpu=False, conf_threshold=90)
     expected_kwargs = ocr_call_for(entry, folder, PROJECT_DIR).kwargs
 
-    def during(call):
-        call["subtitle_callback"](408.0, 410.5, "第一句")
-        call["subtitle_callback"](411.0, 413.25, "第二句")
-        return "[Script Info]"
-
-    fake = Recording(api.get_subtitles, during=during)
+    fake = Recording(api.get_subtitles, returns=_dialogue_ass(
+        (408.0, 410.5, "第一句"), (411.0, 413.25, "第二句\n第二行, 带逗号")))
     monkeypatch.setattr(api, "get_subtitles", fake)
     job = ProofOcrJob(PROJECT_DIR, entry, folder)
     # Captured at construction: later edits do not change the proof.
@@ -1331,18 +1520,69 @@ def test_proof_job_runs_the_files_exact_ocr_call_on_one_window(monkeypatch):
     assert call["cancel_event"] is ctx.cancel_event
     defaults = {name: p.default for name, p in fake.signature.parameters.items()}
     passed = {name: value for name, value in call.items()
-              if name not in ("time_ranges", "subtitle_callback", "cancel_event")
+              if name not in ("time_ranges", "cancel_event")
               and (name in expected_kwargs or value != defaults[name])}
     assert passed == expected_kwargs
     assert isinstance(out, ProofResult)
     assert out.file == "a.mp4"
     assert out.window == (pytest.approx(407.4), pytest.approx(437.4))
-    assert out.lines == [(408.0, 410.5, "第一句"), (411.0, 413.25, "第二句")]
+    assert out.lines == [(408.0, 410.5, "第一句"), (411.0, 413.25, "第二句\n第二行, 带逗号")]
     assert out.seconds >= 0.0
 
 
-def test_a_proof_with_no_lines_still_returns_a_result(monkeypatch):
-    monkeypatch.setattr(api, "get_subtitles", Recording(api.get_subtitles, returns=""))
+def test_a_labels_only_proof_lists_the_label_lines(monkeypatch):
+    labels = [SimpleNamespace(start_pts=409.0, end_pts=411.5, text="张三", pos_x=100, pos_y=200),
+              SimpleNamespace(start_pts=420.25, end_pts=422.0, text="李四\n护法", pos_x=1500, pos_y=90)]
+    fake = Recording(api.get_subtitles, returns=vc_utils.format_labels_only_ass(labels, 1920, 1080))
+    monkeypatch.setattr(api, "get_subtitles", fake)
+    folder = FolderSettings(dialogue_enabled=False, labels_enabled=True)
+    job = ProofOcrJob(PROJECT_DIR, _entry_for_proof(), folder)
+
+    out = job.run(_ctx(job))
+
+    assert fake.calls[0]["only_labels"] is True
+    assert out.lines == [(409.0, 411.5, "张三"), (420.25, 422.0, "李四\n护法")]
+
+
+def test_a_proof_lists_dialogue_and_label_lines_as_the_run_writes_them(monkeypatch):
+    dialogue = _dialogue_ass((408.0, 410.5, "第一句"), (415.0, 417.0, "第三句"))
+    labels = [SimpleNamespace(start_pts=412.0, end_pts=413.0, text="张三", pos_x=100, pos_y=200)]
+    monkeypatch.setattr(api, "get_subtitles",
+                        Recording(api.get_subtitles, returns=vc_utils.merge_ass_output(dialogue, labels, 1920, 1080)))
+    job = ProofOcrJob(PROJECT_DIR, _entry_for_proof(), FolderSettings())
+    out = job.run(_ctx(job))
+    assert out.lines == [(408.0, 410.5, "第一句"), (412.0, 413.0, "张三"), (415.0, 417.0, "第三句")]
+
+
+def test_proof_text_loses_override_tags_and_keeps_line_breaks(monkeypatch):
+    ass = (vc_utils.format_ass_header(1920, 1080, include_label_style=True)
+           + "Dialogue: 0,0:06:48.00,0:06:50.50,Label,,0,0,0,,{\\pos(10,20)}{\\an8}上{\\i1}行\\N下行\n")
+    monkeypatch.setattr(api, "get_subtitles", Recording(api.get_subtitles, returns=ass))
+    job = ProofOcrJob(PROJECT_DIR, _entry_for_proof(), FolderSettings())
+    assert job.run(_ctx(job)).lines == [(408.0, 410.5, "上行\n下行")]
+
+
+def test_proof_lines_split_only_on_ass_line_ends(monkeypatch):
+    ass = _dialogue_ass((408.0, 410.5, "甲\u2028乙\x1c丙")).replace("\n", "\r\n")
+    monkeypatch.setattr(api, "get_subtitles", Recording(api.get_subtitles, returns=ass))
+    job = ProofOcrJob(PROJECT_DIR, _entry_for_proof(), FolderSettings())
+    assert job.run(_ctx(job)).lines == [(408.0, 410.5, "甲\u2028乙\x1c丙")]
+
+
+def test_a_proof_does_not_collect_lines_through_the_callback(monkeypatch):
+    def during(call):
+        if call["subtitle_callback"] is not None:
+            call["subtitle_callback"](408.0, 410.5, "callback only")
+        return ""
+
+    monkeypatch.setattr(api, "get_subtitles", Recording(api.get_subtitles, during=during))
+    job = ProofOcrJob(PROJECT_DIR, _entry_for_proof(), FolderSettings())
+    assert job.run(_ctx(job)).lines == []
+
+
+@pytest.mark.parametrize("ass", ["", vc_utils.format_ass_header(1920, 1080, include_label_style=True)])
+def test_a_proof_with_no_lines_still_returns_a_result(monkeypatch, ass):
+    monkeypatch.setattr(api, "get_subtitles", Recording(api.get_subtitles, returns=ass))
     job = ProofOcrJob(PROJECT_DIR, _entry_for_proof(sample_time=None), FolderSettings())
     out = job.run(_ctx(job))
     assert out.lines == []
@@ -1354,9 +1594,8 @@ def test_a_cancelled_proof_returns_none(monkeypatch):
     ctx = _ctx(job)
 
     def during(call):
-        call["subtitle_callback"](408.0, 410.5, "第一句")
         ctx.cancel_event.set()
-        return ""
+        return _dialogue_ass((408.0, 410.5, "第一句"))
 
     monkeypatch.setattr(api, "get_subtitles", Recording(api.get_subtitles, during=during))
     assert job.run(ctx) is None
@@ -1472,6 +1711,7 @@ def test_real_jobs_on_a_reference_episode_leave_a_proposed_entry(tmp_path):
                                                          entry.crop.height),
                                    [(r.start, r.end) for r in entry.time_ranges.ranges], project.folder),
                      apply_brightness)
+        proof = run(ProofOcrJob(str(tmp_path), entry, project.folder), lambda project, result: None)
     finally:
         assert runner.shutdown(60)
 
@@ -1480,6 +1720,8 @@ def test_real_jobs_on_a_reference_episode_leave_a_proposed_entry(tmp_path):
           f"probes={crop.result.probes_used} ({timings['crop']:.1f}s)")
     print(f"brightness value={bright.result.value} plateau={bright.result.plateau} "
           f"flagged={bright.result.flagged} tiles={bright.tiles} ({timings['brightness']:.1f}s)")
+    print(f"proof window={proof.window} lines={len(proof.lines)} seconds={proof.seconds:.1f} "
+          f"first={proof.lines[:3]} ({timings['proof']:.1f}s)")
 
     assert meta.width > 0 and meta.height > 0
     assert meta.duration > 1000 and meta.fps > 20
@@ -1488,6 +1730,11 @@ def test_real_jobs_on_a_reference_episode_leave_a_proposed_entry(tmp_path):
     assert entry.crop == Crop(*crop.result.box, Source.DETECTED)
     assert entry.brightness == Brightness(bright.result.value, Source.DETECTED)
     assert entry.sample_time == crop.result.hit_pts[0]
+    assert isinstance(proof, ProofResult)
+    assert proof.window == (entry.sample_time, entry.sample_time + 30.0)
+    assert proof.lines
+    assert all(proof.window[0] - 1.0 <= start < end <= proof.window[1] + 5.0 and text
+               for start, end, text in proof.lines)
     recompute_all(project, pending={}, ranges_pending=False)
     assert entry.review == ReviewState.PROPOSED
     save_project(project)

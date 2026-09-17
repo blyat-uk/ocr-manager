@@ -10,16 +10,27 @@ Detection never overrides the user (rulings C1/C2)
     value whose own source is DETECTED or HINT, and only when the result is
     auto_applicable. MANUAL and IMPORTED values are never written by
     detection. The detector's evidence and flags are stored either way, so
-    the inspector can show "detected X, yours Y".
+    the inspector can show "detected X, yours Y". Hint-driven results (a
+    crop consensus seeded from an edit, a brightness re-detect checked
+    against an edited value) are written with source HINT.
+
+Stale brightness
+    A brightness result is dropped entirely (no value, evidence or flag)
+    unless the file's crop still has the (x, y, width, height) the result was
+    measured with (BrightnessJobResult.crop_box).
 
 Review
     compute_review_state() is the only place a file's state is derived.
     REVIEWED is the one stored decision: it is set by the user
     (mark_reviewed, set_manual_*, paste_settings), and it is cleared by an
-    apply only when a detected or hinted value the file was reviewed with
-    changes. A field that was empty had no reviewed value, so filling it
-    leaves REVIEWED alone, and so do the user's own values, which detection
-    never changes.
+    apply that changes a value: a detected or hinted value the file was
+    reviewed with, or an empty field detection fills (the user never saw
+    that value). The user's own values are never changed by detection, so
+    they never clear it.
+    Flags describe detection results. A blocking flag counts against a file
+    only while the field holds a detected or hinted value (or none): a
+    detection that was not applied over the user's value is kept as evidence
+    and does not flag the file.
     Functions here do not know which jobs are still pending. When they
     clear REVIEWED, they store PENDING as a placeholder. The model owner
     follows applies and edits with recompute_all(), which derives every
@@ -88,12 +99,13 @@ def _detection_may_write(value) -> bool:
 
 def _write_detected(entry: FileEntry, field: str, new) -> None:
     """Write a detected value into a field _detection_may_write() allowed.
-    A REVIEWED file loses its review only when the detected or hinted value
-    it was reviewed with changes."""
+    A REVIEWED file loses its review when the OCR-visible value changes: a
+    detected or hinted value replaced by a different one, or an empty field
+    filled."""
     old = getattr(entry, field)
     setattr(entry, field, new)
-    if (entry.review == ReviewState.REVIEWED and old is not None
-            and old.source in DETECTION_SOURCES and _value_key(old) != _value_key(new)):
+    if (entry.review == ReviewState.REVIEWED and (old is None or old.source in DETECTION_SOURCES)
+            and _value_key(old) != _value_key(new)):
         entry.review = ReviewState.PENDING
 
 
@@ -141,14 +153,21 @@ def apply_crop(project: Project, r: CropJobResult | None) -> None:
 
 def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
     """Store the brightness evidence (with its tiles) and flags; write the
-    value when allowed. A hint re-detection whose plateau does not contain
-    the hint value gains "differs-from-hint?" on the file's flags (ruling C3).
-    Its value is still written when auto-applicable, because it is the
-    detector's verified value, and the flag sends the file to review."""
+    value when allowed, with source HINT for a hint re-detection. A hint
+    re-detection whose plateau does not contain the hint value gains
+    "differs-from-hint?" on the file's flags (ruling C3). Its value is still
+    written when auto-applicable, because it is the detector's verified
+    value, and the flag sends the file to review.
+
+    Stale results are dropped entirely: when the file has no crop, or its
+    crop is not the box the result was measured with (r.crop_box), nothing
+    about the file changes."""
     if r is None or detector_cancelled(r.result.flagged):
         return
     entry = project.files.get(r.file)
     if entry is None:
+        return
+    if entry.crop is None or r.crop_box is None or _value_key(entry.crop) != _crop_tuple(r.crop_box):
         return
     result = r.result
     entry.evidence["brightness"] = {**result.to_evidence(),
@@ -161,7 +180,8 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
     entry.flags["brightness"] = flag
 
     if _detection_may_write(entry.brightness) and result.auto_applicable:
-        _write_detected(entry, "brightness", Brightness(int(result.value), Source.DETECTED))
+        source = Source.HINT if r.hint_value is not None else Source.DETECTED
+        _write_detected(entry, "brightness", Brightness(int(result.value), source))
 
 
 def apply_ranges(project: Project, r: RangesJobResult | None) -> None:
@@ -282,19 +302,22 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
     """REVIEWED if the user reviewed it. Otherwise PENDING while a required
     detector (crop and brightness when dialogue is extracted, none for
     labels-only) or the folder's ranges analysis is pending. Otherwise
-    FLAGGED when a required value is missing, or when a required detector's
-    stored flags include a reason that is not informational for that
-    detector ("differs-from-hint?" and unknown reasons block). Otherwise
-    PROPOSED."""
+    FLAGGED when a required value is missing, or when a required value is
+    detected or hinted and its detector's stored flags include a reason that
+    is not informational for that detector ("differs-from-hint?" and unknown
+    reasons block). Flags beside a MANUAL or IMPORTED value do not count.
+    Otherwise PROPOSED."""
     if entry.review == ReviewState.REVIEWED:
         return ReviewState.REVIEWED
     required = DIALOGUE_DETECTORS if folder.dialogue_enabled else ()
     if ranges_pending or any(name in detections_pending for name in required):
         return ReviewState.PENDING
     for name in required:
-        if getattr(entry, name) is None:
+        value = getattr(entry, name)
+        if value is None:
             return ReviewState.FLAGGED
-        if not only_informational(entry.flags.get(name) or None, INFORMATIONAL_FLAGS[name]):
+        if (value.source in DETECTION_SOURCES
+                and not only_informational(entry.flags.get(name) or None, INFORMATIONAL_FLAGS[name])):
             return ReviewState.FLAGGED
     return ReviewState.PROPOSED
 
