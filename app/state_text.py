@@ -25,6 +25,10 @@ dropping a table row plan 3A hasn't wired up yet.
 """
 from __future__ import annotations
 
+import math
+import statistics
+from collections.abc import Iterable
+
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
 from core.detect.flags import only_informational
@@ -356,6 +360,31 @@ def field_blocking(entry: FileEntry, field: str) -> bool:
     value -- the `blocking=` argument of the captions above. `field`: "crop" |
     "brightness" | "ranges"."""
     return _flag_blocks_detected_value(entry, field, getattr(entry, _FIELD_VALUE[field]))
+
+
+# --------------------------------------------------------------------------
+# The series note (the Brightness panel and the inspector's Detected note)
+# --------------------------------------------------------------------------
+
+SERIES_MEDIAN_MIN_FILES = 3      # fewer files than this: a "median" says nothing
+
+
+def series_median_note(entries: Iterable[FileEntry]) -> str | None:
+    """"Series median brightness is {median} — this episode keeps its own."
+    for a folder where at least SERIES_MEDIAN_MIN_FILES files have a
+    brightness value; None otherwise.
+
+    The median runs over the files that HAVE a value, whatever its source:
+    the point of the line is that the episode's own value is allowed to
+    differ from the rest of the series, and a file still waiting for its
+    detection has no opinion to weigh in. An even count gives the mean of
+    the two middle values, rounded half up to a whole level -- brightness is
+    only ever a whole level."""
+    values = [entry.brightness.value for entry in entries if entry.brightness is not None]
+    if len(values) < SERIES_MEDIAN_MIN_FILES:
+        return None
+    median = math.floor(statistics.median(values) + 0.5)
+    return f"Series median brightness is {median} — this episode keeps its own."
 
 
 # --------------------------------------------------------------------------
