@@ -67,13 +67,13 @@ from app.masking import aggregate_crop_box, mask_region
 from app.state_text import clock, crop_caption, crop_flag_summary
 from app.theme import tokens
 from app.views.inspector_sections import Section, note_label
+from app.views.ranges_view import Timeline
 from app.views.thumbnail import GRADIENT_DEGREES, GRADIENT_END_STOP, css_gradient
 from app.widgets.base import Button, KvRow, SectionHeader
 
 COMMIT_DEBOUNCE_MS = 400          # one command per gesture: nudges and spin-box edits
 DEFAULT_BRIGHTNESS = 230          # core.config.Config's default, for a file with no value yet
 NUDGE_SMALL, NUDGE_LARGE = 1, 10  # video pixels, plain and with Shift
-TIMELINE_HEIGHT = 68              # the compact timeline lands here (ruling B5, plan 3C Task 4)
 NUDGE_NOTE = "Arrow keys nudge 1 px, ⇧ arrows nudge 10. Free rectangle — no forced centring."
 COVERED_NOTE = "The amber box already covers it. Click the warned sample to inspect."
 OUTSIDE_NOTE = "This sample falls outside the box."
@@ -1289,10 +1289,10 @@ class CropTab:
         column.addWidget(self.canvas)
         self.strip = SampleStrip()
         column.addWidget(self.strip)
-        self.timeline_placeholder = QWidget()
-        self.timeline_placeholder.setObjectName("CompactTimelinePlaceholder")
-        self.timeline_placeholder.setFixedHeight(TIMELINE_HEIGHT)
-        column.addWidget(self.timeline_placeholder)
+        column.addSpacing(8)
+        self.timeline = Timeline(controller, mode="compact")    # ruling B5
+        self.timeline.seek_requested.connect(self.select_nearest)
+        column.addWidget(self.timeline)
         column.addStretch(1)                     # the slack goes below, not around the frame
         outer.addWidget(body, 1)
         QWidget.setTabOrder(self.canvas, self.strip)
@@ -1346,10 +1346,12 @@ class CropTab:
             self._thumbnails.clear()
             self.strip.reset_page()
         self._file = name
+        self.timeline.set_file(name)
         self.refresh()
 
     def refresh(self) -> None:
         entry = self._entry()
+        self.timeline.refresh()
         if entry is None:
             self._page.setEnabled(False)
             self.strip.set_state([], -1, set(), {})
@@ -1449,6 +1451,15 @@ class CropTab:
 
     def step(self, delta: int) -> None:
         self.select(self._selected + int(delta))
+
+    def select_nearest(self, time: float) -> None:
+        """Ruling B5: a click on the compact timeline jumps the canvas to the
+        sample nearest that time -- the frames here exist only at the times
+        the detector probed, so there is nothing else to jump to."""
+        if not self._samples:
+            return
+        times = [sample.time for sample in self._samples]
+        self.select(min(range(len(times)), key=lambda index: abs(times[index] - float(time))))
 
     # --- commands ---------------------------------------------------------------------
 

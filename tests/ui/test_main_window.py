@@ -28,6 +28,7 @@ from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.views import open_folder as open_folder_module
 from app.views.stage import Stage, StageTab, placeholder_tabs
+from app.widgets.base import KvRow
 from core.detect.brightness import BrightnessResult
 from core.detect.crop import FLAG_LOW_AGREEMENT, CropResult
 from core.jobs.detect_jobs import BrightnessJobResult, CropJobResult, ProofResult
@@ -521,6 +522,30 @@ def test_placeholder_tabs_follow_the_selected_file(qapp, controller, make_window
     window.controller.set_crop(SLAY_NAMES[1], (300, 790, 1300, 50))
     assert crop_tab.values() == ["300, 790 · 1300 × 50", "manual"]
     assert isinstance(crop_tab, StageTab)
+
+
+def test_replaced_rows_are_unparented_not_just_unlaid_out(qapp, controller, make_window,
+                                                          tmp_project):
+    """`removeWidget` leaves a row a child of the list, at whatever size it
+    had -- a row that was never laid out keeps QWidget's default 640x480 and
+    paints over everything beneath it until it is really deleted.
+
+    `held` stands in for what keeps a replaced row alive in real use: a row
+    with a signal connection of its own outlives the call that dropped it,
+    because the two reference each other (app/views/ranges_view.py's rows do,
+    and one of them hid a row of buttons)."""
+    window = make_window(tabs_factory=placeholder_tabs)
+    window.open_folder(str(tmp_project(fixture="slay")))
+    crop_tab = window.stage.tabs()[0]
+    window.queue.select(SLAY_NAMES[1])
+    page = crop_tab.page()
+    held = page.findChildren(KvRow)
+    assert len(held) == 2
+    crop_tab.set_file(None)                        # no file: both rows go
+    assert page.findChildren(KvRow) == []
+    crop_tab.set_file(SLAY_NAMES[1])               # and come back, without the old ones
+    assert len(page.findChildren(KvRow)) == 2
+    assert not set(page.findChildren(KvRow)) & set(held)
 
 
 def test_selecting_a_file_updates_the_inspector_header_and_detected_rows(slay_window):

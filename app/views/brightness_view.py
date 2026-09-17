@@ -42,8 +42,9 @@ head (ruling B3); the page below it is:
     ContextStrip   the whole strip, 26 px, with the draggable amber window
     tiles          3-column grid of ZoomTile, then the dashed PinTile
     ThresholdCurve the two curves, the plateau band and both markers
-    timeline slot  68 px kept free for the compact timeline (ruling B5,
-                   mounted by plan 3C Task 4)
+    Timeline       the compact, read-only timeline (ruling B5): a click on
+                   it picks the frame the pin tile offers, a double-click
+                   pins one straight away
 """
 from __future__ import annotations
 
@@ -51,7 +52,15 @@ from collections.abc import Callable
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QLinearGradient, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QImage,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
@@ -73,6 +82,7 @@ from app.masking import (
 from app.state_text import brightness_flag_text, brightness_is_stale, clock
 from app.theme import tokens
 from app.views.inspector_sections import note_label, small_button
+from app.views.ranges_view import Timeline
 from app.widgets.base import Button, KvRow, SectionHeader
 
 # --- copy ------------------------------------------------------------------
@@ -125,8 +135,6 @@ PLATEAU_ALPHA = 0.08         # rect ... opacity=".08"
 CURVE_WIDTH = 1.5
 CLUTTER_WIDTH = 1.2
 MARKER_RADIUS = 3.5
-
-TIMELINE_SLOT_HEIGHT = 68    # ruling B5: a 52 px track plus a 16 px speech lane
 
 
 def _alpha(colour: str, alpha: float) -> QColor:
@@ -798,8 +806,9 @@ class BrightnessTab:
         self._facts_key: tuple | None = None
         self._crop_box: tuple[int, int, int, int] | None = None
 
-        # Plan 3C Task 4 sets this to the compact timeline's current position
-        # (seconds, or None when it has none); the pin tile asks it for a time.
+        # The compact timeline's current position (seconds, or None when it
+        # has none); the pin tile asks it for a time. `_build_page` points it
+        # at the timeline it mounts (ruling B5).
         self.timeline_position: Callable[[], float | None] | None = None
 
         self._build_page()
@@ -869,10 +878,10 @@ class BrightnessTab:
         self.curve.previewed.connect(self.set_preview)
         column.addWidget(self.curve)
 
-        self._timeline_slot = QWidget()
-        self._timeline_slot.setObjectName("TimelineSlot")
-        self._timeline_slot.setFixedHeight(TIMELINE_SLOT_HEIGHT)
-        column.addWidget(self._timeline_slot)          # under the stage (ruling B5)
+        self._timeline = Timeline(self._controller, mode="compact")
+        self._timeline.pin_requested.connect(self.pin_time)
+        self.timeline_position = self._timeline.position
+        column.addWidget(self._timeline)               # under the stage (ruling B5)
         self._page = page
 
     # --- StageTab ---------------------------------------------------------
@@ -892,10 +901,12 @@ class BrightnessTab:
     def set_file(self, name: str | None) -> None:
         self._file = name
         self._offset, self._offset_ready = 0.0, False
+        self._timeline.set_file(name)
         self.refresh()
 
     def refresh(self) -> None:
         entry = self._entry()
+        self._timeline.refresh()
         evidence = (entry.evidence.get("brightness") or {}) if entry is not None else {}
         self._crop_box = self._box_for(entry, evidence)
         auto = evidence.get("value")
@@ -921,9 +932,11 @@ class BrightnessTab:
     def grid_widgets(self) -> list[QWidget]:
         return [*self._tiles, self.pin_tile_widget]
 
-    def timeline_slot(self) -> QWidget:
-        """The 68 px ruling-B5 placeholder plan 3C Task 4 mounts into."""
-        return self._timeline_slot
+    def timeline_slot(self) -> Timeline:
+        """The compact, read-only timeline under the stage (ruling B5). A
+        click on it picks the frame the pin tile offers; a double-click pins
+        it straight away."""
+        return self._timeline
 
     def threshold(self) -> int:
         return self._preview

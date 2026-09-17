@@ -4,15 +4,16 @@ the pixels they measure with.
 `tests/ui/test_main_window.py::test_views_import_no_core_modules` rejects any
 `core.*` import in `app/views/*.py`, so a view that needs one of the Qt-free,
 pure detector helpers reaches it through here. This is the whole of that
-bridge -- the Crop tab's box aggregation and mask preview, and the Brightness
-tab's strip measurements -- so there is one place to look for what the views
-take from `core`, and one place a detector rename has to reach.
+bridge -- the Crop tab's box aggregation and mask preview, the Brightness
+tab's strip measurements and the Time ranges tab's speech-in-a-skip check --
+so there is one place to look for what the views take from `core`, and one
+place a detector rename has to reach.
 
-Every wrapper calls through the module object (`_crop.` / `ocr_view.`) rather
-than a name bound at import time, so a test that monkeypatches
-`core.detect.crop.aggregate_box` or `core.detect.ocr_view.mask` still sees the
-call. Nothing here holds state beyond one strip's measurements, decides
-anything, or imports Qt.
+Every wrapper calls through the module object (`_crop.` / `ocr_view.` /
+`_audio.`) rather than a name bound at import time, so a test that
+monkeypatches `core.detect.crop.aggregate_box` or `core.detect.ocr_view.mask`
+still sees the call. Nothing here holds state beyond one strip's
+measurements, decides anything, or imports Qt.
 
 `StripPixels` holds one OCR-exact strip (as `ocr_view.grab_ocr_strips_at`
 produced it) plus the detector's polygon boxes for it, and answers the
@@ -41,6 +42,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from core.detect import audio_profile as _audio
 from core.detect import crop as _crop
 from core.detect import ocr_view
 from core.detect.brightness import DEFAULT_BRIGHTNESS, MIN_GLYPH_REGION_PIXELS
@@ -48,7 +50,7 @@ from core.detect.brightness import DEFAULT_BRIGHTNESS, MIN_GLYPH_REGION_PIXELS
 __all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_T",
            "StripPixels",
            "aggregate_crop_box", "clip_boxes", "gate_fires", "mask", "mask_region",
-           "normalise_boxes"]
+           "normalise_boxes", "speech_in_skips"]
 
 MIN_T = 100                # the thresholds the curve spans; a subtitle threshold
 MAX_T = 255                # is never picked outside them (core/detect/brightness.py)
@@ -106,6 +108,16 @@ def aggregate_crop_box(boxes_per_sample, frame_size, settings: dict | None = Non
     box = _crop.aggregate_box(polygons, tuple(int(value) for value in frame_size), settings=settings,
                               sample_times=None if sample_times is None else [float(t) for t in sample_times])
     return None if box is None else tuple(int(value) for value in box)
+
+
+def speech_in_skips(speech, skips, min_overlap_sec: float = 2.0) -> list[tuple[float, float]]:
+    """`core.detect.audio_profile.speech_in_skips`, resolved at call time --
+    the Time ranges tab's speech-in-a-skipped-span warnings.
+
+    `skips` are the timeline's own (start_sec, end_sec) keep-complement
+    spans, not the detected blocks: what matters is what the OCR run will
+    really skip, which is whatever the keep ranges leave out."""
+    return _audio.speech_in_skips(speech, skips, min_overlap_sec)
 
 
 def mask_region(region, threshold: int):
