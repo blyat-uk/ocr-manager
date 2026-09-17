@@ -13,11 +13,12 @@ and one two-line sample.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 import numpy as np
 import pytest
-from PyQt6.QtCore import QEvent, QPointF, QSettings, Qt
+from PyQt6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QWidget
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
-from app.views.crop_view import CropTab
+from app.views.crop_view import DETECTED_TAG, CropCanvas, CropTab, SampleStrip
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
 from core.detect import crop as crop_mod
@@ -487,7 +488,7 @@ def test_no_sample_is_disagreeing_when_the_detection_found_no_box(make_tab):
     harness = make_tab(evidence=crop_evidence(box=None, envelope=None, flagged="static-content"))
     tones = {thumb.sample_index(): thumb.tone() for thumb in harness.tab.strip.thumbnails()}
     assert "warn" not in tones.values()
-    assert any("static-content" in text for _key, text in harness.tab.panel.rows())
+    assert dict(harness.tab.panel.rows())["Detection"] == "a watermark, not subtitles"
 
 
 def test_clicking_a_thumbnail_selects_it_and_takes_the_keyboard(make_tab):
@@ -820,3 +821,180 @@ def test_the_crop_view_never_reaches_for_ocr_strips():
     source = (Path(__file__).resolve().parents[2] / "app" / "views" / "crop_view.py").read_text("utf-8")
     assert "grab_ocr_strips_at" not in source
     assert "request_strips" not in source
+
+
+# --------------------------------------------------------------------------
+# Fix round 1
+# --------------------------------------------------------------------------
+
+def test_a_typed_x_beyond_the_frame_is_clamped_before_it_is_stored(make_tab):
+    """A stored crop the frame cannot hold is a fidelity bug: videocr slices
+    frame[y:y+h, x:x+w] and numpy clips silently, so the OCR pass would read
+    a narrower band than the box says."""
+    harness = make_tab()
+    panel = harness.tab.panel
+    panel.set_spin_values(600, BOX[2], BOX[1], BOX[3])
+    panel.flush()
+    clamped = (FRAME_SIZE[0] - BOX[2], BOX[1], BOX[2], BOX[3])
+    assert harness.crop() == clamped
+    assert harness.tab.canvas.box() == clamped
+    assert panel.spin_values() == clamped
+
+
+def test_a_typed_width_beyond_the_right_edge_is_clamped(make_tab):
+    harness = make_tab()
+    panel = harness.tab.panel
+    panel.set_spin_values(BOX[0], 1800, BOX[1], BOX[3])
+    panel.flush()
+    clamped = (BOX[0], BOX[1], FRAME_SIZE[0] - BOX[0], BOX[3])
+    assert harness.crop() == clamped
+    assert harness.tab.canvas.box() == clamped
+    assert panel.spin_values() == clamped
+
+
+def test_typed_pairs_always_store_exactly_what_is_shown_inside_the_frame(make_tab):
+    harness = make_tab()
+    panel = harness.tab.panel
+    width, height = FRAME_SIZE
+    rng = random.Random(20260917)
+    for _ in range(16):
+        panel.set_spin_values(rng.randrange(-300, 2400), rng.randrange(-80, 2400),
+                              rng.randrange(-300, 1400), rng.randrange(-80, 1400))
+        panel.flush()
+        stored = harness.crop()
+        assert stored == harness.tab.canvas.box() == panel.spin_values()
+        x, y, box_width, box_height = stored
+        assert 0 <= x and 0 <= y
+        assert x + box_width <= width and y + box_height <= height
+        assert box_width >= CropCanvas.MIN_BOX and box_height >= CropCanvas.MIN_BOX
+
+
+def test_fit_to_samples_always_commits_even_when_the_box_is_unchanged(make_tab, monkeypatch):
+    """The aggregation reproducing the detector's own box is the normal case
+    on an unreviewed file; the click must still make the value yours."""
+    monkeypatch.setattr(crop_mod, "aggregate_box", lambda *args, **kwargs: list(BOX))
+    harness = make_tab(source=Source.DETECTED)
+    assert harness.entry().crop.source == Source.DETECTED
+    harness.tab.fit_button.click()
+    assert harness.crop() == BOX
+    assert harness.entry().crop.source == Source.MANUAL
+
+
+def test_a_gesture_that_changes_nothing_commits_nothing(make_tab):
+    harness = make_tab(source=Source.DETECTED)
+    calls = []
+    original = harness.controller.set_crop
+    harness.controller.set_crop = lambda name, box: calls.append(box) or original(name, box)
+    canvas = harness.tab.canvas
+    point = canvas.to_widget(BOX[0] + BOX[2] / 2, BOX[1] + BOX[3] / 2)
+    gesture(canvas, point, point)
+    assert calls == []
+    assert harness.entry().crop.source == Source.DETECTED
+
+
+def test_paging_survives_a_frame_ready_burst(make_tab):
+    harness = make_tab()
+    strip = harness.tab.strip
+    strip.more_button.click()
+    assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(8, 12))
+    harness.deliver_frames()
+    assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(8, 12))
+    harness.tab.select(0)                               # the selection leaving the page re-pages
+    assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(8))
+
+
+def test_partial_evidence_falls_back_to_the_no_evidence_row(make_tab):
+    """A deleted evidence cache can leave a dict with nothing in it worth
+    showing -- 'Samples with text 0 / 0' would be a lie."""
+    harness = make_tab(evidence={"frame_size": list(FRAME_SIZE), "cutoff_frac": 0.55})
+    assert dict(harness.tab.panel.rows()) == {"Source": "set by you"}
+
+
+def test_an_informational_flag_reads_plainly_and_does_not_warn(make_tab):
+    harness = make_tab(evidence=crop_evidence(flagged="no-speech"))
+    panel = harness.tab.panel
+    assert dict(panel.rows())["Detection"] == "no speech — probed evenly"
+    assert panel.row_tone("Detection") == ""
+
+
+def test_a_blocking_flag_reads_in_human_words_and_warns(make_tab):
+    harness = make_tab(evidence=crop_evidence(box=None, envelope=None, flagged="static-content"))
+    panel = harness.tab.panel
+    assert dict(panel.rows())["Detection"] == "a watermark, not subtitles"
+    assert panel.row_tone("Detection") == "warn"
+
+
+def test_thumbnails_centre_crop_instead_of_squashing(make_tab):
+    harness = make_tab()
+    harness.deliver_frames()
+    thumb = harness.tab.strip.thumbnails()[0]
+    target = QRectF(0, 0, SampleStrip.THUMB_WIDTH, SampleStrip.THUMB_HEIGHT)
+    source = thumb.source_rect(target)
+    image = thumb.image()
+    assert image is not None and source is not None
+    assert source.width() / source.height() == pytest.approx(target.width() / target.height())
+    assert source.center().x() == pytest.approx(image.width() / 2)
+    assert source.center().y() == pytest.approx(image.height() / 2)
+
+
+def test_the_detected_overlay_is_independent_of_the_envelope_toggle(make_tab):
+    harness = make_tab(crop=(300, 800, 1300, 60))
+    canvas = harness.tab.canvas
+    assert canvas.tags()["bottom_left"] == DETECTED_TAG
+    harness.tab.envelope_button.click()
+    assert canvas.tags()["bottom_left"] == DETECTED_TAG      # ruling C2 is not a toggle
+    assert "bottom_right" not in canvas.tags()               # only the envelope legend went
+    assert canvas.detected_box() == BOX
+    canvas.grab()
+
+
+def test_two_disagreeing_samples_each_get_their_own_clickable_row(make_tab):
+    samples = default_samples()
+    samples[1 + 6] = sample(SAMPLE_TIMES[6], kept=False, boxes=((310, 860, 1300, 40),))
+    harness = make_tab(evidence=crop_evidence(samples=samples))
+    panel = harness.tab.panel
+    keys = [key for key, _value in panel.rows()]
+    assert keys.count("1 sample sits lower") == 2
+    panel.click_sample_row(6)
+    assert harness.tab.selected_index() == 6
+    panel.click_sample_row(LOWER_INDEX)
+    assert harness.tab.selected_index() == LOWER_INDEX
+
+
+def test_closing_the_page_flushes_a_pending_nudge(make_tab):
+    harness = make_tab()
+    arrow(harness.tab.canvas, Qt.Key.Key_Up)
+    assert harness.crop() == BOX                            # still inside the debounce
+    harness.tab.page().close()
+    assert harness.crop() == (BOX[0], BOX[1] - 1, BOX[2], BOX[3])
+
+
+def test_closing_the_page_flushes_a_typed_value(make_tab):
+    harness = make_tab()
+    harness.tab.panel.set_spin_values(300, 1300, 800, 60)
+    assert harness.crop() == BOX
+    harness.tab.page().close()
+    assert harness.crop() == (300, 800, 1300, 60)
+
+
+def test_closing_the_window_flushes_a_pending_nudge(qapp, fake_runner, tmp_project):
+    """MainWindow.closeEvent shuts the controller down, so the flush has to
+    happen before it -- a hide afterwards would be too late."""
+    controller = ProjectController(fake_runner, save_debounce_ms=10)
+    window = MainWindow(controller, tabs_factory=evidence_tabs)
+    try:
+        path = tmp_project(NAMES)
+        save_project(Project(path=str(path), folder=FolderSettings(labels_enabled=False),
+                             files={name: make_entry(name) for name in NAMES}))
+        window.show()                       # a pending crop edit implies a visible crop page
+        window.open_folder(str(path))
+        window.stage.set_file(NAMES[0])
+        QApplication.processEvents()
+        tab = window.stage.tabs()[0]
+        arrow(tab.canvas, Qt.Key.Key_Up)
+        assert controller.entry(NAMES[0]).crop.y == BOX[1]
+        window.close()
+        assert controller.entry(NAMES[0]).crop.y == BOX[1] - 1
+    finally:
+        window.deleteLater()
+        controller.shutdown(timeout=0.5)

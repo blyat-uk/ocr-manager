@@ -51,7 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PyQt6 import sip
-from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QRadialGradient
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -64,7 +64,7 @@ from PyQt6.QtWidgets import (
 
 from app.imaging import bgr_to_qimage
 from app.masking import aggregate_crop_box, mask_region
-from app.state_text import clock, crop_caption
+from app.state_text import clock, crop_caption, crop_flag_summary
 from app.theme import tokens
 from app.views.inspector_sections import Section, note_label
 from app.views.thumbnail import GRADIENT_DEGREES, GRADIENT_END_STOP, css_gradient
@@ -131,6 +131,23 @@ def _with_alpha(colour: str, alpha: float) -> QColor:
     return result
 
 
+def clamp_box(box, video_size, minimum: int) -> tuple[int, int, int, int]:
+    """`box` as the frame can actually hold it: inside (0, 0, w, h) and at
+    least `minimum` on each side.
+
+    Every path that stores a crop goes through this. The OCR pass slices
+    `frame[y:y + h, x:x + w]` and numpy clips a slice that runs past the
+    edge without a word, so a stored box the frame cannot hold would quietly
+    OCR a smaller region than the value says -- and than this view draws.
+    """
+    video_width, video_height = video_size
+    width = _clamp(int(box[2]), minimum, max(minimum, int(video_width)))
+    height = _clamp(int(box[3]), minimum, max(minimum, int(video_height)))
+    x = _clamp(int(box[0]), 0, max(0, int(video_width) - width))
+    y = _clamp(int(box[1]), 0, max(0, int(video_height) - height))
+    return (x, y, width, height)
+
+
 @dataclass(frozen=True)
 class CropSampleView:
     """One de-duplicated probe frame of `evidence["crop"]["samples"]`."""
@@ -143,6 +160,20 @@ class CropSampleView:
     @property
     def extent(self) -> tuple[int, int, int, int] | None:
         return _union(self.boxes)
+
+
+def _has_evidence(evidence: dict | None) -> bool:
+    """Whether `evidence["crop"]` holds anything worth presenting as
+    evidence.
+
+    The cache is disposable and may come back partial -- a dict carrying
+    only `frame_size` says nothing about any sample, and reporting "Samples
+    with text 0 / 0" for it would be a lie. Such a dict reads as no evidence
+    at all, which is the honest fallback."""
+    if not evidence:
+        return False
+    return bool(evidence.get("samples")) or _read_box(evidence.get("box")) is not None \
+        or _read_box(evidence.get("envelope")) is not None
 
 
 def _preference(sample: CropSampleView) -> tuple[bool, bool]:
@@ -405,12 +436,7 @@ class CropCanvas(QWidget):
             self.box_changed.emit()
 
     def _clamped(self, box) -> tuple[int, int, int, int]:
-        video_width, video_height = self._video
-        width = _clamp(int(box[2]), self.MIN_BOX, video_width)
-        height = _clamp(int(box[3]), self.MIN_BOX, video_height)
-        x = _clamp(int(box[0]), 0, video_width - width)
-        y = _clamp(int(box[1]), 0, video_height - height)
-        return (x, y, width, height)
+        return clamp_box(box, self._video, self.MIN_BOX)
 
     def _resize(self, handle: str | None, start_box, dx: float, dy: float) -> None:
         self._pending = True
@@ -544,8 +570,10 @@ class CropCanvas(QWidget):
                 "top_right": f"crop {x}, {y} · {box_width} × {box_height}"}
         if self._overlays["envelope"]:
             tags["bottom_right"] = f"dashed = text found across all {self._kept} samples"
-            if self._detected is not None:
-                tags["bottom_left"] = DETECTED_TAG
+        if self._detected is not None:
+            # Ruling C2 is not a toggle: the user must always be able to see
+            # that the amber box is theirs and the detection said otherwise.
+            tags["bottom_left"] = DETECTED_TAG
         return tags
 
     def paintEvent(self, event) -> None:
@@ -564,6 +592,7 @@ class CropCanvas(QWidget):
         self._paint_label_masks(painter)
         self._paint_spotlight(painter, bounds)
         self._paint_envelope(painter)
+        self._paint_detected(painter)
         self._paint_box(painter)
         self._paint_grid(painter)
         self._paint_tags(painter, bounds)
@@ -647,15 +676,21 @@ class CropCanvas(QWidget):
         return pen
 
     def _paint_envelope(self, painter: QPainter) -> None:
-        if not self._overlays["envelope"]:
+        if not self._overlays["envelope"] or self._envelope is None:
             return
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        if self._envelope is not None:
-            painter.setPen(self._dashed(_with_alpha(tokens.BLUE, tokens.ENVELOPE_ALPHA)))
-            painter.drawRoundedRect(self.video_rect(self._envelope), tokens.RADIUS_XS, tokens.RADIUS_XS)
-        if self._detected is not None:
-            painter.setPen(self._dashed(QColor(tokens.DIM)))
-            painter.drawRoundedRect(self.video_rect(self._detected), tokens.RADIUS_XS, tokens.RADIUS_XS)
+        painter.setPen(self._dashed(_with_alpha(tokens.BLUE, tokens.ENVELOPE_ALPHA)))
+        painter.drawRoundedRect(self.video_rect(self._envelope), tokens.RADIUS_XS, tokens.RADIUS_XS)
+
+    def _paint_detected(self, painter: QPainter) -> None:
+        """The latest detection, when it differs from the stored box (ruling
+        C2). Drawn whatever the envelope toggle says: it is not evidence the
+        user asked to see, it is a disagreement with their own value."""
+        if self._detected is None:
+            return
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._dashed(QColor(tokens.DIM)))
+        painter.drawRoundedRect(self.video_rect(self._detected), tokens.RADIUS_XS, tokens.RADIUS_XS)
 
     def _paint_box(self, painter: QPainter) -> None:
         rect = self.box_rect()
@@ -741,6 +776,20 @@ class SampleThumbnail(QWidget):
     def tone(self) -> str:
         return self._tone
 
+    def image(self) -> QImage | None:
+        return self._image
+
+    def source_rect(self, target: QRectF) -> QRectF | None:
+        """The centred part of the frame that fills `target` at the frame's
+        own aspect ratio -- a thumbnail centre-crops, it never squashes a
+        16:9 frame into a 16:9-ish box of another shape."""
+        image = self._image
+        if image is None or image.isNull() or target.width() <= 0 or target.height() <= 0:
+            return None
+        scale = max(target.width() / image.width(), target.height() / image.height())
+        width, height = target.width() / scale, target.height() / scale
+        return QRectF((image.width() - width) / 2, (image.height() - height) / 2, width, height)
+
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
             self.clicked.emit(self._index)
@@ -760,8 +809,9 @@ class SampleThumbnail(QWidget):
         gradient.setColorAt(GRADIENT_END_STOP, QColor(tokens.THUMB_BOTTOM))
         gradient.setColorAt(1.0, QColor(tokens.THUMB_BOTTOM))
         painter.fillRect(bounds, gradient)
-        if self._image is not None and not self._image.isNull():
-            painter.drawImage(bounds, self._image)
+        source = self.source_rect(bounds)
+        if source is not None:
+            painter.drawImage(bounds, self._image, source)
         else:
             self._paint_bars(painter, bounds)
         painter.restore()
@@ -850,6 +900,13 @@ class SampleStrip(QWidget):
     def pages(self) -> int:
         return max(1, -(-len(self._samples) // self.PAGE))
 
+    def reveal(self, index: int) -> None:
+        """Page to the sample at `index`: the view followed a click, ◀ / ▶,
+        a warn row in the panel, or a fresh detection."""
+        if 0 <= index < len(self._samples):
+            self._page = min(index // self.PAGE, self.pages() - 1)
+            self._relayout()
+
     def next_page(self) -> None:
         self._page = (self._page + 1) % self.pages()
         self._relayout()
@@ -860,9 +917,10 @@ class SampleStrip(QWidget):
         self._selected = selected
         self._warned = set(warned)
         self._images = dict(images)
-        if 0 <= selected < len(self._samples):
-            self._page = min(selected // self.PAGE, self.pages() - 1)
-        self._page = min(self._page, self.pages() - 1)
+        # The page is never re-derived here: a refresh must not undo
+        # "more ▸", and frame_ready arrives in bursts. Picking a sample
+        # pages to it through `reveal`.
+        self._page = min(max(0, self._page), self.pages() - 1)
         self._relayout()
 
     def _relayout(self) -> None:
@@ -902,7 +960,14 @@ class _ClickableKvRow(KvRow):
 
 
 class _SpinPair(QWidget):
-    """A kv row whose value is two spin boxes -- "X / width", "Y / height"."""
+    """A kv row whose value is two spin boxes -- an origin and a size, as
+    "X / width" and "Y / height".
+
+    The two maxima are coupled to each other, so the pair cannot express a
+    box that runs off the frame: the origin reaches at most `extent - size`
+    and the size at most `extent - origin`, re-derived after every change.
+    `CropTab._commit_box` clamps as well -- this is what stops the spin
+    boxes from showing a value that would then be clamped under the user."""
 
     edited = pyqtSignal()
 
@@ -931,25 +996,45 @@ class _SpinPair(QWidget):
             spin.valueChanged.connect(self._on_changed)
             layout.addWidget(spin)
         self._syncing = False
+        self._extent = 1
+        self._minimum = 0
 
     def values(self) -> tuple[int, int]:
         return (self.first.value(), self.second.value())
 
-    def set_limits(self, first_max: int, second_max: int, second_min: int = 0) -> None:
+    def set_limits(self, extent: int, minimum: int) -> None:
+        """`extent`: the frame's width or height. `minimum`: the smallest
+        the size may be."""
+        self._extent = max(0, int(extent))
+        self._minimum = max(0, int(minimum))
+        self._couple()
+
+    def _couple(self) -> None:
+        """Each maximum from the other's value, twice: setting the size's
+        range may clamp it, and the origin's range follows the clamped
+        size."""
         self._syncing = True
-        self.first.setRange(0, max(0, first_max))
-        self.second.setRange(second_min, max(second_min, second_max))
+        self.second.setRange(self._minimum, max(self._minimum, self._extent - self.first.value()))
+        self.first.setRange(0, max(0, self._extent - self.second.value()))
+        self.second.setRange(self._minimum, max(self._minimum, self._extent - self.first.value()))
         self._syncing = False
 
     def set_values(self, first: int, second: int) -> None:
+        """Show a box without committing: the ranges open up first, so a
+        value is never clipped by the limits the old box left behind."""
         self._syncing = True
+        self.first.setRange(0, self._extent)
+        self.second.setRange(self._minimum, max(self._minimum, self._extent))
         self.first.setValue(int(first))
         self.second.setValue(int(second))
         self._syncing = False
+        self._couple()
 
     def _on_changed(self, _value: int) -> None:
-        if not self._syncing:
-            self.edited.emit()
+        if self._syncing:
+            return
+        self._couple()
+        self.edited.emit()
 
 
 class CropInspectorPanel(Section):
@@ -976,7 +1061,9 @@ class CropInspectorPanel(Section):
         self.evidence_header = SectionHeader("Evidence")
         self.body.addWidget(self.evidence_header)
         self._rows: list[KvRow] = []
-        self._row_keys: list[str] = []
+        self._row_ids: list[str] = []
+        self._row_labels: list[str] = []
+        self._rows_by_sample: dict[int, _ClickableKvRow] = {}
         self.note = note_label("")
         self.body.addWidget(self.note)
         self.body.addStretch(1)
@@ -1007,13 +1094,29 @@ class CropInspectorPanel(Section):
         self.y_row.set_values(box[1], box[3])
 
     def rows(self) -> list[tuple[str, str]]:
-        return list(zip(self._row_keys, [row.value() for row in self._rows], strict=True))
+        """The evidence rows as read: (key, value). Two samples at the same
+        side share a key, which is why the rows are identified by `row_id`
+        internally and clicked by sample index."""
+        return [(key, row.value()) for key, row in zip(self._row_labels, self._rows, strict=True)]
+
+    def row_tone(self, key: str) -> str:
+        row = next((row for label, row in zip(self._row_labels, self._rows, strict=True)
+                    if label == key), None)
+        return "" if row is None else (row.value_tone() or "")
 
     def click_row(self, key: str) -> None:
-        for name, row in zip(self._row_keys, self._rows, strict=True):
-            if name == key and isinstance(row, _ClickableKvRow):
+        """Click the first row with this key; `click_sample_row` reaches a
+        particular one when two share it."""
+        for label, row in zip(self._row_labels, self._rows, strict=True):
+            if label == key and isinstance(row, _ClickableKvRow):
                 row.clicked.emit()
                 return
+
+    def click_sample_row(self, sample: int) -> None:
+        """Click the warn row that points at that sample."""
+        row = self._rows_by_sample.get(sample)
+        if row is not None:
+            row.clicked.emit()
 
     def nudge_note(self) -> str:
         return self.nudge_label.text()
@@ -1024,10 +1127,12 @@ class CropInspectorPanel(Section):
     # --- writing ------------------------------------------------------------------
 
     def set_state(self, box, video_size, rows, note: str) -> None:
-        """`rows`: (key, value, tone, sample index or None) per evidence row."""
+        """`rows`: (row_id, key, value, tone, sample index or None) per
+        evidence row. `row_id` is what identifies a row across refreshes --
+        two samples on the same side of the envelope share a key."""
         width, height = video_size
-        self.x_row.set_limits(width, width, CropCanvas.MIN_BOX)
-        self.y_row.set_limits(height, height, CropCanvas.MIN_BOX)
+        self.x_row.set_limits(width, CropCanvas.MIN_BOX)
+        self.y_row.set_limits(height, CropCanvas.MIN_BOX)
         enabled = box is not None
         for row in (self.x_row, self.y_row):
             row.setEnabled(enabled)
@@ -1038,28 +1143,37 @@ class CropInspectorPanel(Section):
         self.note.setVisible(bool(note))
 
     def _set_rows(self, rows) -> None:
-        keys = [key for key, _value, _tone, _index in rows]
-        clickable = [index is not None for _key, _value, _tone, index in rows]
-        if keys != self._row_keys or [isinstance(row, _ClickableKvRow) for row in self._rows] != clickable:
+        ids = [row_id for row_id, _key, _value, _tone, _index in rows]
+        if ids != self._row_ids:
             for row in self._rows:
                 self.body.removeWidget(row)
                 row.deleteLater()
             self._rows = []
             position = self.body.indexOf(self.evidence_header) + 1
-            for offset, (key, _value, _tone, index) in enumerate(rows):
+            for offset, (_row_id, key, _value, _tone, index) in enumerate(rows):
                 row = _ClickableKvRow(key, "") if index is not None else KvRow(key, "")
                 self.body.insertWidget(position + offset, row)
                 self._rows.append(row)
-            self._row_keys = keys
-        for row, (_key, value, tone, index) in zip(self._rows, rows, strict=True):
+            self._row_ids = ids
+        self._row_labels = [key for _row_id, key, _value, _tone, _index in rows]
+        self._rows_by_sample = {}
+        for row, (_row_id, _key, value, tone, index) in zip(self._rows, rows, strict=True):
             row.set_value(value, tone)
             if isinstance(row, _ClickableKvRow):
+                self._rows_by_sample[index] = row
                 row.setCursor(Qt.CursorShape.PointingHandCursor)
                 try:
                     row.clicked.disconnect()
                 except TypeError:
                     pass
                 row.clicked.connect(lambda sample=index: self.sample_requested.emit(sample))
+
+    def flush(self) -> None:
+        """Commit a typed value now instead of when the debounce ends -- the
+        page is closing, or a test does not want to wait."""
+        if self._commit.isActive():
+            self._commit.stop()
+            self._emit_box()
 
     def _on_edited(self) -> None:
         self._commit.start()
@@ -1073,6 +1187,40 @@ class CropInspectorPanel(Section):
 # The tab
 # --------------------------------------------------------------------------
 
+class _CropPage(QWidget):
+    """The tab's page, which flushes the pending commit when it goes away.
+
+    An edit inside the 400 ms debounce would otherwise be lost to a window
+    close: `MainWindow.closeEvent` shuts the controller down, so reacting to
+    the hide that follows would be too late. Filtering the window's own
+    Close event runs before that handler. Hiding (switching stage tabs, or
+    the window closing without a Close event) flushes as well.
+    """
+
+    def __init__(self, flush):
+        super().__init__()
+        self._flush = flush
+        self._watched: QWidget | None = None
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        window = self.window()
+        if window is not self._watched:
+            if self._watched is not None and not sip.isdeleted(self._watched):
+                self._watched.removeEventFilter(self)
+            self._watched = window
+            window.installEventFilter(self)
+
+    def hideEvent(self, event) -> None:
+        self._flush()
+        super().hideEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self._watched and event.type() == QEvent.Type.Close:
+            self._flush()
+        return False
+
+
 class CropTab:
     """`StageTab` for "Crop": the canvas, the filmstrip and their panel."""
 
@@ -1085,7 +1233,7 @@ class CropTab:
         self._selected = 0
         self._thumbnails: dict[float, QImage] = {}
 
-        self._page = QWidget()
+        self._page = _CropPage(self._flush)
         self._page.setObjectName("CropPage")
         self._page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         outer = QVBoxLayout(self._page)
@@ -1187,13 +1335,16 @@ class CropTab:
         self._page.setEnabled(True)
         evidence = entry.evidence.get("crop") or {}
         samples = read_samples(evidence)
-        if [sample.time for sample in samples] != [sample.time for sample in self._samples]:
+        reseated = [sample.time for sample in samples] != [sample.time for sample in self._samples]
+        if reseated:
             self._selected = self._first_kept(samples)      # a new detection: back to its first hit
         self._samples = samples
         self._selected = max(0, min(self._selected, max(0, len(samples) - 1)))
         self._request_frames()
         self._sync_canvas(entry, evidence)
         self._sync_strip(evidence)
+        if reseated:
+            self.strip.reveal(self._selected)
         self._sync_toolbar()
         self._sync_panel(entry, evidence)
 
@@ -1271,6 +1422,7 @@ class CropTab:
             return
         self._selected = max(0, min(int(index), len(self._samples) - 1))
         self.refresh()
+        self.strip.reveal(self._selected)
 
     def step(self, delta: int) -> None:
         self.select(self._selected + int(delta))
@@ -1303,19 +1455,26 @@ class CropTab:
                                  self._video_size(entry, evidence), settings,
                                  [sample.time for sample in kept])
         if box is not None:
-            self._commit_box(box)
+            self._commit_box(box, force=True)     # always makes the value yours
 
-    def _commit_box(self, box) -> None:
+    def _commit_box(self, box, *, force: bool = False) -> None:
         """The one place an edit becomes a MANUAL value (ruling C8: only the
-        controller mutates the model)."""
+        controller mutates the model).
+
+        The box is clamped here, not only on the canvas: a typed spin value
+        reaches this straight from the panel, and a stored box the frame
+        cannot hold is a fidelity bug (see `clamp_box`). `force` commits a
+        box equal to the stored one -- "fit to all samples" must make the
+        value yours even when the aggregation reproduces the detector's."""
         self._commit.stop()
         self.canvas.clear_pending()
         entry = self._entry()
         if entry is None:
             return
-        box = tuple(int(value) for value in box)
+        box = clamp_box(box, self.canvas.video_size(), CropCanvas.MIN_BOX)
         crop = entry.crop
-        if crop is not None and (crop.x, crop.y, crop.width, crop.height) == box:
+        if not force and crop is not None and (crop.x, crop.y, crop.width, crop.height) == box:
+            self.refresh()                       # the spins may still show what was typed
             return
         self._controller.set_crop(self._file, box)
         self.refresh()
@@ -1327,8 +1486,11 @@ class CropTab:
         self.refresh()
 
     def _flush(self) -> None:
+        """Commit anything still waiting for its debounce -- a key nudge on
+        the canvas and a typed value in the panel."""
         if self._commit.isActive():
             self._commit_box(self.canvas.box())
+        self.panel.flush()
 
     def _on_box_changed(self) -> None:
         box = self.canvas.box()
@@ -1410,27 +1572,33 @@ class CropTab:
         self.panel.set_state(box, video_size, rows, note)
 
     def _panel_rows(self, entry, evidence, box) -> tuple[list[tuple], str]:
-        if not evidence:
+        """(rows, note). A row is (row_id, key, value, tone, sample index):
+        `row_id` identifies it across refreshes, since two samples on the
+        same side of the envelope produce the same key."""
+        if not _has_evidence(evidence):
             source = None if entry.crop is None else entry.crop.source
-            return [("Source", crop_caption(None, source)[0], None, None)], ""
+            return [("source", "Source", crop_caption(None, source)[0], None, None)], ""
         total = len(self._samples)
         kept = sum(1 for sample in self._samples if sample.kept)
         envelope = _read_box(evidence.get("envelope"))
-        rows = [("Samples with text", f"{kept} / {total}", None, None),
-                ("Text envelope", "—" if envelope is None
+        rows = [("samples", "Samples with text", f"{kept} / {total}", None, None),
+                ("envelope", "Text envelope", "—" if envelope is None
                  else f"y {envelope[1]}–{envelope[1] + envelope[3]}", None, None)]
-        flagged = evidence.get("flagged")
-        if flagged:
-            rows.append(("Flagged", str(flagged), "warn", None))
+        flagged = crop_flag_summary(evidence.get("flagged"))
+        if flagged is not None:
+            text, blocking = flagged
+            rows.append(("flagged", "Detection", text, "warn" if blocking else None, None))
         detected = _read_box(evidence.get("box"))
         if detected is not None and detected != box:
-            rows.append(("detected", f"{_box_text(detected)} · yours {_box_text(box)}", "warn", None))
+            rows.append(("detected", "detected",
+                         f"{_box_text(detected)} · yours {_box_text(box)}", "warn", None))
         covered, disagreeing = True, self._disagreeing(evidence)
         for index in disagreeing:
             sample = self._samples[index]
             extent = sample.extent
             where = "lower" if self._below(extent, envelope) else "higher"
-            rows.append((f"1 sample sits {where}", f"{clock(sample.time)} ▸", "warn", index))
+            rows.append((f"sample-{index}", f"1 sample sits {where}",
+                         f"{clock(sample.time)} ▸", "warn", index))
             covered = covered and _covers(box, extent)
         note = "" if not disagreeing else (COVERED_NOTE if covered else OUTSIDE_NOTE)
         return rows, note
