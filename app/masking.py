@@ -35,12 +35,14 @@ import numpy as np
 from core.detect import ocr_view
 from core.detect.brightness import DEFAULT_BRIGHTNESS
 
-__all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "MAX_T", "MIN_T", "StripPixels",
+__all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_T",
+           "StripPixels",
            "clip_boxes", "gate_fires", "mask"]
 
 MIN_T = 100                # the thresholds the curve spans; a subtitle threshold
 MAX_T = 255                # is never picked outside them (core/detect/brightness.py)
 LOST_ALERT_PERCENT = 10    # at or above this, a tile's status turns bad
+LOST_RISE_POINTS = 10      # a tile this far above its own baseline is losing strokes
 MIN_SPLIT_PIXELS = 16      # too few pixels inside the boxes to split: no glyph mask
 
 
@@ -170,7 +172,9 @@ class StripPixels:
     def first_losing_threshold(self, start: int, limit: float = LOST_ALERT_PERCENT,
                                stop: int = MAX_T) -> int | None:
         """The lowest whole threshold in [start, stop] at which `limit` % or
-        more of the glyph pixels are lost, or None when none is.
+        more of the glyph pixels are lost, or None when none is. `limit` is
+        the caller's bar -- the Brightness tab passes the tile's own lost %
+        at the detector's value plus LOST_RISE_POINTS (see its `_measure`).
 
         Binary search: raising the threshold can only drop more pixels, so
         `lost_percent` never decreases in `t`."""

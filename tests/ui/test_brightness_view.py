@@ -11,6 +11,7 @@ the gate's centre square, so `gate_fires` flips at a known threshold.
 """
 from __future__ import annotations
 
+import json
 import time as time_mod
 
 import numpy as np
@@ -198,8 +199,12 @@ def tab(controller):
 
 
 def deliver(controller, fake_runner, *, name: str = NAME, box=BOX, strips=None) -> None:
-    """Answer the newest strips job for `name` with `strips`."""
+    """Answer the newest strips job for `name` with `strips`; a no-op when it
+    has already been answered (the controller caches strips per crop box, so
+    a second view over the same file asks for nothing)."""
     submission = fake_runner.last("strips", name)
+    if fake_runner.ended(submission):
+        return
     fake_runner.finish(submission, StripsResult(name, tuple(box),
                                                 strips_for() if strips is None else strips))
     controller.drain_events()
@@ -493,10 +498,57 @@ def test_the_panel_shows_auto_and_yours(loaded, controller):
 
 
 def test_the_note_names_the_safe_range_the_losing_threshold_and_the_leak(loaded):
+    """auto is 209, where the thin sample has already lost its dim glyph rows
+    -- that is the loss the detector picked, so it is that tile's baseline.
+    The note names the threshold where some tile loses 10 points MORE than it
+    had at auto: 241, where the bright rows drop out of every tile."""
     notes = " ".join(loaded.panel.notes())
     assert "Safe range 190–240." in notes
-    assert "Above 201 the 00:30 sample starts losing strokes." in notes
+    assert "Above 241 the 00:10 sample starts losing strokes." in notes
     assert "Below 190 the background leaks and the frame gate fires on empty frames." in notes
+
+
+def test_the_losing_threshold_is_calibrated_against_each_tile_at_the_auto_value(
+        controller, fake_runner):
+    """The same strips, read against two different auto values.
+
+    At auto 190 nothing is lost anywhere, so the thin sample's baseline is 0
+    and the note fires at 201, where its dim rows go. At auto 209 that same
+    loss is already the detector's choice, so the baseline is 50% and the
+    note only fires where the tile gets 10 points worse than that.
+    """
+    seen = {}
+    for auto in (190, 209):
+        give_values(controller, value=auto, evidence=brightness_evidence(value=auto))
+        made = BrightnessTab(controller)
+        made.page().resize(880, 620)
+        made.page().show()
+        made.set_file(NAME)
+        deliver(controller, fake_runner)
+        made.refresh()
+        settle()
+        seen[auto] = " ".join(made.panel.notes())
+        assert made.threshold() == auto
+        made.page().close()
+
+    assert "Above 201 the 00:30 sample starts losing strokes." in seen[190]
+    assert "Above 241 the 00:10 sample starts losing strokes." in seen[209]
+    for auto, notes in seen.items():                  # never fires at the value itself
+        assert f"Above {auto} " not in notes
+
+
+def test_a_stale_brightness_says_re_detecting_while_one_is_pending(controller):
+    give_values(controller, box=OTHER_BOX,
+                evidence=brightness_evidence(crop_box=OTHER_BOX, value_crop_box=BOX))
+    controller.entry(NAME).crop = Crop(*OTHER_BOX, Source.DETECTED)
+    controller.pending_detectors = lambda: {NAME: {"brightness"}}
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.panel.stale_text() == "measured on an earlier crop — re-detecting"
+    made.page().close()
 
 
 def test_flags_are_shown_as_a_warn_line(controller, fake_runner):
@@ -668,3 +720,91 @@ def test_fifty_threshold_changes_redraw_six_tiles_quickly(controller, fake_runne
     elapsed = (time_mod.perf_counter() - started) * 1000
     made.page().close()
     assert elapsed < 250, f"50 threshold changes took {elapsed:.0f} ms"
+
+
+# --------------------------------------------------------------------------
+# Real pixels: the losing threshold on a reference episode
+# --------------------------------------------------------------------------
+
+@pytest.mark.slow
+@pytest.mark.needs_media
+def test_the_losing_threshold_holds_on_a_reference_episodes_real_strips(
+        reference_media, controller, fake_runner, tmp_path, capsys):
+    """The self-calibrating rule, on the pixels the OCR pass really sees.
+
+    Glyph pixels include every anti-aliased pixel above the Otsu split, and a
+    real subtitle threshold always eats part of that skirt -- which is why
+    the note measures each tile against its own loss at the detector's value
+    instead of against an absolute bar. This runs the real detector on a
+    reference episode, re-grabs its chosen tiles with
+    `ocr_view.grab_ocr_strips_at`, and checks that
+
+      (a) nothing fires at the detector's own value, and
+      (b) something does fire above it.
+
+    The reference project is never written to: the episode is symlinked into
+    tmp_path and the controller opens that.
+    """
+    from core.detect import brightness as brightness_mod
+    from core.detect import ocr_view
+    from core.detect.tiles import choose_tiles
+    from videocr import engine_registry
+
+    slay = reference_media.get("slay")
+    if slay is None or not slay["crop"]:
+        pytest.skip("the slay reference project is not present")
+    video, box = slay["video"], tuple(slay["crop"])
+    ranges = (json.loads((slay["dir"] / ".ocr.json").read_text(encoding="utf-8"))
+              .get("files", {}).get(video.name, {}).get("time_ranges") or None)
+
+    with engine_registry.lease_detection_engine(None, True) as det, \
+            engine_registry.lease_ocr_engine("ch", None, None, True) as ocr:
+        result = brightness_mod.detect_brightness(str(video), box, ranges, det, ocr)
+    tiles = choose_tiles(result.strips, result.value)
+    assert tiles, "the detector chose no tiles"
+    assert result.plateau is not None, f"no plateau to calibrate from (flagged {result.flagged})"
+
+    strips = dict(ocr_view.grab_ocr_strips_at(str(video), box, sorted(set(tiles.values()))))
+    assert strips, "no strips came back"
+
+    folder = tmp_path / "reference"
+    folder.mkdir()
+    (folder / video.name).symlink_to(video)          # never write into the reference project
+    controller.open_folder(str(folder))
+    entry = controller.entry(video.name)
+    entry.crop = Crop(*box, Source.DETECTED)
+    entry.brightness = Brightness(result.value, Source.DETECTED)
+    entry.evidence["brightness"] = {**result.to_evidence(),
+                                    "tiles": {k: float(t) for k, t in tiles.items()},
+                                    "crop_box": list(box), "value_crop_box": list(box)}
+
+    made = BrightnessTab(controller)
+    made.page().resize(1100, 700)
+    made.page().show()
+    made.set_file(video.name)
+    deliver(controller, fake_runner, name=video.name, box=box, strips=strips)
+    made.refresh()
+    settle()
+
+    lo, hi = result.plateau
+    baselines = []
+    for tile in made.tiles():
+        pixels = made.strip_pixels(tile.time)
+        if tile.kind == "leaking" or pixels is None or not pixels.has_glyphs():
+            continue
+        baselines.append((tile.kind, tile.time, pixels.lost_percent(result.value),
+                          pixels.first_losing_threshold(lo, (pixels.lost_percent(result.value) or 0) + 10)))
+    losing = made.losing_threshold()
+    with capsys.disabled():
+        print(f"\n{video.name}: auto={result.value} plateau={result.plateau} "
+              f"flagged={result.flagged}")
+        for kind, at, baseline, trips in baselines:
+            print(f"  {kind:9s} t={at:8.2f}s  lost at auto={baseline:5.1f}%  "
+                  f"+10 points at {trips}")
+        print(f"  note fires at {losing}")
+
+    assert baselines, "no text tile with measurable glyphs"
+    assert losing is not None, (
+        f"nothing ever trips above the auto value {result.value} (plateau {lo}-{hi})")
+    assert losing > result.value, (
+        f"the note fires at {losing}, at or below the detector's own value {result.value}")

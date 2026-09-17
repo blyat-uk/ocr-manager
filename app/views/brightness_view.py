@@ -60,7 +60,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.masking import DEFAULT_BRIGHTNESS, LOST_ALERT_PERCENT, MAX_T, MIN_T, StripPixels
+from app.masking import (
+    DEFAULT_BRIGHTNESS,
+    LOST_ALERT_PERCENT,
+    LOST_RISE_POINTS,
+    MAX_T,
+    MIN_T,
+    StripPixels,
+)
 from app.state_text import (
     brightness_is_stale,
     clock,
@@ -875,7 +882,7 @@ class BrightnessTab:
         self._sync_tiles(evidence)
         self._request_strips()
         self._load_pixels()
-        self._measure(evidence)
+        self._measure(evidence, auto)
         self.curve.set_state(evidence.get("curve"), evidence.get("clutter_curve"),
                              evidence.get("plateau"), auto, self._preview)
         self._render()
@@ -921,6 +928,18 @@ class BrightnessTab:
 
     def pinned_times(self) -> list[float]:
         return list(self._pinned.get(self._file or "", ()))
+
+    def strip_pixels(self, time: float) -> StripPixels | None:
+        """The loaded pixels of the tile at `time`, or None while its strip
+        has not arrived."""
+        return self._pixels.get(float(time))
+
+    def losing_threshold(self) -> int | None:
+        """The threshold the note's "Above {t} …" sentence names, or None
+        when no tile ever loses LOST_RISE_POINTS more than it already had at
+        the detector's value (see `_measure`)."""
+        losing = self._facts.get("losing")
+        return None if losing is None else losing[0]
 
     # --- commands ---------------------------------------------------------
 
@@ -1164,7 +1183,8 @@ class BrightnessTab:
         entry = self._entry()
         self._load_pixels()
         self._facts_key = None                  # the note's facts need the new pixels
-        self._measure((entry.evidence.get("brightness") or {}) if entry is not None else {})
+        evidence = (entry.evidence.get("brightness") or {}) if entry is not None else {}
+        self._measure(evidence, evidence.get("value"))
         self._render()
         self._refresh_panel()
 
@@ -1174,27 +1194,50 @@ class BrightnessTab:
 
     # --- the note's facts -------------------------------------------------
 
-    def _measure(self, evidence) -> None:
+    def _measure(self, evidence, auto: int | None = None) -> None:
         """The two facts the note needs, which do not move with the preview:
         the lowest threshold at which a text tile starts losing strokes, and
         whether the leaking tile's gate still fires below the plateau.
 
-        Recomputed only when the file, the tiles or the pixels change -- a
-        threshold drag must not re-measure (and must not mask a strip behind
-        the tiles' backs, which is what the one-mask-per-tile-per-change
-        budget is)."""
+        **The losing threshold is self-calibrating.** "Glyph pixels" are
+        everything above the Otsu split inside the detector's boxes, which
+        necessarily includes the anti-aliased skirt around every stroke --
+        and a subtitle threshold always eats part of that skirt, so a healthy
+        tile can sit at 20-30% lost with every stroke core intact. An
+        absolute bar would therefore fire on every file. So each text tile is
+        measured against ITSELF: its lost % at the detector's auto value is
+        its baseline, and the note fires at the lowest whole threshold from
+        the plateau's `lo` up at which some tile has lost LOST_RISE_POINTS
+        more of its glyphs than it had already lost at auto. That is the
+        point where the threshold starts taking pixels the detector's own
+        pick was keeping.
+
+        Without an auto value (no evidence) the baseline is measured at `lo`
+        instead, so the rule still reads "how much worse than the bottom of
+        the safe range". The per-tile caption is unaffected: it states the
+        plain fact (LOST_ALERT_PERCENT of the glyphs gone) rather than a
+        judgement about this file.
+
+        Recomputed only when the file, the tiles, the pixels or the reference
+        value change -- a threshold drag must not re-measure (and must not
+        mask a strip behind the tiles' backs, which is what the
+        one-mask-per-tile-per-change budget is)."""
         plateau = evidence.get("plateau")
-        key = (self._file, tuple(sorted(self._pixels)), None if plateau is None else tuple(plateau))
+        key = (self._file, tuple(sorted(self._pixels)),
+               None if plateau is None else tuple(plateau), auto)
         if key == self._facts_key:
             return
         self._facts_key = key
         lo = None if plateau is None else int(plateau[0])
+        start = MIN_T if lo is None else lo
+        reference = start if auto is None else int(auto)
         losing: tuple[int, float] | None = None
         for tile in self._tiles:
             held = self._pixels.get(tile.time)
             if held is None or tile.kind == "leaking" or not held.has_glyphs():
                 continue
-            found = held.first_losing_threshold(MIN_T if lo is None else lo)
+            baseline = held.lost_percent(reference) or 0.0
+            found = held.first_losing_threshold(start, baseline + LOST_RISE_POINTS)
             if found is not None and (losing is None or found < losing[0]):
                 losing = (found, tile.time)
         leaks = False
@@ -1233,10 +1276,15 @@ class BrightnessTab:
         return " · ".join(dict.fromkeys(reasons))
 
     def _stale_text(self, entry) -> str:
+        """"…re-detecting" while a brightness measurement for the file is
+        still to come -- queued, running, or held by auto-pilot behind the
+        folder's ranges analysis (`pending_detectors`, not
+        `running_detectors`: a job that has not started yet is still on its
+        way) -- and "…re-detect to refresh" when nothing is coming."""
         if entry is None or not brightness_is_stale(entry):
             return ""
-        running = self._controller.running_detectors(entry.name)
-        return STALE_REDETECTING if "brightness" in running else STALE_REDETECT
+        pending = self._controller.pending_detectors().get(entry.name, frozenset())
+        return STALE_REDETECTING if "brightness" in pending else STALE_REDETECT
 
     def _series_text(self) -> str:
         """The series-median sentence, shared with the inspector's Detected
