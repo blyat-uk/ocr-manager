@@ -52,7 +52,9 @@ File workers, pause and stop (ruling C6)
     each file.
 
 Outcomes
-    ok        the final file was replaced; lines = Dialogue lines in it.
+    ok        the final file was replaced; lines = Dialogue lines in it
+              (counted on the QA'd .partial just before the replace, so
+              "failed" always means the final was not replaced).
     failed    an exception (its first line; the traceback goes to ctx.log),
               or "no subtitles produced" when OCR wrote nothing.
     cancelled the file was stopped mid-way ("cancelled"), or never started
@@ -258,8 +260,9 @@ class RunJob:
                 status, error = _CANCELLED, ERROR_CANCELLED
             elif os.path.exists(partial):
                 _qafix.process_file(partial)
+                counted = _count_dialogue_lines(partial)    # the bytes the replace installs
                 os.replace(partial, final)
-                lines = _count_dialogue_lines(final)
+                lines = counted
                 status, error = _OK, ""
             else:
                 status, error = _FAILED, ERROR_NO_SUBTITLES

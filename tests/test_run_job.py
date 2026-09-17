@@ -35,6 +35,7 @@ import pytest
 
 from core import ass_qafix
 from core.jobs import JobContext, JobEvent, JobRunner, Lane
+from core.jobs import run as run_module
 from core.jobs.run import RunFile, RunJob, RunSummary
 from core.project.model import (
     Brightness,
@@ -617,10 +618,45 @@ def test_a_failed_replace_keeps_the_old_final(tmp_path, ocr, qa, monkeypatch):
         return real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "replace", failing_replace)
-    summary, _ = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
+    summary, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
     assert summary.failed == {"a.mp4": "disk full"}
     assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
     assert os.listdir(tmp_path / "chi") == ["a.ass"]
+    assert events.of("a.mp4")[-1].result == {"ok": False, "lines": 0, "error": "disk full"}
+
+
+def test_lines_are_counted_on_the_qad_partial_before_the_final_is_replaced(tmp_path, ocr, qa, monkeypatch):
+    write_old_final(tmp_path, "a.mp4")
+    real_count = run_module._count_dialogue_lines
+    counted = []
+
+    def count(path):
+        counted.append((path, Path(path).read_bytes(), final_of(tmp_path, "a.mp4").read_bytes()))
+        return real_count(path)
+
+    monkeypatch.setattr(run_module, "_count_dialogue_lines", count)
+    summary, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
+
+    assert summary.succeeded == ["a.mp4"]
+    qad = (ass_text("a.mp4") + QA_LINE).encode("utf-8")
+    assert counted == [(str(partial_of(tmp_path, "a.mp4")), qad, OLD_FINAL)]
+    assert final_of(tmp_path, "a.mp4").read_bytes() == qad
+    assert events.of("a.mp4")[-1].result == {"ok": True, "lines": 3, "error": ""}
+
+
+def test_failed_always_means_the_final_was_not_replaced(tmp_path, ocr, qa, monkeypatch):
+    write_old_final(tmp_path, "a.mp4")
+
+    def count(path):
+        raise OSError("read back failed")
+
+    monkeypatch.setattr(run_module, "_count_dialogue_lines", count)
+    summary, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
+
+    assert summary.failed == {"a.mp4": "read back failed"}
+    assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
+    assert os.listdir(tmp_path / "chi") == ["a.ass"]
+    assert events.of("a.mp4")[-1].result == {"ok": False, "lines": 0, "error": "read back failed"}
 
 
 def test_a_file_worker_that_cannot_start_stops_and_joins_the_others_before_raising(
@@ -674,16 +710,25 @@ def test_summary_sorts_every_file_into_one_outcome_in_snapshot_order(tmp_path, o
 @pytest.mark.parametrize("parallel", [1, 2, 3])
 def test_parallel_files_run_at_once_and_never_more(tmp_path, ocr, qa, parallel):
     names = [f"{i}.mp4" for i in range(3 * parallel + 1)]
+    reached = []
 
-    def overlap(kwargs):
-        ocr.wait_active(parallel, timeout=0.5)
-        time.sleep(0.02)
+    def first(kwargs):
+        # The first `parallel` files are taken by `parallel` workers and none of
+        # them ends before all are running, so this wait must succeed.
+        reached.append(ocr.wait_active(parallel, timeout=WAIT))
+        # Hold a moment, so a worker too many would be running meanwhile.
+        extra = ocr.wait_active(parallel + 1, timeout=QUIET)
+        reached.append(not extra)
 
-    for name in names:
-        ocr.hooks[name] = overlap
+    def later(kwargs):
+        time.sleep(0.01)
+
+    for index, name in enumerate(names):
+        ocr.hooks[name] = first if index < parallel else later
     summary, _ = run_now(tmp_path, [run_file(tmp_path, n) for n in names], parallel)
 
     assert summary.succeeded == names
+    assert reached == [True] * (2 * parallel)
     assert ocr.max_active == parallel
 
 
