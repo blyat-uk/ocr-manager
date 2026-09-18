@@ -7,6 +7,10 @@ checked for the dynamic properties app/theme/qss.py selects on -- pytest-qt
 is not installed, so click behaviour uses PyQt6.QtTest.QTest directly (see
 tests/ui/conftest.py).
 """
+import contextlib
+import importlib
+import os
+import re
 from pathlib import Path
 
 import pytest
@@ -85,9 +89,65 @@ def test_font_stack_is_cjk_capable_fallback_chain():
     assert tokens.FONT_STACK == ["Inter", "Segoe UI", "Noto Sans", "Noto Sans CJK SC", "sans-serif"]
 
 
+# ui-spec.md's own numbers, which are the mockup's -- so they are pinned
+# against the unscaled `*_BASE` constants. `UI_SCALE` (and with it every
+# scaled token) is a property of the running window, not of the spec:
+# test_every_base_token_has_a_scaled_partner below is what ties the two
+# together.
+SIZE_TOKENS_FROM_UI_SPEC = [
+    ("RAIL_WIDTH_BASE", 246),          # §2.3 ".rail -- width:246px"
+    ("INSPECTOR_WIDTH_BASE", 322),     # §2.3 ".insp -- width:322px"
+    ("THUMB_WIDTH_BASE", 56),          # §5 ".thumb (56x32px)"
+    ("THUMB_HEIGHT_BASE", 32),
+    ("BAR_WIDTH_BASE", 74),            # §5 "a 74x3px .bar"
+    ("BAR_HEIGHT_BASE", 3),
+    ("MINI_WIDTH_BASE", 90),           # §5 "a .mini progress bar (90x4px)"
+    ("MINI_HEIGHT_BASE", 4),
+    ("RADIUS_THUMB_BOX_BASE", 1),      # §2.4 radii table
+    ("RADIUS_XS_BASE", 2),
+    ("RADIUS_THUMB_BASE", 3),
+    ("RADIUS_TAG_BASE", 4),
+    ("RADIUS_SEG_BASE", 5),
+    ("RADIUS_BTN_BASE", 6),
+    ("RADIUS_ROW_BASE", 7),
+    ("RADIUS_CHIP_BASE", 20),
+    # §2.2's type scale.
+    ("FONT_SIZE_XS_BASE", 9),
+    ("FONT_SIZE_SCOPE_BASE", 9.5),
+    ("FONT_SIZE_SM_BASE", 10),
+    ("FONT_SIZE_BTN_SM_BASE", 10.5),
+    ("FONT_SIZE_BODY_BASE", 11.5),
+    ("FONT_SIZE_MD_BASE", 12.5),
+    ("FONT_SIZE_PROJ_BASE", 13.5),
+    # Not in ui-spec's prose: read from the mockups' literal CSS, as
+    # tokens.py records. Pinned here so a later edit cannot drift them.
+    ("DOT_SIZE_BASE", 7),
+    ("RADIUS_CHIP_QT_BASE", 10),
+]
+
+
+@pytest.mark.parametrize("name, expected", SIZE_TOKENS_FROM_UI_SPEC)
+def test_size_token_base_matches_ui_spec(name, expected):
+    assert getattr(tokens, name) == expected
+
+
+def test_every_base_token_has_a_scaled_partner():
+    """The other half of the pin above: each `*_BASE` is the mockup's value
+    and its partner is that value at `UI_SCALE`, so the window can be made
+    readable without any number here drifting from the spec. A size token
+    added later without going through `px()`/`pt()` fails here."""
+    bases = sorted(name for name in vars(tokens) if name.endswith("_BASE"))
+    assert len(bases) >= len(SIZE_TOKENS_FROM_UI_SPEC)
+    for name in bases:
+        scaled_name = name[: -len("_BASE")]
+        base_value = getattr(tokens, name)
+        scale = tokens.pt if scaled_name.startswith("FONT_SIZE_") else tokens.px
+        assert getattr(tokens, scaled_name) == scale(base_value), scaled_name
+
+
 def test_rail_and_inspector_widths():
-    assert tokens.RAIL_WIDTH == 246
-    assert tokens.INSPECTOR_WIDTH == 322
+    assert tokens.RAIL_WIDTH == tokens.px(246)
+    assert tokens.INSPECTOR_WIDTH == tokens.px(322)
 
 
 def test_app_package_resolves_to_real_source_package():
@@ -435,9 +495,232 @@ def test_stylesheet_shows_keyboard_focus_on_every_button():
 
 def test_chip_radius_is_the_qt_adjusted_token():
     # CSS clamps `.chip`'s 20px to a pill; Qt draws square corners for a radius above half the height.
-    assert tokens.RADIUS_CHIP == 20
-    assert tokens.RADIUS_CHIP_QT == 10
+    assert tokens.RADIUS_CHIP == tokens.px(20)
+    assert tokens.RADIUS_CHIP_QT == tokens.px(10)
     sheet = qss.build_stylesheet()
     chip_rule = sheet[sheet.index("QWidget#Chip {"):]
     assert f"border-radius: {tokens.RADIUS_CHIP_QT}px;" in chip_rule[:chip_rule.index("}")]
     assert not hasattr(qss, "CHIP_QT_RADIUS")
+
+
+# --------------------------------------------------------------------------
+# UI scale: nothing may be pinned to a literal pixel
+# --------------------------------------------------------------------------
+# The window is drawn at `tokens.UI_SCALE` (the mockups' 9-11 px type is
+# unreadable on a real desktop). These are the tests that keep it that way:
+# a length written as a literal instead of `tokens.px(...)` would simply not
+# move between the two scales below, and every one of them says so.
+
+
+@contextlib.contextmanager
+def ui_scale(value: float):
+    """Re-read the tokens at `value`, as a fresh process with
+    `$OCR_MANAGER_UI_SCALE=value` would.
+
+    Only `app.theme.tokens` is reloaded, and `importlib.reload` updates a
+    module in place: `app.theme.qss` and `app.widgets.base` both hold the
+    module object (`from app.theme import tokens`), so they see the new
+    sizes without being reloaded themselves -- no class object is replaced,
+    so widgets built inside and outside this block stay the same types."""
+    previous = os.environ.get("OCR_MANAGER_UI_SCALE")
+    os.environ["OCR_MANAGER_UI_SCALE"] = str(value)
+    importlib.reload(tokens)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("OCR_MANAGER_UI_SCALE", None)
+        else:
+            os.environ["OCR_MANAGER_UI_SCALE"] = previous
+        importlib.reload(tokens)
+
+
+@contextlib.contextmanager
+def themed_ui_scale(qapp, value: float):
+    """`ui_scale()`, with the stylesheet that goes with it installed on the
+    session QApplication -- the only way to measure what a widget actually
+    lays out to. The ambient theme is restored however the block exits, so a
+    failing assertion cannot leak a scale into the tests that follow."""
+    try:
+        with ui_scale(value):
+            qss.apply_theme(qapp)
+            yield
+    finally:
+        qss.apply_theme(qapp)
+
+
+def _stylesheet_lengths(sheet: str) -> list[float]:
+    return [float(value) for value in re.findall(r"([0-9]+(?:\.[0-9]+)?)px", sheet)]
+
+
+def test_ui_scale_reads_the_environment_and_clamps_it():
+    ambient = tokens.UI_SCALE                # whatever this run was started at
+    with ui_scale(1.0):
+        assert tokens.UI_SCALE == 1.0
+        assert tokens.px(246) == 246 and tokens.pt(11.5) == 11.5
+    with ui_scale(2.0):
+        assert tokens.UI_SCALE == 2.0
+        assert tokens.px(246) == 492 and tokens.pt(11.5) == 23.0
+    with ui_scale(9.0):                      # out of range: clamped, not raised
+        assert tokens.UI_SCALE == tokens.UI_SCALE_MAX
+    assert tokens.UI_SCALE == ambient        # and restored afterwards
+
+
+def test_every_stylesheet_length_follows_the_ui_scale():
+    """A regression guard against re-introducing a literal: at twice the
+    scale every length in the generated QSS must have grown with it. The
+    only lengths allowed to stay put are 1 px hairlines -- borders and the
+    menu separator, whose width is part of Qt's box model."""
+    with ui_scale(1.0):
+        single = _stylesheet_lengths(qss.build_stylesheet())
+    with ui_scale(2.0):
+        double = _stylesheet_lengths(qss.build_stylesheet())
+
+    assert single and len(single) == len(double)
+    scaled = 0
+    for one, two in zip(single, double, strict=True):
+        if one == 1:
+            assert two in (1.0, 2.0)         # a hairline stays; a 1 px padding doubles
+            continue
+        assert two > one, f"{one}px did not grow with the scale"
+        assert abs(two - 2 * one) <= 1, f"{one}px -> {two}px is not the scale"
+        scaled += 1
+    assert scaled >= 40                      # the sheet really is mostly lengths
+
+
+def test_stylesheet_font_sizes_are_whole_pixels_from_the_scaled_tokens():
+    """Qt's QSS parser truncates a fractional `font-size:...px`, so a token
+    emitted raw would lose most of a pixel (9.5 at 1.25 is 11.875 -> 11,
+    +16% where every other size gets +25%)."""
+    sheet = qss.build_stylesheet()
+    sizes = re.findall(r"font-size: ([0-9.]+)px", sheet)
+    assert sizes
+    for size in sizes:
+        assert "." not in size, f"font-size: {size}px is fractional"
+    assert f"font-size: {round(tokens.FONT_SIZE_BODY)}px" in sheet
+    assert f"font-size: {round(tokens.FONT_SIZE_XS)}px" in sheet
+    # ... and they are the scaled tokens, not the mockup's own numbers.
+    with ui_scale(1.0):
+        single = qss.build_stylesheet()
+    with ui_scale(2.0):
+        doubled = qss.build_stylesheet()
+    assert "font-size: 12px" in single and "font-size: 12px" not in doubled   # .btn, 11.5
+    assert "font-size: 23px" in doubled and "font-size: 23px" not in single
+
+
+def test_hairline_borders_stay_one_pixel_at_every_scale():
+    """The deliberate exception. A border is part of Qt's box model: at 2 px
+    the content box shrinks by a pixel on each side, which moves every label
+    inside a button, and the focus ring would resize its own button. A 1 px
+    rule still reads at any scale."""
+    for scale in (1.0, 2.0, 3.0):
+        with ui_scale(scale):
+            sheet = qss.build_stylesheet()
+        assert f"border: 1px solid {tokens.ACC};" in sheet     # the focus ring
+        assert "border-bottom: 1px solid" in sheet             # panel separators
+        assert "2px solid" not in sheet
+
+
+def _widget_metrics() -> dict[str, int]:
+    """Every length the base widgets lay out with, measured off real
+    widgets (not read back from the tokens they were built from)."""
+    chip = Chip(dot="ok", count=3, label="reviewed")
+    kv = KvRow("Crop", "288, 784 · 1344 × 55")
+    header = SectionHeader("Detected")
+    conf = ConfBar(0.5, caption="12 of 12 samples agree")
+    mini = MiniProgress(0.5)
+    toggle = base.Toggle(True)
+    horizontal = SegmentedControl(["All 5"])
+    vertical = SegmentedControl(["All 5"], orientation=Qt.Orientation.Vertical)
+    chip_margins = chip.layout().contentsMargins()
+    kv_margins = kv.layout().contentsMargins()
+    conf_margins = conf.layout().contentsMargins()
+    return {
+        "dot": Dot().width(),
+        "dot_height": Dot().height(),
+        "chip_margin_x": chip_margins.left(),
+        "chip_margin_y": chip_margins.top(),
+        "chip_spacing": chip.layout().spacing(),
+        "chip_min_height": chip.minimumHeight(),
+        "kv_margin_x": kv_margins.left(),
+        "kv_margin_y": kv_margins.top(),
+        "kv_spacing": kv.layout().spacing(),
+        "header_spacing": header.layout().spacing(),
+        "conf_margin_top": conf_margins.top(),
+        "conf_margin_bottom": conf_margins.bottom(),
+        "conf_spacing": conf.layout().spacing(),
+        "conf_track_width": conf._track.width(),
+        "conf_track_height": conf._track.height(),
+        "mini_track_width": mini._track.width(),
+        "mini_track_height": mini._track.height(),
+        "segment_spacing_h": horizontal._layout.spacing(),
+        "segment_spacing_v": vertical._layout.spacing(),
+        "toggle_track_width": toggle.TRACK_WIDTH,
+        "toggle_track_height": toggle.TRACK_HEIGHT,
+        "toggle_knob": toggle.KNOB,
+        "toggle_gap": toggle.GAP,
+    }
+
+
+def test_base_widget_lengths_follow_the_ui_scale(qapp):
+    with ui_scale(1.0):
+        single = _widget_metrics()
+    with ui_scale(2.0):
+        double = _widget_metrics()
+    # At scale 1 every one of them is the mockup's own number ...
+    assert single == {
+        "dot": 7, "dot_height": 7,
+        "chip_margin_x": 9, "chip_margin_y": 3, "chip_spacing": 6, "chip_min_height": 20,
+        "kv_margin_x": 8, "kv_margin_y": 5, "kv_spacing": 8,
+        "header_spacing": 6,
+        "conf_margin_top": 2, "conf_margin_bottom": 8, "conf_spacing": 6,
+        "conf_track_width": 74, "conf_track_height": 3,
+        "mini_track_width": 90, "mini_track_height": 4,
+        "segment_spacing_h": 4, "segment_spacing_v": 2,
+        "toggle_track_width": 24, "toggle_track_height": 14, "toggle_knob": 8, "toggle_gap": 7,
+    }
+    # ... and at scale 2, exactly twice it. A literal would sit still here.
+    assert double == {name: 2 * value for name, value in single.items()}
+
+
+def test_the_dot_stays_round_and_the_bar_track_radius_stays_proportional(qapp):
+    """A scale is not a licence to change a shape. `Dot` is square, so it
+    paints a circle; `_BarTrack`'s radius is clamped to half its height, so
+    the 3-4 px bar keeps rounded ends instead of square-cut ones (the token
+    alone, 2 px at scale 1, already outgrows half of a 3 px bar)."""
+    radii = {}
+    for scale in (1.0, 1.25, 2.0, 3.0):
+        with ui_scale(scale):
+            dot = Dot("ok")
+            assert dot.width() == dot.height() == tokens.px(tokens.DOT_SIZE_BASE)
+            conf, mini = ConfBar(1.0), MiniProgress(1.0)
+            for name, track in (("conf", conf._track), ("mini", mini._track)):
+                assert 0 < track.radius() <= track.height() / 2
+                radii.setdefault(name, []).append(track.radius())
+    for values in radii.values():
+        assert values[-1] == 3 * values[0]          # ... and it scaled with the rest
+
+
+def test_the_chip_stays_a_pill_at_every_scale(qapp):
+    """Qt does not clamp a border-radius to half the box the way CSS does --
+    it squares the corners off instead -- and font metrics do not grow in
+    exact step with the scaled padding, so the chip carries a floor."""
+    for scale in (1.0, 1.25, 1.75, 2.0, 3.0):
+        with themed_ui_scale(qapp, scale):
+            chip = Chip(dot="warn", count=1, label="needs you")
+            chip.ensurePolished()
+            chip.adjustSize()
+            assert chip.height() >= 2 * tokens.RADIUS_CHIP_QT, f"squared corners at {scale}"
+
+
+def test_scaled_padding_never_clips_a_button_label(qapp):
+    """The padding grew; so must the button. Qt measures a styled button as
+    text + padding + border, so this fails the moment a padding is scaled
+    past a font size that is not."""
+    for scale in (1.0, 1.25, 2.0, 3.0):
+        with themed_ui_scale(qapp, scale):
+            for button in (Button("Mark reviewed"), Button("re-detect", variant="ghost", small=True)):
+                button.ensurePolished()
+                text = button.fontMetrics().horizontalAdvance(button.text())
+                assert button.sizeHint().width() >= text + 2 * tokens.px(3)
+                assert button.sizeHint().height() > button.fontMetrics().height()
