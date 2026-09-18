@@ -51,7 +51,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import numpy as np
-from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -118,29 +118,69 @@ PREVIEW_ROW = "{stored} → {preview}"
 PREVIEW_NOTE = "preview only — {value} is not kept yet"
 
 # --- geometry (the literal CSS of tabs-hifi.html figure 1) ------------------
+#
+# Every length here is a mockup pixel put through `tokens.px`, so the tiles,
+# the context strip and the curve grow with the rest of the window
+# (app/theme/tokens.py's UI_SCALE); the comments name the mockup's own value,
+# which is the number `tokens.px` is called with. Alphas, column counts and
+# the fractions below are not lengths and are left alone -- and neither the
+# strip arrays nor the boxes measured on them are ever scaled: the UI scale
+# changes the size those pixels are DRAWN at, never a pixel.
 
 ZOOM_PRESETS = ("fit", "100%", "300%", "600%")
 DEFAULT_PRESET = "300%"
-PRESET_FACTORS = {"100%": 1.0, "300%": 3.0, "600%": 6.0}
+# The magnification, in mockup pixels per strip pixel, scaled like every
+# other length: at "300%" one strip pixel fills the same share of a tile at
+# any UI scale, which is what keeps a stroke readable when the window grows.
+# "fit" is computed from the tile's own width (`zoom_factor`) and so follows
+# on its own. Blitting is nearest-neighbour at every preset, as it already is
+# at "fit", so no strip pixel is ever interpolated away.
+PRESET_FACTORS = {"100%": 1.0 * tokens.UI_SCALE,
+                  "300%": 3.0 * tokens.UI_SCALE,
+                  "600%": 6.0 * tokens.UI_SCALE}
 
-CONTEXT_HEIGHT = 26          # .ctxstrip
-WINDOW_BORDER = 1.5          # .ctxstrip .win
-WINDOW_FILL_ALPHA = 0.12     # rgba(255,194,71,.12)
-TAG_BG = QColor(10, 12, 16, 209)      # .tag background rgba(10,12,16,.82)
+CONTEXT_HEIGHT = tokens.px(26)          # .ctxstrip
+# A pen is not snapped to a whole device pixel, so the stroke widths below
+# scale as floats: rounding 1.5 and 1.2 to ints would collapse two
+# deliberately different weights (the OCR curve and the clutter curve).
+WINDOW_BORDER = 1.5 * tokens.UI_SCALE   # .ctxstrip .win
+WINDOW_MIN_WIDTH = tokens.px(2)         # ... never thinner than this, however far out
+WINDOW_FILL_ALPHA = 0.12                # rgba(255,194,71,.12)
+TAG_BG = QColor(10, 12, 16, 209)        # .tag background rgba(10,12,16,.82)
+CTX_TAG_X = tokens.px(6)                # the "full strip …" chip, off the strip's corner
+CTX_TAG_Y = tokens.px(3)
+CTX_TAG_PAD_X = tokens.px(12)           # ... and around its text
+CTX_TAG_INSET_Y = tokens.px(9)          # its height is the strip's less this
 
-GLYPHS_HEIGHT = 96           # .ztile .glyphs -- the mockup's height, and the minimum here
-CAPTION_HEIGHT = 18          # .ztile .cap (3px padding, 9.5px text)
+GLYPHS_HEIGHT = tokens.px(96)  # .ztile .glyphs -- the mockup's height, and the minimum here
+CAPTION_HEIGHT = tokens.px(18)  # .ztile .cap (3px padding, 9.5px text)
 TILE_HEIGHT = GLYPHS_HEIGHT + CAPTION_HEIGHT
-TILE_COLUMNS = 3
-TILE_GAP = 9
+TILE_MIN_WIDTH = tokens.px(120)
+TILE_BORDER = 1              # the 1 px border `content_rect` sits inside
+CAPTION_PAD_X = tokens.px(6)  # the caption's text, off the tile's edges
+CAPTION_GAP = tokens.px(8)    # ... and the least room between its two halves
+TILE_COLUMNS = 3             # a count, not a length
+TILE_GAP = tokens.px(9)
 LOST_TINT_ALPHA = 140        # rgba(244,112,125,.55)
 
-PLOT_HEIGHT = 64             # the SVG's viewBox height
-LEGEND_HEIGHT = 16
+PLOT_HEIGHT = tokens.px(64)  # the SVG's viewBox height
+LEGEND_HEIGHT = tokens.px(16)
+LEGEND_AXIS_GAP = tokens.px(10)   # between an axis label and the first legend chip
+MARKER_Y = tokens.px(10)          # the "yours" dot, down from the top of the plot
 PLATEAU_ALPHA = 0.08         # rect ... opacity=".08"
-CURVE_WIDTH = 1.5
-CLUTTER_WIDTH = 1.2
-MARKER_RADIUS = 3.5
+CURVE_WIDTH = 1.5 * tokens.UI_SCALE
+CLUTTER_WIDTH = 1.2 * tokens.UI_SCALE
+MARKER_RADIUS = 3.5 * tokens.UI_SCALE
+
+PAGE_MARGIN_X = tokens.px(12)     # the page's own padding
+PAGE_MARGIN_TOP = tokens.px(10)
+PAGE_MARGIN_BOTTOM = tokens.px(12)
+PAGE_SPACING = tokens.px(10)      # between the strip, the tiles, the curve and the timeline
+TOOLBAR_GAP = tokens.px(4)        # between the zoom presets ...
+TOOLBAR_SPACING = tokens.px(6)    # ... and before the two toggles
+PANEL_ROW_SPACING = tokens.px(5)  # between two inspector rows
+PANEL_BUTTON_TOP = tokens.px(3)   # above "use {auto}" / "keep {yours}"
+PANEL_BUTTON_GAP = tokens.px(6)
 
 
 def _alpha(colour: str, alpha: float) -> QColor:
@@ -162,6 +202,28 @@ def _round_half_up(value: float) -> int:
     return int(value + 0.5) if value >= 0 else -int(-value + 0.5)
 
 
+def caption_texts(metrics, width: float, left: str, right: str,
+                  short: str = "") -> tuple[str, str]:
+    """The tile caption's two halves as they are drawn.
+
+    They share one rect, one flush left and one flush right, so a tile too
+    narrow for both prints them through each other -- which at the UI scale
+    is every tile in a 1440 px window ("09:38 · dark scene" over "28% of
+    glyph pixels lost"). The status keeps its words: it is the tile's whole
+    answer, and the tile is red or green because of it.
+
+    The other half gives way in two steps. `short` is the part worth keeping
+    whole (the time), so a tile that cannot hold "09:38 · dark scene" reads
+    "09:38" rather than "09:38 · …", which says less in the same space.
+    Below even that, it elides."""
+    room = float(width) - (metrics.horizontalAdvance(right) + CAPTION_GAP if right else 0.0)
+    for text in (left, short):
+        if text and metrics.horizontalAdvance(text) <= room:
+            return text, right
+    return metrics.elidedText(short or left, Qt.TextElideMode.ElideRight,
+                              max(0, int(room))), right
+
+
 # --------------------------------------------------------------------------
 # Tiles
 # --------------------------------------------------------------------------
@@ -181,7 +243,7 @@ class ZoomTile(QWidget):
         super().__init__(parent)
         self.kind = kind
         self.time = float(time)
-        self.setMinimumSize(120, TILE_HEIGHT)
+        self.setMinimumSize(TILE_MIN_WIDTH, TILE_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self._pixels: StripPixels | None = None
@@ -219,7 +281,8 @@ class ZoomTile(QWidget):
         strip and cut the tops and bottoms off the strokes -- the one thing
         the tile exists to show. So the tiles share whatever height the page
         has left instead, never less than the mockup's."""
-        return QRect(1, 1, max(0, self.width() - 2), max(0, self.height() - CAPTION_HEIGHT - 1))
+        return QRect(TILE_BORDER, TILE_BORDER, max(0, self.width() - 2 * TILE_BORDER),
+                     max(0, self.height() - CAPTION_HEIGHT - TILE_BORDER))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -349,18 +412,21 @@ class ZoomTile(QWidget):
             painter.drawText(content, Qt.AlignmentFlag.AlignCenter, "waiting for the frame")
         painter.restore()
 
-        caption = QRectF(1, self.height() - CAPTION_HEIGHT, self.width() - 2, CAPTION_HEIGHT - 1)
+        caption = QRectF(TILE_BORDER, self.height() - CAPTION_HEIGHT,
+                         self.width() - 2 * TILE_BORDER, CAPTION_HEIGHT - TILE_BORDER)
         painter.fillRect(caption, QColor(tokens.PANEL))
         painter.setPen(QPen(QColor(tokens.LINE), 1))
         painter.drawLine(QPointF(caption.left(), caption.top()), QPointF(caption.right(), caption.top()))
         painter.setFont(_font(tokens.FONT_SIZE_SCOPE))
-        text_area = caption.adjusted(6, 0, -6, 0)
+        text_area = caption.adjusted(CAPTION_PAD_X, 0, -CAPTION_PAD_X, 0)
+        left, right = caption_texts(painter.fontMetrics(), text_area.width(),
+                                    self.caption_left(), self._right, clock(self.time))
         painter.setPen(QColor(tokens.DIM2))
         painter.drawText(text_area, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                         self.caption_left())
+                         left)
         painter.setPen(QColor(_TONE_COLOURS[self._tone]))
         painter.drawText(text_area, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-                         self._right)
+                         right)
 
         border = tokens.TAG_BAD_BORDER if self.is_bad() else tokens.LINE
         painter.setPen(QPen(QColor(border), 1))
@@ -379,7 +445,7 @@ class PinTile(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setMinimumSize(120, TILE_HEIGHT)
+        self.setMinimumSize(TILE_MIN_WIDTH, TILE_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._text = PIN_TILE_TEXT
@@ -406,7 +472,12 @@ class PinTile(QWidget):
         painter.drawRoundedRect(bounds, tokens.RADIUS_SEG, tokens.RADIUS_SEG)
         painter.setPen(QColor(tokens.DIM2))
         painter.setFont(_font(tokens.FONT_SIZE_BTN_SM))
-        painter.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, self._text)
+        # Wrapped, not cut: at the UI scale the sentence is wider than a tile
+        # in a 1440 px window, and this is the one way into the tab on a file
+        # whose detection found nothing to show.
+        painter.drawText(QRectF(self.rect()).adjusted(CAPTION_PAD_X, 0, -CAPTION_PAD_X, 0),
+                         int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+                         self._text)
         painter.end()
 
 
@@ -463,7 +534,8 @@ class ContextStrip(QWidget):
         if width <= 0 or self._visible <= 0:
             return QRectF(0, -1, self.width(), self.height() + 2)
         scale = self.width() / width
-        return QRectF(self._offset * scale, -1, max(2.0, self._visible * scale), self.height() + 2)
+        return QRectF(self._offset * scale, -1,
+                      max(float(WINDOW_MIN_WIDTH), self._visible * scale), self.height() + 2)
 
     # --- panning ----------------------------------------------------------
 
@@ -507,6 +579,25 @@ class ContextStrip(QWidget):
             painter.setPen(QColor(tokens.DIM2))
             painter.setFont(_font(tokens.FONT_SIZE_SCOPE))
             painter.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, "waiting for the frames")
+        # The caption goes UNDER the amber window, not over it. The window is
+        # the thing on this strip you can take hold of, and at the UI scale
+        # the caption is more than half the width of a strip in a 1440 px
+        # window -- drawn last it hid the window whenever the zoom sat in the
+        # left half, which is where it starts on a centred subtitle.
+        if self._caption:
+            painter.setFont(_font(tokens.FONT_SIZE_SCOPE))
+            metrics = painter.fontMetrics()
+            # Never past the strip's own right edge, either.
+            width = min(metrics.horizontalAdvance(self._caption) + CTX_TAG_PAD_X,
+                        max(0.0, self.width() - 2 * CTX_TAG_X))
+            tag = QRectF(CTX_TAG_X, CTX_TAG_Y, width, CONTEXT_HEIGHT - CTX_TAG_INSET_Y)
+            painter.setPen(QPen(QColor(tokens.LINE2), 1))
+            painter.setBrush(TAG_BG)
+            painter.drawRoundedRect(tag, tokens.RADIUS_TAG, tokens.RADIUS_TAG)
+            painter.setPen(QColor(tokens.DIM))
+            painter.drawText(tag, Qt.AlignmentFlag.AlignCenter,
+                             metrics.elidedText(self._caption, Qt.TextElideMode.ElideRight,
+                                                int(max(0.0, width - CTX_TAG_PAD_X))))
         window = self.window_rect()
         painter.fillRect(window, _alpha(tokens.ACC, WINDOW_FILL_ALPHA))
         painter.setPen(QPen(QColor(tokens.ACC), WINDOW_BORDER))
@@ -514,16 +605,6 @@ class ContextStrip(QWidget):
         painter.drawRect(window.adjusted(WINDOW_BORDER / 2, 0, -WINDOW_BORDER / 2, 0))
         painter.restore()
 
-        if self._caption:
-            painter.setFont(_font(tokens.FONT_SIZE_SCOPE))
-            metrics = painter.fontMetrics()
-            width = metrics.horizontalAdvance(self._caption) + 12
-            tag = QRectF(6, 3, width, CONTEXT_HEIGHT - 9)
-            painter.setPen(QPen(QColor(tokens.LINE2), 1))
-            painter.setBrush(TAG_BG)
-            painter.drawRoundedRect(tag, tokens.RADIUS_TAG, tokens.RADIUS_TAG)
-            painter.setPen(QColor(tokens.DIM))
-            painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, self._caption)
         painter.setPen(QPen(QColor(tokens.LINE), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
@@ -682,7 +763,7 @@ class ThresholdCurve(QWidget):
             painter.drawLine(QPointF(value_x, 0), QPointF(value_x, PLOT_HEIGHT))
             painter.setBrush(QColor(tokens.ACC))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(value_x, 10), MARKER_RADIUS, MARKER_RADIUS)
+            painter.drawEllipse(QPointF(value_x, MARKER_Y), MARKER_RADIUS, MARKER_RADIUS)
 
         self._paint_legend(painter)
         painter.end()
@@ -697,8 +778,8 @@ class ThresholdCurve(QWidget):
         metrics = painter.fontMetrics()
         texts, tones = self.legend_texts(), self._legend_tones()
         widths = [metrics.horizontalAdvance(text) for text in texts]
-        left = metrics.horizontalAdvance(low) + 10
-        right = self.width() - metrics.horizontalAdvance(high) - 10
+        left = metrics.horizontalAdvance(low) + LEGEND_AXIS_GAP
+        right = self.width() - metrics.horizontalAdvance(high) - LEGEND_AXIS_GAP
         gaps = max(1, len(texts) + 1)
         spare = max(0.0, (right - left) - sum(widths))
         x = left + spare / gaps
@@ -707,6 +788,79 @@ class ThresholdCurve(QWidget):
             painter.drawText(QRectF(x, PLOT_HEIGHT, width, LEGEND_HEIGHT),
                              int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
             x += width + spare / gaps
+
+
+# --------------------------------------------------------------------------
+# The stage-head toolbar
+# --------------------------------------------------------------------------
+
+class WrappingToolbar(QWidget):
+    """Two groups of controls on one row where there is room for one row, and
+    on two rows where there is not.
+
+    Ruling B3 puts a tab's controls in the stage head, and the head lays its
+    tab buttons and the toolbar out in a single row -- so the toolbar's
+    minimum width IS part of the window's minimum width. At the UI scale this
+    tab's seven controls want 494 px of the 730 the shell leaves the stage in
+    a 1440 px window, and the head's tab buttons want 287 of it: the window
+    could not then be opened at 1440 at all, on a screen that is exactly that
+    wide. A second row costs the head some height, which it has and can grow
+    into; a width floor the screen cannot meet is not something the user can
+    do anything about.
+
+    `sizeHint` always asks for the one-row width, so the moment the head can
+    give it that much the two groups snap back onto one row. `minimumSizeHint`
+    is the wider group alone, which is the narrowest this can honestly be.
+    """
+
+    def __init__(self, first: QWidget, second: QWidget, gap: int,
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self._first, self._second = first, second
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(gap)
+        grid.setVerticalSpacing(gap)
+        # The layout may not pin the widget's own minimum to the arrangement
+        # it happens to be in: `minimumSizeHint` below is the honest floor,
+        # and it is what lets the head make this narrow enough to wrap.
+        grid.setSizeConstraint(QGridLayout.SizeConstraint.SetNoConstraint)
+        self._grid = grid
+        self._rows = 0
+        self._arrange(1)
+
+    def rows(self) -> int:
+        """1 or 2 -- how the groups are laid out right now."""
+        return self._rows
+
+    def one_row_width(self) -> int:
+        return (self._first.sizeHint().width() + self._grid.horizontalSpacing()
+                + self._second.sizeHint().width())
+
+    def _arrange(self, rows: int) -> None:
+        if rows == self._rows:
+            return
+        self._rows = rows
+        for widget in (self._first, self._second):
+            self._grid.removeWidget(widget)
+        self._grid.addWidget(self._first, 0, 0)
+        self._grid.addWidget(self._second, *((1, 0) if rows == 2 else (0, 1)))
+        self.updateGeometry()
+
+    def sizeHint(self):
+        """The one-row width whatever the current arrangement: a layout hands
+        a widget its size hint before its maximum, so this is what asks for
+        the room that would let the second row come back up."""
+        return QSize(self.one_row_width(), super().sizeHint().height())
+
+    def minimumSizeHint(self):
+        return QSize(max(self._first.minimumSizeHint().width(),
+                         self._second.minimumSizeHint().width()),
+                     super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._arrange(1 if self.width() >= self.one_row_width() else 2)
 
 
 # --------------------------------------------------------------------------
@@ -724,7 +878,7 @@ class BrightnessInspectorPanel(QWidget):
         super().__init__(parent)
         column = QVBoxLayout(self)
         column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(5)
+        column.setSpacing(PANEL_ROW_SPACING)
         column.addWidget(SectionHeader("Brightness"))
         self.auto_row = KvRow("Auto", NO_VALUE)
         self.yours_row = KvRow("Yours", NO_VALUE, tone="acc")
@@ -743,8 +897,8 @@ class BrightnessInspectorPanel(QWidget):
         for label in (self.stale_label, self.crop_note, self.flag_label, self.note):
             column.addWidget(label)
         buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 3, 0, 0)
-        buttons.setSpacing(6)
+        buttons.setContentsMargins(0, PANEL_BUTTON_TOP, 0, 0)
+        buttons.setSpacing(PANEL_BUTTON_GAP)
         self.use_button = small_button("use")
         self.keep_button = small_button("keep", "ghost")
         self.use_button.clicked.connect(self.use_auto)
@@ -851,33 +1005,45 @@ class BrightnessTab:
         page.setObjectName("BrightnessPage")
         page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         column = QVBoxLayout(page)
-        column.setContentsMargins(12, 10, 12, 12)
-        column.setSpacing(10)
+        column.setContentsMargins(PAGE_MARGIN_X, PAGE_MARGIN_TOP,
+                                  PAGE_MARGIN_X, PAGE_MARGIN_BOTTOM)
+        column.setSpacing(PAGE_SPACING)
 
-        self._toolbar = QWidget()
-        self._toolbar.setObjectName("BrightnessToolbar")
-        toolbar = QHBoxLayout(self._toolbar)
-        toolbar.setContentsMargins(0, 0, 0, 0)
-        toolbar.setSpacing(4)
+        zooms = QWidget()
+        zoom_row = QHBoxLayout(zooms)
+        zoom_row.setContentsMargins(0, 0, 0, 0)
+        zoom_row.setSpacing(TOOLBAR_GAP)
+        # Leading, so a row with room to spare right-aligns its controls the
+        # way the head right-aligns the toolbar -- without it the buttons
+        # stretch across the whole of a wrapped row.
+        zoom_row.addStretch(1)
         zoom_label = QLabel(ZOOM_LABEL)
         zoom_label.setObjectName("Note")
-        toolbar.addWidget(zoom_label)
+        zoom_row.addWidget(zoom_label)
         self.zoom_buttons: list[Button] = []
         for preset in ZOOM_PRESETS:
             button = small_button(preset, "ghost")
             button.set_toggled(preset == self._zoom)
             button.clicked.connect(lambda _checked=False, name=preset: self.set_zoom(name))
-            toolbar.addWidget(button)
+            zoom_row.addWidget(button)
             self.zoom_buttons.append(button)
-        toolbar.addSpacing(6)
+        toggles = QWidget()
+        toggle_row = QHBoxLayout(toggles)
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+        toggle_row.setSpacing(TOOLBAR_GAP)
+        toggle_row.addStretch(1)
         self.lost_button = small_button(LOST_TOGGLE_TEXT, "ghost")
         self.lost_button.set_toggled(True)
         self.lost_button.clicked.connect(self.toggle_lost_pixels)
         self.mask_button = small_button(MASK_TOGGLE_TEXT, "ghost")
         self.mask_button.set_toggled(True)
         self.mask_button.clicked.connect(self.toggle_masked)
-        toolbar.addWidget(self.lost_button)
-        toolbar.addWidget(self.mask_button)
+        toggle_row.addWidget(self.lost_button)
+        toggle_row.addWidget(self.mask_button)
+        # The presets and the toggles are two groups, so the head can put them
+        # on two rows when one will not fit -- see WrappingToolbar.
+        self._toolbar = WrappingToolbar(zooms, toggles, TOOLBAR_SPACING)
+        self._toolbar.setObjectName("BrightnessToolbar")
 
         self.context = ContextStrip()
         self.context.panned.connect(self._on_panned)
@@ -902,6 +1068,12 @@ class BrightnessTab:
 
         header_hint = QLabel(CURVE_HINT)
         header_hint.setObjectName("Note")
+        # The title and this hint are both a line of prose, and at the UI
+        # scale the pair is wider than the stage has at a 1440 px window. A
+        # non-wrapping QLabel asks for its whole line as a MINIMUM, which
+        # would make this row the width the window could not go under; the
+        # hint wraps instead, and it is the line that can afford to.
+        header_hint.setWordWrap(True)
         column.addWidget(SectionHeader(CURVE_HEADER, header_hint))
         self.curve = ThresholdCurve()
         self.curve.previewed.connect(self.set_preview)

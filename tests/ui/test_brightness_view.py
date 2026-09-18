@@ -17,16 +17,21 @@ import time as time_mod
 import numpy as np
 import pytest
 from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from app.controller import ProjectController
+from app.theme import tokens
+from app.views import ranges_view
 from app.views.brightness_view import (
+    CAPTION_GAP,
     KIND_LABELS,
     PIN_TILE_TEXT,
     BrightnessTab,
     PinTile,
     ZoomTile,
+    caption_texts,
 )
 from app.views.tabs import evidence_tabs
 from core.detect import ocr_view
@@ -273,18 +278,47 @@ def test_tile_captions_name_the_time_and_the_kind(loaded):
     assert KIND_LABELS["leaking"] == "background leaking"
 
 
+def test_a_narrow_caption_elides_the_kind_rather_than_printing_through_it(qapp):
+    """The two halves share one rect, from opposite ends. At the UI scale a
+    tile in a 1440 px window is not wide enough for both, and they used to be
+    drawn through each other; the status keeps its words and the time and
+    kind give way."""
+    metrics = QFontMetrics(QFont())
+    left, right = "09:38 · dark scene", "28% of glyph pixels lost"
+    wide = metrics.horizontalAdvance(left) + metrics.horizontalAdvance(right) + CAPTION_GAP
+    assert caption_texts(metrics, wide, left, right) == (left, right)     # room for both
+
+    # Too narrow for both: the time is kept whole rather than elided into.
+    narrow = wide - metrics.horizontalAdvance("dark scene")
+    drawn_left, drawn_right = caption_texts(metrics, narrow, left, right, "09:38")
+    assert drawn_right == right                                # the answer is never cut
+    assert drawn_left == "09:38"
+    assert (metrics.horizontalAdvance(drawn_left) + CAPTION_GAP
+            + metrics.horizontalAdvance(drawn_right)) <= narrow
+
+    # Narrower than even the time: then, and only then, it elides.
+    tiny = metrics.horizontalAdvance(right) + CAPTION_GAP + metrics.horizontalAdvance("09")
+    assert caption_texts(metrics, tiny, left, right, "09:38")[0].endswith("…")
+
+    # No status at all: the whole width is the left half's, gap and all.
+    assert caption_texts(metrics, wide, left, "", "09:38") == (left, "")
+
+
 def test_zoom_presets_pick_the_source_rectangle(loaded):
     tile = tile_of(loaded, "dark")
     loaded.set_zoom("300%")
     settle()
-    assert loaded.zoom_factor() == pytest.approx(3.0)
+    # A preset is a mockup magnification, scaled like every other length --
+    # never the bare 3.0, which would only be right at UI_SCALE 1.0.
+    assert loaded.zoom_factor() == pytest.approx(3.0 * tokens.UI_SCALE)
     rect = tile.source_rect()
     assert rect is not None
-    assert rect.width() == round(tile.content_rect().width() / 3)
+    assert rect.width() == round(tile.content_rect().width() / (3.0 * tokens.UI_SCALE))
 
     loaded.set_zoom("600%")
     settle()
-    assert tile.source_rect().width() == round(tile.content_rect().width() / 6)
+    assert tile.source_rect().width() == round(
+        tile.content_rect().width() / (6.0 * tokens.UI_SCALE))
 
     loaded.set_zoom("fit")
     settle()
@@ -907,14 +941,40 @@ def test_the_zoom_and_toggle_controls_live_in_the_stage_head(loaded):
     assert isinstance(bar, QWidget)
     owned = [*loaded.zoom_buttons, loaded.lost_button, loaded.mask_button]
     for button in owned:
-        assert button.parentWidget() is bar
-    assert not any(button.parentWidget() is loaded.page() for button in owned)
+        # ... in one of the toolbar's two groups (WrappingToolbar), never
+        # loose on the page.
+        assert bar.isAncestorOf(button)
+        assert not loaded.page().isAncestorOf(button)
     assert [button.text() for button in loaded.zoom_buttons] == ["fit", "100%", "300%", "600%"]
     assert bar.findChildren(QLabel)[0].text() == "zoom"
 
 
+def test_the_toolbar_wraps_rather_than_setting_the_windows_minimum_width(loaded):
+    """The stage head lays its tab buttons and the toolbar out in one row, so
+    an unbreakable toolbar is an unbreakable window width. At the UI scale
+    seven controls do not fit the 730 px the shell leaves the stage in a
+    1440 px window -- they go on two rows instead, and come back to one the
+    moment the head can hold them."""
+    bar = loaded.toolbar()
+    bar.show()                                   # `Stage` mounts it; here it is its own window
+    bar.resize(bar.one_row_width(), bar.sizeHint().height())
+    settle()
+    assert bar.rows() == 1
+
+    bar.resize(bar.one_row_width() - 1, bar.sizeHint().height())
+    settle()
+    assert bar.rows() == 2
+    assert bar.minimumSizeHint().width() < bar.one_row_width()
+
+    bar.resize(bar.one_row_width(), bar.sizeHint().height())
+    settle()
+    assert bar.rows() == 1                       # ... and back again
+    assert bar.sizeHint().width() == bar.one_row_width()
+
+
 def test_the_tab_leaves_room_for_the_compact_timeline(loaded):
-    assert loaded.timeline_slot().height() == 68
+    # Same scaled constant on both sides: the slot grows with the strip in it.
+    assert loaded.timeline_slot().height() == ranges_view.TIMELINE_HEIGHT
 
 
 # --------------------------------------------------------------------------

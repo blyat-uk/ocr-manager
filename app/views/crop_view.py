@@ -51,8 +51,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PyQt6 import sip
-from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QRadialGradient
+from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFontMetricsF,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QRadialGradient,
+)
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -82,8 +90,28 @@ DETECTED_TAG = "dashed grey = the latest detection"
 # The keyboard-focus ring the canvas and the filmstrip paint themselves: a
 # widget with a stylesheet gets no focus rectangle from Qt, and the arrows
 # mean different things on the two surfaces (nudge the box / step samples).
-FOCUS_RING_WIDTH = 1.5
-PAGE_MARGIN = 12                  # the page's own padding, all four sides
+#
+# Stroke widths are scaled as floats rather than through `tokens.px`: a pen
+# is not snapped to a whole device pixel, and rounding 1.5 and 1.2 to ints
+# would collapse two deliberately different weights onto the same one.
+FOCUS_RING_WIDTH = 1.5 * tokens.UI_SCALE
+BOX_EDGE_WIDTH = 1.5 * tokens.UI_SCALE   # the amber crop box's own outline
+PAGE_MARGIN = tokens.px(12)       # the page's own padding, all four sides
+CANVAS_MIN_WIDTH = tokens.px(240)  # the canvas never shrinks below this ...
+CANVAS_MIN_HEIGHT = tokens.px(120)  # ... which is also `heightForWidth`'s floor
+STRIP_MARGIN_X = tokens.px(6)     # the filmstrip's clearance for its focus ring
+STRIP_MARGIN_TOP = tokens.px(9)
+STRIP_MARGIN_BOTTOM = tokens.px(4)
+STRIP_GAP = tokens.px(6)          # between the label, the thumbnails and "more ▸"
+PANEL_ROW_SPACING = tokens.px(5)  # between two inspector rows
+PANEL_SECTION_GAP = tokens.px(4)  # above the "Evidence" header
+SPIN_PADDING_X = tokens.px(8)     # the spin row's own padding, as .kv has
+SPIN_PADDING_Y = tokens.px(3)
+SPIN_GAP = tokens.px(6)
+SPIN_WIDTH = tokens.px(64)        # one spin box
+TOOLBAR_GAP = tokens.px(4)        # between the three overlay toggles ...
+TOOLBAR_SPACING = tokens.px(6)    # ... and before "⤢ fit to all N samples"
+TIMELINE_GAP = tokens.px(8)       # between the filmstrip and the compact timeline
 # The detector settings "fit to all samples" re-aggregates with; the cutoff is
 # added from the evidence, never from the folder alone (see the module docstring).
 DETECTOR_FIELDS = ("crop_width_fraction", "crop_vertical_padding", "crop_min_height_fraction")
@@ -241,14 +269,22 @@ class CropCanvas(QWidget):
     tab turns them into controller commands."""
 
     HANDLES = ("tl", "tr", "bl", "br", "tc", "bc")
-    HANDLE_SIZE = 7                # `.cropbox b`: a 7x7 amber square per handle
-    HANDLE_GRAB = 13               # the square is small; this is what the mouse actually hits
+    # Screen lengths, so they go through `tokens.px`: the handle is a 7x7
+    # amber square in the mockup and the mouse actually hits 13x13 around it,
+    # both of which have to grow with the window or the affordance shrinks
+    # against everything beside it.
+    HANDLE_SIZE = tokens.px(7)     # `.cropbox b`: a 7x7 amber square per handle
+    HANDLE_GRAB = tokens.px(13)    # the square is small; this is what the mouse actually hits
+    # ... and these two are VIDEO pixels, which the UI scale must never touch:
+    # MIN_BOX is the model's own floor (`core.project.model.MIN_CROP_SIDE`) and
+    # MIN_MASK decides whether a right-drag is stored as a label mask at all.
+    # Scaling either would change what is written to `.ocr.json`.
     MIN_BOX = MIN_CROP_SIDE        # video pixels; the model's own floor, so the two cannot drift
-    MIN_MASK = 6                   # a right-drag smaller than this counts as a click
-    GRID_DIVISIONS = 10            # the "grid" overlay: every 10%
+    MIN_MASK = 6                   # video pixels: a right-drag smaller than this counts as a click
+    GRID_DIVISIONS = 10            # the "grid" overlay: every 10% -- a fraction, not a length
     GRID_ALPHA = 0.45
-    TAG_MARGIN = 8
-    TAG_PAD_X, TAG_PAD_Y = 6, 2
+    TAG_MARGIN = tokens.px(8)
+    TAG_PAD_X, TAG_PAD_Y = tokens.px(6), tokens.px(2)
     PLACEHOLDER_TEXT = "loading frame…"
 
     box_changed = pyqtSignal()
@@ -266,7 +302,7 @@ class CropCanvas(QWidget):
         policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
-        self.setMinimumSize(240, 120)
+        self.setMinimumSize(CANVAS_MIN_WIDTH, CANVAS_MIN_HEIGHT)
         self._video = (1920, 1080)
         self._frame = None
         self._image: QImage | None = None
@@ -746,7 +782,7 @@ class CropCanvas(QWidget):
     def _paint_box(self, painter: QPainter) -> None:
         rect = self.box_rect()
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor(tokens.ACC), 1.5))
+        painter.setPen(QPen(QColor(tokens.ACC), BOX_EDGE_WIDTH))
         painter.drawRoundedRect(rect, tokens.RADIUS_XS, tokens.RADIUS_XS)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(tokens.ACC))
@@ -766,6 +802,41 @@ class CropCanvas(QWidget):
             painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
 
+    def tag_rect(self, corner: str, bounds: QRectF, width: float, height: float) -> QRectF:
+        """Where a canvas tag sits: its own corner of the frame, stepped
+        clear of the crop box when the box reaches into that corner.
+
+        A subtitle crop is a band along the bottom of the frame, so the
+        bottom tags land on it -- and at the UI scale a tag is a quarter
+        taller and wider than the mockup's while the canvas, at a 1440 px
+        window, is smaller. The legend was printing straight through the
+        subtitle it was about. It steps to the other side of the box, and
+        only if the frame has room for it there."""
+        x = (bounds.x() + self.TAG_MARGIN if corner.endswith("left")
+             else bounds.right() - self.TAG_MARGIN - width)
+        y = (bounds.y() + self.TAG_MARGIN if corner.startswith("top")
+             else bounds.bottom() - self.TAG_MARGIN - height)
+        rect = QRectF(x, y, width, height)
+        box = self.box_rect()
+        if not rect.intersects(box):
+            return rect
+        clear = (box.bottom() + self.TAG_MARGIN if corner.startswith("top")
+                 else box.top() - self.TAG_MARGIN - height)
+        if bounds.top() <= clear and clear + height <= bounds.bottom():
+            rect.moveTop(clear)
+        return rect
+
+    def tag_rects(self, bounds: QRectF | None = None) -> dict[str, QRectF]:
+        """Every tag's rectangle, by corner -- what `_paint_tags` draws."""
+        bounds = self.frame_rect() if bounds is None else bounds
+        font = self.font()
+        font.setPixelSize(round(tokens.FONT_SIZE_SCOPE))
+        metrics = QFontMetricsF(font)
+        return {corner: self.tag_rect(corner, bounds,
+                                      metrics.horizontalAdvance(text) + 2 * self.TAG_PAD_X,
+                                      metrics.ascent() + metrics.descent() + 2 * self.TAG_PAD_Y)
+                for corner, text in self.tags().items()}
+
     def _paint_tags(self, painter: QPainter, bounds: QRectF) -> None:
         font = painter.font()
         font.setPixelSize(round(tokens.FONT_SIZE_SCOPE))
@@ -774,11 +845,7 @@ class CropCanvas(QWidget):
         for corner, text in self.tags().items():
             width = metrics.horizontalAdvance(text) + 2 * self.TAG_PAD_X
             height = metrics.ascent() + metrics.descent() + 2 * self.TAG_PAD_Y
-            x = (bounds.x() + self.TAG_MARGIN if corner.endswith("left")
-                 else bounds.right() - self.TAG_MARGIN - width)
-            y = (bounds.y() + self.TAG_MARGIN if corner.startswith("top")
-                 else bounds.bottom() - self.TAG_MARGIN - height)
-            rect = QRectF(x, y, width, height)
+            rect = self.tag_rect(corner, bounds, width, height)
             colour, border = _TAG_TONES[corner]
             painter.setPen(QPen(QColor(border), 1))
             painter.setBrush(QColor(*tokens.TAG_BG))
@@ -795,10 +862,11 @@ class SampleThumbnail(QWidget):
     """`.sthumb`: one sampled frame, 64x36, with one or two white bars for
     the text rows found in it and a border for its state."""
 
-    BAR_INSET = 0.12               # `.sthumb i`: left/right 12%
-    BAR_BOTTOM = 0.20
+    BAR_INSET = 0.12               # `.sthumb i`: left/right 12% -- fractions of the
+    BAR_BOTTOM = 0.20              # thumbnail, so they scale with it for free
     BAR_BOTTOM_TWO = 0.34
-    BAR_HEIGHT = 3
+    BAR_HEIGHT = tokens.px(3)
+    BORDER = 1                     # the CSS box's 1 px border, on each side
 
     clicked = pyqtSignal(int)
 
@@ -806,7 +874,7 @@ class SampleThumbnail(QWidget):
         super().__init__(parent)
         self.setObjectName("SampleThumbnail")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(width + 2, height + 2)       # 1 px border on each side, as the CSS box does
+        self.setFixedSize(width + 2 * self.BORDER, height + 2 * self.BORDER)
         self._index = -1
         self._image: QImage | None = None
         self._lines = 0
@@ -891,12 +959,22 @@ class SampleThumbnail(QWidget):
 
 
 class SampleStrip(QWidget):
-    """`.strip`: "samples", up to eight thumbnails, "more ▸" to page."""
+    """`.strip`: "samples", up to eight thumbnails, "more ▸" to page.
 
-    PAGE = 8
-    THUMB_WIDTH = 64
-    THUMB_HEIGHT = 36
-    LABEL_WIDTH = 46
+    The page is eight where eight fit and fewer where they do not
+    (`fits()`). A thumbnail is a fixed 64x36 of the mockup's -- at the UI
+    scale, 80x45 -- and eight of those plus the label, the button and the
+    hint is more than the stage has at 1440 px wide. A row of fixed-size
+    children would make that a HARD minimum: the window could not be opened
+    narrower, whatever the screen. So the row shows the thumbnails its width
+    can hold at full size and "more ▸" reaches the rest, which is the
+    affordance the mockup already has for the samples past the eighth.
+    """
+
+    PAGE = 8                       # the mockup's page -- a count, not a length
+    THUMB_WIDTH = tokens.px(64)
+    THUMB_HEIGHT = tokens.px(36)
+    LABEL_WIDTH = tokens.px(46)
 
     selected = pyqtSignal(int)
     stepped = pyqtSignal(int)
@@ -914,9 +992,20 @@ class SampleStrip(QWidget):
         # Clearance on the sides and the bottom for the focus ring, which the
         # row paints on its own edge (`_paint_focus_ring`) -- at the mockup's
         # flush margins the ring cut through the "◀ ▶ arrow keys" hint.
-        layout.setContentsMargins(6, 9, 6, 4)
-        layout.setSpacing(6)
+        layout.setContentsMargins(STRIP_MARGIN_X, STRIP_MARGIN_TOP,
+                                  STRIP_MARGIN_X, STRIP_MARGIN_BOTTOM)
+        layout.setSpacing(STRIP_GAP)
+        # ... which also means the layout may not push its own minimum onto
+        # the widget: `minimumSizeHint` below is what the page's layout asks,
+        # and `resizeEvent` hides whatever the width cannot hold.
+        layout.setSizeConstraint(QHBoxLayout.SizeConstraint.SetNoConstraint)
         self._label = note_label("samples")
+        # One line, both of them: this is a fixed-height row of thumbnails,
+        # and a wrapping QLabel asks for almost no width -- which is how the
+        # hint ended up stacked three deep ("◀ ▶" / "arrow" / "keys") beside
+        # eight thumbnails that had squeezed it out. Off, the two are plain
+        # fixed furniture and `fits()` can count on their width.
+        self._label.setWordWrap(False)
         self._label.setFixedWidth(self.LABEL_WIDTH)
         layout.addWidget(self._label)
         self._thumbs: list[SampleThumbnail] = []
@@ -930,8 +1019,49 @@ class SampleStrip(QWidget):
         self.more_button.clicked.connect(self.next_page)
         layout.addWidget(self.more_button)
         layout.addStretch(1)
-        layout.addWidget(note_label(ARROW_HINT))
+        self._hint = note_label(ARROW_HINT)
+        self._hint.setWordWrap(False)
+        layout.addWidget(self._hint)
         self._focus_ring = False
+        self._shown = 0                        # thumbnails the last `_relayout` left visible
+
+    # --- how many fit -----------------------------------------------------------
+
+    def _furniture_width(self) -> int:
+        """Everything on the row that is not a thumbnail: the margins, the
+        "samples" label, "more ▸", the arrow hint and the gaps between them.
+
+        "more ▸" is counted whether or not it is on screen: the number that
+        fits is what decides whether there IS a next page, so measuring the
+        button only when it shows would make the two chase each other -- and
+        the row would jump by a thumbnail as paging appeared."""
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        gaps = 4 * layout.spacing()            # label | more | stretch | hint
+        return (margins.left() + margins.right() + gaps + self.LABEL_WIDTH
+                + self.more_button.sizeHint().width() + self._hint.sizeHint().width())
+
+    def _thumb_step(self) -> int:
+        return self.THUMB_WIDTH + 2 * SampleThumbnail.BORDER + self.layout().spacing()
+
+    def fits(self) -> int:
+        """How many thumbnails this width can hold, at most the mockup's
+        eight and never fewer than one -- a row with no thumbnail at all
+        would leave the samples unreachable."""
+        room = self.width() - self._furniture_width()
+        return max(1, min(self.PAGE, room // self._thumb_step()))
+
+    def minimumSizeHint(self):
+        """One thumbnail's worth. The filmstrip is never what decides how
+        narrow the window may be (see the class docstring); the layout's own
+        minimum -- all eight -- is not asked for."""
+        return QSize(self._furniture_width() + self._thumb_step(),
+                     super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.fits() != self._shown:
+            self._relayout()
 
     # --- focus ----------------------------------------------------------------
 
@@ -990,13 +1120,13 @@ class SampleStrip(QWidget):
         self._page = 0
 
     def pages(self) -> int:
-        return max(1, -(-len(self._samples) // self.PAGE))
+        return max(1, -(-len(self._samples) // self.fits()))
 
     def reveal(self, index: int) -> None:
         """Page to the sample at `index`: the view followed a click, ◀ / ▶,
         a warn row in the panel, or a fresh detection."""
         if 0 <= index < len(self._samples):
-            self._page = min(index // self.PAGE, self.pages() - 1)
+            self._page = min(index // self.fits(), self.pages() - 1)
             self._relayout()
 
     def next_page(self) -> None:
@@ -1016,8 +1146,9 @@ class SampleStrip(QWidget):
         self._relayout()
 
     def _relayout(self) -> None:
-        start = self._page * self.PAGE
-        shown = self._samples[start:start + self.PAGE]
+        self._shown = self.fits()
+        start = self._page * self._shown
+        shown = self._samples[start:start + self._shown]
         for offset, thumb in enumerate(self._thumbs):
             if offset >= len(shown):
                 thumb.hide()
@@ -1026,7 +1157,7 @@ class SampleStrip(QWidget):
             tone = "selected" if index == self._selected else ("warn" if index in self._warned else "")
             thumb.set_state(index, self._images.get(index), shown[offset].lines, tone)
             thumb.show()
-        self.more_button.setVisible(len(self._samples) > self.PAGE)
+        self.more_button.setVisible(len(self._samples) > self._shown)
 
     def keyPressEvent(self, event) -> None:
         """◀ / ▶ walk the samples while the filmstrip has focus (the canvas
@@ -1078,8 +1209,9 @@ class _SpinPair(QWidget):
         self.setObjectName("KvRow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 3, 8, 3)
-        layout.setSpacing(6)
+        layout.setContentsMargins(SPIN_PADDING_X, SPIN_PADDING_Y,
+                                  SPIN_PADDING_X, SPIN_PADDING_Y)
+        layout.setSpacing(SPIN_GAP)
         label = QLabel(key)
         label.setProperty("kvRole", "key")
         layout.addWidget(label)
@@ -1087,13 +1219,14 @@ class _SpinPair(QWidget):
         self.first, self.second = QSpinBox(), QSpinBox()
         for spin in (self.first, self.second):
             spin.setRange(0, 1)
-            spin.setFixedWidth(64)
+            spin.setFixedWidth(SPIN_WIDTH)
             spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
             spin.setStyleSheet(
                 f"QSpinBox {{ background: {tokens.BG}; color: {tokens.TXT}; "
                 f"border: 1px solid {tokens.LINE2}; border-radius: {tokens.RADIUS_XS}px; "
-                f"padding: 1px 4px; font-size: {tokens.FONT_SIZE_BODY}px; }}"
+                f"padding: {tokens.px(1)}px {tokens.px(4)}px; "
+                f"font-size: {round(tokens.FONT_SIZE_BODY)}px; }}"
                 f"QSpinBox:focus {{ border-color: {tokens.ACC}; }}")
             layout.addWidget(spin)
         self.first.valueChanged.connect(lambda _value: self._on_changed(self.ORIGIN))
@@ -1163,7 +1296,7 @@ class CropInspectorPanel(Section):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.body.setSpacing(5)
+        self.body.setSpacing(PANEL_ROW_SPACING)
         self.x_row = _SpinPair("X / width")
         self.y_row = _SpinPair("Y / height")
         for row in (self.x_row, self.y_row):
@@ -1171,7 +1304,7 @@ class CropInspectorPanel(Section):
             self.body.addWidget(row)
         self.nudge_label = note_label(NUDGE_NOTE)
         self.body.addWidget(self.nudge_label)
-        self.body.addSpacing(4)
+        self.body.addSpacing(PANEL_SECTION_GAP)
         self.evidence_header = SectionHeader("Evidence")
         self.body.addWidget(self.evidence_header)
         self._rows: list[KvRow] = []
@@ -1362,13 +1495,13 @@ class CropTab:
         self._toolbar.setObjectName("CropToolbar")
         bar = QHBoxLayout(self._toolbar)
         bar.setContentsMargins(0, 0, 0, 0)
-        bar.setSpacing(4)
+        bar.setSpacing(TOOLBAR_GAP)
         self.envelope_button = self._toggle("envelope", "envelope", on=True)
         self.masked_button = self._toggle("masked", "masked")
         self.grid_button = self._toggle("grid", "grid")
         for button in (self.envelope_button, self.masked_button, self.grid_button):
             bar.addWidget(button)
-        bar.addSpacing(6)
+        bar.addSpacing(TOOLBAR_SPACING)
         self.fit_button = Button("⤢ fit to all 0 samples", small=True)
         self.fit_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.fit_button.clicked.connect(self.fit_to_samples)
@@ -1387,7 +1520,7 @@ class CropTab:
         column.addWidget(self.canvas)
         self.strip = SampleStrip()
         column.addWidget(self.strip)
-        column.addSpacing(8)
+        column.addSpacing(TIMELINE_GAP)
         self.timeline = Timeline(controller, mode="compact")    # ruling B5
         self.timeline.seek_requested.connect(self.select_nearest)
         column.addWidget(self.timeline)
