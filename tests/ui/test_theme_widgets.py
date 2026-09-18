@@ -724,3 +724,58 @@ def test_scaled_padding_never_clips_a_button_label(qapp):
                 text = button.fontMetrics().horizontalAdvance(button.text())
                 assert button.sizeHint().width() >= text + 2 * tokens.px(3)
                 assert button.sizeHint().height() > button.fontMetrics().height()
+
+
+def _font_size_rules(sheet: str) -> list[tuple[str, float]]:
+    """`[(selector, font-size in px)]` for every rule in the sheet that sets
+    one, in source order. Comments go first so a `1 px` in prose cannot be
+    read as a declaration."""
+    body = re.sub(r"/\*.*?\*/", "", sheet, flags=re.S)
+    rules = []
+    for selector, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", body):
+        match = re.search(r"font-size:\s*([0-9.]+)px", declarations)
+        if match:
+            rules.append((" ".join(selector.split()), float(match.group(1))))
+    return rules
+
+
+# Every rule that must carry a scaled font size. The six at the end had a
+# literal `11px` (ui-spec §2.2's one size with no FONT_SIZE_* token of its
+# own) until they were routed through `tokens.pt(11)`; #LogBody in
+# particular is the densest text in the window to read, so a straggler there
+# is the one most worth catching.
+RULES_THAT_SET_A_FONT_SIZE = [
+    "QPushButton", 'QPushButton[small="true"]', "QPushButton#SegmentItem",
+    "QPushButton#StageTab", "QPushButton#LogHeader",
+    'QLabel[badge="default"]', 'QLabel[badge="warn"]', 'QLabel[badge="good"]', 'QLabel[badge="bad"]',
+    "QWidget#KvRow QLabel", 'QWidget#SectionHeader QLabel[sectionRole="title"]',
+    "QMenu", "QLabel#ProjectName", "QLabel#BannerTitle", "QLabel#BannerText",
+    "QLabel#QueueName", "QLabel#QueueSub", "QLabel#QueueHint",
+    "QLabel#InspectorScope", "QLabel#InspectorFile", "QLabel#InspectorSub", "QLabel#Note",
+    "QLabel#OcrTime", "QWidget#ActivityStrip QLabel", "QLabel#OpenTitle", "QLabel#OpenError",
+    "QLabel#StartError", "QLabel#RunHeaderCell", "QLabel#RunFile, QLabel#RunPhase, QLabel#RunResult",
+    "QWidget#RunFooter QLabel", "QLabel#LiveTitle", "QLabel#FeedTime",
+    "QLabel#FolderSettingsTitle",
+    "QWidget#FolderSettings QAbstractSpinBox, QWidget#FolderSettings QComboBox",
+    # The former literals.
+    "QWidget#Chip QLabel", "QLabel#ProjectPath", "QLabel#OcrText", "QLabel#FeedText",
+    "QPlainTextEdit#LogBody", "QLabel#FolderSettingsScope",
+]
+
+
+def test_every_font_size_rule_scales_and_names_the_straggler():
+    """The per-rule counterpart to the sheet-wide length check: a font size
+    left as a literal sits still between the two scales, and the rule it
+    sits in is named in the failure rather than an anonymous index."""
+    with ui_scale(1.0):
+        single = _font_size_rules(qss.build_stylesheet())
+    with ui_scale(2.0):
+        double = _font_size_rules(qss.build_stylesheet())
+
+    assert [selector for selector, _ in single] == [selector for selector, _ in double]
+    for (selector, one), (_, two) in zip(single, double, strict=True):
+        assert two > one, f"{selector} kept a literal font-size ({one:g}px at both scales)"
+        assert abs(two - 2 * one) <= 1, f"{selector}: {one:g}px -> {two:g}px is not the scale"
+
+    # ... and no rule may quietly stop setting one either.
+    assert sorted(selector for selector, _ in single) == sorted(RULES_THAT_SET_A_FONT_SIZE)
