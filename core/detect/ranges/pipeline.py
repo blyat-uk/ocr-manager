@@ -93,6 +93,31 @@ class Segment:
     matches: tuple[SegmentMatch, ...]
 
 
+@dataclass(frozen=True)
+class Block:
+    """One repeating-segment match, as evidence for the review UI.
+
+    Blocks are the RAW matched segments per file -- possibly overlapping,
+    never merged. This is deliberately different from compute_keep_ranges(),
+    which inverts each file's *merged* skip blocks into keep spans; a Block
+    here is one SegmentMatch, one-to-one, so the UI can show exactly what
+    was matched (and against how many other files, and how well) rather
+    than the collapsed result. See compute_blocks().
+    """
+    start_sec: float
+    end_sec: float
+    kind: str            # "intro" | "outro" | "repeat"
+    matched_files: int    # distinct files this segment was matched in, including this one
+    score: float          # this file's own SegmentMatch.score
+
+
+@dataclass(frozen=True)
+class RangesAnalysis:
+    keep: dict[str, list[tuple[str | None, str | None]]]   # identical to analyse()'s return
+    blocks: dict[str, list[Block]]                          # per filename, sorted by start_sec
+    durations: dict[str, float]
+
+
 ProgressFn = Callable[[ProgressEvent], None]
 CancelFn = Callable[[], bool]
 
@@ -595,10 +620,69 @@ def compute_keep_ranges(
 
 
 # ---------------------------------------------------------------------------
+# Blocks (evidence: raw matched segments per file, kind, count, score)
+# ---------------------------------------------------------------------------
+
+# The band, at each end of a file, within which a matched segment counts as
+# "intro"/"outro" rather than a plain repeat. Picked, not measured: 5% of a
+# typical 20-40 min episode is 1-2 minutes -- generous enough for a cold-open
+# or a trailing sponsor card -- while the 5.0 s floor keeps that same margin
+# meaningful on short clips instead of shrinking to nothing.
+_EDGE_MIN_SEC = 5.0
+_EDGE_FRACTION = 0.05
+
+
+def _block_kind(start_sec: float, end_sec: float, duration: float) -> str:
+    """"intro" if the match starts at or before the edge band, else "outro"
+    if it ends at or after the edge band from the end, else "repeat". Both
+    comparisons are inclusive of the edge itself (<=, >=): a match landing
+    exactly on the boundary counts as intro/outro, not as a plain repeat."""
+    edge = max(_EDGE_MIN_SEC, _EDGE_FRACTION * duration)
+    if start_sec <= edge:
+        return "intro"
+    if end_sec >= duration - edge:
+        return "outro"
+    return "repeat"
+
+
+def compute_blocks(
+    segments: Sequence[Segment],
+    names: Sequence[str],
+    durations: Sequence[float],
+) -> dict[str, list[Block]]:
+    """One Block per SegmentMatch that belongs to a file, keyed by filename.
+
+    Deliberately NOT the merged skip spans compute_keep_ranges() derives
+    from the same segments: if two matches in the same file overlap (across
+    different discovered segments), both are kept as separate Blocks here,
+    unmerged. Each file's list is sorted by start_sec. ``matched_files`` is
+    the number of distinct files among that segment's own matches (not
+    ``len(segment.matches)`` -- a segment is not guaranteed to have exactly
+    one match per file); ``score`` is this file's own SegmentMatch.score.
+    Files with no match are absent from the result, matching
+    compute_keep_ranges()'s own convention.
+    """
+    blocks: dict[str, list[Block]] = {}
+    for seg in segments:
+        matched_files = len({mm.file for mm in seg.matches})
+        for mm in seg.matches:
+            if not 0 <= mm.file < len(names):
+                continue
+            duration = durations[mm.file] or 0.0
+            kind = _block_kind(mm.start_sec, mm.end_sec, duration)
+            blocks.setdefault(names[mm.file], []).append(
+                Block(mm.start_sec, mm.end_sec, kind, matched_files, mm.score)
+            )
+    for file_blocks in blocks.values():
+        file_blocks.sort(key=lambda b: b.start_sec)
+    return blocks
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def analyse(
+def analyse_detailed(
     files: Sequence[FileEntry],
     cfg: RangesConfig,
     progress: ProgressFn | None = None,
@@ -606,13 +690,15 @@ def analyse(
     cache_dir: str | None = None,
     workers: int = DEFAULT_WORKERS,
     cancel: CancelFn | None = None,
-) -> dict[str, list[tuple[str | None, str | None]]]:
-    """Keep ranges per filename for a folder of episodes.
+) -> RangesAnalysis:
+    """Keep ranges, plus the evidence analyse() drops: each file's raw
+    matched blocks (kind/matched_files/score, see compute_blocks()) and
+    every analysed file's duration.
 
-    ``cache_dir`` is where fingerprints are cached (normally
-    ``default_cache_dir(project)``); None disables caching and writes
-    nothing. Raises AnalysisCancelled when ``cancel()`` returns True, and
-    lets decode errors (no audio stream, ffmpeg failure) propagate.
+    Same parameters, same cache behaviour, same exceptions as analyse():
+    AnalysisCancelled when ``cancel()`` returns True, decode errors (no
+    audio stream, ffmpeg failure) propagate uncaught. analyse()'s own
+    return is exactly this call's ``.keep``.
     """
     def emit(event: ProgressEvent) -> None:
         if progress is not None:
@@ -632,6 +718,30 @@ def analyse(
     _check_cancel(cancel)
 
     emit(ProgressEvent("phase", "Computing time ranges"))
-    return compute_keep_ranges(
-        segments, [f.name for f in files], durations, cfg.merge_repeating_silences,
-    )
+    names = [f.name for f in files]
+    keep = compute_keep_ranges(segments, names, durations, cfg.merge_repeating_silences)
+    blocks = compute_blocks(segments, names, durations)
+    durations_by_name = dict(zip(names, durations))
+
+    return RangesAnalysis(keep=keep, blocks=blocks, durations=durations_by_name)
+
+
+def analyse(
+    files: Sequence[FileEntry],
+    cfg: RangesConfig,
+    progress: ProgressFn | None = None,
+    *,
+    cache_dir: str | None = None,
+    workers: int = DEFAULT_WORKERS,
+    cancel: CancelFn | None = None,
+) -> dict[str, list[tuple[str | None, str | None]]]:
+    """Keep ranges per filename for a folder of episodes.
+
+    ``cache_dir`` is where fingerprints are cached (normally
+    ``default_cache_dir(project)``); None disables caching and writes
+    nothing. Raises AnalysisCancelled when ``cancel()`` returns True, and
+    lets decode errors (no audio stream, ffmpeg failure) propagate.
+    """
+    return analyse_detailed(
+        files, cfg, progress, cache_dir=cache_dir, workers=workers, cancel=cancel,
+    ).keep

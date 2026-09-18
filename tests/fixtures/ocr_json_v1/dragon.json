@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "global": {
+    "brightness": 230,
+    "ocr_parallel": 4,
+    "dialogue_enabled": true,
+    "labels_enabled": true,
+    "time_range": {
+      "start": "02:21",
+      "end": "09:15"
+    }
+  },
+  "videocr": {
+    "ocr_lang": "ch",
+    "conf_threshold": "95",
+    "sim_threshold": "82",
+    "similar_image": "0.3"
+  },
+  "files": {
+    "LPJT_-_037_[4K]YK10B.mp4": {
+      "crop": {
+        "x": 576,
+        "y": 1917,
+        "width": 2688,
+        "height": 139
+      },
+      "time_ranges": [
+        {
+          "start": "02:21",
+          "end": "09:15"
+        }
+      ],
+      "resolution": {
+        "width": 3840,
+        "height": 2160
+      },
+      "duration": 679,
+      "subtitle_position": 4279
+    },
+    "LPJT_-_038_[4K]YK10B.mp4": {
+      "crop": {
+        "x": 576,
+        "y": 1921,
+        "width": 2688,
+        "height": 135
+      },
+      "time_ranges": [
+        {
+          "start": "02:21",
+          "end": "09:37"
+        }
+      ],
+      "resolution": {
+        "width": 3840,
+        "height": 2160
+      },
+      "duration": 701,
+      "subtitle_position": 4014
+    },
+    "LPJT_-_039_[4K]YK10B.mp4": {
+      "crop": {
+        "x": 576,
+        "y": 1930,
+        "width": 2688,
+        "height": 122
+      },
+      "time_ranges": [
+        {
+          "start": "02:21",
+          "end": "09:34"
+        }
+      ],
+      "resolution": {
+        "width": 3840,
+        "height": 2160
+      },
+      "duration": 697,
+      "subtitle_position": 4157
+    },
+    "LPJT_-_040_[4K]YK10B.mp4": {
+      "crop": {
+        "x": 576,
+        "y": 1921,
+        "width": 2688,
+        "height": 135
+      },
+      "time_ranges": [
+        {
+          "start": "02:21",
+          "end": "09:35"
+        }
+      ],
+      "resolution": {
+        "width": 3840,
+        "height": 2160
+      },
+      "duration": 698,
+      "subtitle_position": 4085
+    }
+  },
+  "labels": {
+    "label_min_duration": "0.5",
+    "label_max_duration": "5.0",
+    "label_conf_threshold": "95",
+    "label_conf_threshold_min": "80"
+  },
+  "autodetect": {
+    "min_segment_length": "30",
+    "merge_repeating_silences": "true"
+  },
+  "automation": {
+    "crop_width_fraction": "0.7",
+    "crop_vertical_padding": "0.0",
+    "crop_min_height_fraction": "0.05",
+    "bottom_half_cutoff": "0.5",
+    "detection_batch_size": "10"
+  }
+}

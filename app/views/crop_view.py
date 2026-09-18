@@ -1,0 +1,1877 @@
+"""The Crop review view (plan 3C Task 2, ui-spec §3.4, rulings B2/B3/B5).
+
+`CropTab` is a `StageTab`: a frame canvas with a free six-handle box, the
+detector's text envelope, a sample filmstrip and its own inspector panel.
+
+Pixels
+    Every frame here -- the canvas and the filmstrip thumbnails -- comes
+    from `controller.request_frames` / `controller.frame`, i.e.
+    `core.detect.crop.grab_frames`, at the times the crop detector itself
+    recorded. That is the only source whose times re-fetch the frames the
+    evidence was measured on (the frame-addressing table in
+    `core/detect/__init__.py`). The "masked" toggle previews the OCR pass's
+    brightness filter over the crop region of the frame already in hand; it
+    is a preview of the filter, not of the OCR pass's own pixels, so nothing
+    here tunes a brightness threshold -- that is the Brightness tab's job,
+    and it uses `ocr_view` strips.
+
+Evidence is a disposable cache: every `evidence["crop"]` key is read with
+`.get` and missing keys fall back to the no-evidence presentation.
+
+    - Samples are de-duplicated by time, preferring the kept entry: the
+      full-frame retry re-probes times the bottom-band round already probed,
+      so one time can carry both an empty and a kept entry. Every count and
+      the filmstrip use the de-duplicated list.
+    - A sample is "disagreeing" only when the result HAS a box. Without one
+      (a confirmed watermark, the height ceiling, ...) nothing disagrees --
+      there is nothing to disagree with -- and the panel shows the flag
+      reason instead.
+    - "⤢ fit to all N samples" re-runs the detector's own aggregation over
+      the kept samples' boxes with the cutoff the detection used
+      (`cutoff_frac`, 0.0 after a full-frame retry), falling back to the
+      folder setting when the evidence predates that field.
+
+Edits are MANUAL values committed through `controller.set_crop`: on mouse
+release for a drag, and 400 ms after the last key nudge or spin-box change,
+so one gesture is one command. Label masks are folder-level and go through
+`controller.set_label_masks`; the whole affordance is hidden when the folder
+has labels off.
+
+Ruling C2: a detection never overwrites a MANUAL/IMPORTED value, but its
+evidence still replaces `evidence["crop"]`. When the two differ, the amber
+box stays the stored value and the detection is drawn separately, dashed and
+labelled, with a panel row naming both.
+
+Views import no `core` module (tests/ui/test_main_window.py), so the two
+pure detector helpers this view needs -- `crop.aggregate_box` and
+`ocr_view.mask` -- are reached through `app.masking`.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from PyQt6 import sip
+from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFontMetricsF,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QRadialGradient,
+)
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.imaging import bgr_to_qimage
+from app.masking import MIN_CROP_SIDE, aggregate_crop_box, clamp_crop_box, mask_region
+from app.state_text import clock, crop_caption, crop_flag_summary
+from app.theme import tokens
+from app.views.inspector_sections import Section, note_label
+from app.views.ranges_view import Timeline
+from app.views.thumbnail import GRADIENT_DEGREES, GRADIENT_END_STOP, css_gradient
+from app.widgets.base import Button, KvRow, SectionHeader
+
+COMMIT_DEBOUNCE_MS = 400          # one command per gesture: nudges and spin-box edits
+DEFAULT_BRIGHTNESS = 230          # core.config.Config's default, for a file with no value yet
+NUDGE_SMALL, NUDGE_LARGE = 1, 10  # video pixels, plain and with Shift
+NUDGE_NOTE = "Arrow keys nudge 1 px, ⇧ arrows nudge 10. Free rectangle — no forced centring."
+COVERED_NOTE = "The amber box already covers it. Click the warned sample to inspect."
+OUTSIDE_NOTE = "This sample falls outside the box."
+ARROW_HINT = "◀ ▶ arrow keys"
+DETECTED_TAG = "dashed grey = the latest detection"
+# The keyboard-focus ring the canvas and the filmstrip paint themselves: a
+# widget with a stylesheet gets no focus rectangle from Qt, and the arrows
+# mean different things on the two surfaces (nudge the box / step samples).
+#
+# Stroke widths are scaled as floats rather than through `tokens.px`: a pen
+# is not snapped to a whole device pixel, and rounding 1.5 and 1.2 to ints
+# would collapse two deliberately different weights onto the same one.
+FOCUS_RING_WIDTH = 1.5 * tokens.UI_SCALE
+BOX_EDGE_WIDTH = 1.5 * tokens.UI_SCALE   # the amber crop box's own outline
+PAGE_MARGIN = tokens.px(12)       # the page's own padding, all four sides
+CANVAS_MIN_WIDTH = tokens.px(240)  # the canvas never shrinks below this ...
+CANVAS_MIN_HEIGHT = tokens.px(120)  # ... which is also `heightForWidth`'s floor
+STRIP_MARGIN_X = tokens.px(6)     # the filmstrip's clearance for its focus ring
+STRIP_MARGIN_TOP = tokens.px(9)
+STRIP_MARGIN_BOTTOM = tokens.px(4)
+STRIP_GAP = tokens.px(6)          # between the label, the thumbnails and "more ▸"
+PANEL_ROW_SPACING = tokens.px(5)  # between two inspector rows
+PANEL_SECTION_GAP = tokens.px(4)  # above the "Evidence" header
+SPIN_PADDING_X = tokens.px(8)     # the spin row's own padding, as .kv has
+SPIN_PADDING_Y = tokens.px(3)
+SPIN_GAP = tokens.px(6)
+SPIN_WIDTH = tokens.px(64)        # one spin box
+TOOLBAR_GAP = tokens.px(4)        # between the three overlay toggles ...
+TOOLBAR_SPACING = tokens.px(6)    # ... and before "⤢ fit to all N samples"
+TIMELINE_GAP = tokens.px(8)       # between the filmstrip and the compact timeline
+# The detector settings "fit to all samples" re-aggregates with; the cutoff is
+# added from the evidence, never from the folder alone (see the module docstring).
+DETECTOR_FIELDS = ("crop_width_fraction", "crop_vertical_padding", "crop_min_height_fraction")
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def _timecode(seconds: float) -> str:
+    """"MM:SS.ss" -- the canvas tag's time, to the hundredth of a second."""
+    total = max(0.0, float(seconds))
+    minutes = int(total // 60)
+    return f"{minutes:02d}:{total - minutes * 60:05.2f}"
+
+
+def _box_text(box) -> str:
+    return f"{box[0]}, {box[1]} · {box[2]} × {box[3]}"
+
+
+def _read_box(values) -> tuple[int, int, int, int] | None:
+    """A JSON (x, y, w, h) list from the evidence, or None for anything else."""
+    try:
+        if values is None or len(values) != 4:
+            return None
+        return tuple(int(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+
+
+def _union(boxes) -> tuple[int, int, int, int] | None:
+    if not boxes:
+        return None
+    left = min(box[0] for box in boxes)
+    top = min(box[1] for box in boxes)
+    right = max(box[0] + box[2] for box in boxes)
+    bottom = max(box[1] + box[3] for box in boxes)
+    return (left, top, right - left, bottom - top)
+
+
+def _covers(outer, inner) -> bool:
+    return (outer[0] <= inner[0] and outer[1] <= inner[1]
+            and outer[0] + outer[2] >= inner[0] + inner[2]
+            and outer[1] + outer[3] >= inner[1] + inner[3])
+
+
+def _with_alpha(colour: str, alpha: float) -> QColor:
+    result = QColor(colour)
+    result.setAlphaF(alpha)
+    return result
+
+
+def clamp_box(box, video_size, minimum: int = MIN_CROP_SIDE) -> tuple[int, int, int, int]:
+    """`box` as the frame can actually hold it: inside (0, 0, w, h) and at
+    least `minimum` on each side.
+
+    The model's own rule (`core.project.model.clamp_crop_box`, through
+    `app/masking.py` -- views import no `core`), not a second spelling of it.
+    Every path that STORES a crop clamps with it, so the box this view draws,
+    reports and commits is the box that is kept; the two used to disagree for
+    a frame smaller than `minimum` and for a frame whose size is not known
+    yet, and the model would then silently correct what the user had just
+    placed. The name stays local so the view's call sites read the same.
+    """
+    return clamp_crop_box(box, video_size, minimum)
+
+
+@dataclass(frozen=True)
+class CropSampleView:
+    """One de-duplicated probe frame of `evidence["crop"]["samples"]`."""
+
+    time: float
+    boxes: tuple[tuple[int, int, int, int], ...]
+    kept: bool
+    lines: int
+
+    @property
+    def extent(self) -> tuple[int, int, int, int] | None:
+        return _union(self.boxes)
+
+
+def _has_evidence(evidence: dict | None) -> bool:
+    """Whether `evidence["crop"]` holds anything worth presenting as
+    evidence.
+
+    The cache is disposable and may come back partial -- a dict carrying
+    only `frame_size` says nothing about any sample, and reporting "Samples
+    with text 0 / 0" for it would be a lie. Such a dict reads as no evidence
+    at all, which is the honest fallback."""
+    if not evidence:
+        return False
+    return bool(evidence.get("samples")) or _read_box(evidence.get("box")) is not None \
+        or _read_box(evidence.get("envelope")) is not None
+
+
+def _preference(sample: CropSampleView) -> tuple[bool, bool]:
+    return (sample.kept, bool(sample.boxes))
+
+
+def read_samples(evidence: dict | None) -> list[CropSampleView]:
+    """The evidence's samples, one per time, chronologically.
+
+    The full-frame retry re-probes times the bottom-band rounds already
+    probed, so a time can carry two entries -- one empty, one kept. The kept
+    entry wins, then the one that found text."""
+    best: dict[float, CropSampleView] = {}
+    for raw in (evidence or {}).get("samples") or []:
+        try:
+            time = float(raw.get("time"))
+        except (TypeError, ValueError):
+            continue
+        boxes = tuple(box for box in (_read_box(value) for value in raw.get("boxes") or [])
+                      if box is not None)
+        try:
+            lines = int(raw.get("lines") or 0)
+        except (TypeError, ValueError):
+            lines = 0
+        sample = CropSampleView(time, boxes, bool(raw.get("kept")), lines)
+        current = best.get(time)
+        if current is None or _preference(sample) > _preference(current):
+            best[time] = sample
+    return [best[time] for time in sorted(best)]
+
+
+# --------------------------------------------------------------------------
+# The canvas
+# --------------------------------------------------------------------------
+
+# canvas-tag corner -> (text colour, border colour): `.tag` plain, amber-tinted
+# for the crop, blue-tinted for the envelope legend (ui-spec §2.5).
+_TAG_TONES = {"top_left": (tokens.DIM, tokens.LINE2),
+              "top_right": (tokens.ACC, tokens.ACC_DIM),
+              "bottom_right": (tokens.BLUE, tokens.TAG_BLUE_BORDER),
+              "bottom_left": (tokens.DIM, tokens.LINE2)}
+# `.sthumb.on` / a disagreeing sample's border.
+_THUMB_TONES = {"selected": tokens.ACC, "warn": tokens.WARN}
+
+_HANDLE_EDGES = {
+    "tl": ("left", "top"), "tr": ("right", "top"),
+    "bl": ("left", "bottom"), "br": ("right", "bottom"),
+    "tc": ("top",), "bc": ("bottom",),
+}
+
+
+class CropCanvas(QWidget):
+    """The frame with the crop box drawn over it (ui-spec §3.4).
+
+    Draw order, back to front: the frame (or the gradient placeholder), the
+    masked crop preview, the label masks, the spotlight dimming outside the
+    box, the dashed envelope, the amber box and its six handles, the 10%
+    grid, the canvas tags.
+
+    The widget owns no model: it reports edits (`commit_requested` on mouse
+    release, debounced by `CropTab` for key nudges) and sample steps, and the
+    tab turns them into controller commands."""
+
+    HANDLES = ("tl", "tr", "bl", "br", "tc", "bc")
+    # Screen lengths, so they go through `tokens.px`: the handle is a 7x7
+    # amber square in the mockup and the mouse actually hits 13x13 around it,
+    # both of which have to grow with the window or the affordance shrinks
+    # against everything beside it.
+    HANDLE_SIZE = tokens.px(7)     # `.cropbox b`: a 7x7 amber square per handle
+    HANDLE_GRAB = tokens.px(13)    # the square is small; this is what the mouse actually hits
+    # ... and these two are VIDEO pixels, which the UI scale must never touch:
+    # MIN_BOX is the model's own floor (`core.project.model.MIN_CROP_SIDE`) and
+    # MIN_MASK decides whether a right-drag is stored as a label mask at all.
+    # Scaling either would change what is written to `.ocr.json`.
+    MIN_BOX = MIN_CROP_SIDE        # video pixels; the model's own floor, so the two cannot drift
+    MIN_MASK = 6                   # video pixels: a right-drag smaller than this counts as a click
+    GRID_DIVISIONS = 10            # the "grid" overlay: every 10% -- a fraction, not a length
+    GRID_ALPHA = 0.45
+    TAG_MARGIN = tokens.px(8)
+    TAG_PAD_X, TAG_PAD_Y = tokens.px(6), tokens.px(2)
+    PLACEHOLDER_TEXT = "loading frame…"
+
+    box_changed = pyqtSignal()
+    commit_requested = pyqtSignal(tuple)       # the box to store
+    nudged = pyqtSignal()                      # a key nudge: start the commit debounce
+    masks_changed = pyqtSignal(list)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("CropCanvas")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Stretches across the stage, but only as tall as the frame it shows:
+        # the figure's canvas is the frame, with the filmstrip right under it,
+        # not a frame floating in a letterbox.
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self.setMinimumSize(CANVAS_MIN_WIDTH, CANVAS_MIN_HEIGHT)
+        self._video = (1920, 1080)
+        self._frame = None
+        self._image: QImage | None = None
+        self._box = (0, 0, 0, 0)
+        self._envelope: tuple[int, int, int, int] | None = None
+        self._detected: tuple[int, int, int, int] | None = None
+        self._masks: list[tuple[int, int, int, int]] = []
+        self._masks_enabled = False
+        self._brightness = DEFAULT_BRIGHTNESS
+        self._overlays = {"envelope": True, "masked": False, "grid": False}
+        self._time = 0.0
+        self._kept = 0
+        self._drag: tuple | None = None
+        self._pending = False                   # edited, not committed yet: a refresh must not undo it
+        self._mask_drag: list | None = None
+        self._mask_cache: tuple | None = None
+        self._focus_ring = False                # what the last paint actually drew
+
+    # --- focus ------------------------------------------------------------------
+
+    def focus_ring_painted(self) -> bool:
+        """Whether the last paint drew the keyboard-focus ring. The arrows
+        mean "nudge the box" here and "step samples" on the filmstrip, so
+        which surface holds the keyboard has to be visible -- and a
+        stylesheet suppresses the focus rectangle Qt would draw itself."""
+        return self._focus_ring
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.update()
+
+    # --- state ------------------------------------------------------------------
+
+    def video_size(self) -> tuple[int, int]:
+        return self._video
+
+    def set_video_size(self, size) -> None:
+        width, height = (int(value) for value in size)
+        if width > 0 and height > 0 and (width, height) != self._video:
+            self._video = (width, height)
+            self._mask_cache = None
+            self._cap_height()
+            self.update()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._cap_height()
+
+    def _cap_height(self) -> None:
+        """Never taller than the frame it shows. `heightForWidth` alone only
+        sets the canvas' preferred height -- a Preferred policy still lets a
+        layout with spare height stretch it, and the fit would then centre
+        the frame inside a letterbox instead of the page's own margins
+        taking that height (see `CropTab`'s two stretches). The cap is
+        idempotent: QWidget ignores a maximum it already has."""
+        self.setMaximumHeight(self.heightForWidth(self.width()))
+
+    def set_frame(self, frame) -> None:
+        """`frame`: a BGR numpy array from `controller.frame`, or None."""
+        if frame is self._frame:
+            return
+        self._frame = frame
+        self._image = bgr_to_qimage(frame)
+        self._mask_cache = None
+        self.update()
+
+    def placeholder_text(self) -> str:
+        return "" if self._image is not None and not self._image.isNull() else self.PLACEHOLDER_TEXT
+
+    def box(self) -> tuple[int, int, int, int]:
+        return self._box
+
+    def set_box(self, box) -> None:
+        """Show the stored box. Ignored while the user is mid-gesture or an
+        edit is still waiting for its debounced commit -- a frame arriving
+        must never undo what was just typed or nudged."""
+        if self._drag is not None or self._pending:
+            return
+        self._store_box(tuple(int(value) for value in box))
+
+    def pending(self) -> bool:
+        return self._pending
+
+    def clear_pending(self) -> None:
+        """The tab has committed (or dropped) this edit."""
+        self._pending = False
+
+    def set_evidence(self, envelope, detected) -> None:
+        if (envelope, detected) != (self._envelope, self._detected):
+            self._envelope, self._detected = envelope, detected
+            self.update()
+
+    def detected_box(self) -> tuple[int, int, int, int] | None:
+        return self._detected
+
+    def set_meta(self, time: float, kept_samples: int) -> None:
+        if (float(time), int(kept_samples)) != (self._time, self._kept):
+            self._time, self._kept = float(time), int(kept_samples)
+            self.update()
+
+    def set_brightness(self, value: int) -> None:
+        if int(value) != self._brightness:
+            self._brightness = int(value)
+            self._mask_cache = None
+            self.update()
+
+    def overlays(self) -> dict[str, bool]:
+        return dict(self._overlays)
+
+    def set_overlay(self, name: str, on: bool) -> None:
+        if self._overlays.get(name) != bool(on):
+            self._overlays[name] = bool(on)
+            self.update()
+
+    def masks(self) -> list[tuple[int, int, int, int]]:
+        return list(self._masks)
+
+    def masks_enabled(self) -> bool:
+        return self._masks_enabled
+
+    def set_masks(self, masks, enabled: bool) -> None:
+        masks = [tuple(int(value) for value in mask) for mask in masks]
+        if (masks, bool(enabled)) != (self._masks, self._masks_enabled):
+            self._masks, self._masks_enabled = masks, bool(enabled)
+            if not self._masks_enabled:
+                self._mask_drag = None
+            self.update()
+
+    # --- geometry ---------------------------------------------------------------
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        video_width, video_height = self._video
+        return max(self.minimumHeight(), round(width * video_height / video_width))
+
+    def frame_rect(self) -> QRectF:
+        """Where the video frame is drawn: its aspect ratio fitted, centred.
+
+        The coordinate space is the NATIVE frame size (`entry.media`), not
+        the decoded image's -- frames arrive scaled to at most 720 rows, and
+        the crop box is in native pixels."""
+        bounds = QRectF(self.rect())
+        width, height = self._video
+        if width <= 0 or height <= 0:
+            return bounds
+        scale = min(bounds.width() / width, bounds.height() / height)
+        drawn_width, drawn_height = width * scale, height * scale
+        return QRectF(bounds.x() + (bounds.width() - drawn_width) / 2,
+                      bounds.y() + (bounds.height() - drawn_height) / 2,
+                      drawn_width, drawn_height)
+
+    def to_widget(self, x: float, y: float) -> QPointF:
+        rect = self.frame_rect()
+        width, height = self._video
+        return QPointF(rect.x() + float(x) * rect.width() / width,
+                       rect.y() + float(y) * rect.height() / height)
+
+    def to_video(self, point: QPointF) -> tuple[float, float]:
+        rect = self.frame_rect()
+        width, height = self._video
+        if rect.width() <= 0 or rect.height() <= 0:
+            return (0.0, 0.0)
+        return ((point.x() - rect.x()) * width / rect.width(),
+                (point.y() - rect.y()) * height / rect.height())
+
+    def box_rect(self) -> QRectF:
+        return self.video_rect(self._box)
+
+    def video_rect(self, box) -> QRectF:
+        x, y, width, height = box
+        return QRectF(self.to_widget(x, y), self.to_widget(x + width, y + height))
+
+    def handle_rect(self, handle: str) -> QRectF:
+        rect = self.box_rect()
+        edges = _HANDLE_EDGES[handle]
+        x = rect.center().x() if handle in ("tc", "bc") else (rect.left() if "left" in edges else rect.right())
+        y = rect.top() if "top" in edges else rect.bottom()
+        size = self.HANDLE_SIZE
+        return QRectF(x - size / 2, y - size / 2, size, size)
+
+    def _handle_at(self, point: QPointF) -> str | None:
+        grow = (self.HANDLE_GRAB - self.HANDLE_SIZE) / 2
+        for handle in self.HANDLES:
+            if self.handle_rect(handle).adjusted(-grow, -grow, grow, grow).contains(point):
+                return handle
+        return None
+
+    # --- editing -----------------------------------------------------------------
+
+    def _store_box(self, box) -> None:
+        box = self._clamped(box)
+        if box != self._box:
+            self._box = box
+            self._mask_cache = None
+            self.update()
+            self.box_changed.emit()
+
+    def _clamped(self, box) -> tuple[int, int, int, int]:
+        return clamp_box(box, self._video, self.MIN_BOX)
+
+    def _resize(self, handle: str | None, start_box, dx: float, dy: float) -> None:
+        self._pending = True
+        x, y, width, height = start_box
+        left, top, right, bottom = x, y, x + width, y + height
+        video_width, video_height = self._video
+        if handle is None:
+            self._store_box((round(x + dx), round(y + dy), width, height))
+            return
+        edges = _HANDLE_EDGES[handle]
+        if "left" in edges:
+            left = _clamp(round(x + dx), 0, right - self.MIN_BOX)
+        if "right" in edges:
+            right = _clamp(round(right + dx), left + self.MIN_BOX, video_width)
+        if "top" in edges:
+            top = _clamp(round(y + dy), 0, bottom - self.MIN_BOX)
+        if "bottom" in edges:
+            bottom = _clamp(round(bottom + dy), top + self.MIN_BOX, video_height)
+        self._store_box((left, top, right - left, bottom - top))
+
+    def mousePressEvent(self, event) -> None:
+        point = event.position()
+        if event.button() == Qt.MouseButton.RightButton:
+            if not self._masks_enabled:
+                super().mousePressEvent(event)
+                return
+            start = self.to_video(point)
+            self._mask_drag = [start, start]
+            event.accept()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        handle = self._handle_at(point)
+        if handle is None and not self.box_rect().contains(point):
+            super().mousePressEvent(event)
+            return
+        self._drag = (handle, self.to_video(point), self._box)
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        point = event.position()
+        if self._mask_drag is not None:
+            self._mask_drag[1] = self.to_video(point)
+            self.update()
+            event.accept()
+            return
+        if self._drag is None:
+            super().mouseMoveEvent(event)
+            return
+        handle, (start_x, start_y), start_box = self._drag
+        moved = self.to_video(point)
+        self._resize(handle, start_box, moved[0] - start_x, moved[1] - start_y)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton and self._mask_drag is not None:
+            self._finish_mask()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._drag is not None:
+            self._drag = None
+            self.commit_requested.emit(self._box)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        """All four arrows nudge the box by 1 px, Shift+arrow by 10.
+
+        Stepping the samples is ◀ / ▶ on the filmstrip -- the two are split
+        by which widget has focus, so nudging keeps both axes (Tab walks
+        canvas -> filmstrip, and clicking a sample moves focus there)."""
+        key = event.key()
+        step = NUDGE_LARGE if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else NUDGE_SMALL
+        deltas = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0),
+                  Qt.Key.Key_Up: (0, -step), Qt.Key.Key_Down: (0, step)}
+        if key in deltas:
+            self._nudge(*deltas[key])
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _nudge(self, dx: int, dy: int) -> None:
+        self._pending = True
+        x, y, width, height = self._box
+        self._store_box((x + dx, y + dy, width, height))
+        self.nudged.emit()
+
+    # --- label masks --------------------------------------------------------------
+
+    def _mask_drag_box(self) -> tuple[int, int, int, int] | None:
+        if self._mask_drag is None:
+            return None
+        (x0, y0), (x1, y1) = self._mask_drag
+        video_width, video_height = self._video
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        left, right = _clamp(round(left), 0, video_width), _clamp(round(right), 0, video_width)
+        top, bottom = _clamp(round(top), 0, video_height), _clamp(round(bottom), 0, video_height)
+        return (left, top, right - left, bottom - top)
+
+    def _finish_mask(self) -> None:
+        drawn = self._mask_drag_box()
+        point = self._mask_drag[1]
+        self._mask_drag = None
+        if drawn is None:
+            return
+        if drawn[2] >= self.MIN_MASK and drawn[3] >= self.MIN_MASK:
+            masks = [*self._masks, drawn]
+        else:                                        # a right-click: remove the mask under it
+            x, y = point
+            masks = [mask for mask in self._masks
+                     if not (mask[0] <= x <= mask[0] + mask[2] and mask[1] <= y <= mask[1] + mask[3])]
+            if masks == self._masks:
+                self.update()
+                return
+        self._masks = masks
+        self.update()
+        self.masks_changed.emit(list(masks))
+
+    # --- painting -------------------------------------------------------------------
+
+    def tags(self) -> dict[str, str]:
+        """The canvas-tag chips, by corner -- what the figure prints over the
+        frame, and what the tests read instead of pixels."""
+        width, height = self._video
+        x, y, box_width, box_height = self._box
+        tags = {"top_left": f"{width} × {height} · t {_timecode(self._time)}",
+                "top_right": f"crop {x}, {y} · {box_width} × {box_height}"}
+        # Only with an envelope to explain: `_paint_envelope` draws nothing
+        # without one, and the legend would then name a dashed rectangle
+        # that is not on screen ("across all 0 samples").
+        if self._overlays["envelope"] and self._envelope is not None:
+            tags["bottom_right"] = f"dashed = text found across all {self._kept} samples"
+        if self._detected is not None:
+            # Ruling C2 is not a toggle: the user must always be able to see
+            # that the amber box is theirs and the detection said otherwise.
+            tags["bottom_left"] = DETECTED_TAG
+        return tags
+
+    def paintEvent(self, event) -> None:
+        # Everything is drawn inside the fitted frame, never the widget: the
+        # canvas IS the frame (`.canvas`, radius 6), and the space the fit
+        # leaves over is the stage's own background, not a letterbox.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        bounds = self.frame_rect()
+        clip = QPainterPath()
+        clip.addRoundedRect(bounds, tokens.RADIUS_BTN, tokens.RADIUS_BTN)
+        painter.setClipPath(clip)
+        self._paint_frame(painter, bounds)
+        self._paint_masked(painter)
+        self._paint_label_masks(painter)
+        self._paint_spotlight(painter, bounds)
+        self._paint_envelope(painter)
+        self._paint_detected(painter)
+        self._paint_box(painter)
+        self._paint_grid(painter)
+        self._paint_tags(painter, bounds)
+        self._focus_ring = self._paint_focus_ring(painter, bounds)
+        painter.end()
+
+    def _paint_focus_ring(self, painter: QPainter, bounds: QRectF) -> bool:
+        """The frame's own edge, in the accent. Inside the clip path, so it
+        follows the canvas' rounded corners rather than the widget's."""
+        if not self.hasFocus():
+            return False
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(tokens.ACC), FOCUS_RING_WIDTH))
+        inset = FOCUS_RING_WIDTH / 2
+        painter.drawRoundedRect(bounds.adjusted(inset, inset, -inset, -inset),
+                                tokens.RADIUS_BTN, tokens.RADIUS_BTN)
+        return True
+
+    def _paint_frame(self, painter: QPainter, bounds: QRectF) -> None:
+        width, height = bounds.width(), bounds.height()
+        radius_x, radius_y = width * 1.2, height * 0.9          # radial-gradient(120% 90% at 30% 25%)
+        if radius_x > 0 and radius_y > 0:
+            gradient = QRadialGradient(QPointF(0, 0), radius_x)
+            gradient.setColorAt(0.0, QColor(tokens.CANVAS_TOP))
+            gradient.setColorAt(tokens.CANVAS_MID_STOP, QColor(tokens.CANVAS_MID))
+            gradient.setColorAt(1.0, QColor(tokens.CANVAS_BOTTOM))
+            painter.save()
+            painter.translate(bounds.x() + width * 0.3, bounds.y() + height * 0.25)
+            painter.scale(1.0, radius_y / radius_x)
+            span = max(width, height) * 4 * radius_x / radius_y
+            painter.fillRect(QRectF(-span, -span, 2 * span, 2 * span), gradient)
+            painter.restore()
+        if self._image is not None and not self._image.isNull():
+            painter.drawImage(self.frame_rect(), self._image)
+            return
+        painter.setPen(QColor(tokens.DIM2))
+        font = painter.font()
+        font.setPixelSize(round(tokens.FONT_SIZE_SM))
+        painter.setFont(font)
+        painter.drawText(bounds, int(Qt.AlignmentFlag.AlignCenter), self.PLACEHOLDER_TEXT)
+
+    def _masked_image(self) -> QImage | None:
+        """The crop region of the frame in hand, through the OCR pass's
+        brightness filter (`ocr_view.mask`). The frame is decoded smaller
+        than the native size, so the box is scaled into it first."""
+        frame = self._frame
+        if frame is None:
+            return None
+        key = (self._box, self._brightness, id(frame))
+        if self._mask_cache is not None and self._mask_cache[0] == key:
+            return self._mask_cache[1]
+        height, width = frame.shape[:2]
+        video_width, video_height = self._video
+        scale_x, scale_y = width / video_width, height / video_height
+        x, y, box_width, box_height = self._box
+        left, top = max(0, round(x * scale_x)), max(0, round(y * scale_y))
+        right = min(width, round((x + box_width) * scale_x))
+        bottom = min(height, round((y + box_height) * scale_y))
+        image = None
+        if right - left >= 1 and bottom - top >= 1:
+            image = bgr_to_qimage(mask_region(frame[top:bottom, left:right], self._brightness))
+        self._mask_cache = (key, image)
+        return image
+
+    def _paint_masked(self, painter: QPainter) -> None:
+        if not self._overlays["masked"]:
+            return
+        image = self._masked_image()
+        if image is not None and not image.isNull():
+            painter.drawImage(self.box_rect(), image)
+
+    def _paint_label_masks(self, painter: QPainter) -> None:
+        if not self._masks_enabled:
+            return
+        for mask in self._masks:                     # what the OCR pass blacks out
+            painter.fillRect(self.video_rect(mask), QColor(Qt.GlobalColor.black))
+        drawing = self._mask_drag_box()
+        if drawing is not None:
+            painter.fillRect(self.video_rect(drawing), _with_alpha(tokens.BG, 0.75))
+            painter.setPen(QPen(QColor(tokens.DIM), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.video_rect(drawing))
+
+    def _paint_spotlight(self, painter: QPainter, bounds: QRectF) -> None:
+        outside = QPainterPath()
+        outside.addRect(bounds)
+        inside = QPainterPath()
+        inside.addRoundedRect(self.box_rect(), tokens.RADIUS_XS, tokens.RADIUS_XS)
+        painter.fillPath(outside.subtracted(inside), QColor(*tokens.SPOTLIGHT))
+
+    def _dashed(self, colour: QColor) -> QPen:
+        pen = QPen(colour, 1)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        return pen
+
+    def _paint_envelope(self, painter: QPainter) -> None:
+        if not self._overlays["envelope"] or self._envelope is None:
+            return
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._dashed(_with_alpha(tokens.BLUE, tokens.ENVELOPE_ALPHA)))
+        painter.drawRoundedRect(self.video_rect(self._envelope), tokens.RADIUS_XS, tokens.RADIUS_XS)
+
+    def _paint_detected(self, painter: QPainter) -> None:
+        """The latest detection, when it differs from the stored box (ruling
+        C2). Drawn whatever the envelope toggle says: it is not evidence the
+        user asked to see, it is a disagreement with their own value."""
+        if self._detected is None:
+            return
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(self._dashed(QColor(tokens.DIM)))
+        painter.drawRoundedRect(self.video_rect(self._detected), tokens.RADIUS_XS, tokens.RADIUS_XS)
+
+    def _paint_box(self, painter: QPainter) -> None:
+        rect = self.box_rect()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(tokens.ACC), BOX_EDGE_WIDTH))
+        painter.drawRoundedRect(rect, tokens.RADIUS_XS, tokens.RADIUS_XS)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(tokens.ACC))
+        for handle in self.HANDLES:
+            painter.drawRoundedRect(self.handle_rect(handle), tokens.RADIUS_THUMB_BOX,
+                                    tokens.RADIUS_THUMB_BOX)
+
+    def _paint_grid(self, painter: QPainter) -> None:
+        if not self._overlays["grid"]:
+            return
+        rect = self.frame_rect()
+        painter.setPen(QPen(_with_alpha(tokens.LINE2, self.GRID_ALPHA), 1))
+        for step in range(1, self.GRID_DIVISIONS):
+            fraction = step / self.GRID_DIVISIONS
+            x = rect.x() + rect.width() * fraction
+            y = rect.y() + rect.height() * fraction
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+
+    def tag_rect(self, corner: str, bounds: QRectF, width: float, height: float) -> QRectF:
+        """Where a canvas tag sits: its own corner of the frame, stepped
+        clear of the crop box when the box reaches into that corner.
+
+        A subtitle crop is a band along the bottom of the frame, so the
+        bottom tags land on it -- and at the UI scale a tag is a quarter
+        taller and wider than the mockup's while the canvas, at a 1440 px
+        window, is smaller. The legend was printing straight through the
+        subtitle it was about. It steps to the other side of the box, and
+        only if the frame has room for it there."""
+        x = (bounds.x() + self.TAG_MARGIN if corner.endswith("left")
+             else bounds.right() - self.TAG_MARGIN - width)
+        y = (bounds.y() + self.TAG_MARGIN if corner.startswith("top")
+             else bounds.bottom() - self.TAG_MARGIN - height)
+        rect = QRectF(x, y, width, height)
+        box = self.box_rect()
+        if not rect.intersects(box):
+            return rect
+        clear = (box.bottom() + self.TAG_MARGIN if corner.startswith("top")
+                 else box.top() - self.TAG_MARGIN - height)
+        if bounds.top() <= clear and clear + height <= bounds.bottom():
+            rect.moveTop(clear)
+        return rect
+
+    def tag_rects(self, bounds: QRectF | None = None) -> dict[str, QRectF]:
+        """Every tag's rectangle, by corner -- what `_paint_tags` draws."""
+        bounds = self.frame_rect() if bounds is None else bounds
+        font = self.font()
+        font.setPixelSize(round(tokens.FONT_SIZE_SCOPE))
+        metrics = QFontMetricsF(font)
+        return {corner: self.tag_rect(corner, bounds,
+                                      metrics.horizontalAdvance(text) + 2 * self.TAG_PAD_X,
+                                      metrics.ascent() + metrics.descent() + 2 * self.TAG_PAD_Y)
+                for corner, text in self.tags().items()}
+
+    def _paint_tags(self, painter: QPainter, bounds: QRectF) -> None:
+        font = painter.font()
+        font.setPixelSize(round(tokens.FONT_SIZE_SCOPE))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        for corner, text in self.tags().items():
+            width = metrics.horizontalAdvance(text) + 2 * self.TAG_PAD_X
+            height = metrics.ascent() + metrics.descent() + 2 * self.TAG_PAD_Y
+            rect = self.tag_rect(corner, bounds, width, height)
+            colour, border = _TAG_TONES[corner]
+            painter.setPen(QPen(QColor(border), 1))
+            painter.setBrush(QColor(*tokens.TAG_BG))
+            painter.drawRoundedRect(rect, tokens.RADIUS_TAG, tokens.RADIUS_TAG)
+            painter.setPen(QColor(colour))
+            painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
+
+
+# --------------------------------------------------------------------------
+# The filmstrip
+# --------------------------------------------------------------------------
+
+class SampleThumbnail(QWidget):
+    """`.sthumb`: one sampled frame, 64x36, with one or two white bars for
+    the text rows found in it and a border for its state."""
+
+    BAR_INSET = 0.12               # `.sthumb i`: left/right 12% -- fractions of the
+    BAR_BOTTOM = 0.20              # thumbnail, so they scale with it for free
+    BAR_BOTTOM_TWO = 0.34
+    BAR_HEIGHT = tokens.px(3)
+    BORDER = 1                     # the CSS box's 1 px border, on each side
+
+    clicked = pyqtSignal(int)
+
+    def __init__(self, width: int, height: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("SampleThumbnail")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(width + 2 * self.BORDER, height + 2 * self.BORDER)
+        self._index = -1
+        self._image: QImage | None = None
+        self._lines = 0
+        self._tone = ""
+
+    def set_state(self, index: int, image: QImage | None, lines: int, tone: str) -> None:
+        state = (index, image, lines, tone)
+        if state != (self._index, self._image, self._lines, self._tone):
+            self._index, self._image, self._lines, self._tone = state
+            self.update()
+
+    def sample_index(self) -> int:
+        return self._index
+
+    def lines(self) -> int:
+        return self._lines
+
+    def tone(self) -> str:
+        return self._tone
+
+    def image(self) -> QImage | None:
+        return self._image
+
+    def source_rect(self, target: QRectF) -> QRectF | None:
+        """The centred part of the frame that fills `target` at the frame's
+        own aspect ratio -- a thumbnail centre-crops, it never squashes a
+        16:9 frame into a 16:9-ish box of another shape."""
+        image = self._image
+        if image is None or image.isNull() or target.width() <= 0 or target.height() <= 0:
+            return None
+        scale = max(target.width() / image.width(), target.height() / image.height())
+        width, height = target.width() / scale, target.height() / scale
+        return QRectF((image.width() - width) / 2, (image.height() - height) / 2, width, height)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(self._index)
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        clip = QPainterPath()
+        clip.addRoundedRect(bounds, tokens.RADIUS_THUMB, tokens.RADIUS_THUMB)
+        painter.save()
+        painter.setClipPath(clip)
+        gradient = css_gradient(bounds, GRADIENT_DEGREES)
+        gradient.setColorAt(0.0, QColor(tokens.THUMB_TOP))
+        gradient.setColorAt(GRADIENT_END_STOP, QColor(tokens.THUMB_BOTTOM))
+        gradient.setColorAt(1.0, QColor(tokens.THUMB_BOTTOM))
+        painter.fillRect(bounds, gradient)
+        source = self.source_rect(bounds)
+        if source is not None:
+            painter.drawImage(bounds, self._image, source)
+        else:
+            self._paint_bars(painter, bounds)
+        painter.restore()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        colour = _THUMB_TONES.get(self._tone)
+        painter.setPen(QPen(QColor(colour), 1) if colour else QPen(Qt.PenStyle.NoPen))
+        if colour:
+            painter.drawRoundedRect(bounds, tokens.RADIUS_THUMB, tokens.RADIUS_THUMB)
+        painter.end()
+
+    def _paint_bars(self, painter: QPainter, bounds: QRectF) -> None:
+        """The stand-in for text in a sample whose frame has not arrived."""
+        if self._lines <= 0:
+            return
+        left = bounds.x() + bounds.width() * self.BAR_INSET
+        width = bounds.width() * (1 - 2 * self.BAR_INSET)
+        bar = QColor(Qt.GlobalColor.white)
+        bar.setAlphaF(tokens.SAMPLE_BAR_ALPHA)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bar)
+        for index in range(min(2, self._lines)):
+            fraction = self.BAR_BOTTOM if index == 0 else self.BAR_BOTTOM_TWO
+            y = bounds.bottom() - bounds.height() * fraction - self.BAR_HEIGHT
+            painter.drawRoundedRect(QRectF(left, y, width, self.BAR_HEIGHT),
+                                    tokens.RADIUS_XS, tokens.RADIUS_XS)
+
+
+class SampleStrip(QWidget):
+    """`.strip`: "samples", up to eight thumbnails, "more ▸" to page.
+
+    The page is eight where eight fit and fewer where they do not
+    (`fits()`). A thumbnail is a fixed 64x36 of the mockup's -- at the UI
+    scale, 80x45 -- and eight of those plus the label, the button and the
+    hint is more than the stage has at 1440 px wide. A row of fixed-size
+    children would make that a HARD minimum: the window could not be opened
+    narrower, whatever the screen. So the row shows the thumbnails its width
+    can hold at full size and "more ▸" reaches the rest, which is the
+    affordance the mockup already has for the samples past the eighth.
+    """
+
+    PAGE = 8                       # the mockup's page -- a count, not a length
+    THUMB_WIDTH = tokens.px(64)
+    THUMB_HEIGHT = tokens.px(36)
+    LABEL_WIDTH = tokens.px(46)
+
+    selected = pyqtSignal(int)
+    stepped = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("SampleStrip")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._samples: list[CropSampleView] = []
+        self._page = 0
+        self._selected = -1
+        self._warned: set[int] = set()
+        self._images: dict[int, QImage | None] = {}
+        layout = QHBoxLayout(self)
+        # Clearance on the sides and the bottom for the focus ring, which the
+        # row paints on its own edge (`_paint_focus_ring`) -- at the mockup's
+        # flush margins the ring cut through the "◀ ▶ arrow keys" hint.
+        layout.setContentsMargins(STRIP_MARGIN_X, STRIP_MARGIN_TOP,
+                                  STRIP_MARGIN_X, STRIP_MARGIN_BOTTOM)
+        layout.setSpacing(STRIP_GAP)
+        # ... which also means the layout may not push its own minimum onto
+        # the widget: `minimumSizeHint` below is what the page's layout asks,
+        # and `resizeEvent` hides whatever the width cannot hold.
+        layout.setSizeConstraint(QHBoxLayout.SizeConstraint.SetNoConstraint)
+        self._label = note_label("samples")
+        # One line, both of them: this is a fixed-height row of thumbnails,
+        # and a wrapping QLabel asks for almost no width -- which is how the
+        # hint ended up stacked three deep ("◀ ▶" / "arrow" / "keys") beside
+        # eight thumbnails that had squeezed it out. Off, the two are plain
+        # fixed furniture and `fits()` can count on their width.
+        self._label.setWordWrap(False)
+        self._label.setFixedWidth(self.LABEL_WIDTH)
+        layout.addWidget(self._label)
+        self._thumbs: list[SampleThumbnail] = []
+        for _ in range(self.PAGE):
+            thumb = SampleThumbnail(self.THUMB_WIDTH, self.THUMB_HEIGHT)
+            thumb.clicked.connect(self._on_clicked)
+            layout.addWidget(thumb)
+            self._thumbs.append(thumb)
+        self.more_button = Button("more ▸", "ghost", small=True)
+        self.more_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.more_button.clicked.connect(self.next_page)
+        layout.addWidget(self.more_button)
+        layout.addStretch(1)
+        self._hint = note_label(ARROW_HINT)
+        self._hint.setWordWrap(False)
+        layout.addWidget(self._hint)
+        self._focus_ring = False
+        self._shown = 0                        # thumbnails the last `_relayout` left visible
+
+    # --- how many fit -----------------------------------------------------------
+
+    def _furniture_width(self) -> int:
+        """Everything on the row that is not a thumbnail: the margins, the
+        "samples" label, "more ▸", the arrow hint and the gaps between them.
+
+        "more ▸" is counted whether or not it is on screen: the number that
+        fits is what decides whether there IS a next page, so measuring the
+        button only when it shows would make the two chase each other -- and
+        the row would jump by a thumbnail as paging appeared."""
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        gaps = 4 * layout.spacing()            # label | more | stretch | hint
+        return (margins.left() + margins.right() + gaps + self.LABEL_WIDTH
+                + self.more_button.sizeHint().width() + self._hint.sizeHint().width())
+
+    def _thumb_step(self) -> int:
+        return self.THUMB_WIDTH + 2 * SampleThumbnail.BORDER + self.layout().spacing()
+
+    def fits(self) -> int:
+        """How many thumbnails this width can hold, at most the mockup's
+        eight and never fewer than one -- a row with no thumbnail at all
+        would leave the samples unreachable."""
+        room = self.width() - self._furniture_width()
+        return max(1, min(self.PAGE, room // self._thumb_step()))
+
+    def minimumSizeHint(self):
+        """One thumbnail's worth. The filmstrip is never what decides how
+        narrow the window may be (see the class docstring); the layout's own
+        minimum -- all eight -- is not asked for."""
+        return QSize(self._furniture_width() + self._thumb_step(),
+                     super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.fits() != self._shown:
+            self._relayout()
+
+    # --- focus ----------------------------------------------------------------
+
+    def focus_ring_painted(self) -> bool:
+        """Whether the last paint drew the keyboard-focus ring -- see
+        `CropCanvas.focus_ring_painted`: ◀ / ▶ step samples here and nudge
+        the box there, so the two must be told apart at a glance."""
+        return self._focus_ring
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        self._focus_ring = self._paint_focus_ring()
+
+    def _paint_focus_ring(self) -> bool:
+        """The whole row, including the "◀ ▶ arrow keys" hint on its right:
+        those are the keys the ring says are live. Around the thumbnails
+        alone it would have nothing to enclose on a file whose detection
+        produced no samples -- the row still takes the focus."""
+        if not self.hasFocus():
+            return False
+        inset = FOCUS_RING_WIDTH / 2
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(tokens.ACC), FOCUS_RING_WIDTH))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset),
+                                tokens.RADIUS_BTN, tokens.RADIUS_BTN)
+        painter.end()
+        return True
+
+    def _on_clicked(self, index: int) -> None:
+        """Picking a sample with the mouse hands the strip the keyboard too,
+        so ◀ / ▶ carry on from there."""
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.selected.emit(index)
+
+    def label_text(self) -> str:
+        return self._label.text()
+
+    def thumbnails(self) -> list[SampleThumbnail]:
+        """The thumbnails currently showing a sample (up to eight)."""
+        return [thumb for thumb in self._thumbs if not thumb.isHidden()]
+
+    def page(self) -> int:
+        return self._page
+
+    def reset_page(self) -> None:
+        self._page = 0
+
+    def pages(self) -> int:
+        return max(1, -(-len(self._samples) // self.fits()))
+
+    def reveal(self, index: int) -> None:
+        """Page to the sample at `index`: the view followed a click, ◀ / ▶,
+        a warn row in the panel, or a fresh detection."""
+        if 0 <= index < len(self._samples):
+            self._page = min(index // self.fits(), self.pages() - 1)
+            self._relayout()
+
+    def next_page(self) -> None:
+        self._page = (self._page + 1) % self.pages()
+        self._relayout()
+
+    def set_state(self, samples, selected: int, warned: set[int], images) -> None:
+        """`images`: sample index -> a thumbnail-sized QImage, or None."""
+        self._samples = list(samples)
+        self._selected = selected
+        self._warned = set(warned)
+        self._images = dict(images)
+        # The page is never re-derived here: a refresh must not undo
+        # "more ▸", and frame_ready arrives in bursts. Picking a sample
+        # pages to it through `reveal`.
+        self._page = min(max(0, self._page), self.pages() - 1)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        self._shown = self.fits()
+        start = self._page * self._shown
+        shown = self._samples[start:start + self._shown]
+        for offset, thumb in enumerate(self._thumbs):
+            if offset >= len(shown):
+                thumb.hide()
+                continue
+            index = start + offset
+            tone = "selected" if index == self._selected else ("warn" if index in self._warned else "")
+            thumb.set_state(index, self._images.get(index), shown[offset].lines, tone)
+            thumb.show()
+        self.more_button.setVisible(len(self._samples) > self._shown)
+
+    def keyPressEvent(self, event) -> None:
+        """◀ / ▶ walk the samples while the filmstrip has focus (the canvas
+        nudges the box with the same keys); Shift changes nothing here."""
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            self.stepped.emit(-1 if event.key() == Qt.Key.Key_Left else 1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+# --------------------------------------------------------------------------
+# The inspector panel
+# --------------------------------------------------------------------------
+
+class _ClickableKvRow(KvRow):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class _SpinPair(QWidget):
+    """A kv row whose value is two spin boxes -- an origin and a size, as
+    "X / width" and "Y / height".
+
+    The two ranges are independent (origin 0..extent-minimum, size
+    minimum..extent), so either field always accepts any value the frame
+    could hold. Deriving one maximum from the other's current value would
+    make the pair unusable in one order: with the width still full-frame the
+    X field could accept nothing but 0, and the user would have to know to
+    shrink the width first.
+
+    The pair is reconciled instead at commit time, by `resolved()`, on a
+    last-edited-wins rule: the field just typed keeps its value and the
+    partner shrinks to fit. Only when the partner cannot shrink that far
+    (it is already at `minimum`) does the typed field give way -- and the
+    panel then simply shows the result, since `CropTab.refresh` repaints
+    both spin boxes and the canvas from the stored box."""
+
+    ORIGIN, SIZE = "origin", "size"
+
+    edited = pyqtSignal()
+
+    def __init__(self, key: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("KvRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(SPIN_PADDING_X, SPIN_PADDING_Y,
+                                  SPIN_PADDING_X, SPIN_PADDING_Y)
+        layout.setSpacing(SPIN_GAP)
+        label = QLabel(key)
+        label.setProperty("kvRole", "key")
+        layout.addWidget(label)
+        layout.addStretch(1)
+        self.first, self.second = QSpinBox(), QSpinBox()
+        for spin in (self.first, self.second):
+            spin.setRange(0, 1)
+            spin.setFixedWidth(SPIN_WIDTH)
+            spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+            spin.setStyleSheet(
+                f"QSpinBox {{ background: {tokens.BG}; color: {tokens.TXT}; "
+                f"border: 1px solid {tokens.LINE2}; border-radius: {tokens.RADIUS_XS}px; "
+                f"padding: {tokens.px(1)}px {tokens.px(4)}px; "
+                f"font-size: {round(tokens.FONT_SIZE_BODY)}px; }}"
+                f"QSpinBox:focus {{ border-color: {tokens.ACC}; }}")
+            layout.addWidget(spin)
+        self.first.valueChanged.connect(lambda _value: self._on_changed(self.ORIGIN))
+        self.second.valueChanged.connect(lambda _value: self._on_changed(self.SIZE))
+        self._syncing = False
+        self._extent = 1
+        self._minimum = 0
+        self._last: str | None = None
+
+    def values(self) -> tuple[int, int]:
+        """What the two spin boxes read, which need not fit the frame --
+        `resolved()` is the pair as it would be stored."""
+        return (self.first.value(), self.second.value())
+
+    def set_limits(self, extent: int, minimum: int) -> None:
+        """`extent`: the frame's width or height. `minimum`: the smallest
+        the size may be."""
+        self._extent = max(0, int(extent))
+        self._minimum = max(0, int(minimum))
+        self._syncing = True
+        self.first.setRange(0, max(0, self._extent - self._minimum))
+        self.second.setRange(self._minimum, max(self._minimum, self._extent))
+        self._syncing = False
+
+    def resolved(self) -> tuple[int, int]:
+        """(origin, size) as the frame can hold them, the field the user
+        typed last keeping its value (see the class docstring)."""
+        origin, size = self.values()
+        extent, minimum = self._extent, self._minimum
+        size = _clamp(size, minimum, max(minimum, extent))
+        origin = _clamp(origin, 0, max(0, extent))
+        if origin + size <= extent:
+            return origin, size
+        if self._last == self.ORIGIN:
+            origin = min(origin, max(0, extent - minimum))
+            size = max(minimum, extent - origin)
+            return min(origin, max(0, extent - size)), size
+        # The size was typed last, or neither was (a programmatic sync): the
+        # size is kept and the origin gives way, as `clamp_box` does.
+        return max(0, extent - size), size
+
+    def set_values(self, first: int, second: int) -> None:
+        """Show a box without committing. It claims no authorship, so a
+        later `resolved()` still credits whichever field the user typed."""
+        self._syncing = True
+        self.first.setValue(int(first))
+        self.second.setValue(int(second))
+        self._syncing = False
+        self._last = None
+
+    def _on_changed(self, field: str) -> None:
+        if self._syncing:
+            return
+        self._last = field
+        self.edited.emit()
+
+
+class CropInspectorPanel(Section):
+    """The Crop tab's slice of the inspector (ruling B4): the box as two spin
+    pairs, the nudge note, and the evidence rows.
+
+    B4 drops the "◆ this episode only" header the tab-scoped mockup shows --
+    the inspector's own header already says it."""
+
+    box_edited = pyqtSignal(tuple)
+    sample_requested = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.body.setSpacing(PANEL_ROW_SPACING)
+        self.x_row = _SpinPair("X / width")
+        self.y_row = _SpinPair("Y / height")
+        for row in (self.x_row, self.y_row):
+            row.edited.connect(self._on_edited)
+            self.body.addWidget(row)
+        self.nudge_label = note_label(NUDGE_NOTE)
+        self.body.addWidget(self.nudge_label)
+        self.body.addSpacing(PANEL_SECTION_GAP)
+        self.evidence_header = SectionHeader("Evidence")
+        self.body.addWidget(self.evidence_header)
+        self._rows: list[KvRow] = []
+        self._row_ids: list[str] = []
+        self._row_labels: list[str] = []
+        self._rows_by_sample: dict[int, _ClickableKvRow] = {}
+        self.note = note_label("")
+        self.body.addWidget(self.note)
+        self.body.addStretch(1)
+        self._commit = QTimer(self)
+        self._commit.setSingleShot(True)
+        self._commit.setInterval(COMMIT_DEBOUNCE_MS)
+        self._commit.timeout.connect(self._emit_box)
+
+    # --- reading (the tests' view of the panel) ---------------------------------
+
+    def spin_values(self) -> tuple[int, int, int, int]:
+        """(x, y, width, height) -- the stored box's order, not the rows'."""
+        x, width = self.x_row.values()
+        y, height = self.y_row.values()
+        return (x, y, width, height)
+
+    def set_spin_values(self, x: int, width: int, y: int, height: int) -> None:
+        """Type into the spin boxes as the user would: this starts the
+        debounced commit. `show_box` is the silent counterpart."""
+        self.x_row.first.setValue(int(x))
+        self.x_row.second.setValue(int(width))
+        self.y_row.first.setValue(int(y))
+        self.y_row.second.setValue(int(height))
+
+    def show_box(self, box) -> None:
+        """Follow the canvas without committing anything of our own."""
+        self.x_row.set_values(box[0], box[2])
+        self.y_row.set_values(box[1], box[3])
+
+    def rows(self) -> list[tuple[str, str]]:
+        """The evidence rows as read: (key, value). Two samples at the same
+        side share a key, which is why the rows are identified by `row_id`
+        internally and clicked by sample index."""
+        return [(key, row.value()) for key, row in zip(self._row_labels, self._rows, strict=True)]
+
+    def row_tone(self, key: str) -> str:
+        row = next((row for label, row in zip(self._row_labels, self._rows, strict=True)
+                    if label == key), None)
+        return "" if row is None else (row.value_tone() or "")
+
+    def click_row(self, key: str) -> None:
+        """Click the first row with this key; `click_sample_row` reaches a
+        particular one when two share it."""
+        for label, row in zip(self._row_labels, self._rows, strict=True):
+            if label == key and isinstance(row, _ClickableKvRow):
+                row.clicked.emit()
+                return
+
+    def click_sample_row(self, sample: int) -> None:
+        """Click the warn row that points at that sample."""
+        row = self._rows_by_sample.get(sample)
+        if row is not None:
+            row.clicked.emit()
+
+    def nudge_note(self) -> str:
+        return self.nudge_label.text()
+
+    def evidence_note(self) -> str:
+        return self.note.text()
+
+    # --- writing ------------------------------------------------------------------
+
+    def set_state(self, box, video_size, rows, note: str) -> None:
+        """`rows`: (row_id, key, value, tone, sample index or None) per
+        evidence row. `row_id` is what identifies a row across refreshes --
+        two samples on the same side of the envelope share a key."""
+        width, height = video_size
+        self.x_row.set_limits(width, CropCanvas.MIN_BOX)
+        self.y_row.set_limits(height, CropCanvas.MIN_BOX)
+        enabled = box is not None
+        for row in (self.x_row, self.y_row):
+            row.setEnabled(enabled)
+        if box is not None and not self._commit.isActive():     # never overwrite an edit in flight
+            self.show_box(box)
+        self._set_rows(rows)
+        self.note.setText(note)
+        self.note.setVisible(bool(note))
+
+    def _set_rows(self, rows) -> None:
+        ids = [row_id for row_id, _key, _value, _tone, _index in rows]
+        if ids != self._row_ids:
+            for row in self._rows:
+                self.body.removeWidget(row)
+                row.setParent(None)  # removeWidget alone leaves it parented and painting
+                row.deleteLater()
+            self._rows = []
+            position = self.body.indexOf(self.evidence_header) + 1
+            for offset, (_row_id, key, _value, _tone, index) in enumerate(rows):
+                row = _ClickableKvRow(key, "") if index is not None else KvRow(key, "")
+                self.body.insertWidget(position + offset, row)
+                self._rows.append(row)
+            self._row_ids = ids
+        self._row_labels = [key for _row_id, key, _value, _tone, _index in rows]
+        self._rows_by_sample = {}
+        for row, (_row_id, _key, value, tone, index) in zip(self._rows, rows, strict=True):
+            row.set_value(value, tone)
+            if isinstance(row, _ClickableKvRow):
+                self._rows_by_sample[index] = row
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+                try:
+                    row.clicked.disconnect()
+                except TypeError:
+                    pass
+                row.clicked.connect(lambda sample=index: self.sample_requested.emit(sample))
+
+    def flush(self) -> None:
+        """Commit a typed value now instead of when the debounce ends -- the
+        page is closing, or a test does not want to wait."""
+        if self._commit.isActive():
+            self._commit.stop()
+            self._emit_box()
+
+    def _on_edited(self) -> None:
+        self._commit.start()
+
+    def _emit_box(self) -> None:
+        x, width = self.x_row.resolved()
+        y, height = self.y_row.resolved()
+        self.box_edited.emit((x, y, width, height))
+
+
+# --------------------------------------------------------------------------
+# The tab
+# --------------------------------------------------------------------------
+
+class _CropPage(QWidget):
+    """The tab's page, which flushes the pending commit when it goes away.
+
+    An edit inside the 400 ms debounce would otherwise be lost to a window
+    close: `MainWindow.closeEvent` shuts the controller down, so reacting to
+    the hide that follows would be too late. Filtering the window's own
+    Close event runs before that handler. Hiding (switching stage tabs, or
+    the window closing without a Close event) flushes as well.
+    """
+
+    def __init__(self, flush):
+        super().__init__()
+        self._flush = flush
+        self._watched: QWidget | None = None
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        window = self.window()
+        if window is not self._watched:
+            if self._watched is not None and not sip.isdeleted(self._watched):
+                self._watched.removeEventFilter(self)
+            self._watched = window
+            window.installEventFilter(self)
+
+    def hideEvent(self, event) -> None:
+        self._flush()
+        super().hideEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self._watched and event.type() == QEvent.Type.Close:
+            self._flush()
+        return False
+
+
+class CropTab:
+    """`StageTab` for "Crop": the canvas, the filmstrip and their panel."""
+
+    title = "Crop"
+
+    def __init__(self, controller):
+        self._controller = controller
+        self._file: str | None = None
+        self._samples: list[CropSampleView] = []
+        self._selected = 0
+        self._thumbnails: dict[float, QImage] = {}
+
+        self._page = _CropPage(self._flush)
+        self._page.setObjectName("CropPage")
+        self._page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        outer = QVBoxLayout(self._page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Ruling B3: these live right-aligned in the stage head, which the
+        # Stage mounts through `toolbar()` -- not on the page.
+        self._toolbar = QWidget()
+        self._toolbar.setObjectName("CropToolbar")
+        bar = QHBoxLayout(self._toolbar)
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(TOOLBAR_GAP)
+        self.envelope_button = self._toggle("envelope", "envelope", on=True)
+        self.masked_button = self._toggle("masked", "masked")
+        self.grid_button = self._toggle("grid", "grid")
+        for button in (self.envelope_button, self.masked_button, self.grid_button):
+            bar.addWidget(button)
+        bar.addSpacing(TOOLBAR_SPACING)
+        self.fit_button = Button("⤢ fit to all 0 samples", small=True)
+        self.fit_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.fit_button.clicked.connect(self.fit_to_samples)
+        bar.addWidget(self.fit_button)
+
+        body = QWidget()
+        column = QVBoxLayout(body)
+        column.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
+        column.setSpacing(0)
+        # The canvas is exactly as tall as its aspect ratio makes it at the
+        # stage's width, so height the page does not use cannot go into the
+        # frame -- a taller canvas would only letterbox it. The slack is
+        # split above and below instead of piling up under the timeline.
+        column.addStretch(1)
+        self.canvas = CropCanvas()
+        column.addWidget(self.canvas)
+        self.strip = SampleStrip()
+        column.addWidget(self.strip)
+        column.addSpacing(TIMELINE_GAP)
+        self.timeline = Timeline(controller, mode="compact")    # ruling B5
+        self.timeline.seek_requested.connect(self.select_nearest)
+        column.addWidget(self.timeline)
+        column.addStretch(1)                     # ... and the other half, see above the canvas
+        outer.addWidget(body, 1)
+        QWidget.setTabOrder(self.canvas, self.strip)
+
+        self.panel = CropInspectorPanel()
+
+        self._commit = QTimer(self._page)
+        self._commit.setSingleShot(True)
+        self._commit.setInterval(COMMIT_DEBOUNCE_MS)
+        self._commit.timeout.connect(lambda: self._commit_box(self.canvas.box()))
+        self._frames_timer = QTimer(self._page)         # coalesce a burst of frame_ready
+        self._frames_timer.setSingleShot(True)
+        self._frames_timer.setInterval(0)
+        self._frames_timer.timeout.connect(self.refresh)
+
+        self.canvas.commit_requested.connect(self._commit_box)
+        self.canvas.nudged.connect(self._commit.start)
+        self.canvas.masks_changed.connect(self._commit_masks)
+        self.canvas.box_changed.connect(self._on_box_changed)
+        self.strip.selected.connect(self.select)
+        self.strip.stepped.connect(self.step)
+        self.panel.box_edited.connect(self._commit_box)
+        self.panel.sample_requested.connect(self.select)
+        controller.frame_ready.connect(self._on_frame_ready)
+
+    def _toggle(self, text: str, key: str, *, on: bool = False) -> Button:
+        button = Button(text, "ghost" if not on else "default", small=True, toggled_on=on)
+        button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        button.clicked.connect(lambda _checked=False, name=key: self._flip(name))
+        return button
+
+    # --- StageTab -----------------------------------------------------------------
+
+    def page(self) -> QWidget:
+        return self._page
+
+    def inspector_panel(self) -> QWidget:
+        return self.panel
+
+    def toolbar(self) -> QWidget:
+        """envelope / masked / grid and "⤢ fit to all N samples", which the
+        Stage mounts in the stage head (ruling B3)."""
+        return self._toolbar
+
+    def set_file(self, name: str | None) -> None:
+        if name != self._file:
+            self._flush()                        # a nudge still waiting belongs to the old file
+            self.canvas.clear_pending()
+            self._samples = []
+            self._selected = 0
+            self._thumbnails.clear()
+            self.strip.reset_page()
+        self._file = name
+        self.timeline.set_file(name)
+        self.refresh()
+
+    def refresh(self) -> None:
+        entry = self._entry()
+        self.timeline.refresh()
+        if entry is None:
+            self._page.setEnabled(False)
+            self.strip.set_state([], -1, set(), {})
+            self.panel.set_state(None, (1, 1), [], "")
+            return
+        self._page.setEnabled(True)
+        evidence = entry.evidence.get("crop") or {}
+        samples = read_samples(evidence)
+        reseated = [sample.time for sample in samples] != [sample.time for sample in self._samples]
+        if reseated:
+            self._selected = self._first_kept(samples)      # a new detection: back to its first hit
+        self._samples = samples
+        self._selected = max(0, min(self._selected, max(0, len(samples) - 1)))
+        self._request_frames()
+        self._sync_canvas(entry, evidence)
+        self._sync_strip(evidence)
+        if reseated:
+            self.strip.reveal(self._selected)
+        self._sync_toolbar()
+        self._sync_panel(entry, evidence)
+
+    # --- reading ---------------------------------------------------------------------
+
+    def current_file(self) -> str | None:
+        return self._file
+
+    def samples(self) -> list[CropSampleView]:
+        return list(self._samples)
+
+    def selected_index(self) -> int:
+        return self._selected
+
+    def current_time(self) -> float:
+        if self._samples:
+            return self._samples[min(self._selected, len(self._samples) - 1)].time
+        entry = self._entry()
+        if entry is None:
+            return 0.0
+        if entry.sample_time is not None:
+            return float(entry.sample_time)
+        return 0.4 * float(entry.media.duration or 0.0)
+
+    def _entry(self):
+        name = self._file
+        if name is None or name not in self._controller.names():
+            return None
+        return self._controller.entry(name)
+
+    @staticmethod
+    def _first_kept(samples) -> int:
+        return next((index for index, sample in enumerate(samples) if sample.kept), 0)
+
+    def _video_size(self, entry, evidence) -> tuple[int, int]:
+        """The coordinate space the crop box lives in: the NATIVE frame size.
+        Frames arrive scaled to at most 720 rows, so the decoded image's size
+        is never it; the evidence's `frame_size` stands in until the metadata
+        job has run."""
+        media = entry.media
+        if media.width > 0 and media.height > 0:
+            return (media.width, media.height)
+        size = evidence.get("frame_size")
+        try:
+            if size is not None and len(size) == 2 and int(size[0]) > 0 and int(size[1]) > 0:
+                return (int(size[0]), int(size[1]))
+        except (TypeError, ValueError):
+            pass
+        return (1920, 1080)
+
+    def _displayed_box(self, entry, evidence, video_size) -> tuple[int, int, int, int]:
+        crop = entry.crop
+        if crop is not None:
+            return (crop.x, crop.y, crop.width, crop.height)
+        detected = _read_box(evidence.get("box"))
+        if detected is not None:
+            return detected
+        width, height = video_size
+        return (0, int(height * 0.8), width, max(CropCanvas.MIN_BOX, int(height * 0.15)))
+
+    def _disagreeing(self, evidence) -> list[int]:
+        """Samples that found text but did not contribute -- only when the
+        detection produced a box to disagree with."""
+        if _read_box(evidence.get("box")) is None:
+            return []
+        return [index for index, sample in enumerate(self._samples)
+                if not sample.kept and sample.boxes]
+
+    # --- selection -------------------------------------------------------------------
+
+    def select(self, index: int) -> None:
+        """Show that sample's frame. Out-of-range clamps, so ◀ / ▶ stop at
+        the ends rather than wrapping."""
+        if not self._samples:
+            return
+        self._selected = max(0, min(int(index), len(self._samples) - 1))
+        self.refresh()
+        self.strip.reveal(self._selected)
+
+    def step(self, delta: int) -> None:
+        self.select(self._selected + int(delta))
+
+    def select_nearest(self, time: float) -> None:
+        """Ruling B5: a click on the compact timeline jumps the canvas to the
+        sample nearest that time -- the frames here exist only at the times
+        the detector probed, so there is nothing else to jump to."""
+        if not self._samples:
+            return
+        times = [sample.time for sample in self._samples]
+        self.select(min(range(len(times)), key=lambda index: abs(times[index] - float(time))))
+
+    # --- commands ---------------------------------------------------------------------
+
+    def _flip(self, key: str) -> None:
+        on = not self.canvas.overlays()[key]
+        self.canvas.set_overlay(key, on)
+        button = {"envelope": self.envelope_button, "masked": self.masked_button,
+                  "grid": self.grid_button}[key]
+        button.set_toggled(on)
+        button.set_variant("default" if on else "ghost")
+
+    def fit_to_samples(self) -> None:
+        """Re-run the detector's aggregation over the kept samples' boxes,
+        with the cutoff the detection itself used (the module docstring)."""
+        entry = self._entry()
+        if entry is None:
+            return
+        evidence = entry.evidence.get("crop") or {}
+        kept = [sample for sample in self._samples if sample.kept]
+        if not kept:
+            return
+        folder = self._controller.project.folder
+        settings = {field: getattr(folder, field) for field in DETECTOR_FIELDS}
+        cutoff = evidence.get("cutoff_frac")
+        settings["bottom_half_cutoff"] = float(folder.bottom_half_cutoff if cutoff is None else cutoff)
+        box = aggregate_crop_box([sample.boxes for sample in kept],
+                                 self._video_size(entry, evidence), settings,
+                                 [sample.time for sample in kept])
+        if box is not None:
+            self._commit_box(box, force=True)     # always makes the value yours
+
+    def _commit_box(self, box, *, force: bool = False) -> None:
+        """The one place an edit becomes a MANUAL value (ruling C8: only the
+        controller mutates the model).
+
+        The box is clamped here, not only on the canvas: a typed spin value
+        reaches this straight from the panel, and a stored box the frame
+        cannot hold is a fidelity bug (see `clamp_box`). `force` commits a
+        box equal to the stored one -- "fit to all samples" must make the
+        value yours even when the aggregation reproduces the detector's."""
+        self._commit.stop()
+        self.canvas.clear_pending()
+        entry = self._entry()
+        if entry is None:
+            return
+        box = clamp_box(box, self.canvas.video_size(), CropCanvas.MIN_BOX)
+        crop = entry.crop
+        if not force and crop is not None and (crop.x, crop.y, crop.width, crop.height) == box:
+            self.refresh()                       # the spins may still show what was typed
+            return
+        self._controller.set_crop(self._file, box)
+        self.refresh()
+
+    def _commit_masks(self, masks) -> None:
+        if self._controller.project is None:
+            return
+        self._controller.set_label_masks([tuple(int(value) for value in mask) for mask in masks])
+        self.refresh()
+
+    def _flush(self) -> None:
+        """Commit anything still waiting for its debounce -- a key nudge on
+        the canvas and a typed value in the panel."""
+        if self._commit.isActive():
+            self._commit_box(self.canvas.box())
+        self.panel.flush()
+
+    def _on_box_changed(self) -> None:
+        box = self.canvas.box()
+        self.canvas.set_meta(self.current_time(), sum(1 for s in self._samples if s.kept))
+        self.panel.show_box(box)
+
+    # --- frames --------------------------------------------------------------------------
+
+    def _request_frames(self) -> None:
+        name = self._file
+        if name is None:
+            return
+        times = [sample.time for sample in self._samples]
+        current = self.current_time()
+        if current not in times:
+            times.append(current)
+        if times:
+            self._controller.request_frames(name, times)
+
+    def _on_frame_ready(self, name: str, _time: float) -> None:
+        """One job brings back many frames, so the signal arrives in bursts:
+        coalesce them into one repaint on the event loop.
+
+        `CropTab` is not a QObject, so Qt cannot disconnect this for us when
+        the widgets go; the deleted check is what a QWidget view gets for
+        free."""
+        if name == self._file and not sip.isdeleted(self._page):
+            self._frames_timer.start()
+
+    def _thumbnail(self, time: float) -> QImage | None:
+        cached = self._thumbnails.get(time)
+        if cached is not None:
+            return cached
+        frame = self._controller.frame(self._file, time)
+        if frame is None:
+            return None
+        image = bgr_to_qimage(frame)
+        if image is None or image.isNull():
+            return None
+        image = image.scaled(SampleStrip.THUMB_WIDTH, SampleStrip.THUMB_HEIGHT,
+                             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                             Qt.TransformationMode.SmoothTransformation)
+        self._thumbnails[time] = image
+        return image
+
+    # --- syncing the widgets -------------------------------------------------------------
+
+    def _sync_canvas(self, entry, evidence) -> None:
+        video_size = self._video_size(entry, evidence)
+        box = self._displayed_box(entry, evidence, video_size)
+        detected = _read_box(evidence.get("box"))
+        self.canvas.set_video_size(video_size)
+        self.canvas.set_box(box)
+        self.canvas.set_evidence(_read_box(evidence.get("envelope")),
+                                 None if detected == box else detected)
+        self.canvas.set_brightness(entry.brightness.value if entry.brightness else DEFAULT_BRIGHTNESS)
+        self.canvas.set_meta(self.current_time(), sum(1 for s in self._samples if s.kept))
+        folder = self._controller.project.folder
+        self.canvas.set_masks(folder.label_mask_crops, folder.labels_enabled)
+        self.canvas.set_frame(self._controller.frame(self._file, self.current_time()))
+
+    def _sync_strip(self, evidence) -> None:
+        warned = set(self._disagreeing(evidence))
+        images = {index: self._thumbnail(sample.time) for index, sample in enumerate(self._samples)}
+        self.strip.set_state(self._samples, self._selected, warned, images)
+
+    def _sync_toolbar(self) -> None:
+        kept = sum(1 for sample in self._samples if sample.kept)
+        self.fit_button.setText(f"⤢ fit to all {kept} samples")
+        self.fit_button.setEnabled(kept > 0)
+
+    def _sync_panel(self, entry, evidence) -> None:
+        # The canvas is synced first, so its box IS the displayed box -- and
+        # while an edit waits for its debounced commit it is the edited one,
+        # which is what the spin pairs and the "covers it" note must read.
+        video_size = self._video_size(entry, evidence)
+        box = self.canvas.box()
+        rows, note = self._panel_rows(entry, evidence, box)
+        self.panel.set_state(box, video_size, rows, note)
+
+    def _panel_rows(self, entry, evidence, box) -> tuple[list[tuple], str]:
+        """(rows, note). A row is (row_id, key, value, tone, sample index):
+        `row_id` identifies it across refreshes, since two samples on the
+        same side of the envelope produce the same key."""
+        if not _has_evidence(evidence):
+            source = None if entry.crop is None else entry.crop.source
+            return [("source", "Source", crop_caption(None, source)[0], None, None)], ""
+        total = len(self._samples)
+        kept = sum(1 for sample in self._samples if sample.kept)
+        envelope = _read_box(evidence.get("envelope"))
+        rows = [("samples", "Samples with text", f"{kept} / {total}", None, None),
+                ("envelope", "Text envelope", "—" if envelope is None
+                 else f"y {envelope[1]}–{envelope[1] + envelope[3]}", None, None)]
+        flagged = crop_flag_summary(evidence.get("flagged"))
+        if flagged is not None:
+            text, blocking = flagged
+            rows.append(("flagged", "Detection", text, "warn" if blocking else None, None))
+        detected = _read_box(evidence.get("box"))
+        if detected is not None and detected != box:
+            rows.append(("detected", "detected",
+                         f"{_box_text(detected)} · yours {_box_text(box)}", "warn", None))
+        covered, disagreeing = True, self._disagreeing(evidence)
+        for index in disagreeing:
+            sample = self._samples[index]
+            extent = sample.extent
+            where = "lower" if self._below(extent, envelope) else "higher"
+            rows.append((f"sample-{index}", f"1 sample sits {where}",
+                         f"{clock(sample.time)} ▸", "warn", index))
+            covered = covered and _covers(box, extent)
+        note = "" if not disagreeing else (COVERED_NOTE if covered else OUTSIDE_NOTE)
+        return rows, note
+
+    @staticmethod
+    def _below(extent, envelope) -> bool:
+        if extent is None:
+            return False
+        if envelope is None:
+            return True
+        return (extent[1] + extent[3] / 2) > (envelope[1] + envelope[3] / 2)

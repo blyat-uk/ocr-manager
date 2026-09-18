@@ -9,9 +9,9 @@ growing across consecutive probe batches -- see _run_round()'s
 convergence stop -- instead of walking the whole 40-60% window at a fixed
 step, or stopping once an arbitrary count of probes has agreed.
 
-Two correctness rules this module fixes relative to the old detector
-(`core/subtitle_detector.py`'s `_compute_crop_from_polys`), both pinned by
-tests in `tests/test_detect_crop.py`:
+Two correctness rules this module fixes relative to the v1 app's detector
+(its `core/subtitle_detector.py`'s `_compute_crop_from_polys`, deleted with
+that window), both pinned by tests in `tests/test_detect_crop.py`:
 
 1. Union, not tightest box. The old code kept a running min/max across all
    *accepted* polys but picked the *single* candidate frame with the
@@ -52,20 +52,20 @@ from statistics import median
 import av
 import numpy as np
 
-from core.config import Config as _Config
 from core.detect import vad
 from core.detect.flags import compose_flag as _compose_flag
 from core.detect.flags import is_cancelled as _is_cancelled
 from core.detect.flags import only_informational
+from core.project.model import FolderSettings as _FolderSettings
 from videocr.pyav_adapter import _TRC_ARIB_STD_B67, _TRC_SMPTE2084, PyAVCapture, _pyav_has_zscale
 
 logger = logging.getLogger(__name__)
 
-# --- Geometry defaults, mirroring core/subtitle_detector.py's `automation`
-# settings keys so a settings dict built for the old detector still works
-# here. `CROP_VERTICAL_PADDING` is the one deliberate change: the old
-# default was 0 (no padding); this module's default is 0.3% of frame
-# height, per the brief's rule 2 above.
+# --- Geometry defaults. The keys are the folder settings
+# core.jobs.detect_jobs.crop_settings() passes as `settings`.
+# `CROP_VERTICAL_PADDING` is the one deliberate change from the v1 app: its
+# default was 0 (no padding); this module's default is 0.3% of frame height,
+# per the brief's rule 2 above.
 CROP_WIDTH_FRACTION = 0.70
 CROP_VERTICAL_PADDING = 0.003
 CROP_MIN_HEIGHT_FRACTION = 0.05
@@ -76,18 +76,18 @@ MAX_CROP_HEIGHT_FRAC = 0.25
 DT_SCORE_THRESHOLD = 0.9
 
 def _label_max_duration_default() -> float:
-    """Read core.config.Config's own label_max_duration default rather than
-    hardcoding a twin of it: the label pipeline already encodes "how long a
-    single subtitle can plausibly stay on screen" as this value, and if
-    that assumption ever changes, this module's watermark-vs-repeated-line
-    boundary (below) should track it automatically instead of silently
-    diverging. core/config.py has no Qt imports, so this import doesn't
+    """Read core.project.model.FolderSettings' own label_max_duration default
+    rather than hardcoding a twin of it: the label pipeline already encodes
+    "how long a single subtitle can plausibly stay on screen" as this value,
+    and if that assumption ever changes, this module's watermark-vs-repeated-
+    line boundary (below) should track it automatically instead of silently
+    diverging. core/project/ has no Qt imports, so this import doesn't
     violate core/detect/'s Qt-free convention.
     """
-    for f in _dataclass_fields(_Config):
+    for f in _dataclass_fields(_FolderSettings):
         if f.name == "label_max_duration":
             return float(f.default)
-    return 5.0  # matches Config's own fallback, in case the field is ever renamed
+    return 5.0  # matches FolderSettings' own value, in case the field is ever renamed
 
 
 # Watermark rejection: a box present in every sampled frame, to within this
@@ -284,6 +284,51 @@ BLOCKING_FLAGS = frozenset({
 })
 
 
+# CropSample.lines: two boxes sit on the same text row when their vertical
+# extents overlap by at least this fraction of the smaller box's height.
+TEXT_ROW_MIN_OVERLAP_FRAC = 0.5
+
+
+@dataclass(frozen=True)
+class CropSample:
+    """One analysed probe frame, as evidence for reviewing a CropResult.
+
+    `time`: the entry of CropResult.sample_pts this frame was recorded under
+    (same position, same value) -- re-fetch it with grab_frames().
+    `boxes`: (x, y, w, h) of every text polygon detect_crop() accepted on
+    this frame -- score >= DT_SCORE_THRESHOLD and centre inside the band its
+    round judged (the bottom-band cutoff; the whole frame on the full-frame
+    retry) -- in the source frame's native pixels like CropResult.box, NOT in
+    the cropped, downscaled band grab_frames() returns. Rounded like
+    CropResult.envelope, sorted by (y, x). Empty when nothing was accepted.
+    `kept`: this frame contributed to the kept union (the frames `agreed`
+    counts and `hit_pts` lists). Decided per frame, not per time: the
+    full-frame retry re-probes times the bottom-band rounds already probed,
+    and only the retry's frame at such a time is kept, although the time is
+    in hit_pts.
+    `lines`: distinct text rows among `boxes` (see _count_text_rows()), 0
+    when there are none.
+    """
+
+    time: float
+    boxes: tuple[tuple[int, int, int, int], ...]
+    kept: bool
+    lines: int
+
+    def to_evidence(self) -> dict:
+        """JSON-able: {"time", "boxes" (lists), "kept", "lines"}."""
+        return {
+            "time": float(self.time),
+            "boxes": [[int(v) for v in box] for box in self.boxes],
+            "kept": bool(self.kept),
+            "lines": int(self.lines),
+        }
+
+
+def _int_list(values) -> list[int] | None:
+    return None if values is None else [int(v) for v in values]
+
+
 @dataclass
 class CropResult:
     """One file's crop detection.
@@ -327,6 +372,32 @@ class CropResult:
     # detect_crop() -- lets callers convert `box` into (y_frac, h_frac)
     # without a second, redundant dimension probe of their own.
     frame_size: tuple[int, int] | None = None
+    # One CropSample per sample_pts entry, same order: what each analysed
+    # frame showed and whether it contributed -- evidence for review only;
+    # nothing above is derived from it.
+    samples: list[CropSample] = field(default_factory=list)
+    # The bottom_half_cutoff the kept samples were judged with, and `box` was
+    # built with: the settings' band (default BOTTOM_HALF_CUTOFF), or 0.0 after
+    # the full-frame retry. Re-running aggregate_box over the samples ("fit to
+    # all samples") must use it. Evidence for review only, like `samples`;
+    # None for a result detect_crop() did not build.
+    cutoff_frac: float | None = None
+
+    def to_evidence(self) -> dict:
+        """The result as JSON-able evidence for review: box, envelope,
+        agreed, probes_used, flagged, hit_pts, frame_size, samples as dicts
+        (CropSample.to_evidence()) and cutoff_frac. Tuples become lists."""
+        return {
+            "box": _int_list(self.box),
+            "envelope": _int_list(self.envelope),
+            "agreed": int(self.agreed),
+            "probes_used": int(self.probes_used),
+            "flagged": self.flagged,
+            "hit_pts": [float(t) for t in self.hit_pts],
+            "frame_size": _int_list(self.frame_size),
+            "samples": [sample.to_evidence() for sample in self.samples],
+            "cutoff_frac": None if self.cutoff_frac is None else float(self.cutoff_frac),
+        }
 
     @property
     def auto_applicable(self) -> bool:
@@ -1179,10 +1250,10 @@ def aggregate_box(polys_per_frame, frame_size: tuple[int, int], band_frac: float
     `frame_size`: (width, height) of the coordinate space the polygons are in.
     `band_frac`: fraction of frame height below which a poly's center must
     sit to be accepted -- overridable via settings['bottom_half_cutoff'].
-    `settings`: optional dict mirroring core/subtitle_detector.py's
-    `automation` keys (crop_width_fraction, crop_vertical_padding,
-    crop_min_height_fraction, bottom_half_cutoff). None means the defaults
-    at the top of this module.
+    `settings`: optional dict of the folder settings
+    core.jobs.detect_jobs.crop_settings() passes (crop_width_fraction,
+    crop_vertical_padding, crop_min_height_fraction, bottom_half_cutoff).
+    None means the defaults at the top of this module.
     `sample_times`: optional, one timestamp per entry of `polys_per_frame`
     (same length, same order) -- lets the watermark check require real
     temporal spread among the contributing samples instead of only extent
@@ -1271,6 +1342,27 @@ def _consistent_with_consensus(y_frac: float, h_frac: float,
     return True
 
 
+def consistent_with_consensus(box: tuple[int, int, int, int], frame_size: tuple[int, int],
+                              consensus: list[tuple[float, float]]) -> bool:
+    """Whether a finished crop `box` agrees with `consensus` under the rule
+    detect_crop() applies before consensus may relax its convergence stop
+    (_consistent_with_consensus(): height within CONSENSUS_MAX_HEIGHT_RATIO
+    of the series median both ways, top within CONSENSUS_Y_DEVIATION_FRAC).
+
+    `box` is (x, y, w, h) in the native pixels of a frame `frame_size`
+    (width, height), as CropResult.box / CropResult.frame_size give them;
+    `consensus` holds (y_frac, h_frac) entries, as detect_crop() takes them.
+    For judging a result after the fact, e.g. a hint re-detection against
+    its hint (core.jobs.apply). detect_crop() itself does not call this: it
+    checks its raw union, so detection is unchanged. Raises ValueError
+    without a frame height.
+    """
+    _width, height = frame_size
+    if not height or height <= 0:
+        raise ValueError(f"frame_size {frame_size!r} has no height")
+    return _consistent_with_consensus(box[1] / height, box[3] / height, list(consensus))
+
+
 def _spread_order(times: list[float]) -> list[float]:
     """Reorder timestamps by greedy farthest-point sampling: the earliest
     entries visited are maximally spread apart, rather than adjacent in
@@ -1344,7 +1436,7 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     batch -- so at most one already-in-flight batch (already-dispatched
     ffmpeg grabs + one det_engine.predict() call) still completes after
     cancellation is requested, not an unbounded number of them. A caller
-    driving this from a background thread (see core/subtitle_detector.py)
+    driving this from a background thread (core.jobs.detect_jobs.CropJob)
     can therefore expect cancellation to take effect within roughly one
     batch, not only once the whole candidate list or MAX_PROBES_PER_ROUND
     is exhausted.
@@ -1525,6 +1617,95 @@ def _run_round(video_path: str, times: list[float], det_engine, band_frac: float
     return polys_per_frame, sample_pts, raw_hits, frame_times
 
 
+# --------------------------------------------------------------------------
+# Evidence (CropResult.samples) -- read-only over what detection already
+# decided; nothing here feeds back into the box, flags or times.
+# --------------------------------------------------------------------------
+
+def _count_text_rows(boxes) -> int:
+    """Distinct text rows among (x, y, w, h) boxes. Two boxes share a row
+    when their vertical extents overlap by at least
+    TEXT_ROW_MIN_OVERLAP_FRAC of the smaller box's height; rows chain, so a
+    box sharing a row with each of two others joins all three."""
+    row_of = list(range(len(boxes)))
+
+    def row(i: int) -> int:
+        while row_of[i] != i:
+            i = row_of[i]
+        return i
+
+    for i, (_xi, yi, _wi, hi) in enumerate(boxes):
+        for j in range(i + 1, len(boxes)):
+            _xj, yj, _wj, hj = boxes[j]
+            overlap = min(yi + hi, yj + hj) - max(yi, yj)
+            if overlap >= TEXT_ROW_MIN_OVERLAP_FRAC * min(hi, hj):
+                row_of[row(j)] = row(i)
+    return sum(1 for i in range(len(boxes)) if row(i) == i)
+
+
+def _accepted_boxes(polys, frame_h: float, cutoff_frac: float) -> tuple[tuple[int, int, int, int], ...]:
+    """(x, y, w, h) of each of one frame's polygons that the union accepts
+    (see CropSample.boxes), sorted by (y, x). Each polygon goes through
+    _per_frame_extents() itself, so a box is shown exactly when the
+    aggregation counts that polygon. `polys` already passed the score
+    threshold and are full-frame (see _run_round()).
+
+    A polygon that cannot be parsed or rounded is left out rather than
+    raised: evidence must never fail a detection whose result stands."""
+    boxes = []
+    for poly in polys:
+        try:
+            extent = _per_frame_extents([[poly]], frame_h, cutoff_frac)[0]
+            if extent is not None:
+                min_x, min_y, max_x, max_y = extent
+                boxes.append((int(round(min_x)), int(round(min_y)),
+                              int(round(max_x - min_x)), int(round(max_y - min_y))))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return tuple(sorted(boxes, key=lambda b: (b[1], b[0], b[2], b[3])))
+
+
+def _frame_of_sample(sample_times: list[float], frame_times: list[float]) -> dict[int, int]:
+    """For one _run_round() call: which analysed frame (index into its
+    polys_per_frame / frame_times) each recorded sample (index into its
+    sample_pts) is. Both lists are in probing order; frame_times has one
+    entry per frame the engine answered, so it equals sample_times unless
+    the engine returned fewer results than frames. Matched in order, so a
+    sample the engine did not answer gets no frame instead of the next
+    sample's."""
+    frame_of_sample: dict[int, int] = {}
+    i = 0
+    for j, t in enumerate(frame_times):
+        while i < len(sample_times) and sample_times[i] != t:
+            i += 1
+        if i == len(sample_times):
+            break
+        frame_of_sample[i] = j
+        i += 1
+    return frame_of_sample
+
+
+def _crop_samples(rounds: list[tuple[list[float], list, list[float], bool]], frame_h: float,
+                  band_cutoff_frac: float, kept_idx: list[int]) -> list[CropSample]:
+    """CropResult.samples from every _run_round() call detect_crop() made,
+    in order, each as (sample_pts, polys_per_frame, frame_times, full-frame
+    retry?). Each round's frames are judged against the band that round
+    probed: the whole frame for the full-frame retry, `band_cutoff_frac`
+    otherwise. `kept_idx` indexes the LAST round's frames, the only ones the
+    union was built from."""
+    samples: list[CropSample] = []
+    for k, (sample_times, polys_per_frame, frame_times, full_frame) in enumerate(rounds):
+        cutoff_frac = 0.0 if full_frame else band_cutoff_frac
+        kept_frames = set(kept_idx) if k == len(rounds) - 1 else set()
+        frame_of_sample = _frame_of_sample(sample_times, frame_times[:len(polys_per_frame)])
+        for i, t in enumerate(sample_times):
+            j = frame_of_sample.get(i)
+            boxes = () if j is None else _accepted_boxes(polys_per_frame[j], frame_h, cutoff_frac)
+            samples.append(CropSample(time=t, boxes=boxes, kept=j is not None and j in kept_frames,
+                                      lines=_count_text_rows(boxes)))
+    return samples
+
+
 def detect_crop(video_path: str, duration_sec: float, det_engine,
                  consensus: list[tuple[float, float]] | None = None,
                  settings: dict | None = None,
@@ -1540,8 +1721,8 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     there, the result is just "cancelled", with nothing probed), between
     probe batches (see _run_round()) AND between the fallback rounds
     below, so a caller driving several files from a background thread
-    (core/subtitle_detector.py) can make Cancel take effect within roughly
-    one batch of one file, not only between whole files.
+    (core.jobs.detect_jobs.CropJob) can make Cancel take effect within
+    roughly one batch of one file, not only between whole files.
 
     Orchestration: vad.probe_times() picks candidate timestamps ranked by
     likelihood of carrying dialogue -> they are fetched in batches (one-shot
@@ -1603,7 +1784,8 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         # Cancelled before a single probe: say so, and nothing else --
         # falling through would compose no-speech onto a file that was
         # never listened to.
-        return CropResult(box=None, flagged=FLAG_CANCELLED, frame_size=frame_size)
+        return CropResult(box=None, flagged=FLAG_CANCELLED, frame_size=frame_size,
+                          cutoff_frac=float((settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)))
     speech_probing_available = bool(times)
     if not speech_probing_available:
         times = _uniform_probe_times(duration_sec)
@@ -1614,6 +1796,9 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
     # container holds several decoded reference frames.
     fetcher = _open_frame_fetcher(video_path, known_dims)
     used_full_frame_retry = False
+    # Every round's (sample_pts, polys_per_frame, frame_times, full-frame
+    # retry?), for CropResult.samples only.
+    rounds: list[tuple[list[float], list, list[float], bool]] = []
     try:
         polys_per_frame, used, raw_hits, frame_times = _run_round(
             video_path, times, det_engine, band_frac=BOTTOM_HALF_CUTOFF,
@@ -1621,6 +1806,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
             cancel_check=cancel_check, fetcher=fetcher, transfer=transfer,
         )
         sample_pts.extend(used)
+        rounds.append((used, polys_per_frame, frame_times, False))
         # Checked (and reused, not re-polled) once per round, right after that
         # round returns: cancel_check() cutting a round short is a real,
         # distinct reason a round found little or nothing -- composed
@@ -1644,6 +1830,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                 transfer=transfer,
             )
             sample_pts.extend(used)
+            rounds.append((used, polys_per_frame, frame_times, False))
             flagged = _compose_flag(flagged, FLAG_SPEECH_PROBES_EXHAUSTED)
             cancelled = _is_cancelled(cancel_check)
             if cancelled:
@@ -1663,6 +1850,7 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
                 transfer=transfer,
             )
             sample_pts.extend(used)
+            rounds.append((used, polys_per_frame, frame_times, True))
             flagged = _compose_flag(flagged, FLAG_TOP_POSITIONED)
             used_full_frame_retry = True
             if _is_cancelled(cancel_check):
@@ -1748,6 +1936,11 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         )
         flagged = _compose_flag(flagged, FLAG_UNKNOWN_REJECTION)
 
+    # Evidence only, built once every field above is final.
+    samples = _crop_samples(
+        rounds, orig_h, float((settings or {}).get("bottom_half_cutoff", BOTTOM_HALF_CUTOFF)), kept_idx,
+    )
+
     return CropResult(
         box=box,
         sample_pts=sample_pts,
@@ -1757,4 +1950,6 @@ def detect_crop(video_path: str, duration_sec: float, det_engine,
         flagged=flagged,
         hit_pts=hit_pts,
         frame_size=frame_size,
+        samples=samples,
+        cutoff_frac=cutoff_frac,
     )
