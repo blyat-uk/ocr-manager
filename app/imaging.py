@@ -15,7 +15,13 @@ from collections import OrderedDict
 import numpy as np
 from PyQt6.QtGui import QImage
 
-DEFAULT_MAX_BYTES = 512 * 1024**2      # ~190 frames of 1280x720 BGR
+# ~70 frames of 1280x720 BGR (2.8 MB each), on top of whatever PaddleOCR is
+# holding. A crop view shows one canvas frame and about a dozen filmstrip
+# frames, so this keeps the last five or so files hot -- enough to walk back
+# and forth through a stretch of the queue without decoding again -- while
+# browsing a hundred-file folder can no longer grow the process by half a
+# gigabyte of frames nobody is looking at any more.
+DEFAULT_MAX_BYTES = 192 * 1024**2
 
 
 def bgr_to_qimage(image) -> QImage | None:

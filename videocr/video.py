@@ -160,6 +160,41 @@ MIN_SUBTITLE_DURATION = 0.15
 # against the previous frame, so the gate is never applied there.
 
 
+def infer_crop_region(frame_width: int, frame_height: int, crop_x, crop_y, crop_width, crop_height):
+    """The (x_start, y_start, x_end, y_end) the OCR pass really slices out of
+    a `frame_width` x `frame_height` frame for this crop, or None when there
+    is nothing to slice.
+
+    Missing components are inferred (x/y default to 0, width/height to the
+    rest of the frame) and the result is clamped to the frame: a crop wider
+    or taller than the frame is NARROWED here, keeping its origin, and one
+    whose clamped width or height reaches zero is dropped -- run_ocr then
+    falls back to the bottom third of the frame. Both are silent, which is
+    why every writer of a stored crop clamps it first
+    (`core.project.model.clamp_crop_box`); this function is what that clamp
+    has to agree with.
+
+    All None (no crop asked for) is also None: the caller uses the whole
+    frame or its own default.
+    """
+    if all(part is None for part in (crop_x, crop_y, crop_width, crop_height)):
+        return None
+    # infer missing crop parameters
+    inferred_x = 0 if crop_x is None else crop_x
+    inferred_y = 0 if crop_y is None else crop_y
+    inferred_width = (frame_width - inferred_x) if crop_width is None else crop_width
+    inferred_height = (frame_height - inferred_y) if crop_height is None else crop_height
+
+    # clamp to valid ranges
+    inferred_x = max(0, min(int(inferred_x), frame_width))
+    inferred_y = max(0, min(int(inferred_y), frame_height))
+    inferred_width = max(0, min(int(inferred_width), frame_width - inferred_x))
+    inferred_height = max(0, min(int(inferred_height), frame_height - inferred_y))
+    if inferred_width <= 0 or inferred_height <= 0:
+        return None
+    return (inferred_x, inferred_y, inferred_x + inferred_width, inferred_y + inferred_height)
+
+
 def _center_mask_is_empty(center_bgr: np.ndarray, threshold: int) -> bool:
     """True iff no pixel in `center_bgr` has every channel >= threshold.
 
@@ -376,23 +411,9 @@ class Video:
             crop_y_end = None
 
             if not self.use_fullframe:
-                if not all(p is None for p in [crop_x, crop_y, crop_width, crop_height]):
-                    # infer missing crop parameters
-                    inferred_x = 0 if crop_x is None else crop_x
-                    inferred_y = 0 if crop_y is None else crop_y
-                    inferred_width = (self.width - inferred_x) if crop_width is None else crop_width
-                    inferred_height = (self.height - inferred_y) if crop_height is None else crop_height
-
-                    # clamp to valid ranges
-                    inferred_x = max(0, min(int(inferred_x), self.width))
-                    inferred_y = max(0, min(int(inferred_y), self.height))
-                    inferred_width = max(0, min(int(inferred_width), self.width - inferred_x))
-                    inferred_height = max(0, min(int(inferred_height), self.height - inferred_y))
-                    if inferred_width > 0 and inferred_height > 0:
-                        crop_x_start = inferred_x
-                        crop_y_start = inferred_y
-                        crop_x_end = inferred_x + inferred_width
-                        crop_y_end = inferred_y + inferred_height
+                region = infer_crop_region(self.width, self.height, crop_x, crop_y, crop_width, crop_height)
+                if region is not None:
+                    crop_x_start, crop_y_start, crop_x_end, crop_y_end = region
 
             # Decode-level downscaling for 4K+ videos. Mirrors the same
             # self.height > DECODE_TARGET_HEIGHT check PyAVCapture just made

@@ -57,11 +57,27 @@ Review
     Flags describe detection results. A blocking flag counts against a file
     only while the field holds a detected or hinted value (or none): a
     detection that was not applied over the user's value is kept as evidence
-    and does not flag the file.
+    and does not flag the file. The exception is SOURCE_INDEPENDENT_FLAGS --
+    reasons about the stored value rather than about a detection (a crop cut
+    to fit the frame, a brightness pasted for a crop the file cannot hold).
+    Those count whoever set the value, until the user answers them by marking
+    the file reviewed or writing the field again (see _counts_flagged).
+
     Functions here do not know which jobs are still pending. When they
     clear REVIEWED, they store PENDING as a placeholder. The model owner
     follows applies and edits with recompute_all(), which derives every
     non-reviewed file's real state.
+
+Crops the frame can hold
+    A stored crop is always a box the file's frame can hold, because the OCR
+    pass clamps differently (videocr.video.infer_crop_region narrows the box
+    or drops it and reads the bottom third instead), so a box that does not
+    fit would make the run read a region the stored value does not name.
+    set_manual_crop and paste_settings clamp with
+    core.project.model.clamp_crop_box; apply_metadata re-checks the stored
+    box when the frame size first becomes known and cuts it then. A crop that
+    had to be cut is not the value the caller gave, so the file is flagged
+    FLAG_CROP_CLAMPED and un-reviewed.
 """
 from __future__ import annotations
 
@@ -69,7 +85,7 @@ from dataclasses import replace
 
 from core.detect import brightness as _brightness
 from core.detect import crop as _crop
-from core.detect.flags import compose_flag, only_informational
+from core.detect.flags import compose_flag, only_informational, remove_flag
 from core.jobs.detect_jobs import (
     AudioProfileResult,
     BrightnessJobResult,
@@ -89,9 +105,20 @@ from core.project.model import (
     Source,
     TimeRange,
     TimeRanges,
+    clamp_crop_box,
+    frame_size_known,
 )
 
 FLAG_DIFFERS_FROM_HINT = "differs-from-hint?"   # blocking: a hint re-detection that disagrees with its hint
+
+# Blocking reasons about the STORED value rather than about a detection, so
+# they count whoever set it -- see _counts_flagged.
+FLAG_CROP_CLAMPED = "crop-cut-to-fit"           # the box given did not fit the frame and was cut
+FLAG_BRIGHTNESS_OTHER_CROP = "brightness-other-crop"   # pasted from a file whose crop this one cannot hold
+SOURCE_INDEPENDENT_FLAGS = {
+    "crop": frozenset({FLAG_CROP_CLAMPED}),
+    "brightness": frozenset({FLAG_BRIGHTNESS_OTHER_CROP}),
+}
 
 # Sources detection may overwrite (ruling C2).
 DETECTION_SOURCES = frozenset({Source.DETECTED, Source.HINT})
@@ -152,8 +179,54 @@ def brightness_is_stale(entry: FileEntry) -> bool:
     return entry.crop is None or _value_key(entry.crop) != _crop_tuple(measured)
 
 
-def _counts_as_missing(entry: FileEntry, name: str) -> bool:
+def counts_as_missing(entry: FileEntry, name: str) -> bool:
+    """Whether the required field `name` ("crop" | "brightness") has no value
+    the file can be run with: None, or a brightness measured on a crop the
+    file no longer has. The one rule for "a required value is missing",
+    shared with the window (app.state_text.can_mark_reviewed) so the button
+    and the store cannot disagree about it: REVIEWED is never stored while
+    this is true (see compute_review_state)."""
     return getattr(entry, name) is None or (name == "brightness" and brightness_is_stale(entry))
+
+
+def _source_independent(entry: FileEntry, name: str) -> set[str]:
+    """The reasons in `entry.flags[name]` that describe the stored value
+    itself, so they count whatever its source is."""
+    reasons = set((entry.flags.get(name) or "").split("+"))
+    return reasons & SOURCE_INDEPENDENT_FLAGS.get(name, frozenset())
+
+
+def _counts_flagged(entry: FileEntry, name: str) -> bool:
+    """Whether `entry.flags[name]` counts against the file.
+
+    A detector's flag is its opinion of its OWN result, so it counts only
+    while the field still holds that detected or hinted value (a value the
+    user has accepted or replaced is not in doubt). A source-independent
+    reason is a fact about the stored value -- a crop that had to be cut to
+    fit the frame, a brightness pasted for a crop this file cannot hold --
+    and counts on a MANUAL or IMPORTED value too, until the user answers it
+    (mark_reviewed) or writes the field again.
+    """
+    if _source_independent(entry, name):
+        return True
+    return _is_detected(getattr(entry, name)) and _blocking(entry, name)
+
+
+def _set_own_flag(entry: FileEntry, name: str, reason: str, on: bool) -> None:
+    """Add or drop one source-independent reason, leaving the detector's own
+    reasons in the string untouched."""
+    existing = entry.flags.get(name) or ""
+    flag = compose_flag(existing, reason) if on else remove_flag(existing, reason)
+    if flag or name in entry.flags:     # never store "" for a field that had no flags at all
+        entry.flags[name] = flag
+
+
+def _fitted_crop(entry: FileEntry, box) -> tuple[tuple[int, int, int, int], bool]:
+    """(`box` as the file's frame can hold it, whether that changed it). An
+    unknown frame size cannot change it: see clamp_crop_box."""
+    box = _crop_tuple(box)
+    fitted = clamp_crop_box(box, (entry.media.width, entry.media.height))
+    return fitted, fitted != box
 
 
 def _write_detected(entry: FileEntry, field: str, new, *, old_stale: bool = False) -> None:
@@ -177,6 +250,13 @@ def _unreview_on_blocking_flag(project: Project, entry: FileEntry, name: str) ->
         entry.review = ReviewState.PENDING
 
 
+def _unreview(entry: FileEntry) -> None:
+    """Drop the stored REVIEWED mark (PENDING is a placeholder the model
+    owner's recompute_all replaces with the real state)."""
+    if entry.review == ReviewState.REVIEWED:
+        entry.review = ReviewState.PENDING
+
+
 def _crop_tuple(box) -> tuple[int, int, int, int]:
     x, y, width, height = box
     return int(x), int(y), int(width), int(height)
@@ -186,11 +266,34 @@ def _crop_tuple(box) -> tuple[int, int, int, int]:
 # Job results
 # --------------------------------------------------------------------------
 
-def apply_metadata(project: Project, r: MetadataResult | None) -> None:
+def apply_metadata(project: Project, r: MetadataResult | None) -> list[str]:
+    """Store the file's frame size, duration and fps, and re-check its stored
+    crop against the size now that it is known.
+
+    Returns the files whose crop box this changed (at most one), so the model
+    owner can re-measure what was measured on the old box, exactly as it does
+    after an edit. A crop is stored before the size is known -- by a paste, a
+    v1 import, or an edit made while the metadata job was still queued -- and
+    a box the frame cannot hold is not the region the run would read
+    (clamp_crop_box). It is cut to fit here rather than left to be narrowed
+    or dropped silently at OCR time, and the file is flagged FLAG_CROP_CLAMPED
+    and un-reviewed: the stored value is now honest, but it is not the value
+    the user drew, so they are sent back to look at it.
+    """
     if r is None or r.file not in project.files:
-        return
-    project.files[r.file].media = Media(width=int(r.width), height=int(r.height),
-                                        duration=float(r.duration), fps=float(r.fps))
+        return []
+    entry = project.files[r.file]
+    entry.media = Media(width=int(r.width), height=int(r.height),
+                        duration=float(r.duration), fps=float(r.fps))
+    if entry.crop is None or not frame_size_known(entry.media):
+        return []
+    fitted, cut = _fitted_crop(entry, (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height))
+    _set_own_flag(entry, "crop", FLAG_CROP_CLAMPED, cut)
+    if not cut:
+        return []
+    entry.crop = Crop(*fitted, entry.crop.source)
+    _unreview(entry)
+    return [r.file]
 
 
 def apply_crop(project: Project, r: CropJobResult | None) -> None:
@@ -210,6 +313,10 @@ def apply_crop(project: Project, r: CropJobResult | None) -> None:
     flag = result.flagged or ""
     if r.hint is not None and result.box is not None and not _crop_agrees_with_hint(result, r.hint):
         flag = compose_flag(flag, FLAG_DIFFERS_FROM_HINT)
+    # A detector's flags replace the previous ones, but a source-independent
+    # reason is not the detector's to withdraw: a MANUAL box that had to be
+    # cut to fit is still cut, whatever this detection found.
+    kept = _source_independent(entry, "crop")
     entry.flags["crop"] = flag
 
     written = False
@@ -217,6 +324,9 @@ def apply_crop(project: Project, r: CropJobResult | None) -> None:
         source = Source.HINT if r.hint is not None else Source.DETECTED
         _write_detected(entry, "crop", Crop(*_crop_tuple(result.box), source))
         written = True
+    if not written:                         # the box those reasons describe is still the stored one
+        for reason in kept:
+            _set_own_flag(entry, "crop", reason, True)
     _unreview_on_blocking_flag(project, entry, "crop")
 
     if result.hit_pts and (entry.sample_time is None or written):
@@ -266,12 +376,18 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
         plateau = result.plateau
         if plateau is None or not plateau[0] <= r.hint_value <= plateau[1]:
             flag = compose_flag(flag, FLAG_DIFFERS_FROM_HINT)
+    kept = _source_independent(entry, "brightness")     # not this detection's to withdraw (see apply_crop)
     entry.flags["brightness"] = flag
 
+    written = False
     if _detection_may_write(entry.brightness) and result.auto_applicable:
         source = Source.HINT if r.hint_value is not None else Source.DETECTED
         _write_detected(entry, "brightness", Brightness(int(result.value), source), old_stale=old_stale)
         evidence["value_crop_box"] = list(_crop_tuple(r.crop_box))
+        written = True
+    if not written:                                    # the value those reasons describe is still the stored one
+        for reason in kept:
+            _set_own_flag(entry, "brightness", reason, True)
     _unreview_on_blocking_flag(project, entry, "brightness")
 
 
@@ -321,11 +437,11 @@ def apply_audio_profile(project: Project, r: AudioProfileResult | None) -> None:
 # User edits
 # --------------------------------------------------------------------------
 
-def _flagged_detected_fields(folder: FolderSettings, entry: FileEntry) -> list[str]:
-    """Required fields holding a detected or hinted value with a blocking flag
-    (stale or not)."""
-    return [name for name in _required(folder)
-            if _is_detected(getattr(entry, name)) and _blocking(entry, name)]
+def _flagged_fields(folder: FolderSettings, entry: FileEntry) -> list[str]:
+    """Required fields whose stored flags count against the file
+    (_counts_flagged): a detected or hinted value with a blocking flag (stale
+    or not), or a value of any source carrying a source-independent reason."""
+    return [name for name in _required(folder) if _counts_flagged(entry, name)]
 
 
 def _store_computed_state(folder: FolderSettings, entry: FileEntry) -> None:
@@ -338,7 +454,7 @@ def _store_computed_state(folder: FolderSettings, entry: FileEntry) -> None:
 def _review_unless_flagged(folder: FolderSettings, entry: FileEntry) -> None:
     """Store REVIEWED when no required field holds a flagged detected or
     hinted value; otherwise store the computed state."""
-    if _flagged_detected_fields(folder, entry):
+    if _flagged_fields(folder, entry):
         _store_computed_state(folder, entry)
     else:
         entry.review = ReviewState.REVIEWED
@@ -349,9 +465,19 @@ def _review_after_edit(project: Project, entry: FileEntry) -> None:
 
 
 def set_manual_crop(project: Project, file: str, box: tuple[int, int, int, int]) -> None:
-    """MANUAL crop; REVIEWED unless another required field is still flagged."""
+    """MANUAL crop, cut to a box the file's frame can hold (clamp_crop_box);
+    REVIEWED unless another required field is still flagged.
+
+    The box a view commits is already inside the frame it drew on, so the
+    clamp is normally a no-op. It is not one for a box drawn against a
+    guessed frame size, or pasted from a bigger file: the file is then
+    flagged FLAG_CROP_CLAMPED, because what is stored is no longer what the
+    caller asked for. A frame size that is not known yet cannot cut anything;
+    apply_metadata re-checks the value when it arrives."""
     entry = project.files[file]
-    entry.crop = Crop(*_crop_tuple(box), Source.MANUAL)
+    fitted, cut = _fitted_crop(entry, box)
+    entry.crop = Crop(*fitted, Source.MANUAL)
+    _set_own_flag(entry, "crop", FLAG_CROP_CLAMPED, cut)
     _review_after_edit(project, entry)
 
 
@@ -391,10 +517,15 @@ def mark_reviewed(project: Project, file: str, reviewed: bool = True) -> None:
         if entry.review == ReviewState.REVIEWED:
             entry.review = ReviewState.PENDING
         return
-    for name in _flagged_detected_fields(project.folder, entry):
-        if not _counts_as_missing(entry, name):
+    for name in _flagged_fields(project.folder, entry):
+        if not counts_as_missing(entry, name):
             value = getattr(entry, name)
             setattr(entry, name, replace(value, source=Source.MANUAL))
+            # A reason about the stored value itself (a crop cut to fit, a
+            # brightness pasted for another crop) is exactly what the user is
+            # answering here, so it is dropped rather than kept as evidence.
+            for reason in _source_independent(entry, name):
+                _set_own_flag(entry, name, reason, False)
     _review_unless_flagged(project.folder, entry)
 
 
@@ -420,14 +551,25 @@ def paste_settings(project: Project, target: str, clip: dict) -> None:
     """Apply every value the clip has (key present and not None) to `target`
     as MANUAL, then store REVIEWED, or the computed state when a required
     field it did not replace still holds a flagged detected or hinted value.
-    A clip with nothing in it changes nothing."""
+    A clip with nothing in it changes nothing.
+
+    The crop is cut to a box `target`'s frame can hold, as set_manual_crop
+    does: the clip may come from a file of another resolution. When it had to
+    be cut, the file is flagged FLAG_CROP_CLAMPED, and a brightness pasted
+    with it FLAG_BRIGHTNESS_OTHER_CROP -- it was measured inside a region
+    this file does not have, so it is stored (the user asked for it) but not
+    claimed as reviewed until they say so."""
     entry = project.files[target]
     pasted = False
+    cut = False
     if clip.get("crop") is not None:
-        entry.crop = Crop(*_crop_tuple(clip["crop"]), Source.MANUAL)
+        fitted, cut = _fitted_crop(entry, clip["crop"])
+        entry.crop = Crop(*fitted, Source.MANUAL)
+        _set_own_flag(entry, "crop", FLAG_CROP_CLAMPED, cut)
         pasted = True
     if clip.get("brightness") is not None:
         entry.brightness = Brightness(int(clip["brightness"]), Source.MANUAL)
+        _set_own_flag(entry, "brightness", FLAG_BRIGHTNESS_OTHER_CROP, cut)
         pasted = True
     if clip.get("time_ranges") is not None:
         entry.time_ranges = TimeRanges([TimeRange(start, end) for start, end in clip["time_ranges"]],
@@ -451,8 +593,7 @@ def apply_folder_change(project: Project, old: FolderSettings, new: FolderSettin
     for entry in project.files.values():
         if entry.review != ReviewState.REVIEWED:
             continue
-        if any(_counts_as_missing(entry, name) or (_is_detected(getattr(entry, name)) and _blocking(entry, name))
-               for name in newly_required):
+        if any(counts_as_missing(entry, name) or _counts_flagged(entry, name) for name in newly_required):
             _store_computed_state(new, entry)
 
 
@@ -475,19 +616,21 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
        detected or hinted value, or while the folder's ranges are pending
        and the file's time_ranges may still be written by them (None,
        DETECTED or HINT; MANUAL and IMPORTED ranges never wait).
-    4. FLAGGED when a required field's value is detected or hinted and its
-       stored flags include a reason that is not informational for that
-       detector ("differs-from-hint?" and unknown reasons block). Flags beside
-       a MANUAL or IMPORTED value do not count.
+    4. FLAGGED when a required field's stored flags count against it
+       (_counts_flagged): a value that is detected or hinted and whose flags
+       include a reason that is not informational for that detector
+       ("differs-from-hint?" and unknown reasons block), or a value of any
+       source carrying one of SOURCE_INDEPENDENT_FLAGS. Other flags beside a
+       MANUAL or IMPORTED value do not count.
     5. PROPOSED.
     """
     required = _required(folder)
     for name in required:
-        if _counts_as_missing(entry, name):
+        if counts_as_missing(entry, name):
             return ReviewState.PENDING if name in detections_pending else ReviewState.FLAGGED
     if entry.review == ReviewState.REVIEWED:
         return ReviewState.REVIEWED
-    blocked = any(_is_detected(getattr(entry, name)) and _blocking(entry, name) for name in required)
+    blocked = any(_counts_flagged(entry, name) for name in required)
     if (ranges_pending and _detection_may_write(entry.time_ranges)) or any(
             name in detections_pending and _is_detected(getattr(entry, name)) for name in required):
         return ReviewState.PENDING

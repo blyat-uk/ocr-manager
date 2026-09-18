@@ -91,6 +91,9 @@ THUMB_HEIGHT = 72                 # px; thumbnails are whole frames scaled to th
 PROOF_WINDOW_SEC = 30.0           # length of the proof OCR window
 PROOF_START_FRACTION = 0.4        # window start without a sample time, as a fraction of the duration
 PROOF_PRIORITY = 100              # above every auto-pilot priority (tests/test_autopilot.py checks)
+# Why a proof cannot run yet, in the window's voice: the duration comes from
+# the metadata job, so an unknown one means the file has not been scanned.
+UNSCANNED_MESSAGE = "this file hasn't been scanned yet"
 
 
 # --------------------------------------------------------------------------
@@ -375,10 +378,11 @@ def proof_window(sample_time: float | None, duration: float) -> tuple[float, flo
     Starts at `sample_time`, or at PROOF_START_FRACTION of the duration
     without one. Lasts PROOF_WINDOW_SEC, clamped to [0, duration]; when the
     end would pass the file's end, the start moves back instead. Raises
-    ValueError when the duration is unknown (<= 0): scan metadata first.
+    ValueError, worded for the person who pressed T (UNSCANNED_MESSAGE), when
+    the duration is unknown (<= 0): the metadata job has not run.
     """
     if not duration or duration <= 0:
-        raise ValueError(f"media duration unknown ({duration!r}): scan the file's metadata first")
+        raise ValueError(UNSCANNED_MESSAGE)
     start = PROOF_START_FRACTION * duration if sample_time is None else float(sample_time)
     start = min(max(start, 0.0), duration)
     if start + PROOF_WINDOW_SEC > duration:

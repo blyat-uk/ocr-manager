@@ -20,6 +20,16 @@ def compose_flag(existing: str | None, new: str) -> str:
     return existing if new in parts else f"{existing}+{new}"
 
 
+def remove_flag(existing: str | None, reason: str) -> str:
+    """`existing` without `reason`, keeping the order of the rest. "" when
+    nothing is left. The inverse of compose_flag, for a reason the user has
+    answered (accepting a crop that had to be cut to fit, say) rather than
+    one the detector withdrew."""
+    if not existing:
+        return ""
+    return "+".join(part for part in existing.split("+") if part and part != reason)
+
+
 def only_informational(flagged: str | None, informational: Collection[str]) -> bool:
     """True when `flagged` is None or every reason in it is in
     `informational`. A reason the caller does not list counts as blocking."""

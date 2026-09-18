@@ -2441,3 +2441,149 @@ def test_real_jobs_on_a_reference_episode_leave_a_proposed_entry(tmp_path):
 
 def _wait_long(events: Events, key: str) -> object:
     return events.terminal(key, timeout=800.0)
+
+
+# --------------------------------------------------------------------------
+# A stored crop is one the file's frame can hold
+# --------------------------------------------------------------------------
+# A crop bigger than the frame is narrowed (or dropped, leaving the OCR pass
+# on the bottom third) by videocr at run time, so the run would not read the
+# band the user reviewed. Every writer clamps; the flag says the value the
+# user gave was not the value stored.
+
+SMALL = (1280, 720)
+BIG_BOX = (288, 784, 1344, 55)            # a 1080p subtitle band
+FITTED_BOX = (0, 665, 1280, 55)           # the same band as 720p can hold it
+
+
+def _sized(project: Project, name: str, size=SMALL) -> FileEntry:
+    entry = project.files[name]
+    entry.media = Media(size[0], size[1], 1418.0, 23.976)
+    return entry
+
+
+def test_set_manual_crop_clamps_to_a_box_the_frame_holds():
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    project = _project()
+    entry = _sized(project, "a.mp4")
+    set_manual_crop(project, "a.mp4", BIG_BOX)
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == FITTED_BOX
+    assert entry.crop.source == Source.MANUAL
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+
+
+def test_set_manual_crop_that_fits_stores_it_untouched_and_clears_the_clamp_flag():
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    project = _project()
+    entry = _sized(project, "a.mp4")
+    entry.flags["crop"] = FLAG_CROP_CLAMPED
+    set_manual_crop(project, "a.mp4", (10, 600, 1200, 60))
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == (10, 600, 1200, 60)
+    assert FLAG_CROP_CLAMPED not in (entry.flags.get("crop") or "")
+
+
+def test_set_manual_crop_without_a_frame_size_stores_what_it_was_given():
+    """Nothing to clamp against yet; apply_metadata re-checks it."""
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    project = _project()
+    set_manual_crop(project, "a.mp4", BIG_BOX)
+    entry = project.files["a.mp4"]
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == BIG_BOX
+    assert FLAG_CROP_CLAMPED not in (entry.flags.get("crop") or "")
+
+
+def test_apply_metadata_clamps_a_stored_crop_the_frame_cannot_hold():
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*BIG_BOX, Source.MANUAL)
+    entry.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    entry.review = ReviewState.REVIEWED
+    changed = apply_metadata(project, MetadataResult("a.mp4", SMALL[0], SMALL[1], 1418.0, 23.976))
+    assert changed == ["a.mp4"]
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == FITTED_BOX
+    assert entry.crop.source == Source.MANUAL                   # still the user's value, only cut to fit
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+    assert entry.review != ReviewState.REVIEWED
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+def test_apply_metadata_leaves_a_crop_the_frame_holds_alone():
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.MANUAL)
+    entry.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    entry.review = ReviewState.REVIEWED
+    assert apply_metadata(project, MetadataResult("a.mp4", 1920, 1080, 1418.0, 23.976)) == []
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == NEW_BOX
+    assert FLAG_CROP_CLAMPED not in (entry.flags.get("crop") or "")
+    assert entry.review == ReviewState.REVIEWED
+
+
+def test_apply_crop_does_not_wipe_a_clamp_flag_off_a_manual_box():
+    """A detection cannot overwrite the MANUAL crop, so its flag string must
+    not silently clear the fact that the stored box had to be cut."""
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    project = _project()
+    entry = _sized(project, "a.mp4")
+    entry.crop = Crop(*FITTED_BOX, Source.MANUAL)
+    entry.flags["crop"] = FLAG_CROP_CLAMPED
+    apply_crop(project, _crop_job_result())
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+
+
+def test_paste_settings_clamps_the_crop_to_the_target_and_doubts_the_brightness():
+    from core.jobs.apply import FLAG_BRIGHTNESS_OTHER_CROP, FLAG_CROP_CLAMPED
+
+    project = _project()
+    source = project.files["a.mp4"]
+    source.media = Media(1920, 1080, 1418.0, 23.976)
+    source.crop = Crop(*BIG_BOX, Source.MANUAL)
+    source.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    target = _sized(project, "b.mp4")
+
+    paste_settings(project, "b.mp4", copy_settings(project, "a.mp4"))
+
+    assert (target.crop.x, target.crop.y, target.crop.width, target.crop.height) == FITTED_BOX
+    assert FLAG_CROP_CLAMPED in target.flags["crop"]
+    assert target.brightness == Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    assert FLAG_BRIGHTNESS_OTHER_CROP in target.flags["brightness"]
+    assert _state(project, "b.mp4") == ReviewState.FLAGGED
+
+
+def test_paste_settings_between_files_of_one_size_flags_nothing():
+    project = _project()
+    source = _sized(project, "a.mp4", (1920, 1080))
+    source.crop = Crop(*NEW_BOX, Source.MANUAL)
+    source.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    _sized(project, "b.mp4", (1920, 1080))
+
+    paste_settings(project, "b.mp4", copy_settings(project, "a.mp4"))
+    target = project.files["b.mp4"]
+    assert (target.crop.x, target.crop.y, target.crop.width, target.crop.height) == NEW_BOX
+    assert not (target.flags.get("crop") or "") and not (target.flags.get("brightness") or "")
+    assert target.review == ReviewState.REVIEWED
+
+
+def test_mark_reviewed_accepts_a_clamped_crop_and_a_pasted_brightness():
+    from core.jobs.apply import FLAG_BRIGHTNESS_OTHER_CROP, FLAG_CROP_CLAMPED
+
+    project = _project()
+    entry = _sized(project, "a.mp4")
+    entry.crop = Crop(*FITTED_BOX, Source.MANUAL)
+    entry.brightness = Brightness(NEW_BRIGHTNESS, Source.MANUAL)
+    entry.flags = {"crop": FLAG_CROP_CLAMPED, "brightness": FLAG_BRIGHTNESS_OTHER_CROP}
+    entry.review = ReviewState.FLAGGED
+
+    mark_reviewed(project, "a.mp4")
+    assert entry.review == ReviewState.REVIEWED
+    assert FLAG_CROP_CLAMPED not in (entry.flags.get("crop") or "")
+    assert FLAG_BRIGHTNESS_OTHER_CROP not in (entry.flags.get("brightness") or "")
+    assert _state(project, "a.mp4") == ReviewState.REVIEWED

@@ -256,3 +256,13 @@ def test_knows_is_true_for_a_cached_frame_and_false_for_an_untried_one():
 
     assert cache.knows(("a.mp4", "frame", 1.0))
     assert not cache.knows(("a.mp4", "frame", 2.0))
+
+
+def test_the_default_budget_stays_in_the_hundreds_of_megabytes():
+    """A frame cache big enough for a whole folder is a leak by another
+    name: 512 MB was ~190 decoded 720p frames held beside PaddleOCR."""
+    from app.imaging import DEFAULT_MAX_BYTES
+
+    assert 128 * 1024**2 <= DEFAULT_MAX_BYTES <= 256 * 1024**2
+    frame_bytes = 1280 * 720 * 3
+    assert 45 <= DEFAULT_MAX_BYTES // frame_bytes <= 95      # a handful of files' worth of frames
