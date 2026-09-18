@@ -23,6 +23,26 @@ from __future__ import annotations
 from app.theme import tokens
 
 
+def _font_px(size: float) -> int:
+    """A scaled font size (`tokens.FONT_SIZE_*`, or `tokens.pt(...)` for the
+    one size that has no token) as the whole pixels a stylesheet wants.
+
+    Qt's QSS parser truncates a fractional `font-size:...px` -- `11.875px`
+    becomes 11 -- so every half-pixel token would quietly lose most of a
+    pixel at scale (9.5 px at 1.25 is 11.875, i.e. +16%, not the +25% every
+    other size gets). Rounding here keeps each one at its nearest whole
+    pixel, matching what `apply_theme()` does for the default font."""
+    return round(size)
+
+
+# Hairlines are deliberately NOT scaled. Every `1px` border below is a
+# separator or a state ring (panel edges, the focus ring, the queue row's
+# selection border, a menu separator): its width is part of Qt's box model,
+# so widening it would push the content in and can clip a label, while a
+# 1 px rule still reads at any scale. Only lengths that carry size --
+# padding, margins, radii, widths, heights -- go through `tokens.px()`.
+
+
 def build_stylesheet() -> str:
     """The full QSS for the base widgets in `app/widgets/base.py`. A plain
     string (no QApplication needed): every rule is built directly from
@@ -42,13 +62,13 @@ QToolTip {{
     background-color: {tokens.PANEL2};
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE2};
-    padding: 3px 6px;
+    padding: {tokens.px(3)}px {tokens.px(6)}px;
 }}
 
 /* -- Button (.btn / .btn.ghost / .btn.primary / .btn.sm / .btn.on) --- */
 QPushButton {{
-    font-size: {tokens.FONT_SIZE_BODY}px;
-    padding: 5px 11px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
+    padding: {tokens.px(5)}px {tokens.px(11)}px;
     border-radius: {tokens.RADIUS_BTN}px;
     border: 1px solid {tokens.LINE2};
     background-color: {tokens.PANEL2};
@@ -89,8 +109,8 @@ QPushButton[variant="ghost"]:disabled {{
     color: {tokens.DIM2};
 }}
 QPushButton[small="true"] {{
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
-    padding: 3px 8px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
+    padding: {tokens.px(3)}px {tokens.px(8)}px;
 }}
 QPushButton[toggled="true"] {{
     border-color: {tokens.ACC};
@@ -128,7 +148,7 @@ QWidget#Chip {{
     border-radius: {tokens.RADIUS_CHIP_QT}px;
 }}
 QWidget#Chip QLabel {{
-    font-size: 11px;
+    font-size: {_font_px(tokens.pt(11))}px;
     color: {tokens.DIM};
     background: transparent;
 }}
@@ -142,29 +162,29 @@ QLabel[badge="default"] {{
     background-color: {tokens.BADGE_BG};
     color: {tokens.DIM};
     border-radius: {tokens.RADIUS_TAG}px;
-    padding: 1px 5px;
-    font-size: {tokens.FONT_SIZE_XS}px;
+    padding: {tokens.px(1)}px {tokens.px(5)}px;
+    font-size: {_font_px(tokens.FONT_SIZE_XS)}px;
 }}
 QLabel[badge="warn"] {{
     background-color: {tokens.BADGE_WARN_BG};
     color: {tokens.WARN};
     border-radius: {tokens.RADIUS_TAG}px;
-    padding: 1px 5px;
-    font-size: {tokens.FONT_SIZE_XS}px;
+    padding: {tokens.px(1)}px {tokens.px(5)}px;
+    font-size: {_font_px(tokens.FONT_SIZE_XS)}px;
 }}
 QLabel[badge="good"] {{
     background-color: {tokens.BADGE_GOOD_BG};
     color: {tokens.OK};
     border-radius: {tokens.RADIUS_TAG}px;
-    padding: 1px 5px;
-    font-size: {tokens.FONT_SIZE_XS}px;
+    padding: {tokens.px(1)}px {tokens.px(5)}px;
+    font-size: {_font_px(tokens.FONT_SIZE_XS)}px;
 }}
 QLabel[badge="bad"] {{
     background-color: {tokens.BADGE_BG};
     color: {tokens.BAD};
     border-radius: {tokens.RADIUS_TAG}px;
-    padding: 1px 5px;
-    font-size: {tokens.FONT_SIZE_XS}px;
+    padding: {tokens.px(1)}px {tokens.px(5)}px;
+    font-size: {_font_px(tokens.FONT_SIZE_XS)}px;
 }}
 
 /* -- KvRow (.kv) ------------------------------------------------------ */
@@ -181,7 +201,7 @@ QWidget#KvRow[tone="bad"] {{
 }}
 QWidget#KvRow QLabel {{
     background: transparent;
-    font-size: {tokens.FONT_SIZE_BODY}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
 }}
 QWidget#KvRow QLabel[kvRole="key"] {{
     color: {tokens.DIM};
@@ -205,7 +225,7 @@ QWidget#KvRow QLabel[kvRole="value"][tone="acc"] {{
 /* -- SectionHeader (.sec-h) -------------------------------------------- */
 QWidget#SectionHeader QLabel[sectionRole="title"] {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SCOPE}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SCOPE)}px;
     background: transparent;
 }}
 
@@ -214,8 +234,8 @@ QWidget#SegmentedControl {{
     background: transparent;
 }}
 QPushButton#SegmentItem {{
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
-    padding: 3px 8px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
+    padding: {tokens.px(3)}px {tokens.px(8)}px;
     border-radius: {tokens.RADIUS_SEG}px;
     color: {tokens.DIM};
     background: transparent;
@@ -267,13 +287,13 @@ QScrollArea#InspectorScroll > QWidget#qt_scrollarea_viewport {{
 /* -- Scroll bars and menus --------------------------------------------- */
 QScrollBar:vertical {{
     background: transparent;
-    width: 8px;
-    margin: 2px 1px;
+    width: {tokens.px(8)}px;
+    margin: {tokens.px(2)}px {tokens.px(1)}px;
 }}
 QScrollBar::handle:vertical {{
     background-color: {tokens.LINE2};
-    border-radius: 3px;
-    min-height: 24px;
+    border-radius: {tokens.px(3)}px;
+    min-height: {tokens.px(24)}px;
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
@@ -286,11 +306,11 @@ QMenu {{
     border: 1px solid {tokens.LINE2};
     border-radius: {tokens.RADIUS_BTN}px;
     color: {tokens.TXT};
-    font-size: {tokens.FONT_SIZE_BODY}px;
-    padding: 4px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
+    padding: {tokens.px(4)}px;
 }}
 QMenu::item {{
-    padding: 5px 14px;
+    padding: {tokens.px(5)}px {tokens.px(14)}px;
     border-radius: {tokens.RADIUS_TAG}px;
 }}
 QMenu::item:selected {{
@@ -302,7 +322,7 @@ QMenu::item:disabled {{
 QMenu::separator {{
     height: 1px;
     background-color: {tokens.LINE};
-    margin: 4px 6px;
+    margin: {tokens.px(4)}px {tokens.px(6)}px;
 }}
 
 /* -- Top bar (.topbar / .proj / .path) --------------------------------- */
@@ -310,12 +330,12 @@ QWidget#ChipBar {{
     background: transparent;
 }}
 QLabel#ProjectName {{
-    font-size: {tokens.FONT_SIZE_PROJ}px;
+    font-size: {_font_px(tokens.FONT_SIZE_PROJ)}px;
     font-weight: {tokens.FONT_WEIGHT_PROJ};
     color: {tokens.TXT};
 }}
 QLabel#ProjectPath {{
-    font-size: 11px;
+    font-size: {_font_px(tokens.pt(11))}px;
     color: {tokens.DIM2};
 }}
 
@@ -331,14 +351,14 @@ QWidget#Banner[tone="bad"] {{
 QLabel#BannerTitle {{
     color: {tokens.WARN};
     font-weight: {tokens.FONT_WEIGHT_PROJ};
-    font-size: {tokens.FONT_SIZE_BODY}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
 }}
 QWidget#Banner[tone="bad"] QLabel#BannerTitle {{
     color: {tokens.BAD};
 }}
 QLabel#BannerText {{
     color: {tokens.TXT};
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
 
 /* -- Review queue (.rail-head / .frow / .fname / .fsub) ---------------- */
@@ -359,7 +379,7 @@ QWidget#QueueRow[selected="true"] {{
     border-color: {tokens.ACC_DIM};
 }}
 QLabel#QueueName {{
-    font-size: {tokens.FONT_SIZE_BODY}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
     font-weight: {tokens.FONT_WEIGHT_FNAME};
     color: {tokens.TXT};
 }}
@@ -367,15 +387,15 @@ QWidget#QueueRow[skipped="true"] QLabel#QueueName {{
     color: {tokens.DIM2};
 }}
 QLabel#QueueSub {{
-    font-size: {tokens.FONT_SIZE_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
     color: {tokens.DIM2};
 }}
 QLabel#QueueHint {{
     background-color: {tokens.PANEL};
     border-top: 1px solid {tokens.LINE};
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SM}px;
-    padding: 9px 11px;
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
+    padding: {tokens.px(9)}px {tokens.px(11)}px;
 }}
 
 /* -- Stage (.stage-head / .tab / .tab.on) ------------------------------ */
@@ -387,8 +407,8 @@ QWidget#StageHead {{
     border-bottom: 1px solid {tokens.LINE};
 }}
 QPushButton#StageTab {{
-    font-size: {tokens.FONT_SIZE_BODY}px;
-    padding: 5px 11px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
+    padding: {tokens.px(5)}px {tokens.px(11)}px;
     color: {tokens.DIM};
     background: transparent;
     border: 1px solid transparent;
@@ -418,20 +438,20 @@ QWidget#InspectorFooter {{
 }}
 QLabel#InspectorScope {{
     color: {tokens.ACC};
-    font-size: {tokens.FONT_SIZE_SCOPE}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SCOPE)}px;
 }}
 QLabel#InspectorFile {{
     color: {tokens.TXT};
-    font-size: {tokens.FONT_SIZE_MD}px;
+    font-size: {_font_px(tokens.FONT_SIZE_MD)}px;
     font-weight: {tokens.FONT_WEIGHT_PROJ};
 }}
 QLabel#InspectorSub {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
 QLabel#Note {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
 }}
 QLabel#Note[tone="warn"] {{
     color: {tokens.WARN};
@@ -442,17 +462,17 @@ QWidget#OcrLine {{
 }}
 QLabel#OcrTime {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
 }}
 QLabel#OcrText {{
     color: {tokens.TXT};
-    font-size: 11px;
+    font-size: {_font_px(tokens.pt(11))}px;
 }}
 
 /* -- Activity strip (.activity) ---------------------------------------- */
 QWidget#ActivityStrip QLabel {{
     color: {tokens.DIM};
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
 QWidget#ActivityStrip QLabel#ActivityRecent {{
     color: {tokens.DIM2};
@@ -469,12 +489,12 @@ QWidget#OpenFolder {{
 }}
 QLabel#OpenTitle {{
     color: {tokens.TXT};
-    font-size: {tokens.FONT_SIZE_PROJ}px;
+    font-size: {_font_px(tokens.FONT_SIZE_PROJ)}px;
     font-weight: {tokens.FONT_WEIGHT_PROJ};
 }}
 QLabel#OpenError {{
     color: {tokens.BAD};
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
 """.strip("\n")
 
@@ -487,7 +507,7 @@ def _run_stylesheet() -> str:
 /* == Run (plan 3B Task 5) ============================================== */
 QLabel#StartError {{
     color: {tokens.BAD};
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
 
 /* -- Run view: table (.rrow), footer, live panel (.feed) --------------- */
@@ -507,11 +527,11 @@ QWidget#RunRow[last="true"] {{
 }}
 QLabel#RunHeaderCell {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SCOPE}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SCOPE)}px;
 }}
 QLabel#RunFile, QLabel#RunPhase, QLabel#RunResult {{
     color: {tokens.TXT};
-    font-size: {tokens.FONT_SIZE_BODY}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
 }}
 QLabel#RunPhase[tone="ok"], QLabel#RunResult[tone="ok"] {{
     color: {tokens.OK};
@@ -528,7 +548,7 @@ QWidget#RunFooter {{
 }}
 QWidget#RunFooter QLabel {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_BTN_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
 QWidget#LivePanel {{
     background-color: {tokens.BG};
@@ -536,7 +556,7 @@ QWidget#LivePanel {{
 }}
 QLabel#LiveTitle {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SCOPE}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SCOPE)}px;
 }}
 QWidget#FeedLine {{
     background: transparent;
@@ -544,11 +564,11 @@ QWidget#FeedLine {{
 }}
 QLabel#FeedTime {{
     color: {tokens.DIM2};
-    font-size: {tokens.FONT_SIZE_SM}px;
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
 }}
 QLabel#FeedText {{
     color: {tokens.TXT};
-    font-size: 11px;
+    font-size: {_font_px(tokens.pt(11))}px;
 }}
 
 /* -- Logs window ------------------------------------------------------- */
@@ -559,8 +579,8 @@ QScrollArea#LogsScroll > QWidget#qt_scrollarea_viewport {{
 }}
 QPushButton#LogHeader {{
     text-align: left;
-    font-size: {tokens.FONT_SIZE_BODY}px;
-    padding: 5px 9px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
+    padding: {tokens.px(5)}px {tokens.px(9)}px;
     color: {tokens.TXT};
     background-color: {tokens.PANEL2};
     border: 1px solid {tokens.LINE};
@@ -576,7 +596,7 @@ QPlainTextEdit#LogBody {{
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE};
     border-top: none;
-    font-size: 11px;
+    font-size: {_font_px(tokens.pt(11))}px;
     selection-background-color: {tokens.ACC};
     selection-color: {tokens.PRIMARY_TEXT};
 }}
@@ -600,12 +620,12 @@ QWidget#FolderSettingsHead {{
     border-bottom: 1px solid {tokens.LINE};
 }}
 QLabel#FolderSettingsTitle {{
-    font-size: {tokens.FONT_SIZE_PROJ}px;
+    font-size: {_font_px(tokens.FONT_SIZE_PROJ)}px;
     font-weight: {tokens.FONT_WEIGHT_PROJ};
     color: {tokens.TXT};
 }}
 QLabel#FolderSettingsScope {{
-    font-size: 11px;
+    font-size: {_font_px(tokens.pt(11))}px;
     color: {tokens.DIM2};
 }}
 QWidget#FolderSettingsNav {{
@@ -642,8 +662,8 @@ QWidget#FolderSettings QComboBox {{
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE2};
     border-radius: {tokens.RADIUS_TAG}px;
-    padding: 1px 6px;
-    font-size: {tokens.FONT_SIZE_BODY}px;
+    padding: {tokens.px(1)}px {tokens.px(6)}px;
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
     selection-background-color: {tokens.ACC_DIM};
     selection-color: {tokens.TXT};
 }}

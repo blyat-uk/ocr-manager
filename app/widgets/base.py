@@ -100,9 +100,16 @@ class Chip(QWidget):
         super().__init__(parent)
         self.setObjectName("Chip")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # `.chip` is a pill, and Qt (unlike CSS) does not clamp a radius to
+        # half the box -- it squares the corners off instead. Font metrics
+        # do not grow in exact step with the scaled padding, so at some
+        # scales the natural height lands just under twice the radius; a
+        # floor of exactly that keeps the pill round without ever shrinking
+        # the chip below its content.
+        self.setMinimumHeight(2 * tokens.RADIUS_CHIP_QT)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(9, 3, 9, 3)
-        layout.setSpacing(6)
+        layout.setContentsMargins(tokens.px(9), tokens.px(3), tokens.px(9), tokens.px(3))
+        layout.setSpacing(tokens.px(6))
         self._dot = Dot(dot)
         self._count_label = QLabel()
         self._count_label.setProperty("chipRole", "count")
@@ -158,8 +165,8 @@ class KvRow(QWidget):
         self.setObjectName("KvRow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 5, 8, 5)
-        layout.setSpacing(8)
+        layout.setContentsMargins(tokens.px(8), tokens.px(5), tokens.px(8), tokens.px(5))
+        layout.setSpacing(tokens.px(8))
         self._key_label = QLabel(key)
         self._key_label.setProperty("kvRole", "key")
         self._value_label = QLabel()
@@ -206,7 +213,7 @@ class SectionHeader(QWidget):
         self.setObjectName("SectionHeader")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(tokens.px(6))
         self._label = QLabel()
         self._label.setProperty("sectionRole", "title")
         font = self._label.font()
@@ -235,7 +242,8 @@ class SegmentedControl(QWidget):
     caller driving both directions cannot create a feedback loop.
 
     `orientation=Qt.Orientation.Vertical` stacks the segments as a left
-    aligned list with a 2 px gap (the Folder settings nav, workbench-hifi
+    aligned list with the mockup's 2 px gap -- scaled, like every length
+    here, by `tokens.UI_SCALE` (the Folder settings nav, workbench-hifi
     figure 3: `.seg` with `flex-direction:column; gap:2px`)."""
 
     current_changed = pyqtSignal(int)
@@ -249,7 +257,7 @@ class SegmentedControl(QWidget):
         direction = QBoxLayout.Direction.TopToBottom if vertical else QBoxLayout.Direction.LeftToRight
         self._layout = QBoxLayout(direction, self)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(2 if vertical else 4)
+        self._layout.setSpacing(tokens.px(2) if vertical else tokens.px(4))
         self._buttons: list[QPushButton] = []
         self._current = 0
         self.set_labels(items)
@@ -339,11 +347,19 @@ class _BarTrack(QWidget):
         self._fill = fill
         self.update()
 
+    def radius(self) -> float:
+        """The corner radius actually painted: the `.bar`/`.mini` token, but
+        never more than half the track's height. The track is only 3-4 px
+        tall at scale 1, so the token on its own already outgrows it at most
+        scales, and a radius past half the box cuts the ends square instead
+        of rounding them."""
+        return min(float(tokens.RADIUS_XS), self.height() / 2)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect())
-        radius = min(float(tokens.RADIUS_XS), rect.height() / 2)
+        radius = self.radius()
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -358,21 +374,24 @@ class _BarTrack(QWidget):
 
 
 class ConfBar(QWidget):
-    """`.conf` -- a 74x3px confidence bar (`.bar`) plus caption text, e.g.
-    "12 of 12 samples agree". `tone`: "ok" | "warn" | "bad" picks the
-    fill colour."""
+    """`.conf` -- a confidence bar (`.bar`, 74x3px at scale 1) plus caption
+    text, e.g. "12 of 12 samples agree". `tone`: "ok" | "warn" | "bad" picks
+    the fill colour."""
 
     def __init__(self, fraction: float, tone: str = "ok", caption: str = "",
                  parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("ConfBar")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 2, 0, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, tokens.px(2), 0, tokens.px(8))
+        layout.setSpacing(tokens.px(6))
         self._track = _BarTrack(tokens.BAR_WIDTH, tokens.BAR_HEIGHT, tokens.OK)
         self._caption = QLabel()
+        # Rounded, not truncated: Qt's QSS parser floors a fractional
+        # `font-size:...px`, so `round()` keeps the token at its nearest
+        # whole pixel (the same thing `app/theme/qss.py` does).
         self._caption.setStyleSheet(
-            f"color: {tokens.DIM2}; font-size: {tokens.FONT_SIZE_SM}px; background: transparent;"
+            f"color: {tokens.DIM2}; font-size: {round(tokens.FONT_SIZE_SM)}px; background: transparent;"
         )
         layout.addWidget(self._track)
         layout.addWidget(self._caption, 1)
@@ -389,7 +408,8 @@ class ConfBar(QWidget):
 
 
 class MiniProgress(QWidget):
-    """`.mini` -- a 90x4px, always-blue progress bar (the activity strip).
+    """`.mini` -- an always-blue progress bar, 90x4px at scale 1 (the
+    activity strip).
 
     `set_indeterminate(True)` animates a segment sliding along the track, for
     a job that reports no progress fraction; `set_value()` returns the bar to
@@ -517,13 +537,22 @@ class Toggle(QAbstractButton):
     `clicked(checked)`; `setChecked()` (syncing from a model) emits no
     `clicked`."""
 
-    TRACK_WIDTH = 24
-    TRACK_HEIGHT = 14
-    KNOB = 8
-    GAP = 7
+    # The switch's own geometry, at the mockup's scale. The scaled lengths
+    # the painting uses are per-instance (`self.TRACK_WIDTH`, ...) rather
+    # than class constants so they follow `tokens.UI_SCALE` at construction
+    # time -- a switch frozen at 24x14 beside 18 px type would read as a
+    # decoration rather than a control.
+    TRACK_WIDTH_BASE = 24
+    TRACK_HEIGHT_BASE = 14
+    KNOB_BASE = 8
+    GAP_BASE = 7
 
     def __init__(self, checked: bool = False, parent: QWidget | None = None):
         super().__init__(parent)
+        self.TRACK_WIDTH = tokens.px(self.TRACK_WIDTH_BASE)
+        self.TRACK_HEIGHT = tokens.px(self.TRACK_HEIGHT_BASE)
+        self.KNOB = tokens.px(self.KNOB_BASE)
+        self.GAP = tokens.px(self.GAP_BASE)
         self.setObjectName("Toggle")
         self.setCheckable(True)
         self.setChecked(checked)
@@ -540,7 +569,8 @@ class Toggle(QAbstractButton):
 
     def sizeHint(self) -> QSize:
         text = self.fontMetrics().horizontalAdvance("off")
-        return QSize(text + self.GAP + self.TRACK_WIDTH + 2, max(self.TRACK_HEIGHT + 4, self.fontMetrics().height()))
+        return QSize(text + self.GAP + self.TRACK_WIDTH + tokens.px(2),
+                     max(self.TRACK_HEIGHT + tokens.px(4), self.fontMetrics().height()))
 
     def minimumSizeHint(self) -> QSize:
         return self.sizeHint()
@@ -550,7 +580,11 @@ class Toggle(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
-        track = QRectF(rect.width() - self.TRACK_WIDTH - 1.5, (rect.height() - self.TRACK_HEIGHT) / 2,
+        # The right inset keeps its half pixel at every scale: the track is
+        # stroked with a 1 px pen, which only lands on a crisp edge when its
+        # rectangle sits on a half-pixel boundary.
+        inset_right = tokens.px(1) + 0.5
+        track = QRectF(rect.width() - self.TRACK_WIDTH - inset_right, (rect.height() - self.TRACK_HEIGHT) / 2,
                        self.TRACK_WIDTH, self.TRACK_HEIGHT)
 
         painter.setPen(QColor(tokens.OK if on else tokens.DIM2))
