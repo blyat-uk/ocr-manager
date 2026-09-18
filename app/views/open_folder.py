@@ -17,13 +17,14 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QProcess, QSettings, Qt, pyqtSignal
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from app.theme import tokens
 from app.widgets.base import Button
 
 SETTINGS_ORGANIZATION = "OCRManager"
 SETTINGS_APPLICATION = "OCRTool"
 LAST_PATH_KEY = "project/last_path"
 PICKER_CAPTION = "Select Project Directory"
-ERROR_WIDTH = 560
+ERROR_WIDTH = 560                # mockup px; scaled through tokens.px() where it is used
 
 
 def app_settings() -> QSettings:
@@ -109,7 +110,7 @@ class OpenFolderView(QWidget):
         self.setObjectName("OpenFolder")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout.setSpacing(tokens.px(10))
         layout.addStretch(1)
         self.title_label = QLabel("Open a folder of episodes")
         self.title_label.setObjectName("OpenTitle")
@@ -120,7 +121,7 @@ class OpenFolderView(QWidget):
         self.error_label = QLabel()
         self.error_label.setObjectName("OpenError")
         self.error_label.setWordWrap(True)
-        self.error_label.setFixedWidth(ERROR_WIDTH)
+        self.error_label.setFixedWidth(tokens.px(ERROR_WIDTH))
         self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.error_label.hide()
         for widget in (self.title_label, self.hint_label, self.choose_button):

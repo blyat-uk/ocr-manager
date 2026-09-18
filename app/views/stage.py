@@ -23,6 +23,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 from app.state_text import brightness_text, crop_text, ranges_text
+from app.theme import tokens
 from app.widgets.base import KvRow, SectionHeader, repolish
 
 
@@ -62,8 +63,8 @@ class Stage(QWidget):
         head.setObjectName("StageHead")
         head.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         head_layout = QHBoxLayout(head)
-        head_layout.setContentsMargins(12, 8, 12, 8)
-        head_layout.setSpacing(2)
+        head_layout.setContentsMargins(tokens.px(12), tokens.px(8), tokens.px(12), tokens.px(8))
+        head_layout.setSpacing(tokens.px(2))
         self._buttons: list[QPushButton] = []
         for index, tab in enumerate(self._tabs):
             button = QPushButton(tab.title)
@@ -185,13 +186,14 @@ def _ranges_rows(entry) -> list[tuple[str, str]]:
 class _KvList(QWidget):
     def __init__(self, heading: str, object_name: str | None = None, margins=(0, 0, 0, 0),
                  max_width: int | None = None):
+        """`margins` and `max_width` are mockup pixels, scaled here."""
         super().__init__()
         if object_name:
             self.setObjectName(object_name)
             self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(*margins)
-        self._layout.setSpacing(5)
+        self._layout.setContentsMargins(*(tokens.px(margin) for margin in margins))
+        self._layout.setSpacing(tokens.px(5))
         self._layout.addWidget(SectionHeader(heading))
         self._rows: list[KvRow] = []
         self._keys: list[str] = []
@@ -217,7 +219,7 @@ class _KvList(QWidget):
             for index, key in enumerate(keys):
                 row = KvRow(key, "")
                 if self._max_width:
-                    row.setMaximumWidth(self._max_width)
+                    row.setMaximumWidth(tokens.px(self._max_width))
                 self._layout.insertWidget(1 + index, row)
                 self._rows.append(row)
             self._keys = keys

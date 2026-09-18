@@ -36,11 +36,8 @@ PROOF_LINES_SHOWN = 6             # more recognised lines than this hide behind 
 PULSE_MS = 1400
 PULSE_LOW_OPACITY = 0.35
 
-SECTION_MARGIN_X = 12             # `.sec` padding, left and right
-BUTTON_SM_CHROME = 18             # `.btn.sm`: 8 px padding and a 1 px border each side
-# What a `.btn.sm` label may measure inside a section of the inspector column
-# before the column has to grow and clip (the 1 px is the inspector's border).
-BUTTON_TEXT_BUDGET = tokens.INSPECTOR_WIDTH - 1 - 2 * SECTION_MARGIN_X - BUTTON_SM_CHROME
+SECTION_MARGIN_X = 12             # `.sec` padding, left and right (mockup px, scaled at every use)
+BUTTON_SM_CHROME = 18             # `.btn.sm`: 8 px padding and a 1 px border each side (mockup px)
 
 VALUES_NOTE = "Values belong to this file."
 SHOW_ALL_TEXT = "show all"
@@ -55,6 +52,16 @@ HINT_TEXT = "↻ re-detect the other {count} using this {what} as a hint"
 HINT_NONE_TEXT = "no other file to re-detect with this {what}"
 REDETECTING_TEXT = "re-detecting {count} files…"
 HINT_KINDS = ("crop", "brightness")          # the two kinds ruling C3 offers, in inspector order
+
+
+def button_text_budget() -> int:
+    """What a `.btn.sm` label may measure inside a section of the inspector
+    column before the column has to grow and clip. A function, not a
+    constant: it is the scaled inspector width less the scaled section
+    padding and button chrome, so it follows `tokens.UI_SCALE` instead of
+    freezing whatever the scale was at import time. The bare 1 px is the
+    inspector's own border, the stylesheet's hairline."""
+    return tokens.INSPECTOR_WIDTH - 1 - 2 * tokens.px(SECTION_MARGIN_X) - tokens.px(BUTTON_SM_CHROME)
 
 
 def hint_text(count: int, what: str) -> str:
@@ -124,14 +131,15 @@ def note_label(text: str = "") -> QLabel:
 
 
 class Section(QWidget):
-    """`.sec`: padding 10 12, a hairline below."""
+    """`.sec`: padding 10 12 (mockup px, scaled), a hairline below."""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("InspectorSection")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(SECTION_MARGIN_X, 10, SECTION_MARGIN_X, 10)
+        margin_x = tokens.px(SECTION_MARGIN_X)
+        self.body.setContentsMargins(margin_x, tokens.px(10), margin_x, tokens.px(10))
         self.body.setSpacing(0)
 
 
@@ -164,7 +172,7 @@ class DetectedSection(Section):
         self.redetect_button.clicked.connect(self.redetect_requested)
         header = SectionHeader("Detected", trailing=self.redetect_button)
         self.body.addWidget(header)
-        self.body.addSpacing(8)
+        self.body.addSpacing(tokens.px(8))
         self.crop_row, self.crop_conf = self._add_row("Crop")
         self.brightness_row, self.brightness_conf = self._add_row("Brightness")
         self.window_row, self.window_conf = self._add_row("OCR window")
@@ -176,7 +184,7 @@ class DetectedSection(Section):
         row.clicked.connect(lambda: self.tab_requested.emit(self.TAB_FOR_ROW[key]))
         conf = ConfBar(0.0, "ok", "")
         self.body.addWidget(row)
-        self.body.addSpacing(3)
+        self.body.addSpacing(tokens.px(3))
         self.body.addWidget(conf)
         return row, conf
 
@@ -207,8 +215,8 @@ class _OcrLine(QWidget):
         self.setObjectName("OcrLine")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 4)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, tokens.px(4), 0, tokens.px(4))
+        layout.setSpacing(tokens.px(8))
         self.time_label = QLabel()
         self.time_label.setObjectName("OcrTime")
         self.text_label = QLabel()
@@ -250,7 +258,7 @@ class ProofSection(Section):
         self.run_button = small_button("T run")
         self.run_button.clicked.connect(self.run_requested)
         self.body.addWidget(SectionHeader("Proof · real OCR of 30 s", trailing=self.run_button))
-        self.body.addSpacing(8)
+        self.body.addSpacing(tokens.px(8))
         self.status_label = note_label(RUNNING_UNKNOWN_TEXT)
         self.body.addWidget(self.status_label)
         self._pulse_effect = QGraphicsOpacityEffect(self.status_label)
@@ -269,9 +277,9 @@ class ProofSection(Section):
         self.body.addLayout(self._lines_box)
         self.show_all_button = small_button(SHOW_ALL_TEXT, "ghost")
         self.show_all_button.clicked.connect(self._show_all)
-        self.body.addSpacing(4)
+        self.body.addSpacing(tokens.px(4))
         self.body.addWidget(self.show_all_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.body.addSpacing(6)
+        self.body.addSpacing(tokens.px(6))
         self.note_label = note_label()
         self.body.addWidget(self.note_label)
         self._result = None
@@ -385,21 +393,21 @@ class ChangeOffer(Section):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.body.addWidget(SectionHeader("If you change something here"))
-        self.body.addSpacing(8)
+        self.body.addSpacing(tokens.px(8))
         self.note_label = note_label(self.NOTE)
         self.body.addWidget(self.note_label)
-        self.body.addSpacing(7)
+        self.body.addSpacing(tokens.px(7))
         self.hint_buttons: dict[str, Button] = {}
         for what in HINT_KINDS:
             button = small_button("")
             button.clicked.connect(lambda _checked=False, kind=what: self.hint_requested.emit(kind))
             self.hint_buttons[what] = button
             self.body.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
-            self.body.addSpacing(6)
+            self.body.addSpacing(tokens.px(6))
         self.this_file_only_button = small_button("apply to this file only", "ghost")
         self.this_file_only_button.clicked.connect(self.dismissed)
         self.body.addWidget(self.this_file_only_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.body.addSpacing(6)
+        self.body.addSpacing(tokens.px(6))
         self.status_label = note_label()
         self.body.addWidget(self.status_label)
 
@@ -412,7 +420,7 @@ class ChangeOffer(Section):
             count = counts.get(what)
             button.setVisible(count is not None)
             button.setText(wrap_to_width(hint_text(count or 0, what), button.fontMetrics(),
-                                         BUTTON_TEXT_BUDGET))
+                                         button_text_budget()))
             button.setEnabled(bool(count))
         offering = bool(counts)
         self.note_label.setVisible(offering)

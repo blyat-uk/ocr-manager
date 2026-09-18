@@ -66,6 +66,7 @@ from PyQt6.QtWidgets import (
 from app.controller import ProjectController, UnsupportedProjectVersion
 from app.logbook import PIPELINE_LOG
 from app.state_text import can_mark_reviewed, can_run_proof
+from app.theme import tokens
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
 from app.views.folder_settings import FolderSettingsSheet
@@ -87,6 +88,9 @@ from app.views.topbar import APP_NAME, TopBar
 logger = logging.getLogger(__name__)
 
 GEOMETRY_KEY = "window/geometry"
+# The window's first-run size, in mockup pixels: a window twice the scale
+# needs twice the room to show the same rail, stage and inspector. Geometry
+# the user set themselves is restored verbatim and never scaled.
 DEFAULT_SIZE = (1440, 900)
 REQUIRED_TOOLS = ("ffmpeg",)
 OPEN_FAILED_TITLE = "Could not open this folder"
@@ -437,7 +441,7 @@ class MainWindow(QMainWindow):
         geometry = app_settings().value(GEOMETRY_KEY)
         if isinstance(geometry, QByteArray) and self.restoreGeometry(geometry):
             return
-        width, height = DEFAULT_SIZE
+        width, height = (tokens.px(value) for value in DEFAULT_SIZE)
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             available = screen.availableGeometry()

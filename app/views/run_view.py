@@ -19,9 +19,9 @@ while the review queue stays.
       since the run job fills a free worker at once (B13 as amended). The
       button calls `update_folder(ocr_parallel=m)`, which reaches the
       running job (RunJob.set_parallel).
-- Right panel (300 px) "LIVE · {file}": the recognised lines of the followed
-  file ("MM:SS text"), by default the most recently started file; "follow ▾"
-  picks another. Then the note that reviewing goes on meanwhile.
+- Right panel (300 px, scaled) "LIVE · {file}": the recognised lines of the
+  followed file ("MM:SS text"), by default the most recently started file;
+  "follow ▾" picks another. Then the note that reviewing goes on meanwhile.
 
 Decode fps and OCR img/s are omitted (B13: they need instrumentation inside
 videocr). Views import no core module.
@@ -51,7 +51,8 @@ GPU_POLL_MS = 2000
 GPU_SHUTDOWN_WAIT_MS = 500
 
 HEADERS = ("File", "Phase", "Progress", "Result")
-COLUMN_STRETCH = (17, 9, 12, 7)             # .rrow grid-template-columns: 1.7fr .9fr 1.2fr .7fr
+COLUMN_STRETCH = (17, 9, 12, 7)             # .rrow grid-template-columns: 1.7fr .9fr 1.2fr .7fr (a ratio, not px)
+# Mockup pixels; every use goes through `tokens.px()`.
 ROW_GAP = 10                                # .rrow gap
 PBAR_HEIGHT = 5                             # .pbar height
 PBAR_RADIUS = 3                             # .pbar border-radius
@@ -221,12 +222,12 @@ class GpuMeter(QObject):
 # --------------------------------------------------------------------------
 
 class ProgressTrack(QWidget):
-    """`.pbar` / `.pbar u`: a 5 px rounded track filled to `fraction`; tone
-    "run" (blue), "done" (accent), "bad" or "dim"."""
+    """`.pbar` / `.pbar u`: a 5 px (scaled) rounded track filled to
+    `fraction`; tone "run" (blue), "done" (accent), "bad" or "dim"."""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setFixedHeight(PBAR_HEIGHT)
+        self.setFixedHeight(tokens.px(PBAR_HEIGHT))
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._fraction = 0.0
         self._tone = "dim"
@@ -248,7 +249,7 @@ class ProgressTrack(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect())
         path = QPainterPath()
-        radius = min(float(PBAR_RADIUS), rect.height() / 2)
+        radius = min(float(tokens.px(PBAR_RADIUS)), rect.height() / 2)
         path.addRoundedRect(rect, radius, radius)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(tokens.BADGE_BG))
@@ -265,8 +266,8 @@ def _fill_grid(row: QWidget, cells: list[QWidget]) -> QWidget:
     by COLUMN_STRETCH (the cells' own hints are ignored)."""
     row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
     layout = QHBoxLayout(row)
-    layout.setContentsMargins(10, 7, 10, 7)
-    layout.setSpacing(ROW_GAP)
+    layout.setContentsMargins(tokens.px(10), tokens.px(7), tokens.px(10), tokens.px(7))
+    layout.setSpacing(tokens.px(ROW_GAP))
     for cell, stretch in zip(cells, COLUMN_STRETCH, strict=True):
         cell.setSizePolicy(QSizePolicy.Policy.Ignored, cell.sizePolicy().verticalPolicy())
         layout.addWidget(cell, stretch)
@@ -289,7 +290,7 @@ class RunRow(QWidget):
         phase = QWidget()
         phase_layout = QHBoxLayout(phase)
         phase_layout.setContentsMargins(0, 0, 0, 0)
-        phase_layout.setSpacing(6)
+        phase_layout.setSpacing(tokens.px(6))
         self.phase_dot = Dot("run")
         self.phase_label = ElidedLabel()
         self.phase_label.setObjectName("RunPhase")
@@ -398,8 +399,8 @@ class FeedLine(QWidget):
         self.setObjectName("FeedLine")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 3, 0, 3)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, tokens.px(3), 0, tokens.px(3))
+        layout.setSpacing(tokens.px(8))
         self.time_label = QLabel(feed_time(start))
         self.time_label.setObjectName("FeedTime")
         self.text_label = QLabel(text.replace("\\N", "\n"))
@@ -469,8 +470,8 @@ class RunView(QWidget):
         self.footer.setObjectName("RunFooter")
         self.footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         footer = QHBoxLayout(self.footer)
-        footer.setContentsMargins(10, 8, 10, 8)
-        footer.setSpacing(6)
+        footer.setContentsMargins(tokens.px(10), tokens.px(8), tokens.px(10), tokens.px(8))
+        footer.setSpacing(tokens.px(6))
         self.gpu_label = QLabel()
         self.gpu_separator = QLabel("·")
         self.hint_label = QLabel()
@@ -487,15 +488,16 @@ class RunView(QWidget):
         panel = QWidget()
         panel.setObjectName("LivePanel")
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        panel.setFixedWidth(LIVE_WIDTH)
+        panel.setFixedWidth(tokens.px(LIVE_WIDTH))
         self.live_panel = panel
         column = QVBoxLayout(panel)
-        column.setContentsMargins(11, 10, 10, 10)          # 10 px padding + the 1 px left border
+        pad = tokens.px(10)                                # 10 px of padding ...
+        column.setContentsMargins(pad + 1, pad, pad, pad)  # ... plus the stylesheet's 1 px left border
         column.setSpacing(0)
 
         head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 7)
-        head.setSpacing(6)
+        head.setContentsMargins(0, 0, 0, tokens.px(7))
+        head.setSpacing(tokens.px(6))
         self.live_title = ElidedLabel(LIVE_TITLE)
         self.live_title.setObjectName("LiveTitle")
         font = self.live_title.font()
@@ -517,7 +519,7 @@ class RunView(QWidget):
         self.note_label = QLabel(LIVE_NOTE)
         self.note_label.setObjectName("Note")
         self.note_label.setWordWrap(True)
-        self.note_label.setContentsMargins(0, 8, 0, 0)
+        self.note_label.setContentsMargins(0, tokens.px(8), 0, 0)
         column.addWidget(self.note_label)
         return panel
 

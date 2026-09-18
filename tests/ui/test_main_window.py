@@ -11,11 +11,13 @@ any window is built, so no test reads or writes the user's real settings.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -27,7 +29,9 @@ from PyQt6.QtWidgets import QApplication, QLineEdit, QPushButton, QSpinBox, QVBo
 from app.controller import ProjectController
 from app.controller import UnsupportedProjectVersion
 from app.main_window import OPEN_FAILED_TITLE, SAVE_FAILED_TITLE, MainWindow
-from app.views import open_folder as open_folder_module
+from app.theme import tokens
+from app.views import folder_settings, folder_settings_fields, open_folder as open_folder_module, run_view
+from app.views.inspector_sections import button_text_budget
 from app.views.stage import Stage, StageTab, placeholder_tabs
 from app.widgets.base import KvRow
 from core.detect.brightness import BrightnessResult
@@ -250,14 +254,79 @@ def test_window_shows_counts_start_and_fixed_columns(slay_window):
     assert top.project_label.text() == os.path.basename(folder)
     assert top.path_label.text() == f"· {folder}"
     assert window.windowTitle() == f"OCR Manager — {os.path.basename(folder)}"
-    assert window.queue.minimumWidth() == window.queue.maximumWidth() == 246
-    assert window.inspector.minimumWidth() == window.inspector.maximumWidth() == 322
+    # The tokens, never the numbers: the rail and the inspector are the
+    # mockup's 246 and 322 px at the current UI scale, and a literal put back
+    # here (or in the views) fails this at any scale but 1.0.
+    assert window.queue.minimumWidth() == window.queue.maximumWidth() == tokens.RAIL_WIDTH == tokens.px(246)
+    assert (window.inspector.minimumWidth() == window.inspector.maximumWidth()
+            == tokens.INSPECTOR_WIDTH == tokens.px(322))
     assert window.queue.filter.labels() == ["All 5", "Needs you 0", "Reviewed 5"]
     assert window.queue.visible_names() == SLAY_NAMES
     assert window.queue.selected() == SLAY_NAMES[0]
     row = window.queue.row(SLAY_NAMES[0])
     assert (row.badge.text(), row.badge.property("badge")) == ("reviewed", "good")
     assert row.duration_label.text() == "23:38"
+
+
+@contextmanager
+def ui_scale(value: float):
+    """Rebuild the token module at `value` for the body of the `with`.
+
+    Every view reaches its sizes through the `tokens` MODULE (`from app.theme
+    import tokens`), so reloading it in place is enough for widgets built
+    inside the block to be laid out at that scale -- and it is the only way
+    to reach the sizes a module computed at import time."""
+    before = os.environ.get("OCR_MANAGER_UI_SCALE")
+    os.environ["OCR_MANAGER_UI_SCALE"] = str(value)
+    try:
+        importlib.reload(tokens)
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("OCR_MANAGER_UI_SCALE", None)
+        else:
+            os.environ["OCR_MANAGER_UI_SCALE"] = before
+        importlib.reload(tokens)
+
+
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_the_shell_is_laid_out_at_whatever_the_ui_scale_says(make_window, tmp_project, scale):
+    """Nothing in the shell may depend on the default scale being 1.25: at
+    1.0 the window is the mockup's own size, at 2.0 every length is doubled.
+    A hard-coded pixel anywhere in the rail, the inspector, the thumbnails,
+    the sheet or the run view breaks one of these."""
+    with ui_scale(scale):
+        assert tokens.UI_SCALE == scale
+        assert tokens.RAIL_WIDTH == round(246 * scale)
+        assert tokens.INSPECTOR_WIDTH == round(322 * scale)
+        window = make_window(tabs_factory=placeholder_tabs)
+        window.open_folder(str(tmp_project(fixture="slay")))
+        settle()
+
+        assert window.queue.width() == tokens.RAIL_WIDTH
+        assert window.inspector.width() == tokens.INSPECTOR_WIDTH
+        thumb = window.queue.row(SLAY_NAMES[0]).thumb
+        assert (thumb.width(), thumb.height()) == (tokens.THUMB_WIDTH, tokens.THUMB_HEIGHT)
+        assert button_text_budget() == tokens.INSPECTOR_WIDTH - 1 - tokens.px(2 * 12) - tokens.px(18)
+
+        # The sheet: min(the scaled 760, the window's own width less the rail).
+        window.open_folder_settings()
+        settle()
+        sheet = window.folder_settings
+        assert sheet.width() == min(tokens.px(folder_settings.MAX_WIDTH), 1440 - tokens.RAIL_WIDTH)
+        assert sheet.nav_panel.width() == tokens.px(folder_settings.NAV_WIDTH)
+        assert sheet.x() >= window.queue.width()                   # the rail stays visible at every scale
+        # ... and its last section still scrolls to the top of the viewport:
+        # the filler that makes room below it has to follow the scale too.
+        titles = [title for title, _fields, _note in folder_settings_fields.SECTIONS]
+        last = [title for title in titles if not sheet.section(title).isHidden()][-1]
+        sheet.nav.item(titles.index(last)).click()
+        settle()
+        assert sheet.section(last).mapTo(sheet.scroll.viewport(), QPoint(0, 0)).y() \
+            == tokens.px(folder_settings.CONTENT_MARGIN)
+        sheet.close_sheet()
+
+        assert window.run_view.live_panel.width() == tokens.px(run_view.LIVE_WIDTH)
 
 
 def test_a_window_over_an_already_open_controller_shows_its_folder(controller, make_window, tmp_project):
@@ -526,10 +595,13 @@ def test_thumbnail_and_crop_overlay_follow_the_model(slay_window, fake_runner):
     thumb = window.queue.row(name).thumb
     assert thumb.image() is None
     box = thumb.crop_rect()
-    # 1920x888 fitted into 56x32 -> 56x25.9 at y 3.05; the crop (288, 786, 1344, 53) sits at its true place
-    assert box.x() == pytest.approx(288 / 1920 * 56, abs=0.01)
-    assert box.width() == pytest.approx(1344 / 1920 * 56, abs=0.01)
-    assert box.y() == pytest.approx((32 - 888 * 56 / 1920) / 2 + 786 * 56 / 1920, abs=0.01)
+    # 1920x888 fitted into the thumbnail (the mockup's 56x32 at the current
+    # UI scale) letterboxes it; the crop (288, 786, 1344, 53) sits at its
+    # true place inside that frame, whatever the scale.
+    wide, high = tokens.THUMB_WIDTH, tokens.THUMB_HEIGHT
+    assert box.x() == pytest.approx(288 / 1920 * wide, abs=0.01)
+    assert box.width() == pytest.approx(1344 / 1920 * wide, abs=0.01)
+    assert box.y() == pytest.approx((high - 888 * wide / 1920) / 2 + 786 * wide / 1920, abs=0.01)
 
     submission = fake_runner.last("thumbnail", name)
     fake_runner.finish(submission, ThumbnailResult(name, submission.job.time, np.zeros((36, 64, 3), np.uint8)))

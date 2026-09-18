@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QSpinBox, QVBoxLayout, QWidget
 
+from app.theme import tokens
 from app.widgets.base import ElidedLabel, SectionHeader
 
 LANGUAGE_NAMES = {"ch": "Chinese"}
@@ -172,19 +173,19 @@ class SettingRow(QWidget):
         self.setObjectName("KvRow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 5, 4)
-        layout.setSpacing(8)
+        layout.setContentsMargins(tokens.px(8), tokens.px(4), tokens.px(5), tokens.px(4))
+        layout.setSpacing(tokens.px(8))
         self.key_label = QLabel(key)
         self.key_label.setProperty("kvRole", "key")
         layout.addWidget(self.key_label)
         layout.addStretch(1)
         layout.addWidget(value)
-        self.setMinimumHeight(30)
+        self.setMinimumHeight(tokens.px(30))
 
 
 class Section(QWidget):
     """`.sec` inside the sheet: the first has no rule above it, the others a
-    hairline with 10 px above and below (figure 3)."""
+    hairline with 10 px (scaled) above and below (figure 3)."""
 
     def __init__(self, title: str, first: bool, parent: QWidget | None = None):
         super().__init__(parent)
@@ -195,20 +196,20 @@ class Section(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setProperty("first", first)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(0, 0 if first else 10, 0, 10)
+        self.body.setContentsMargins(0, 0 if first else tokens.px(10), 0, tokens.px(10))
         self.body.setSpacing(0)
         self.body.addWidget(SectionHeader(title))
-        self.body.addSpacing(8)
+        self.body.addSpacing(tokens.px(8))
 
     def add_row(self, key: str, value: QWidget, note: str) -> None:
         self.keys.append(key)
         self.body.addWidget(SettingRow(key, value))
-        self.body.addSpacing(2)
+        self.body.addSpacing(tokens.px(2))
         explanation = ElidedLabel(note)
         explanation.setObjectName("Note")
-        explanation.setContentsMargins(8, 0, 0, 0)
+        explanation.setContentsMargins(tokens.px(8), 0, 0, 0)
         self.body.addWidget(explanation)
-        self.body.addSpacing(8)
+        self.body.addSpacing(tokens.px(8))
 
     def add_note(self, text: str) -> QLabel:
         self.note_text = text

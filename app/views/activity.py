@@ -16,6 +16,7 @@ import time
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
 
+from app.theme import tokens
 from app.widgets.base import Button, Dot, ElidedLabel, MiniProgress
 
 RECENT_SHOWN = 2
@@ -58,8 +59,8 @@ class ActivityStrip(QWidget):
         self.setObjectName("ActivityStrip")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 6, 14, 6)
-        layout.setSpacing(10)
+        layout.setContentsMargins(tokens.px(14), tokens.px(6), tokens.px(14), tokens.px(6))
+        layout.setSpacing(tokens.px(10))
         self.dot = Dot("idle")
         # Long file names elide instead of widening the window.
         self.text_label = ElidedLabel("idle", Qt.TextElideMode.ElideMiddle)

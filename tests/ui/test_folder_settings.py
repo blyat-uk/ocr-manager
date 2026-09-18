@@ -21,7 +21,8 @@ from PyQt6.QtWidgets import QAbstractButton, QAbstractSpinBox, QApplication, QCo
 
 from app.controller import ProjectController
 from app.main_window import MainWindow
-from app.views.folder_settings import FolderSettingsSheet
+from app.theme import tokens
+from app.views.folder_settings import CONTENT_MARGIN, MAX_WIDTH, NAV_WIDTH, FolderSettingsSheet
 from app.widgets.base import Toggle
 from core.project import Brightness, Crop, FileEntry, FolderSettings, Media, Project, ReviewState, Source, save_project
 
@@ -196,7 +197,9 @@ def test_sheet_opens_from_the_top_bar_between_the_top_bar_and_the_activity_strip
     sheet = open_sheet(window)
     central = window.centralWidget()
     assert sheet.parentWidget() is central
-    assert sheet.width() == 760                                   # min(760, 1440 - 246)
+    # min(the scaled 760, 1440 - the rail): the sheet's own width scales,
+    # the window's does not. Named, so a literal put back fails this.
+    assert sheet.width() == min(tokens.px(MAX_WIDTH), 1440 - tokens.RAIL_WIDTH)
     assert sheet.geometry().right() == central.width() - 1
     assert sheet.y() == window.centre.y()
     assert sheet.geometry().bottom() == window.activity_strip.geometry().top() - 1
@@ -205,17 +208,24 @@ def test_sheet_opens_from_the_top_bar_between_the_top_bar_and_the_activity_strip
     assert sheet.scope_label.full_text() == f"applies to all 5 files in {folder.name}"
     assert sheet.close_button.text() == "✕"
     assert sheet.nav.labels() == SECTIONS
-    assert sheet.nav_panel.width() == 150
+    assert sheet.nav_panel.width() == tokens.px(NAV_WIDTH)
 
 
 def test_resizing_the_window_recomputes_the_sheet(window):
     sheet = open_sheet(window)
     central = window.centralWidget()
+    # As narrow as this window goes -- its layout has a minimum of its own,
+    # which at every scale is still narrower than the cap, so what limits the
+    # sheet here is the rail it has to leave visible, not MAX_WIDTH.
     window.resize(900, 700)
-    assert wait_for(lambda: sheet.width() == 900 - 246 and sheet.geometry().right() == central.width() - 1)
+    assert window.width() - tokens.RAIL_WIDTH < tokens.px(MAX_WIDTH)
+    assert wait_for(lambda: sheet.width() == window.width() - tokens.RAIL_WIDTH
+                    and sheet.geometry().right() == central.width() - 1)
     assert sheet.geometry().bottom() == window.activity_strip.geometry().top() - 1
-    window.resize(1200, 800)
-    assert wait_for(lambda: sheet.width() == 760 and sheet.geometry().right() == central.width() - 1)
+    wide = tokens.px(MAX_WIDTH) + tokens.RAIL_WIDTH + 100        # room to spare: now the cap rules
+    window.resize(wide, 800)
+    assert wait_for(lambda: sheet.width() == tokens.px(MAX_WIDTH)
+                    and sheet.geometry().right() == central.width() - 1)
     assert sheet.geometry() == sheet.target_geometry()
 
 
@@ -269,7 +279,11 @@ def test_nav_scrolls_to_each_section_and_follows_scrolling(window):
         sheet.nav.item(index).click()
         settle()
         assert sheet.nav.current() == index
-        assert sheet.section(title).visibleRegion().boundingRect().top() == 0, title   # its top is in view
+        # Really at the top of the viewport, its own padding above it -- not
+        # merely somewhere in view. The last section needs the filler below
+        # it to get there, and the filler has to follow the UI scale.
+        assert sheet.section(title).mapTo(sheet.scroll.viewport(), QPoint(0, 0)).y() \
+            == tokens.px(CONTENT_MARGIN), title
     bar.setValue(0)
     settle()
     assert sheet.nav.current() == 0

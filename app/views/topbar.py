@@ -32,6 +32,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QSizePolicy, QWidget
 
 from app.run_snapshot import run_status_text
+from app.theme import tokens
 from app.views.deferred import Deferred
 from app.widgets.base import Button, Chip, ElidedLabel, SegmentedControl
 
@@ -58,7 +59,7 @@ class _ProjectBlock(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
+        layout.setSpacing(tokens.px(5))
         self.name_label = ElidedLabel(APP_NAME)
         self.name_label.setObjectName("ProjectName")
         self.name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
@@ -90,8 +91,8 @@ class TopBar(QWidget):
         self.setObjectName("TopBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 9, 14, 9)
-        layout.setSpacing(14)
+        layout.setContentsMargins(tokens.px(14), tokens.px(9), tokens.px(14), tokens.px(9))
+        layout.setSpacing(tokens.px(14))
 
         self._project = _ProjectBlock()
         self._project.clicked.connect(self.open_requested)
@@ -102,8 +103,8 @@ class TopBar(QWidget):
         self._chips = QWidget()
         self._chips.setObjectName("ChipBar")
         chips = QHBoxLayout(self._chips)
-        chips.setContentsMargins(6, 0, 0, 0)
-        chips.setSpacing(6)
+        chips.setContentsMargins(tokens.px(6), 0, 0, 0)
+        chips.setSpacing(tokens.px(6))
         self.reviewed_chip = Chip("ok", 0, "reviewed")
         self.needs_chip = Chip("warn", 0, "needs you")
         self.detecting_chip = Chip("idle", 0, "detecting")
