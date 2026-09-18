@@ -9,12 +9,18 @@ numbers are the brief's: a 27:08 episode with a 0:00-2:33 intro block and a
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from PyQt6.QtCore import QEvent, QPointF, Qt
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
 from app.controller import ProjectController
+from app.theme import tokens
 from app.views import ranges_view
 from app.views.crop_view import CropTab
 from app.views.ranges_view import (
@@ -35,6 +41,7 @@ from app.views.tabs import evidence_tabs
 from core.project import Source, TimeRange, TimeRanges
 from core.project.ocr_kwargs import ocr_call_for
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 NAME = "ep01.mkv"
 OTHERS = ["ep02.mkv", "ep03.mkv"]
 DURATION = 1628.0                      # 27:08 exactly ...
@@ -686,7 +693,7 @@ def compact(controller):
 def test_compact_mode_draws_the_same_spans_without_grips(compact):
     assert [span.keep for span in compact.spans()] == [False, True, False]
     assert compact.grips() == []
-    assert compact.height() == 68
+    assert compact.height() == TIMELINE_HEIGHT == tokens.px(52) + tokens.px(16)
 
 
 def test_compact_mode_drops_the_lane_label(compact, tab):
@@ -837,3 +844,127 @@ def test_the_compact_track_keeps_the_mockups_height(bare_compact):
     settle()
     assert bare_compact.height() == TIMELINE_HEIGHT
     assert bare_compact.maximumHeight() == TIMELINE_HEIGHT
+
+
+# --------------------------------------------------------------------------
+# The width the shell leaves the stage
+# --------------------------------------------------------------------------
+
+SCREEN_WIDTH = 1440                   # the screen this window is designed to open on
+# What the shell leaves the stage there: the rail and the inspector are fixed
+# tokens, so this is a plain subtraction and not a layout question.
+STAGE_ROOM = SCREEN_WIDTH - tokens.RAIL_WIDTH - tokens.INSPECTOR_WIDTH
+
+
+@pytest.mark.skipif(STAGE_ROOM < 400,
+                    reason=f"at UI_SCALE {tokens.UI_SCALE} the rail and the inspector alone "
+                           f"need a wider screen than {SCREEN_WIDTH} px")
+def test_no_evidence_tab_asks_for_more_width_than_the_shell_can_give(controller):
+    """None of the three tabs may set the window's minimum width.
+
+    The stage head lays a tab's toolbar out beside the tab buttons and the
+    page lays its own row of controls out, so an unbreakable row anywhere in
+    a tab becomes a width the window cannot go under -- and at the UI scale
+    the rail and the inspector already take 710 px of a 1440 px screen. A
+    floor above what is left is not something the user can do anything
+    about: they cannot make their screen wider. Each tab must fit what the
+    shell gives it, by wrapping, paging or eliding.
+    """
+    give_values(controller, crop=True)
+    # A full detection's worth of crop samples: the filmstrip is a row of
+    # fixed-size thumbnails, so it is the page most likely to ask for a width
+    # nobody has. (A handful of samples would fit anywhere and prove nothing.)
+    controller.entry(NAME).evidence["crop"] = crop_evidence(
+        times=tuple(60.0 * step for step in range(1, 13)))
+    stage = Stage(controller, evidence_tabs(controller))
+    try:
+        stage.set_file(NAME)
+        stage.resize(STAGE_ROOM, 700)
+        stage.show()
+        settle()
+        for index, tab in enumerate(stage.tabs()):
+            stage.set_current(index)
+            settle()
+            assert stage.minimumSizeHint().width() <= STAGE_ROOM, tab.title
+            assert tab.page().minimumSizeHint().width() <= STAGE_ROOM, tab.title
+            assert stage.head().minimumSizeHint().width() <= STAGE_ROOM, tab.title
+    finally:
+        stage.close()
+        stage.deleteLater()
+
+
+# --------------------------------------------------------------------------
+# The UI scale
+# --------------------------------------------------------------------------
+
+# Run in a child process, once per scale: every constant in the three views is
+# computed at import time from `tokens.UI_SCALE`, so a scale can only be
+# changed before `app.theme.tokens` is imported. Reloading the modules in
+# THIS process would leave every widget the session has already built holding
+# the old numbers.
+_SCALE_PROBE = """
+import os
+scale = float(os.environ["OCR_MANAGER_UI_SCALE"])
+
+from app.theme import tokens
+from app.views import brightness_view as b, crop_view as c, ranges_view as r
+from core.project.model import MIN_CROP_SIDE
+
+px = tokens.px
+assert tokens.UI_SCALE == scale, tokens.UI_SCALE
+
+# --- what is drawn grows, and grows together ---------------------------
+assert r.TRACK_HEIGHT == px(52), r.TRACK_HEIGHT
+assert r.LANE_HEIGHT == px(16), r.LANE_HEIGHT
+assert r.TIMELINE_HEIGHT == r.TRACK_HEIGHT + r.LANE_HEIGHT
+assert r.TRACK_MAX_HEIGHT == 3 * r.TRACK_HEIGHT
+assert r.TIMELINE_MAX_HEIGHT == r.TRACK_MAX_HEIGHT + r.LANE_HEIGHT
+assert (r.GRIP_WIDTH, r.GRIP_GRAB) == (px(5), px(7))
+assert (r.MARK_HEIGHT, r.MARK_WIDTH) == (px(6), px(1))
+assert (r.LABEL_PADDING_X, r.LABEL_PADDING_Y) == (px(5), px(3))
+assert (r.SPEECH_TOP, r.SPEECH_HEIGHT) == (px(3), px(10))
+assert r.SPEECH_TOP + r.SPEECH_HEIGHT <= r.LANE_HEIGHT     # the bar fits its lane
+
+assert (c.CropCanvas.HANDLE_SIZE, c.CropCanvas.HANDLE_GRAB) == (px(7), px(13))
+assert c.CropCanvas.HANDLE_GRAB > c.CropCanvas.HANDLE_SIZE  # ... still easier to hit
+assert (c.SampleStrip.THUMB_WIDTH, c.SampleStrip.THUMB_HEIGHT) == (px(64), px(36))
+assert c.SampleStrip.LABEL_WIDTH == px(46)
+assert c.PAGE_MARGIN == px(12)
+assert c.FOCUS_RING_WIDTH == 1.5 * scale         # a pen is not a whole pixel
+
+assert (b.GLYPHS_HEIGHT, b.CAPTION_HEIGHT) == (px(96), px(18))
+assert b.TILE_HEIGHT == b.GLYPHS_HEIGHT + b.CAPTION_HEIGHT
+assert (b.CONTEXT_HEIGHT, b.TILE_GAP) == (px(26), px(9))
+assert (b.PLOT_HEIGHT, b.LEGEND_HEIGHT) == (px(64), px(16))
+assert b.MARKER_Y + b.MARKER_RADIUS <= b.PLOT_HEIGHT       # the dot is on the plot
+# A preset is a measurement, not a size: "100%" is one strip pixel per
+# device pixel at every scale (tests/ui/test_brightness_view.py).
+assert b.PRESET_FACTORS == {"100%": 1.0, "300%": 3.0, "600%": 6.0}
+
+# --- what is STORED does not ------------------------------------------
+assert c.CropCanvas.MIN_BOX == MIN_CROP_SIDE, c.CropCanvas.MIN_BOX
+assert c.CropCanvas.MIN_MASK == 6                # video pixels, both of them
+assert (r.SNAP_SECONDS, r.MIN_SPAN, r.ADD_RANGE_SECONDS) == (1, 1.0, 60.0)
+assert c.NUDGE_SMALL == 1 and c.NUDGE_LARGE == 10
+assert (b.MIN_T, b.MAX_T) == (100, 255)
+assert c.CropCanvas.GRID_ALPHA == 0.45 and r.WAVE_ALPHA == 0.45   # alphas are not lengths
+assert c.CropCanvas.GRID_DIVISIONS == 10 and b.TILE_COLUMNS == 3   # ... nor are counts
+
+# --- and at 1.0 nothing moved at all -----------------------------------
+if scale == 1.0:
+    assert (r.TRACK_HEIGHT, r.TIMELINE_HEIGHT) == (52, 68)
+    assert (b.TILE_HEIGHT, b.CONTEXT_HEIGHT) == (114, 26)
+    assert c.CropCanvas.HANDLE_SIZE == 7
+print("ok")
+"""
+
+
+@pytest.mark.parametrize("scale", ["1.0", "1.25", "2.0", "3.0"])
+def test_the_three_views_are_drawn_at_the_ui_scale(scale):
+    """Nothing in the evidence views may assume the default 1.25: every
+    painted length is the mockup's own through `tokens.px`, and nothing that
+    decides what gets STORED moves with it."""
+    env = {**os.environ, "OCR_MANAGER_UI_SCALE": scale, "QT_QPA_PLATFORM": "offscreen"}
+    result = subprocess.run([sys.executable, "-c", _SCALE_PROBE], cwd=str(REPO_ROOT),
+                            env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"

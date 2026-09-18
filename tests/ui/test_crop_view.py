@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
-from app.views import crop_view
+from app.views import crop_view, ranges_view
 from app.views.crop_view import DETECTED_TAG, PAGE_MARGIN, CropCanvas, CropTab, SampleStrip
 from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
@@ -481,10 +481,24 @@ def test_samples_are_deduplicated_by_time_preferring_the_kept_entry(make_tab):
     assert samples[TWO_LINE_INDEX].lines == 2
 
 
+def widen(strip, thumbs: int = SampleStrip.PAGE) -> None:
+    """Resize the page until the row has the width `thumbs` thumbnails need.
+    A thumbnail is a fixed size, so how many are on screen is a question
+    about the width the stage has -- at the UI scale the mockup's eight need
+    more than 1440 px of window leaves it."""
+    page = strip.window()
+    chrome = page.width() - strip.width()
+    page.resize(strip.minimumSizeHint().width() + (thumbs - 1) * strip._thumb_step() + chrome,
+                page.height())
+    QApplication.processEvents()
+
+
 def test_the_filmstrip_shows_eight_thumbnails_and_pages(make_tab):
     harness = make_tab()
     strip = harness.tab.strip
+    widen(strip)
     assert strip.label_text() == "samples"
+    assert strip.fits() == 8
     assert len(strip.thumbnails()) == 8
     assert strip.more_button.text() == "more ▸"
     assert strip.more_button.isVisible()
@@ -493,6 +507,41 @@ def test_the_filmstrip_shows_eight_thumbnails_and_pages(make_tab):
     assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(8, 12))
     strip.more_button.click()
     assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(8))
+
+
+def test_the_filmstrip_shows_what_fits_and_pages_through_the_rest(make_tab):
+    """A thumbnail keeps its size; the row does not keep all eight. Eight of
+    them at the UI scale are wider than the stage is at 1440 px, and a row of
+    fixed-size children would make that the window's own minimum width -- the
+    window could then not be opened on a 1440 px screen at all. So the row
+    shows the ones its width holds and "more ▸" reaches every other sample."""
+    harness = make_tab()
+    strip = harness.tab.strip
+    widen(strip, 4)
+    assert strip.fits() == 4
+    assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(4))
+    assert strip.more_button.isVisible()
+    assert strip.pages() == 3
+    seen = []
+    for _ in range(strip.pages()):
+        seen += [thumb.sample_index() for thumb in strip.thumbnails()]
+        strip.more_button.click()
+    assert seen == list(range(12))                   # every sample is reachable
+    widen(strip)
+    assert len(strip.thumbnails()) == 8              # ... and eight again where eight fit
+
+
+def test_the_filmstrip_never_sets_the_windows_minimum_width(make_tab):
+    """One thumbnail's worth, whatever the detection found: the evidence
+    view may not decide how narrow the window can be."""
+    strip = make_tab().tab.strip
+    one = strip.minimumSizeHint().width()
+    assert one < 8 * strip._thumb_step()              # never all eight ...
+    assert one == make_tab(evidence=crop_evidence(samples=[])).tab.strip.minimumSizeHint().width()
+    widen(strip, 1)
+    assert strip.fits() == 1
+    assert len(strip.thumbnails()) == 1               # ... and it still shows one
+    assert strip.pages() == 12
 
 
 def test_the_selected_and_disagreeing_samples_are_bordered(make_tab):
@@ -706,6 +755,25 @@ def test_the_canvas_tags_name_the_frame_the_crop_and_the_envelope(make_tab):
     assert "bottom_right" not in harness.tab.canvas.tags()
 
 
+def test_a_canvas_tag_steps_clear_of_the_crop_box(make_tab):
+    """A subtitle crop is a band along the bottom of the frame, which is
+    where the bottom tags land. At the UI scale the tag is taller and the
+    canvas, in a 1440 px window, is shorter, and the legend was printing
+    through the subtitle it names."""
+    harness = make_tab(crop=(0, 700, 1920, 188))        # the whole bottom fifth
+    canvas = harness.tab.canvas
+    harness.size_canvas(700, 324)                      # the stage's width at 1440x900
+    QApplication.processEvents()
+    box = canvas.box_rect()
+    rects = canvas.tag_rects()
+    assert set(rects) == set(canvas.tags())
+    for corner, rect in rects.items():
+        assert not rect.intersects(box), corner
+        assert canvas.frame_rect().contains(rect), corner
+    assert rects["bottom_right"].bottom() <= box.top()  # ... above it, not over it
+    assert rects["top_left"].top() < box.top()          # the top pair never moved
+
+
 def test_the_envelope_legend_is_left_out_when_there_is_no_envelope(make_tab):
     """The legend explains a dashed rectangle. With no envelope none is
     drawn, and "dashed = text found across all 0 samples" points at nothing
@@ -740,7 +808,9 @@ def test_the_page_mounts_the_compact_timeline_under_the_stage(make_tab):
     assert isinstance(timeline, Timeline)
     assert timeline.mode == "compact"
     assert timeline.grips() == []
-    assert timeline.height() == 68
+    # The compact slot and the widget in it are the same scaled constant, so
+    # the strip cannot outgrow the room the page leaves it.
+    assert timeline.height() == ranges_view.TIMELINE_HEIGHT
 
 
 # --------------------------------------------------------------------------
@@ -974,6 +1044,7 @@ def test_a_gesture_that_changes_nothing_commits_nothing(make_tab):
 def test_paging_survives_a_frame_ready_burst(make_tab):
     harness = make_tab()
     strip = harness.tab.strip
+    widen(strip)
     strip.more_button.click()
     assert [thumb.sample_index() for thumb in strip.thumbnails()] == list(range(8, 12))
     harness.deliver_frames()

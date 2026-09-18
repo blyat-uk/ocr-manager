@@ -5,6 +5,8 @@
 the waveform, the keep and skip spans and their amber grips, fused to a
 16 px speech lane -- plus one warning row per speech span that falls inside
 a span the run would skip, and an inspector panel listing the keep ranges.
+Every px here is a mockup px: the whole of the geometry block below goes
+through `tokens.px`, so at UI_SCALE 1.25 that track is 65 px on screen.
 
 Two modes, one widget (ruling B5). The Time ranges tab hosts the editable
 one; the Crop and Brightness tabs mount the same widget read-only and
@@ -85,9 +87,20 @@ SKIP_LABEL = "SKIP"                   # a skip span no detected block explains .
 SKIP_KIND = "skipped"                 # ... and how its warning sentence names it
 
 # --- geometry (the literal CSS of tabs-hifi.html figure 3) -----------------
+#
+# Every length here is a mockup pixel put through `tokens.px`, so the track,
+# its grips, its block labels and the speech lane grow with the rest of the
+# window (app/theme/tokens.py's UI_SCALE). The comments name the mockup's own
+# value, which is what `tokens.px(n)` is called with -- at UI_SCALE 1.0 every
+# constant below is exactly the number in its comment.
+#
+# Nothing under "editing" is a length: those are seconds, and the time <-> x
+# maths in `x_for` / `time_at` is a fraction of the widget's own width. The
+# scale changes what is DRAWN and how big a hit target is, never what a drag
+# stores.
 
-TRACK_HEIGHT = 52                     # .track
-LANE_HEIGHT = 16                      # .lane, fused under it
+TRACK_HEIGHT = tokens.px(52)          # .track
+LANE_HEIGHT = tokens.px(16)           # .lane, fused under it
 TIMELINE_HEIGHT = TRACK_HEIGHT + LANE_HEIGHT
 # The stage hands this page about 760 px at 1440x900 for ~180 px of content.
 # The track is the thing being edited -- blocks to read, boundaries to drag,
@@ -98,15 +111,18 @@ TIMELINE_HEIGHT = TRACK_HEIGHT + LANE_HEIGHT
 # it is a strip under another tab's stage, not the subject of the page.
 TRACK_MAX_HEIGHT = 3 * TRACK_HEIGHT
 TIMELINE_MAX_HEIGHT = TRACK_MAX_HEIGHT + LANE_HEIGHT
-PAGE_MARGIN = 12                      # the page's own padding, all four sides
-GRIP_WIDTH = 5                        # .grip
+PAGE_MARGIN = tokens.px(12)           # the page's own padding, all four sides
+ROWS_GAP = tokens.px(10)              # between the timeline and the warning rows
+ROW_SPACING = tokens.px(5)            # between two warning rows, and two panel rows
+GRIP_WIDTH = tokens.px(5)             # .grip
 GRIP_ALPHA = 0.85
-GRIP_GRAB = 7                         # how far from a grip a press still takes it
+GRIP_GRAB = tokens.px(7)              # how far from a grip a press still takes it
+POSITION_WIDTH = tokens.px(1)         # compact mode's "you clicked here" hairline
 WAVE_ALPHA = 0.45                     # .wave
-WAVE_AMPLITUDE = 16                   # the mockup's polyline swings 26 ± 16, at its loudest
-WAVE_STEP = 8                         # ... every 8 units of its 600-wide viewBox
-SPEECH_TOP = 3                        # .speech: top:3px; height:10px
-SPEECH_HEIGHT = 10
+WAVE_AMPLITUDE = tokens.px(16)        # the mockup's polyline swings 26 ± 16, at its loudest
+WAVE_STEP = tokens.px(8)              # ... every 8 units of its 600-wide viewBox
+SPEECH_TOP = tokens.px(3)             # .speech: top:3px; height:10px
+SPEECH_HEIGHT = tokens.px(10)
 SPEECH_ALPHA = 0.55
 WARN_ALPHA = 0.9
 KEEP_FILL_ALPHA = 0.10                # .blk.keep  rgba(111,212,138,.10)
@@ -114,15 +130,21 @@ KEEP_EDGE_ALPHA = 0.55
 SKIP_FILL_ALPHA = 0.07                # .blk.skip  the fainter half of the stripe gradient
 SKIP_STRIPE_ALPHA = 0.16              # ... and the stronger one
 SKIP_EDGE_ALPHA = 0.6
-STRIPE_WIDTH = 6                      # repeating-linear-gradient(45deg, ... 0 6px, ... 6px 12px)
-STRIPE_PERIOD = 12
-LABEL_PADDING_X = 5                   # .blk padding: 3px 5px
-LABEL_PADDING_Y = 3
-LABEL_GAP = 6                         # between a keep's label and its inline length
-LABEL_MIN_WIDTH = 26                  # a block narrower than this is left unlabelled
-SUB_LINE_GAP = 2                      # the sub-line's margin-top
+STRIPE_WIDTH = tokens.px(6)           # repeating-linear-gradient(45deg, ... 0 6px, ... 6px 12px)
+STRIPE_PERIOD = tokens.px(12)
+LABEL_PADDING_X = tokens.px(5)        # .blk padding: 3px 5px
+LABEL_PADDING_Y = tokens.px(3)
+LABEL_GAP = tokens.px(6)              # between a keep's label and its inline length
+LABEL_MIN_WIDTH = tokens.px(26)       # a block narrower than this is left unlabelled
+SUB_LINE_GAP = tokens.px(2)           # the sub-line's margin-top
+LANE_LABEL_INSET = tokens.px(4)       # "speech", off the lane's left edge
 MARK_ALPHA = 0.75                     # a crop sample's tick, compact mode ...
-MARK_HEIGHT = 6                       # ... 6 px along the bottom, as workbench-hifi's `.marks s`
+MARK_HEIGHT = tokens.px(6)            # ... 6 px along the bottom, as workbench-hifi's `.marks s`
+MARK_WIDTH = tokens.px(1)
+WARN_ROW_PADDING_X = tokens.px(8)     # the warn-tinted .kv around the sentence
+WARN_ROW_PADDING_Y = tokens.px(5)
+WARN_ROW_GAP = tokens.px(8)           # ... between it and "extend keep →"
+BUTTON_GAP = tokens.px(6)             # "+ add range" / "use whole file"
 
 # --- editing ---------------------------------------------------------------
 
@@ -355,8 +377,9 @@ class SpeechWarning:
 
 
 class Timeline(QWidget):
-    """The 52 px track and its 16 px speech lane, editable (`mode="edit"`)
-    or read-only and compact (`mode="compact"`, ruling B5).
+    """The 52 px track and its 16 px speech lane -- TRACK_HEIGHT and
+    LANE_HEIGHT at the current UI scale -- editable (`mode="edit"`) or
+    read-only and compact (`mode="compact"`, ruling B5).
 
     It draws the file and, in edit mode, edits it; it decides nothing about
     the tab it is mounted in. A compact click and double-click leave as
@@ -672,7 +695,8 @@ class Timeline(QWidget):
                                  _alpha(tokens.ACC, GRIP_ALPHA))
         elif self._position is not None:
             x = self.x_for(self._position)
-            painter.fillRect(QRectF(x - 0.5, rect.top(), 1.0, rect.height()),
+            painter.fillRect(QRectF(x - POSITION_WIDTH / 2, rect.top(),
+                                    POSITION_WIDTH, rect.height()),
                              _alpha(tokens.ACC, GRIP_ALPHA))
         painter.restore()
         painter.setPen(QPen(QColor(tokens.LINE), 1))
@@ -764,8 +788,8 @@ class Timeline(QWidget):
     def _paint_mark(self, painter: QPainter, rect: QRectF, time: float) -> None:
         """A sample's tick: 6 px along the bottom of the track, so it reads
         as a mark rather than as a grip it cannot be."""
-        painter.fillRect(QRectF(self.x_for(time) - 0.5, rect.bottom() - MARK_HEIGHT,
-                                1.0, MARK_HEIGHT),
+        painter.fillRect(QRectF(self.x_for(time) - MARK_WIDTH / 2, rect.bottom() - MARK_HEIGHT,
+                                MARK_WIDTH, MARK_HEIGHT),
                          _alpha(tokens.ACC, MARK_ALPHA))
 
     def _paint_lane(self, painter: QPainter, rect: QRectF) -> None:
@@ -780,7 +804,7 @@ class Timeline(QWidget):
         if self.lane_label():
             painter.setFont(_font(tokens.FONT_SIZE_XS))
             painter.setPen(QColor(tokens.DIM2))
-            painter.drawText(rect.adjusted(4, 0, 0, 0),
+            painter.drawText(rect.adjusted(LANE_LABEL_INSET, 0, 0, 0),
                              int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                              self.lane_label())
         painter.restore()
@@ -793,7 +817,7 @@ class Timeline(QWidget):
         left, right = self.x_for(start), self.x_for(end)
         segment = QRectF(left, rect.top() + SPEECH_TOP - 0.5, max(1.0, right - left), SPEECH_HEIGHT)
         path = QPainterPath()
-        path.addRoundedRect(segment, 1, 1)
+        path.addRoundedRect(segment, tokens.RADIUS_THUMB_BOX, tokens.RADIUS_THUMB_BOX)
         painter.fillPath(path, colour)
 
 
@@ -894,8 +918,9 @@ class WarningRow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setProperty("tone", "warn")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 5, 8, 5)
-        layout.setSpacing(8)
+        layout.setContentsMargins(WARN_ROW_PADDING_X, WARN_ROW_PADDING_Y,
+                                  WARN_ROW_PADDING_X, WARN_ROW_PADDING_Y)
+        layout.setSpacing(WARN_ROW_GAP)
         self._label = QLabel(text)
         self._label.setProperty("kvRole", "value")
         self._label.setProperty("tone", "warn")
@@ -940,12 +965,12 @@ class RangesInspectorPanel(Section):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.body.setSpacing(5)
+        self.body.setSpacing(ROW_SPACING)
         self._rows: list[KeepRow] = []
         self._buttons = QWidget()
         buttons = QHBoxLayout(self._buttons)
         buttons.setContentsMargins(0, 0, 0, 0)
-        buttons.setSpacing(6)
+        buttons.setSpacing(BUTTON_GAP)
         self.add_button = small_button(ADD_TEXT)
         self.add_button.clicked.connect(self.add_requested)
         self.whole_file_button = small_button(WHOLE_FILE_TEXT, "ghost")
@@ -1018,11 +1043,11 @@ class RangesTab:
         # stretch factor, Expanding policy or not. Its maximum still caps it,
         # and what it cannot take goes back to the margins.
         column.addWidget(self.timeline, 1)
-        column.addSpacing(10)
+        column.addSpacing(ROWS_GAP)
         self._rows_host = QWidget()
         self._rows_layout = QVBoxLayout(self._rows_host)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._rows_layout.setSpacing(5)
+        self._rows_layout.setSpacing(ROW_SPACING)
         column.addWidget(self._rows_host)
         # Why the timeline is not showing what the file stores: a range it
         # could not place (warn), or a duration nothing has measured yet.
