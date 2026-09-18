@@ -937,7 +937,9 @@ assert b.TILE_HEIGHT == b.GLYPHS_HEIGHT + b.CAPTION_HEIGHT
 assert (b.CONTEXT_HEIGHT, b.TILE_GAP) == (px(26), px(9))
 assert (b.PLOT_HEIGHT, b.LEGEND_HEIGHT) == (px(64), px(16))
 assert b.MARKER_Y + b.MARKER_RADIUS <= b.PLOT_HEIGHT       # the dot is on the plot
-assert b.PRESET_FACTORS == {"100%": scale, "300%": 3.0 * scale, "600%": 6.0 * scale}
+# A preset is a measurement, not a size: "100%" is one strip pixel per
+# device pixel at every scale (tests/ui/test_brightness_view.py).
+assert b.PRESET_FACTORS == {"100%": 1.0, "300%": 3.0, "600%": 6.0}
 
 # --- what is STORED does not ------------------------------------------
 assert c.CropCanvas.MIN_BOX == MIN_CROP_SIDE, c.CropCanvas.MIN_BOX

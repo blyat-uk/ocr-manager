@@ -124,20 +124,21 @@ PREVIEW_NOTE = "preview only — {value} is not kept yet"
 # (app/theme/tokens.py's UI_SCALE); the comments name the mockup's own value,
 # which is the number `tokens.px` is called with. Alphas, column counts and
 # the fractions below are not lengths and are left alone -- and neither the
-# strip arrays nor the boxes measured on them are ever scaled: the UI scale
-# changes the size those pixels are DRAWN at, never a pixel.
+# strip arrays, the boxes measured on them nor the zoom presets are ever
+# scaled: the UI scale changes how big a tile is, never what a strip pixel
+# is or how many device pixels a preset spreads it over.
 
 ZOOM_PRESETS = ("fit", "100%", "300%", "600%")
 DEFAULT_PRESET = "300%"
-# The magnification, in mockup pixels per strip pixel, scaled like every
-# other length: at "300%" one strip pixel fills the same share of a tile at
-# any UI scale, which is what keeps a stroke readable when the window grows.
-# "fit" is computed from the tile's own width (`zoom_factor`) and so follows
-# on its own. Blitting is nearest-neighbour at every preset, as it already is
-# at "fit", so no strip pixel is ever interpolated away.
-PRESET_FACTORS = {"100%": 1.0 * tokens.UI_SCALE,
-                  "300%": 3.0 * tokens.UI_SCALE,
-                  "600%": 6.0 * tokens.UI_SCALE}
+# **Not scaled, deliberately.** These are a measurement, not a size: "100%"
+# promises one strip pixel per device pixel, which is how the user judges
+# whether a stroke survives the threshold, and "300%" that each one is
+# exactly three across. Multiplying by the UI scale would make the labels
+# lie (125%, 375%) and put the blit off the pixel grid. The tiles grow with
+# the scale instead, and a bigger tile at a true 100% simply shows more of
+# the strip -- which is the right outcome. "fit" is the one preset computed
+# from the tile's own width (`zoom_factor`), and it is fractional by nature.
+PRESET_FACTORS = {"100%": 1.0, "300%": 3.0, "600%": 6.0}
 
 CONTEXT_HEIGHT = tokens.px(26)          # .ctxstrip
 # A pen is not snapped to a whole device pixel, so the stroke widths below

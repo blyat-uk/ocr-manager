@@ -12,7 +12,11 @@ the gate's centre square, so `gate_fires` flips at a known threshold.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import time as time_mod
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,7 +26,6 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from app.controller import ProjectController
-from app.theme import tokens
 from app.views import ranges_view
 from app.views.brightness_view import (
     CAPTION_GAP,
@@ -40,6 +43,7 @@ from core.project import Brightness, Crop, Source
 
 NAME = "ep01.mkv"
 OTHERS = ["ep02.mkv", "ep03.mkv", "ep04.mkv"]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 BOX = (288, 786, 1344, 53)
 OTHER_BOX = (300, 800, 1300, 60)
 
@@ -305,25 +309,56 @@ def test_a_narrow_caption_elides_the_kind_rather_than_printing_through_it(qapp):
 
 
 def test_zoom_presets_pick_the_source_rectangle(loaded):
+    """A preset is a measurement, not a size: it does NOT move with the UI
+    scale. "100%" is one strip pixel per device pixel and "300%" is exactly
+    three, so the blit lands on whole pixels and the label means what it
+    says -- a scaled 1.25 would make it read 125% and put the nearest-
+    neighbour blit between pixels, on the one view whose whole job is to
+    show what a threshold does to a stroke. The tiles grow instead, and a
+    bigger tile at a true 100% shows more of the strip.
+
+    Run at the session's scale here and at 1.0 and 2.0 in a child process
+    (see below), so the label cannot drift from the maths."""
     tile = tile_of(loaded, "dark")
+    loaded.set_zoom("100%")
+    settle()
+    assert loaded.zoom_factor() == 1.0
+    # One strip pixel per device pixel, for as much of the strip as the tile
+    # holds -- a tile wider than the strip simply shows all of it.
+    assert tile.source_rect().width() == min(STRIP_W, tile.content_rect().width())
+
     loaded.set_zoom("300%")
     settle()
-    # A preset is a mockup magnification, scaled like every other length --
-    # never the bare 3.0, which would only be right at UI_SCALE 1.0.
-    assert loaded.zoom_factor() == pytest.approx(3.0 * tokens.UI_SCALE)
+    assert loaded.zoom_factor() == 3.0
     rect = tile.source_rect()
     assert rect is not None
-    assert rect.width() == round(tile.content_rect().width() / (3.0 * tokens.UI_SCALE))
+    assert rect.width() == round(tile.content_rect().width() / 3)
 
     loaded.set_zoom("600%")
     settle()
-    assert tile.source_rect().width() == round(
-        tile.content_rect().width() / (6.0 * tokens.UI_SCALE))
+    assert loaded.zoom_factor() == 6.0
+    assert tile.source_rect().width() == round(tile.content_rect().width() / 6)
 
     loaded.set_zoom("fit")
     settle()
     assert tile.source_rect().width() == STRIP_W
     assert loaded.zoom_factor() == pytest.approx(tile.content_rect().width() / STRIP_W)
+
+
+@pytest.mark.parametrize("scale", ["1.0", "2.0"])
+def test_the_zoom_presets_are_the_same_magnification_at_any_ui_scale(scale):
+    """The test above, again, with the window drawn at another scale.
+
+    Every size token is read at import time, so the scale can only be
+    changed before `app.theme.tokens` is imported -- which means another
+    process. Only that one test node runs there, so this does not recurse."""
+    env = {**os.environ, "OCR_MANAGER_UI_SCALE": scale, "QT_QPA_PLATFORM": "offscreen"}
+    node = f"{__file__}::test_zoom_presets_pick_the_source_rectangle"
+    result = subprocess.run([sys.executable, "-m", "pytest", node, "-q", "--no-header", "-p",
+                             "no:cacheprovider"],
+                            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+                            timeout=300, check=False)
+    assert result.returncode == 0, f"stdout={result.stdout[-3000:]!r}"
 
 
 def test_dragging_the_context_window_pans_every_tile_equally(loaded):
