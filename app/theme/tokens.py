@@ -18,6 +18,54 @@ Single dark theme only: no light variant, no `prefers-color-scheme`
 equivalent, no qt-material (ruling C9).
 """
 
+import os
+
+# --------------------------------------------------------------------------
+# UI scale
+# --------------------------------------------------------------------------
+# The mockups were drawn for a browser at a comfortable reading distance;
+# on a real desktop at 1440p their 9-11 px type is too small to read. Every
+# size below is therefore the mockup's own value multiplied by UI_SCALE, so
+# the whole window grows in proportion -- type, chrome, rails, radii and the
+# painted geometry in the views alike. The `*_BASE` constants keep the
+# untouched mockup values, which is what the tests compare against ui-spec.
+#
+# Override per run without editing code:
+#     OCR_MANAGER_UI_SCALE=1.4 .venv/bin/python main.py
+UI_SCALE_DEFAULT = 1.25
+UI_SCALE_MIN = 1.0
+UI_SCALE_MAX = 3.0
+
+
+def _scale_from_env() -> float:
+    """UI_SCALE_DEFAULT, or $OCR_MANAGER_UI_SCALE clamped to [1.0, 3.0].
+    An unreadable value is ignored rather than raising at import time: a
+    typo in a shell profile must not stop the app from starting."""
+    raw = os.environ.get("OCR_MANAGER_UI_SCALE", "").strip()
+    if not raw:
+        return UI_SCALE_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return UI_SCALE_DEFAULT
+    return min(UI_SCALE_MAX, max(UI_SCALE_MIN, value))
+
+
+UI_SCALE = _scale_from_env()
+
+
+def px(value: float) -> int:
+    """A mockup pixel length at the current scale, rounded to a whole pixel
+    (widths, heights, margins, radii -- anything Qt wants as an int)."""
+    return int(round(value * UI_SCALE))
+
+
+def pt(value: float) -> float:
+    """A mockup font size at the current scale, keeping its fraction (Qt
+    takes fractional point sizes, and 9.5 -> 11.875 reads better than 12)."""
+    return value * UI_SCALE
+
+
 # --------------------------------------------------------------------------
 # Colour tokens (ui-spec.md §2.1, the `.hf { --bg:...; }` custom-property
 # block)
@@ -76,13 +124,20 @@ TAG_BG = (10, 12, 16, 209)
 # glyph tiles always has coverage.
 FONT_STACK = ["Inter", "Segoe UI", "Noto Sans", "Noto Sans CJK SC", "sans-serif"]
 
-FONT_SIZE_XS = 9            # .badge, rrow header labels, lane "speech" label
-FONT_SIZE_SCOPE = 9.5       # .insp-scope, .sec-h, canvas-tag/.tag, .blk text
-FONT_SIZE_SM = 10           # .fsub, footer hint text, .conf caption text, .note
-FONT_SIZE_BTN_SM = 10.5     # .seg span, .btn.sm, samples label, activity-strip text
-FONT_SIZE_BODY = 11.5       # .btn, .tab, .fname, .kv
-FONT_SIZE_MD = 12.5         # .insp-file
-FONT_SIZE_PROJ = 13.5       # .proj
+FONT_SIZE_XS_BASE = 9
+FONT_SIZE_XS = pt(FONT_SIZE_XS_BASE)            # .badge, rrow header labels, lane "speech" label
+FONT_SIZE_SCOPE_BASE = 9.5
+FONT_SIZE_SCOPE = pt(FONT_SIZE_SCOPE_BASE)       # .insp-scope, .sec-h, canvas-tag/.tag, .blk text
+FONT_SIZE_SM_BASE = 10
+FONT_SIZE_SM = pt(FONT_SIZE_SM_BASE)           # .fsub, footer hint text, .conf caption text, .note
+FONT_SIZE_BTN_SM_BASE = 10.5
+FONT_SIZE_BTN_SM = pt(FONT_SIZE_BTN_SM_BASE)     # .seg span, .btn.sm, samples label, activity-strip text
+FONT_SIZE_BODY_BASE = 11.5
+FONT_SIZE_BODY = pt(FONT_SIZE_BODY_BASE)       # .btn, .tab, .fname, .kv
+FONT_SIZE_MD_BASE = 12.5
+FONT_SIZE_MD = pt(FONT_SIZE_MD_BASE)         # .insp-file
+FONT_SIZE_PROJ_BASE = 13.5
+FONT_SIZE_PROJ = pt(FONT_SIZE_PROJ_BASE)       # .proj
 
 FONT_WEIGHT_FNAME = 550     # .fname
 FONT_WEIGHT_PROJ = 600      # .proj, .insp-file
@@ -94,10 +149,14 @@ LETTER_SPACING_INSP_SCOPE_EM = 0.08  # .insp-scope
 # --------------------------------------------------------------------------
 # Layout sizes (px)
 # --------------------------------------------------------------------------
-RAIL_WIDTH = 246         # .rail
-INSPECTOR_WIDTH = 322    # .insp
-THUMB_WIDTH = 56         # .thumb
-THUMB_HEIGHT = 32
+RAIL_WIDTH_BASE = 246
+RAIL_WIDTH = px(RAIL_WIDTH_BASE)         # .rail
+INSPECTOR_WIDTH_BASE = 322
+INSPECTOR_WIDTH = px(INSPECTOR_WIDTH_BASE)    # .insp
+THUMB_WIDTH_BASE = 56
+THUMB_WIDTH = px(THUMB_WIDTH_BASE)         # .thumb
+THUMB_HEIGHT_BASE = 32
+THUMB_HEIGHT = px(THUMB_HEIGHT_BASE)
 
 # --------------------------------------------------------------------------
 # Radii (ui-spec.md §2.4, transcribed from the literal CSS this task's
@@ -108,24 +167,38 @@ THUMB_HEIGHT = 32
 # `.hf .bar { ... border-radius:2px; ... }`) says 2px for both -- read
 # directly from workbench-hifi.html/tabs-hifi.html, which is what
 # _BarTrack (app/widgets/base.py) actually paints.
-RADIUS_THUMB_BOX = 1   # .thumb i (the crop box drawn on a queue thumbnail)
-RADIUS_XS = 2      # .bar, .mini
-RADIUS_THUMB = 3   # .thumb, .sthumb
-RADIUS_TAG = 4     # .badge, .tag, .pbar
-RADIUS_SEG = 5     # .seg span, .track, .ztile
-RADIUS_BTN = 6     # .btn, .kv, .canvas
-RADIUS_ROW = 7     # .frow
-RADIUS_CHIP = 20   # .chip (pill)
+RADIUS_THUMB_BOX_BASE = 1
+RADIUS_THUMB_BOX = px(RADIUS_THUMB_BOX_BASE)   # .thumb i (the crop box drawn on a queue thumbnail)
+RADIUS_XS_BASE = 2
+RADIUS_XS = px(RADIUS_XS_BASE)      # .bar, .mini
+RADIUS_THUMB_BASE = 3
+RADIUS_THUMB = px(RADIUS_THUMB_BASE)   # .thumb, .sthumb
+RADIUS_TAG_BASE = 4
+RADIUS_TAG = px(RADIUS_TAG_BASE)     # .badge, .tag, .pbar
+RADIUS_SEG_BASE = 5
+RADIUS_SEG = px(RADIUS_SEG_BASE)     # .seg span, .track, .ztile
+RADIUS_BTN_BASE = 6
+RADIUS_BTN = px(RADIUS_BTN_BASE)     # .btn, .kv, .canvas
+RADIUS_ROW_BASE = 7
+RADIUS_ROW = px(RADIUS_ROW_BASE)     # .frow
+RADIUS_CHIP_BASE = 20
+RADIUS_CHIP = px(RADIUS_CHIP_BASE)   # .chip (pill)
 # What the QSS uses for .chip: CSS clamps 20px to half the height (a pill), but Qt draws square
 # corners when a radius exceeds half the widget, so the ~22 px chip gets half its height instead.
-RADIUS_CHIP_QT = 10
+RADIUS_CHIP_QT_BASE = 10
+RADIUS_CHIP_QT = px(RADIUS_CHIP_QT_BASE)
 RADIUS_DOT = 50    # .dot -- CSS 50%; widgets translate this to width/2 px
 
 # --------------------------------------------------------------------------
 # Fixed component sizes (px), from the literal CSS
 # --------------------------------------------------------------------------
-BAR_WIDTH = 74     # .bar (ConfBar's track)
-BAR_HEIGHT = 3
-MINI_WIDTH = 90    # .mini (MiniProgress's track)
-MINI_HEIGHT = 4
-DOT_SIZE = 7       # .dot
+BAR_WIDTH_BASE = 74
+BAR_WIDTH = px(BAR_WIDTH_BASE)     # .bar (ConfBar's track)
+BAR_HEIGHT_BASE = 3
+BAR_HEIGHT = px(BAR_HEIGHT_BASE)
+MINI_WIDTH_BASE = 90
+MINI_WIDTH = px(MINI_WIDTH_BASE)    # .mini (MiniProgress's track)
+MINI_HEIGHT_BASE = 4
+MINI_HEIGHT = px(MINI_HEIGHT_BASE)
+DOT_SIZE_BASE = 7
+DOT_SIZE = px(DOT_SIZE_BASE)       # .dot
