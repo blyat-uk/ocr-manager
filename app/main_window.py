@@ -65,7 +65,7 @@ from PyQt6.QtWidgets import (
 
 from app.controller import ProjectController, UnsupportedProjectVersion
 from app.logbook import PIPELINE_LOG
-from app.state_text import can_mark_reviewed
+from app.state_text import can_mark_reviewed, can_run_proof
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
 from app.views.folder_settings import FolderSettingsSheet
@@ -100,6 +100,12 @@ OVERWRITE_TITLE = "Replace existing subtitles?"
 OVERWRITE_TEXT = ("{n} file(s) already have subtitles in chi/. Re-run and replace them when their new output "
                   "is ready?")
 NOTHING_TO_RUN = "Nothing to run — the files you picked already have subtitles."
+RUN_STOP_TITLE = "A run is in progress"
+RUN_OPEN_TEXT = "Stop it and open the other folder?"
+RUN_QUIT_TEXT = "Stop it and quit?"
+BLOCKED_SAVE_TITLE = "Settings were not saved"
+BLOCKED_SAVE_TEXT = ("This folder's .ocr.json could not be written, so nothing you changed in this session is "
+                     "on disk. Close anyway?")
 
 
 def dependency_problems() -> list[tuple[str, str]]:
@@ -145,6 +151,7 @@ class MainWindow(QMainWindow):
                  tabs_factory: Callable[[ProjectController], list[StageTab]] = placeholder_tabs):
         super().__init__()
         self.controller = controller if controller is not None else ProjectController(parent=self)
+        self._closing = False               # the close was confirmed: never ask its questions twice
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self._picker = FolderPicker(self)
@@ -223,6 +230,7 @@ class MainWindow(QMainWindow):
         controller.project_closed.connect(self._on_project_closed)
         controller.save_failed.connect(lambda message: self.error_banner.show_message(SAVE_FAILED_TITLE, message,
                                                                                       "bad"))
+        controller.project_saved.connect(self._on_project_saved)
         for signal in (controller.project_opened, controller.project_closed, controller.files_changed,
                        controller.file_changed, controller.proof_started, controller.proof_finished):
             signal.connect(self._sync_actions)
@@ -240,10 +248,42 @@ class MainWindow(QMainWindow):
 
     # --- folders --------------------------------------------------------------------------
 
+    def _run_in_progress(self) -> bool:
+        snapshot = self.controller.run_snapshot()
+        return snapshot is not None and not snapshot.finished
+
+    def _ask(self, title: str, text: str) -> bool:
+        """One Yes/No question, default No, in the style of the overwrite
+        prompt (the window's only modals)."""
+        answers = QMessageBox.StandardButton
+        return QMessageBox.question(self, title, text, answers.Yes | answers.No,
+                                    answers.No) == answers.Yes
+
+    def _may_stop_the_run(self, text: str) -> bool:
+        """True to go ahead: no run is on, or the user agreed to stop it. The
+        run is then stopped cooperatively and the stop is logged, rather than
+        vanishing with the folder's jobs (close_folder cancels everything)."""
+        if not self._run_in_progress():
+            return True
+        if not self._ask(RUN_STOP_TITLE, text):
+            return False
+        self.controller.append_log(PIPELINE_LOG, f"\nRun stopped: {text}\n")
+        logger.info("stopping the run: %s", text)
+        self.controller.stop_run()
+        return True
+
     def open_folder(self, path: str) -> None:
         """Open `path`. A folder that cannot be opened (an unsupported project
         version, not a directory, ...) is reported in place: inline in the
-        empty state, or as a banner while another folder stays open."""
+        empty state, or as a banner while another folder stays open.
+
+        Opening a folder closes the open one, which cancels its jobs -- the
+        running OCR among them. The project block is a one-click folder
+        picker sitting exactly where the run status prints, and Ctrl+O and a
+        dropped folder do the same, so a run is never lost to one click:
+        stopping it takes one question first."""
+        if not self._may_stop_the_run(RUN_OPEN_TEXT):
+            return
         try:
             self.controller.open_folder(path)
         except Exception as exc:                     # reported to the user, never raised into Qt
@@ -262,10 +302,18 @@ class MainWindow(QMainWindow):
         remember_path(path)
         self.setWindowTitle(f"{APP_NAME} — {os.path.basename(path) or path}")
         self.open_view.clear_error()
-        self.error_banner.hide()
+        if self.error_banner.title() != SAVE_FAILED_TITLE:
+            self.error_banner.hide()      # an open failure is over; a warning about unsaved work is not
         self.centre.setCurrentWidget(self.workbench)
         self.set_mode(MODE_REVIEW)
         self.queue.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_project_saved(self) -> None:
+        """The next successful save takes the "Not saved" banner down: a
+        banner nothing but ✕ can clear goes on saying the folder is unsaved
+        long after it was written."""
+        if self.error_banner.title() == SAVE_FAILED_TITLE:
+            self.error_banner.hide()
 
     def _on_project_closed(self) -> None:
         self.setWindowTitle(APP_NAME)
@@ -273,21 +321,28 @@ class MainWindow(QMainWindow):
         self.set_mode(MODE_REVIEW)
 
     def _on_selection_changed(self, name) -> None:
+        # Before the views ask for their pixels: the frames and strips of the
+        # file being left are not worth a worker any more (see
+        # ProjectController.set_view_file).
+        self.controller.set_view_file(name)
         self.stage.set_file(name)
         self.inspector.set_file(name)
         self._sync_actions()
 
     def _sync_actions(self, *_args) -> None:
         """Space and T act on the selected file; neither while the focused
-        widget consumes keys, Space not while the file is PENDING, and T not
-        while that file's proof is already running (ruling C4: T and the
+        widget consumes keys, Space not while the file is PENDING or a value
+        it needs is missing, and T not while that file's proof is already
+        running or its metadata has not been read (ruling C4: T and the
         inspector's "T run" button are one command)."""
         name = self.queue.selected()
         has_file = name is not None and name in self.controller.names()
         focused = QApplication.focusWidget()
         editing = consumes_keys(focused) or self.folder_settings.contains_focus(focused)
-        self.proof_action.setEnabled(has_file and not editing and not self.controller.proof_pending(name))
-        self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(self.controller.entry(name)))
+        entry = self.controller.entry(name) if has_file else None
+        self.proof_action.setEnabled(has_file and not editing and not self.controller.proof_pending(name)
+                                     and can_run_proof(entry))
+        self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(entry))
 
     def report_unexpected_error(self, text: str) -> None:
         """An exception nothing handled (see app/__main__.py's excepthook): its
@@ -396,6 +451,17 @@ class MainWindow(QMainWindow):
                                                 "\n\n".join(text for _title, text in problems), "warn")
 
     def closeEvent(self, event) -> None:
+        """Quitting stops whatever is running, so it asks the same questions
+        opening another folder does: once, and only while there is something
+        to lose."""
+        if not self._closing:
+            if not self._may_stop_the_run(RUN_QUIT_TEXT):
+                event.ignore()
+                return
+            if self.controller.save_blocked and not self._ask(BLOCKED_SAVE_TITLE, BLOCKED_SAVE_TEXT):
+                event.ignore()
+                return
+            self._closing = True
         app_settings().setValue(GEOMETRY_KEY, self.saveGeometry())
         if self.logs_window is not None:
             self.logs_window.close()

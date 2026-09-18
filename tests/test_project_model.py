@@ -1107,3 +1107,32 @@ def test_ocr_json_is_written_before_the_evidence(tmp_path, monkeypatch):
     save_project(_evidence_project(tmp_path, ["a.mkv", "b.mkv"]))
     assert [path.name for path in spy.paths][0] == ".ocr.json"
     assert len(spy.paths) == 3
+
+
+# --------------------------------------------------------------------------
+# clamp_crop_box
+# --------------------------------------------------------------------------
+
+def test_clamp_crop_box_leaves_a_box_the_frame_holds_alone():
+    from core.project.model import clamp_crop_box
+
+    assert clamp_crop_box((288, 786, 1344, 53), (1920, 1080)) == (288, 786, 1344, 53)
+    assert clamp_crop_box((0, 0, 1920, 1080), (1920, 1080)) == (0, 0, 1920, 1080)
+
+
+def test_clamp_crop_box_keeps_the_size_and_moves_the_origin():
+    """Unlike videocr's own clamp, which keeps the origin and cuts the size:
+    a subtitle band keeps its width and slides inside the frame."""
+    from core.project.model import clamp_crop_box
+
+    assert clamp_crop_box((288, 784, 1344, 55), (1280, 720)) == (0, 665, 1280, 55)
+
+
+def test_clamp_crop_box_without_a_frame_size_changes_nothing():
+    """The metadata job has not run: there is nothing to clamp against, and
+    apply_metadata re-checks the value when the size arrives."""
+    from core.project.model import clamp_crop_box, frame_size_known
+
+    assert clamp_crop_box((288, 784, 1344, 55), (0, 0)) == (288, 784, 1344, 55)
+    assert not frame_size_known(Media())
+    assert frame_size_known(Media(1920, 1080, 10.0, 25.0))

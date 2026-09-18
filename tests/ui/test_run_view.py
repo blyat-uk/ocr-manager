@@ -143,6 +143,9 @@ def make_window(controller, notifications):
 
     yield make
     for window in windows:
+        # The teardown is not a user: it never answers closeEvent's questions
+        # (a run in progress, settings that could not be saved).
+        window._closing = True
         window.close()
         window.deleteLater()
     settle()
@@ -174,6 +177,13 @@ def start(window: MainWindow, fake_runner):
 def deliver(window: MainWindow) -> None:
     window.controller.drain_events()
     settle()
+
+
+def end_run(window: MainWindow, fake_runner, run) -> None:
+    """Let the run job end, so a later close asks nothing."""
+    if not fake_runner.ended(run):
+        fake_runner.finish(run, None, event_type="cancelled")
+    deliver(window)
 
 
 def switch_to(window: MainWindow, index: int) -> None:
@@ -796,3 +806,85 @@ def test_closing_the_window_closes_the_logs_window(controller, make_window, tmp_
     settle()
     assert not logs.isVisible()
 
+
+
+# --------------------------------------------------------------------------
+# Opening another folder, or quitting, while a run is on
+# --------------------------------------------------------------------------
+
+def test_opening_another_folder_during_a_run_asks_first(window, fake_runner, tmp_project, monkeypatch):
+    """The project block is a one-click folder picker sitting where the run
+    status prints, and closing a folder cancels its jobs: losing a run to a
+    misclick must take one question first (ruling C5's spirit)."""
+    from app.main_window import RUN_OPEN_TEXT, RUN_STOP_TITLE
+
+    run = start(window, fake_runner)
+    other = tmp_project(["z01.mkv"])
+    asked = answer(monkeypatch, No)
+
+    window.open_folder(str(other))
+    settle()
+
+    assert [(item[1], item[2]) for item in asked] == [(RUN_STOP_TITLE, RUN_OPEN_TEXT)]
+    assert asked[0][4] == No                                   # default: keep the run
+    assert Path(window.controller.project.path) != other       # the run's folder is still open
+    snapshot = window.controller.run_snapshot()
+    assert snapshot is not None and not snapshot.finished
+    end_run(window, fake_runner, run)
+
+
+def test_opening_another_folder_during_a_run_stops_it_on_yes(window, fake_runner, tmp_project, monkeypatch):
+    start(window, fake_runner)
+    other = tmp_project(["z01.mkv"])
+    answer(monkeypatch, Yes)
+
+    window.open_folder(str(other))
+    settle()
+
+    assert Path(window.controller.project.path) == other
+    assert window.controller.run_snapshot() is None
+    assert "run" in fake_runner.cancelled_keys                 # stopped cooperatively, not just dropped
+
+
+def test_opening_a_folder_with_no_run_asks_nothing(window, fake_runner, tmp_project, monkeypatch):
+    asked = answer(monkeypatch, No)
+    other = tmp_project(["z01.mkv"])
+
+    window.open_folder(str(other))
+    settle()
+
+    assert asked == []
+    assert Path(window.controller.project.path) == other
+
+
+def test_a_finished_run_does_not_guard_the_folder(window, fake_runner, tmp_project, monkeypatch):
+    run = start(window, fake_runner)
+    fake_runner.finish(run, RunSummary(succeeded=list(NAMES), failed={}, cancelled=[], seconds=1.0))
+    deliver(window)
+    asked = answer(monkeypatch, No)
+    other = tmp_project(["z01.mkv"])
+
+    window.open_folder(str(other))
+    settle()
+
+    assert asked == []
+    assert Path(window.controller.project.path) == other
+
+
+@pytest.mark.parametrize("reply, accepted", [(No, False), (Yes, True)])
+def test_quitting_during_a_run_asks_first(window, fake_runner, monkeypatch, reply, accepted):
+    from PyQt6.QtGui import QCloseEvent
+
+    from app.main_window import RUN_QUIT_TEXT, RUN_STOP_TITLE
+
+    run = start(window, fake_runner)
+    asked = answer(monkeypatch, reply)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert [(item[1], item[2]) for item in asked] == [(RUN_STOP_TITLE, RUN_QUIT_TEXT)]
+    assert event.isAccepted() is accepted
+    assert ("run" in fake_runner.cancelled_keys) is accepted
+    fake_runner.finish(run, None, event_type="cancelled")     # so the teardown close asks nothing
+    deliver(window)

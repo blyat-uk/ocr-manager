@@ -199,6 +199,7 @@ class ProjectController(QObject):
     log_appended = pyqtSignal(str, str)         # key ("Pipeline" or filename), text
     logs_cleared = pyqtSignal()                 # logs restarted (a run start keeps "Detections"): re-read log_keys()
     save_failed = pyqtSignal(str)               # message; the values stay in memory
+    project_saved = pyqtSignal()                # .ocr.json written: whatever save_failed said is over
 
     def __init__(self, runner_factory: Callable[[Callable[[JobEvent], None]], JobRunner] = default_runner_factory,
                  parent: QObject | None = None, *, save_debounce_ms: int = 500, drain_interval_ms: int = 30,
@@ -293,6 +294,7 @@ class ProjectController(QObject):
             return
         self._drain_all()
         self._save_now()
+        self._warn_if_save_blocked()
         self._runner.cancel_where(lambda job: True)
         self._autopilot.resume()            # lift this folder's holds from the lanes
         self._discard_events()
@@ -314,6 +316,7 @@ class ProjectController(QObject):
         if self._project is not None:
             self._drain_all()
             self._save_now()
+            self._warn_if_save_blocked()
         self._shut_down = True
         self._drain_timer.stop()
         self._save_timer.stop()
@@ -361,7 +364,14 @@ class ProjectController(QObject):
         return self._proof_outstanding.get(name, 0) > 0
 
     def activity(self) -> ActivitySnapshot:
-        return self._activity.snapshot(paused=self._user_paused, held=self._user_paused or self._run_active)
+        return self._activity.snapshot(paused=self._user_paused)
+
+    def autopilot_held(self) -> bool:
+        """Auto-pilot's detections are held: the user paused it, or a run is
+        in progress. The two reasons are one hold (JobRunner.resume clears
+        every hold on a lane), which is why _sync_autopilot_hold tracks them
+        together."""
+        return self._user_paused or self._run_active
 
     def counts(self) -> dict[str, int]:
         """Chip counts that agree with the row badges (ruling B10):
@@ -408,6 +418,23 @@ class ProjectController(QObject):
         return self._clipboard is not None and any(value is not None for value in self._clipboard.values())
 
     # --- frames and strips for the review views ---------------------------------------
+
+    def set_view_file(self, name: str | None) -> None:
+        """The file the review views are showing, from the window's selection.
+
+        Frames and strips are submitted at VIEW_PRIORITY, above every
+        priority AutoPilot gives its CPU work, on a lane with two workers for
+        the whole folder: view work for a file nobody is looking at any more
+        would decode ahead of the metadata and thumbnails of the file that is
+        on screen. Walking a queue of forty files must not leave thirty-nine
+        files' frames queued, so leaving a file cancels its view jobs.
+
+        A cancelled job teaches nothing about its times (_on_view_event marks
+        nothing for it), so coming back fetches them again. None is "no file
+        shown": all view work is cancelled. Safe with no folder open."""
+        if self._project is None or self._shut_down:
+            return
+        self._runner.cancel_where(lambda job: job.kind in VIEW_KINDS and job.file != name)
 
     def request_frames(self, name: str, times: list[float]) -> None:
         """Fetch `name`'s whole frames at `times` for the crop views.
@@ -649,15 +676,18 @@ class ProjectController(QObject):
 
     # --- run ------------------------------------------------------------------------------
 
-    def startable_files(self, include_flagged: bool = False, *, include_done: bool = False) -> list[str]:
-        """Not skipped, not in the running run, PROPOSED or REVIEWED (FLAGGED
-        too with include_flagged), and not done unless include_done."""
+    def startable_files(self, *, include_done: bool = False) -> list[str]:
+        """Not skipped, not in the running run, PROPOSED or REVIEWED, and not
+        done unless include_done.
+
+        A FLAGGED file is never startable (ruling B6): the way in is to look
+        at what is flagged and mark the file reviewed, which is also what
+        turns its accepted values MANUAL so detection stops changing them."""
         if self._project is None:
             return []
-        states = READY_STATES | ({ReviewState.FLAGGED} if include_flagged else set())
         in_run = set(self._run.snapshot().active_names) if self._run_active else set()
         return [name for name, entry in self._project.files.items()
-                if entry.review in states and not entry.skipped and name not in in_run
+                if entry.review in READY_STATES and not entry.skipped and name not in in_run
                 and (include_done or name not in self._done)]
 
     def files_needing_overwrite(self, names: list[str]) -> list[str]:
@@ -822,7 +852,11 @@ class ProjectController(QObject):
                 self._emit_thumbnails.append(result.file)
             return
         if isinstance(result, MetadataResult):
-            rules.apply_metadata(project, result)
+            # The frame size may cut a crop stored before it was known: that
+            # is a crop change like any other (re-measure what was measured
+            # on the old box, drop the strips grabbed with it).
+            for name in rules.apply_metadata(project, result):
+                self._crop_box_changed(name)
             touched = [result.file]
         elif isinstance(result, CropJobResult):
             rules.apply_crop(project, result)
@@ -1057,6 +1091,18 @@ class ProjectController(QObject):
         if self._project is not None and not self._shut_down and not self._save_blocked:
             self._save_timer.start()
 
+    @property
+    def save_blocked(self) -> bool:
+        """True once a save was refused because the folder's `.ocr.json` was
+        written by a newer version: nothing is saved from here on, so the
+        window warns again before the session's work is lost."""
+        return self._save_blocked
+
+    def _warn_if_save_blocked(self) -> None:
+        if self._project is not None and self._save_blocked:
+            self._save_failure(f"Closing {self._project.path} without saving: "
+                               f"its {store.CONFIG_FILENAME} was written by a newer version.")
+
     def _save_now(self) -> None:
         self._save_timer.stop()
         project = self._project
@@ -1064,6 +1110,7 @@ class ProjectController(QObject):
             return
         try:
             store.save_project(project)
+            self.project_saved.emit()
         except UnsupportedProjectVersion as exc:
             self._save_blocked = True           # someone put a newer project file there: never overwrite it
             self._save_failure(f"Not saving: {exc}")

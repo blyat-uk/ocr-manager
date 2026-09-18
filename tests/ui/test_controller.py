@@ -22,7 +22,7 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
 
 from app.activity import ActivitySnapshot
-from app.controller import ProjectController, default_runner_factory
+from app.controller import VIEW_KINDS, ProjectController, default_runner_factory
 from app.logbook import LOG_LIMIT, LogBook
 from app.run_snapshot import RunSnapshot, RunTracker, notification_for, notify_duration
 from app.state_text import badge_for
@@ -534,7 +534,7 @@ def test_activity_follows_queued_running_and_finished_jobs(make_controller, fake
     assert activity.calls
     snapshot = controller.activity()
     assert isinstance(snapshot, ActivitySnapshot)
-    assert snapshot.current is None and snapshot.queued == len(fake_runner.submissions) and not snapshot.paused
+    assert snapshot.current is None and not snapshot.paused and snapshot.running == ()
 
     crop = fake_runner.last("crop", name)
     fake_runner.start(crop)
@@ -661,7 +661,7 @@ def test_mark_not_reviewed_on_an_idle_folder_is_proposed_not_pending(make_contro
     for submission in list(fake_runner.submissions):          # thumbnails only: finish them
         fake_runner.finish(submission, None)
     controller.drain_events()
-    assert controller.activity().queued == 0 and controller.activity().current is None
+    assert controller.activity().running == () and controller.activity().current is None
 
     controller.mark_reviewed("ep01.mkv", False)
     assert controller.entry("ep01.mkv").review == ReviewState.PROPOSED
@@ -910,7 +910,6 @@ def test_startable_files_and_overwrite(make_controller, fake_runner, tmp_project
     set_states(controller)
 
     assert controller.startable_files() == ["a.mkv", "b.mkv", "g.mkv"]
-    assert controller.startable_files(include_flagged=True) == ["a.mkv", "b.mkv", "c.mkv", "g.mkv"]
     assert controller.startable_files(include_done=True) == ["a.mkv", "b.mkv", "f.mkv", "g.mkv"]
     assert controller.files_needing_overwrite(["a.mkv", "f.mkv", "c.mkv"]) == ["f.mkv"]
 
@@ -1022,7 +1021,7 @@ def test_run_end_releases_autopilot_only_without_a_user_pause(
         controller.pause_autopilot()
     controller.start_run(["ep01.mkv"])
     run = fake_runner.last("run")
-    assert controller.activity().held and fake_runner.resumes == []
+    assert controller.autopilot_held() and fake_runner.resumes == []
 
     run_to_end(fake_runner, run, RunSummary(["ep01.mkv"], {}, [], 42.0))
     controller.drain_events()
@@ -1031,10 +1030,10 @@ def test_run_end_releases_autopilot_only_without_a_user_pause(
     assert snapshot.finished and snapshot.summary == RunSummary(["ep01.mkv"], {}, [], 42.0)
     if user_paused:
         assert fake_runner.resumes == []
-        assert controller.activity().paused and controller.activity().held
+        assert controller.activity().paused and controller.autopilot_held()
         controller.resume_autopilot()
     assert set(fake_runner.resumes) == {Lane.GPU, Lane.CPU}
-    assert not controller.activity().paused and not controller.activity().held
+    assert not controller.activity().paused and not controller.autopilot_held()
     assert len(notifications) == 1
     assert notifications[0][:6] == ["notify-send", "-a", "OCR Manager", "-u", "normal", "OCR Complete"]
     assert notifications[0][6].startswith("Finished in 42s | Avg: ")
@@ -1052,12 +1051,12 @@ def test_resuming_autopilot_during_a_run_keeps_the_run_hold(
 
     controller.resume_autopilot()
     assert fake_runner.resumes == []
-    assert not controller.activity().paused and controller.activity().held
+    assert not controller.activity().paused and controller.autopilot_held()
 
     run_to_end(fake_runner, run, RunSummary(["ep01.mkv"], {}, [], 1.0))
     controller.drain_events()
     assert set(fake_runner.resumes) == {Lane.GPU, Lane.CPU}
-    assert not controller.activity().held
+    assert not controller.autopilot_held()
 
 
 def test_a_run_with_a_failed_file_notifies_critical(make_controller, fake_runner, tmp_project, notifications):
@@ -1109,7 +1108,7 @@ def test_a_failed_run_job_fails_its_unfinished_files(make_controller, fake_runne
     assert notifications == [["notify-send", "-a", "OCR Manager", "-u", "critical",
                               "OCR Failed", "Pipeline encountered an error"]]
     assert "Traceback: disk full" in controller.log_text("Pipeline")
-    assert not controller.activity().held
+    assert not controller.autopilot_held()
 
 
 def test_run_end_re_derives_done_states(make_controller, fake_runner, tmp_project, notifications):
@@ -1704,3 +1703,201 @@ def test_requesting_frames_for_an_unknown_file_is_refused(make_controller, tmp_p
         controller.request_frames("nope.mkv", [10.0])
     with pytest.raises(KeyError):
         controller.request_strips("nope.mkv", BOX, [10.0])
+
+
+# --------------------------------------------------------------------------
+# A stored crop is one the file's frame can hold
+# --------------------------------------------------------------------------
+
+SMALL_BOX = (0, 665, 1280, 55)            # BOX's band as a 1280x720 frame holds it
+
+
+def _unscanned(names):
+    """Entries with no media at all: the metadata job has not run."""
+    entries = [make_entry(name, brightness=205) for name in names]
+    for entry in entries:
+        entry.media = Media()
+    return entries
+
+
+def test_set_crop_clamps_to_the_files_frame(make_controller, fake_runner, tmp_project):
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    names = ["ep01.mkv"]
+    entries = [make_entry(name, brightness=205) for name in names]
+    entries[0].media = Media(1280, 720, DURATION, 23.976)
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    controller.set_crop("ep01.mkv", (288, 784, 1344, 55))
+    entry = controller.entry("ep01.mkv")
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == SMALL_BOX
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+    assert badge_for(entry, running_detectors=set(), done=False, run_state=None)[0] == "check crop"
+
+
+def test_pasting_across_resolutions_fits_the_target_and_doubts_the_brightness(
+        make_controller, fake_runner, tmp_project):
+    from core.jobs.apply import FLAG_BRIGHTNESS_OTHER_CROP, FLAG_CROP_CLAMPED
+
+    names = ["ep01.mkv", "ep02.mkv"]
+    entries = [make_entry("ep01.mkv", crop=(288, 784, 1344, 55), brightness=190),
+               make_entry("ep02.mkv")]
+    entries[1].media = Media(1280, 720, DURATION, 23.976)          # the 720p target
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    controller.copy_settings("ep01.mkv")
+    assert controller.paste_settings("ep02.mkv") is True
+    target = controller.entry("ep02.mkv")
+    assert (target.crop.x, target.crop.y, target.crop.width, target.crop.height) == SMALL_BOX
+    assert FLAG_CROP_CLAMPED in target.flags["crop"]
+    assert target.brightness == Brightness(190, Source.MANUAL)
+    assert FLAG_BRIGHTNESS_OTHER_CROP in target.flags["brightness"]
+    assert target.review == ReviewState.FLAGGED
+    assert badge_for(target, running_detectors=set(), done=False,
+                     run_state=None)[0] == "check crop + brightness"
+
+
+def test_a_crop_edited_before_the_metadata_lands_is_cut_when_it_arrives(
+        make_controller, fake_runner, tmp_project):
+    """The crop canvas has to assume a frame size until the metadata job
+    reports one; whatever it assumed, the stored box is re-checked here."""
+    from core.jobs.apply import FLAG_CROP_CLAMPED
+
+    names = ["ep01.mkv"]
+    folder = tmp_project(names, config=v2_config(_unscanned(names), autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    controller.set_crop("ep01.mkv", (288, 784, 1344, 55))          # drawn against a guessed 1920x1080
+    entry = controller.entry("ep01.mkv")
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == (288, 784, 1344, 55)
+    assert not (entry.flags.get("crop") or "")                     # nothing to check it against yet
+    controller.mark_reviewed("ep01.mkv")
+    assert entry.review == ReviewState.REVIEWED
+
+    changed = Spy(controller.file_changed)
+    metadata = fake_runner.last("metadata", "ep01.mkv")
+    fake_runner.finish(metadata, MetadataResult("ep01.mkv", 1280, 720, DURATION, 23.976))
+    controller.drain_events()
+
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == SMALL_BOX
+    assert FLAG_CROP_CLAMPED in entry.flags["crop"]
+    assert entry.review == ReviewState.FLAGGED
+    assert "ep01.mkv" in changed.firsts
+
+
+def test_metadata_that_fits_the_stored_crop_changes_nothing(make_controller, fake_runner, tmp_project):
+    names = ["ep01.mkv"]
+    entries = _unscanned(names)
+    entries[0].crop = Crop(*BOX, Source.MANUAL)
+    entries[0].brightness = Brightness(205, Source.MANUAL)
+    entries[0].review = ReviewState.REVIEWED
+    folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    metadata = fake_runner.last("metadata", "ep01.mkv")
+    fake_runner.finish(metadata, MetadataResult("ep01.mkv", 1920, 1080, DURATION, 23.976))
+    controller.drain_events()
+
+    entry = controller.entry("ep01.mkv")
+    assert (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height) == BOX
+    assert entry.review == ReviewState.REVIEWED
+
+
+# --------------------------------------------------------------------------
+# View jobs follow the selection
+# --------------------------------------------------------------------------
+
+class Cancels:
+    """Runs the cancel_where predicates the controller records against the
+    fake runner's queue, as the real runner does: a matching queued job ends
+    "cancelled". Only jobs queued when a predicate is recorded can match it,
+    so the predicates are applied in the order they arrive."""
+
+    def __init__(self, controller, fake_runner):
+        self._controller = controller
+        self._runner = fake_runner
+        self._seen = len(fake_runner.cancel_predicates)
+
+    def settle(self) -> None:
+        for predicate in self._runner.cancel_predicates[self._seen:]:
+            for submission in list(self._runner.queued()):
+                if predicate(submission.job):
+                    self._runner.emit(submission, "cancelled", result=None)
+        self._seen = len(self._runner.cancel_predicates)
+        self._controller.drain_events()
+
+    def view_jobs(self) -> list:
+        self.settle()
+        return [s.job for s in self._runner.queued() if s.job.kind in VIEW_KINDS]
+
+
+def test_walking_the_queue_leaves_only_the_current_files_view_jobs(
+        make_controller, fake_runner, tmp_project):
+    """VIEW_PRIORITY outranks every auto-pilot job on a two-worker lane, so
+    frames for files the user has walked past would decode ahead of the
+    metadata and thumbnails of the file they are looking at."""
+    names = [f"ep{index:02d}.mkv" for index in range(1, 6)]
+    controller, _ = _frames_controller(make_controller, tmp_project, names)
+    cancels = Cancels(controller, fake_runner)
+
+    for name in names:
+        controller.set_view_file(name)
+        cancels.settle()
+        controller.request_frames(name, [10.0, 20.0])
+        controller.request_strips(name, BOX, [10.0])
+
+    live = cancels.view_jobs()
+    assert {job.file for job in live} == {"ep05.mkv"}
+    assert sorted(job.kind for job in live) == ["frames", "strips"]
+
+
+def test_leaving_every_file_cancels_all_view_work(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    cancels = Cancels(controller, fake_runner)
+    controller.set_view_file("ep01.mkv")
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_strips("ep01.mkv", BOX, [10.0])
+
+    controller.set_view_file(None)
+    assert cancels.view_jobs() == []
+
+
+def test_set_view_file_never_cancels_anything_but_view_jobs(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.set_view_file("ep02.mkv")
+
+    other = [job for job in (s.job for s in fake_runner.submissions) if job.kind not in VIEW_KINDS]
+    assert other, "the folder submits thumbnails at least"
+    for predicate in fake_runner.cancel_predicates:
+        assert not any(predicate(job) for job in other)
+
+
+def test_a_cancelled_view_job_releases_its_times_for_the_next_visit(
+        make_controller, fake_runner, tmp_project):
+    """_on_view_event marks nothing for a cancelled job: coming back to the
+    file must fetch those times again rather than draw the placeholder."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.set_view_file("ep01.mkv")
+    controller.request_frames("ep01.mkv", [10.0])
+    submission = fake_runner.last("frames", "ep01.mkv")
+
+    controller.set_view_file("ep02.mkv")
+    fake_runner.emit(submission, "cancelled", result=None)
+    controller.drain_events()
+
+    controller.set_view_file("ep01.mkv")
+    controller.request_frames("ep01.mkv", [10.0])
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 2
+
+
+def test_set_view_file_without_a_folder_does_nothing(make_controller):
+    controller = make_controller()
+    controller.set_view_file("ep01.mkv")
+    controller.set_view_file(None)

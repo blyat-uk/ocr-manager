@@ -36,9 +36,7 @@ class ActivitySnapshot:
     current: tuple[str, str | None, float | None, str] | None
     # Finished jobs, newest first: (kind, file, finished_at).
     recent: list[tuple[str, str | None, float]]
-    queued: int                   # jobs queued, not started
     paused: bool                  # the user paused auto-pilot
-    held: bool = False            # auto-pilot's detections are held: user pause or a run in progress
     running: tuple[tuple[str, str | None], ...] = field(default_factory=tuple)   # (kind, file), oldest first
 
 
@@ -87,7 +85,7 @@ class ActivityTracker:
         return {job.kind for job in self._running()
                 if job.file == file or (job.file is None and job.kind == "ranges")}
 
-    def snapshot(self, *, paused: bool, held: bool) -> ActivitySnapshot:
+    def snapshot(self, *, paused: bool) -> ActivitySnapshot:
         running = self._running()
         current = None
         if running:
@@ -96,9 +94,7 @@ class ActivityTracker:
         return ActivitySnapshot(
             current=current,
             recent=list(self._recent),
-            queued=sum(1 for job in self._jobs.values() if job.started_at is None),
             paused=paused,
-            held=held,
             running=tuple((job.kind, job.file) for job in running),
         )
 

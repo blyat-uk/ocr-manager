@@ -392,3 +392,49 @@ def test_matches_old_ocr_worker(entry_factory, folder):
 
     assert new_call.kwargs == old_kwargs
     assert new_call.time_ranges == old_ranges
+
+
+# --------------------------------------------------------------------------
+# The stored crop is the region videocr really slices
+# --------------------------------------------------------------------------
+# A crop the frame cannot hold is narrowed by videocr/video.py's own clamp
+# (or dropped entirely, at which point the OCR pass falls back to "only use
+# bottom third of the frame"), so the run would not read the band the user
+# reviewed. Every writer of a crop clamps with `clamp_crop_box`, and this
+# pins that the clamped value survives videocr's clamp untouched.
+
+@pytest.mark.parametrize(
+    "frame_size, box",
+    [
+        ((1280, 720), (288, 784, 1344, 55)),      # a 1080p crop pasted onto a 720p file
+        ((1920, 1080), (288, 786, 1344, 53)),     # already fits: unchanged
+        ((640, 360), (0, 0, 1920, 1080)),         # larger than the frame in both directions
+        ((1920, 1080), (-40, -10, 4000, 4000)),   # negative origin
+        ((1920, 1080), (1919, 1079, 2, 2)),       # smaller than the minimum side
+        ((16, 12), (5, 5, 400, 400)),             # a frame smaller than the minimum side
+        ((3840, 2160), (100, 2100, 3000, 400)),   # runs past the bottom edge
+    ],
+    ids=["paste_1080p_onto_720p", "fits", "larger_both_ways", "negative_origin",
+         "below_minimum", "tiny_frame", "past_bottom"],
+)
+def test_a_stored_crop_is_the_region_videocr_slices(frame_size, box):
+    from core.project.model import clamp_crop_box
+    from videocr.video import infer_crop_region
+
+    stored = clamp_crop_box(box, frame_size)
+    width, height = frame_size
+    region = infer_crop_region(width, height, *stored)
+    assert region is not None, "videocr would drop this crop and OCR the bottom third instead"
+    x_start, y_start, x_end, y_end = region
+    assert (x_start, y_start, x_end - x_start, y_end - y_start) == stored
+
+
+def test_videocr_narrows_or_drops_a_crop_the_frame_cannot_hold():
+    """The behaviour clamp_crop_box exists to keep out of the model."""
+    from videocr.video import infer_crop_region
+
+    # The verified paste-across-resolutions box: videocr keeps x and cuts the
+    # width, and the height clamps to zero, so the crop is dropped entirely.
+    assert infer_crop_region(1280, 720, 288, 784, 1344, 55) is None
+    # Same box one row higher: kept, but 352 px narrower than the value says.
+    assert infer_crop_region(1280, 720, 288, 600, 1344, 55) == (288, 600, 1280, 655)

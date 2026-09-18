@@ -32,6 +32,7 @@ from core.detect import crop as _crop
 from core.detect.flags import only_informational
 from core.jobs import apply as _apply
 from core.jobs.apply import brightness_is_stale
+from core.jobs.detect_jobs import UNSCANNED_MESSAGE
 from core.jobs.detect_jobs import proof_window as _proof_window
 from core.project.model import FileEntry, ReviewState, Source
 
@@ -69,14 +70,21 @@ def _is_detected_value(value) -> bool:
 
 
 def _flag_blocks_detected_value(entry: FileEntry, name: str, value) -> bool:
-    """Mirrors core.jobs.apply's `_is_detected(value) and _blocking(entry,
-    name)`, the ONLY test apply.py uses to decide a stored flag counts
-    against a field. `entry.flags[name]` is never cleared when a flagged
-    DETECTED/HINT value is accepted as MANUAL (mark_reviewed keeps the flag
-    string -- see its own docstring: "its evidence and flag stay stored"),
-    so a leftover blocking flag on a MANUAL/IMPORTED value must NOT count
-    here, or a badge would keep warning about a value the user already
-    accepted."""
+    """Mirrors core.jobs.apply's `_counts_flagged`, the ONLY test apply.py
+    uses to decide a stored flag counts against a field. `entry.flags[name]`
+    is never cleared when a flagged DETECTED/HINT value is accepted as MANUAL
+    (mark_reviewed keeps the flag string -- see its own docstring: "its
+    evidence and flag stay stored"), so a leftover blocking flag on a
+    MANUAL/IMPORTED value must NOT count here, or a badge would keep warning
+    about a value the user already accepted.
+
+    apply.SOURCE_INDEPENDENT_FLAGS are the exception: they describe the
+    stored value (a crop cut to fit the frame, a brightness pasted for a crop
+    this file cannot hold), not a detection, so they count whoever set it --
+    and mark_reviewed does drop them."""
+    reasons = set((entry.flags.get(name) or "").split("+"))
+    if reasons & _apply.SOURCE_INDEPENDENT_FLAGS.get(name, frozenset()):
+        return True
     return _is_detected_value(value) and _flag_blocks(entry.flags.get(name), _INFORMATIONAL_FLAGS[name])
 
 
@@ -166,11 +174,15 @@ def badge_for(entry: FileEntry, *, running_detectors: set[str], done: bool,
 # Captions (crop_caption / brightness_caption / ranges_caption)
 # --------------------------------------------------------------------------
 
-_NOT_DETECTED = "not detected yet"  # evidence=None, source neither MANUAL nor
-                                     # IMPORTED: not covered by the brief's
-                                     # caption rules (a field with no value
-                                     # and no detection run yet) -- a neutral
-                                     # placeholder rather than a guessed reason.
+_NOT_DETECTED = "not detected yet"   # no value at all (source None) and no
+                                     # evidence: the field is empty and no
+                                     # detection has produced anything for it.
+_NO_EVIDENCE_KEPT = "detected earlier · no evidence kept"
+# A DETECTED/HINT value whose evidence dict is gone. Evidence is written to
+# the disposable `.ocr-cache/` (core/project/store.py), while the value, its
+# source and its flags live in `.ocr.json`, so wiping the cache leaves a
+# perfectly good detected value with nothing to quote. "not detected yet"
+# beside the box that detection produced is simply untrue.
 
 
 def _manual_or_imported(source: Source | None) -> tuple[str, float, str] | None:
@@ -187,6 +199,20 @@ def _manual_or_imported(source: Source | None) -> tuple[str, float, str] | None:
     return None
 
 
+def _no_evidence(source: Source | None, blocking: bool) -> tuple[str, float, str]:
+    """The caption for a field with no evidence dict: provenance for a
+    MANUAL or IMPORTED value, _NOT_DETECTED for no value at all, and
+    _NO_EVIDENCE_KEPT for a detected or hinted value whose reading was
+    thrown away with the cache. `blocking` still warns there -- the flags it
+    comes from are stored beside the value, not in the evidence."""
+    provenance = _manual_or_imported(source)
+    if provenance is not None:
+        return provenance
+    if source is None:
+        return _NOT_DETECTED, 0.0, "default"
+    return _NO_EVIDENCE_KEPT, 0.0, ("warn" if blocking else "default")
+
+
 def crop_caption(evidence: dict | None, source: Source | None, *,
                   blocking: bool = False) -> tuple[str, float, str]:
     """(caption, bar fraction, tone) for the Detected section's Crop row.
@@ -196,12 +222,12 @@ def crop_caption(evidence: dict | None, source: Source | None, *,
     "differs-from-hint?" (core/jobs/apply.py's FLAG_DIFFERS_FROM_HINT),
     composed onto `entry.flags` but never written into the stored evidence
     dict itself. True forces tone "warn" on top of whatever the evidence
-    alone would say. Ignored for the MANUAL/IMPORTED/no-evidence branches,
-    which are provenance text, not a confidence reading."""
+    alone would say. Ignored for the MANUAL/IMPORTED branches, which are
+    provenance text, not a confidence reading."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
-        return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
+        return _no_evidence(source, blocking)
     agreed = int(evidence.get("agreed") or 0)
     probes_used = int(evidence.get("probes_used") or 0)
     bar = (agreed / probes_used) if probes_used else 0.0
@@ -225,11 +251,11 @@ def brightness_caption(evidence: dict | None, source: Source | None, *,
 
     `blocking`: as `crop_caption`'s, e.g. entry.flags["brightness"] holding
     "differs-from-hint?" from a hint re-detection. Ignored for the MANUAL/
-    IMPORTED/no-evidence branches."""
+    IMPORTED branches."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
-        return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
+        return _no_evidence(source, blocking)
     plateau = evidence.get("plateau")
     if plateau is None:
         return "not verified", 0.0, "warn"
@@ -258,12 +284,11 @@ def ranges_caption(evidence: dict | None, source: Source | None, *,
     `blocking`: as `crop_caption`'s -- entry.flags["ranges"] holding a
     blocking flag the caller found (core/jobs/apply.py does not write one
     today; see the module docstring). Forces tone "warn" whether or not
-    blocks were found. Ignored for the MANUAL/IMPORTED/no-evidence
-    branches."""
+    blocks were found. Ignored for the MANUAL/IMPORTED branches."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
-        return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
+        return _no_evidence(source, blocking)
     blocks = [b for b in (evidence.get("blocks") or []) if b.get("kind") in ("intro", "outro")]
     if not blocks:
         return "no repeating intro/outro found", 0.0, ("warn" if blocking else "default")
@@ -367,6 +392,17 @@ def proof_window_clock(sample_time: float | None, duration: float) -> str | None
     return f"{clock(start)}–{clock(end)}"
 
 
+PROOF_WAIT_TOOLTIP = UNSCANNED_MESSAGE     # the same sentence run_proof refuses with
+
+
+def can_run_proof(entry: FileEntry) -> bool:
+    """Whether "Test OCR" (T, the inspector's "T run", the queue's menu item)
+    has a window to run on. `proof_window` refuses a file whose duration is
+    not known yet -- its metadata job has not run, or could not -- so the
+    action is not offered rather than offered and refused."""
+    return proof_window_clock(entry.sample_time, entry.media.duration) is not None
+
+
 # --------------------------------------------------------------------------
 # Brightness flag copy (the Brightness tab's panel)
 # --------------------------------------------------------------------------
@@ -388,6 +424,7 @@ BRIGHTNESS_FLAG_TEXT = {
     _brightness.FLAG_ESCALATE: "not verified",
     _brightness.FLAG_CANCELLED: "detection was cancelled",
     _apply.FLAG_DIFFERS_FROM_HINT: "differs from the value it was hinted with",
+    _apply.FLAG_BRIGHTNESS_OTHER_CROP: "measured for a crop this file cannot hold",
 }
 
 
@@ -446,6 +483,7 @@ def field_blocking(entry: FileEntry, field: str) -> bool:
 # --------------------------------------------------------------------------
 
 REVIEW_WAIT_TOOLTIP = "waiting for detections to finish"
+REVIEW_MISSING_TOOLTIP = "set a {what} first"
 
 
 def is_reviewed(entry: FileEntry) -> bool:
@@ -462,11 +500,40 @@ def is_manual(value) -> bool:
     return value is not None and value.source == Source.MANUAL
 
 
+def missing_required_values(entry: FileEntry) -> list[str]:
+    """Which of crop/brightness the file has not got a usable value for, in
+    B10's order -- `core.jobs.apply.counts_as_missing`, the same predicate
+    that decides REVIEWED is not stored (compute_review_state's first rung
+    outranks the stored mark).
+
+    Only a PENDING or FLAGGED file can be missing one, which is how this
+    reads the folder's requirements without being handed the folder: a
+    labels-only folder requires neither value, so compute_review_state never
+    sends its files to those two states over a missing one, and a PROPOSED or
+    REVIEWED file has everything its folder asks for by construction."""
+    if entry.review not in (ReviewState.PENDING, ReviewState.FLAGGED):
+        return []
+    return [name for name in _apply.DIALOGUE_DETECTORS if _apply.counts_as_missing(entry, name)]
+
+
 def can_mark_reviewed(entry: FileEntry) -> bool:
     """"Mark reviewed" (the button, Space, the queue menu) is offered unless
-    the file is still PENDING: its detections have not finished, so there is
-    nothing settled to accept yet."""
-    return not is_pending(entry)
+    the file is still PENDING -- its detections have not finished, so there is
+    nothing settled to accept yet -- or a required value is missing or stale,
+    which core/jobs/apply.py refuses to store REVIEWED over: offering it then
+    would leave the file exactly as it was, with nothing said."""
+    return not is_pending(entry) and not missing_required_values(entry)
+
+
+def mark_reviewed_tooltip(entry: FileEntry) -> str:
+    """Why "Mark reviewed" is not offered, in the voice of the rest of the
+    review copy; "" when it is."""
+    if is_pending(entry):
+        return REVIEW_WAIT_TOOLTIP
+    missing = missing_required_values(entry)
+    if not missing:
+        return ""
+    return REVIEW_MISSING_TOOLTIP.format(what=" and ".join(_FIELD_LABEL[name] for name in missing))
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +557,7 @@ _CROP_FLAG_TEXT = {
     _crop.FLAG_OUTLIER_DISCARDED: "one odd frame dropped",
     _crop.FLAG_CANCELLED: "stopped early",
     _crop.FLAG_UNKNOWN_REJECTION: "no box could be built",
+    _apply.FLAG_CROP_CLAMPED: "larger than the frame — cut to fit",
 }
 
 
