@@ -376,10 +376,26 @@ def test_crop_caption_no_evidence_no_source_falls_back():
     assert state_text.crop_caption(None, None) == ("not detected yet", 0.0, "default")
 
 
-def test_crop_caption_no_evidence_detected_source_falls_back():
-    # Should not happen via core/jobs/apply.py (evidence is always stored
-    # alongside a written value), but crop_caption() stays defensive.
-    assert state_text.crop_caption(None, Source.DETECTED) == ("not detected yet", 0.0, "default")
+@pytest.mark.parametrize("caption", ["crop_caption", "brightness_caption", "ranges_caption"])
+@pytest.mark.parametrize("source, expected", [
+    (None, ("not detected yet", 0.0, "default")),
+    (Source.DETECTED, ("detected earlier · no evidence kept", 0.0, "default")),
+    (Source.HINT, ("detected earlier · no evidence kept", 0.0, "default")),
+])
+def test_a_detected_value_with_no_evidence_does_not_read_as_undetected(caption, source, expected):
+    """Evidence lives in the disposable .ocr-cache/, so a perfectly good
+    detected value loses its dict when the cache is wiped. Saying "not
+    detected yet" beside the value it produced is simply untrue; that text
+    belongs to a field with no value at all."""
+    assert getattr(state_text, caption)(None, source) == expected
+
+
+@pytest.mark.parametrize("caption", ["crop_caption", "brightness_caption", "ranges_caption"])
+def test_a_flagged_detected_value_with_no_evidence_still_warns(caption):
+    """entry.flags lives in .ocr.json, so the doubt survives the wipe even
+    though the reading behind it does not."""
+    assert getattr(state_text, caption)(None, Source.DETECTED, blocking=True) == (
+        "detected earlier · no evidence kept", 0.0, "warn")
 
 
 def test_crop_caption_evidence_informational_flag_is_ok():

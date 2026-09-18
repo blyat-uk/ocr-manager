@@ -174,11 +174,15 @@ def badge_for(entry: FileEntry, *, running_detectors: set[str], done: bool,
 # Captions (crop_caption / brightness_caption / ranges_caption)
 # --------------------------------------------------------------------------
 
-_NOT_DETECTED = "not detected yet"  # evidence=None, source neither MANUAL nor
-                                     # IMPORTED: not covered by the brief's
-                                     # caption rules (a field with no value
-                                     # and no detection run yet) -- a neutral
-                                     # placeholder rather than a guessed reason.
+_NOT_DETECTED = "not detected yet"   # no value at all (source None) and no
+                                     # evidence: the field is empty and no
+                                     # detection has produced anything for it.
+_NO_EVIDENCE_KEPT = "detected earlier · no evidence kept"
+# A DETECTED/HINT value whose evidence dict is gone. Evidence is written to
+# the disposable `.ocr-cache/` (core/project/store.py), while the value, its
+# source and its flags live in `.ocr.json`, so wiping the cache leaves a
+# perfectly good detected value with nothing to quote. "not detected yet"
+# beside the box that detection produced is simply untrue.
 
 
 def _manual_or_imported(source: Source | None) -> tuple[str, float, str] | None:
@@ -195,6 +199,20 @@ def _manual_or_imported(source: Source | None) -> tuple[str, float, str] | None:
     return None
 
 
+def _no_evidence(source: Source | None, blocking: bool) -> tuple[str, float, str]:
+    """The caption for a field with no evidence dict: provenance for a
+    MANUAL or IMPORTED value, _NOT_DETECTED for no value at all, and
+    _NO_EVIDENCE_KEPT for a detected or hinted value whose reading was
+    thrown away with the cache. `blocking` still warns there -- the flags it
+    comes from are stored beside the value, not in the evidence."""
+    provenance = _manual_or_imported(source)
+    if provenance is not None:
+        return provenance
+    if source is None:
+        return _NOT_DETECTED, 0.0, "default"
+    return _NO_EVIDENCE_KEPT, 0.0, ("warn" if blocking else "default")
+
+
 def crop_caption(evidence: dict | None, source: Source | None, *,
                   blocking: bool = False) -> tuple[str, float, str]:
     """(caption, bar fraction, tone) for the Detected section's Crop row.
@@ -204,12 +222,12 @@ def crop_caption(evidence: dict | None, source: Source | None, *,
     "differs-from-hint?" (core/jobs/apply.py's FLAG_DIFFERS_FROM_HINT),
     composed onto `entry.flags` but never written into the stored evidence
     dict itself. True forces tone "warn" on top of whatever the evidence
-    alone would say. Ignored for the MANUAL/IMPORTED/no-evidence branches,
-    which are provenance text, not a confidence reading."""
+    alone would say. Ignored for the MANUAL/IMPORTED branches, which are
+    provenance text, not a confidence reading."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
-        return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
+        return _no_evidence(source, blocking)
     agreed = int(evidence.get("agreed") or 0)
     probes_used = int(evidence.get("probes_used") or 0)
     bar = (agreed / probes_used) if probes_used else 0.0
@@ -233,11 +251,11 @@ def brightness_caption(evidence: dict | None, source: Source | None, *,
 
     `blocking`: as `crop_caption`'s, e.g. entry.flags["brightness"] holding
     "differs-from-hint?" from a hint re-detection. Ignored for the MANUAL/
-    IMPORTED/no-evidence branches."""
+    IMPORTED branches."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
-        return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
+        return _no_evidence(source, blocking)
     plateau = evidence.get("plateau")
     if plateau is None:
         return "not verified", 0.0, "warn"
@@ -266,12 +284,11 @@ def ranges_caption(evidence: dict | None, source: Source | None, *,
     `blocking`: as `crop_caption`'s -- entry.flags["ranges"] holding a
     blocking flag the caller found (core/jobs/apply.py does not write one
     today; see the module docstring). Forces tone "warn" whether or not
-    blocks were found. Ignored for the MANUAL/IMPORTED/no-evidence
-    branches."""
+    blocks were found. Ignored for the MANUAL/IMPORTED branches."""
     if source == Source.MANUAL:
         return _manual_or_imported(source)
     if evidence is None:
-        return _manual_or_imported(source) or (_NOT_DETECTED, 0.0, "default")
+        return _no_evidence(source, blocking)
     blocks = [b for b in (evidence.get("blocks") or []) if b.get("kind") in ("intro", "outro")]
     if not blocks:
         return "no repeating intro/outro found", 0.0, ("warn" if blocking else "default")
