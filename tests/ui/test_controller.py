@@ -534,7 +534,7 @@ def test_activity_follows_queued_running_and_finished_jobs(make_controller, fake
     assert activity.calls
     snapshot = controller.activity()
     assert isinstance(snapshot, ActivitySnapshot)
-    assert snapshot.current is None and snapshot.queued == len(fake_runner.submissions) and not snapshot.paused
+    assert snapshot.current is None and not snapshot.paused and snapshot.running == ()
 
     crop = fake_runner.last("crop", name)
     fake_runner.start(crop)
@@ -661,7 +661,7 @@ def test_mark_not_reviewed_on_an_idle_folder_is_proposed_not_pending(make_contro
     for submission in list(fake_runner.submissions):          # thumbnails only: finish them
         fake_runner.finish(submission, None)
     controller.drain_events()
-    assert controller.activity().queued == 0 and controller.activity().current is None
+    assert controller.activity().running == () and controller.activity().current is None
 
     controller.mark_reviewed("ep01.mkv", False)
     assert controller.entry("ep01.mkv").review == ReviewState.PROPOSED
@@ -910,7 +910,6 @@ def test_startable_files_and_overwrite(make_controller, fake_runner, tmp_project
     set_states(controller)
 
     assert controller.startable_files() == ["a.mkv", "b.mkv", "g.mkv"]
-    assert controller.startable_files(include_flagged=True) == ["a.mkv", "b.mkv", "c.mkv", "g.mkv"]
     assert controller.startable_files(include_done=True) == ["a.mkv", "b.mkv", "f.mkv", "g.mkv"]
     assert controller.files_needing_overwrite(["a.mkv", "f.mkv", "c.mkv"]) == ["f.mkv"]
 
@@ -1022,7 +1021,7 @@ def test_run_end_releases_autopilot_only_without_a_user_pause(
         controller.pause_autopilot()
     controller.start_run(["ep01.mkv"])
     run = fake_runner.last("run")
-    assert controller.activity().held and fake_runner.resumes == []
+    assert controller.autopilot_held() and fake_runner.resumes == []
 
     run_to_end(fake_runner, run, RunSummary(["ep01.mkv"], {}, [], 42.0))
     controller.drain_events()
@@ -1031,10 +1030,10 @@ def test_run_end_releases_autopilot_only_without_a_user_pause(
     assert snapshot.finished and snapshot.summary == RunSummary(["ep01.mkv"], {}, [], 42.0)
     if user_paused:
         assert fake_runner.resumes == []
-        assert controller.activity().paused and controller.activity().held
+        assert controller.activity().paused and controller.autopilot_held()
         controller.resume_autopilot()
     assert set(fake_runner.resumes) == {Lane.GPU, Lane.CPU}
-    assert not controller.activity().paused and not controller.activity().held
+    assert not controller.activity().paused and not controller.autopilot_held()
     assert len(notifications) == 1
     assert notifications[0][:6] == ["notify-send", "-a", "OCR Manager", "-u", "normal", "OCR Complete"]
     assert notifications[0][6].startswith("Finished in 42s | Avg: ")
@@ -1052,12 +1051,12 @@ def test_resuming_autopilot_during_a_run_keeps_the_run_hold(
 
     controller.resume_autopilot()
     assert fake_runner.resumes == []
-    assert not controller.activity().paused and controller.activity().held
+    assert not controller.activity().paused and controller.autopilot_held()
 
     run_to_end(fake_runner, run, RunSummary(["ep01.mkv"], {}, [], 1.0))
     controller.drain_events()
     assert set(fake_runner.resumes) == {Lane.GPU, Lane.CPU}
-    assert not controller.activity().held
+    assert not controller.autopilot_held()
 
 
 def test_a_run_with_a_failed_file_notifies_critical(make_controller, fake_runner, tmp_project, notifications):
@@ -1109,7 +1108,7 @@ def test_a_failed_run_job_fails_its_unfinished_files(make_controller, fake_runne
     assert notifications == [["notify-send", "-a", "OCR Manager", "-u", "critical",
                               "OCR Failed", "Pipeline encountered an error"]]
     assert "Traceback: disk full" in controller.log_text("Pipeline")
-    assert not controller.activity().held
+    assert not controller.autopilot_held()
 
 
 def test_run_end_re_derives_done_states(make_controller, fake_runner, tmp_project, notifications):

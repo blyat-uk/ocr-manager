@@ -364,7 +364,14 @@ class ProjectController(QObject):
         return self._proof_outstanding.get(name, 0) > 0
 
     def activity(self) -> ActivitySnapshot:
-        return self._activity.snapshot(paused=self._user_paused, held=self._user_paused or self._run_active)
+        return self._activity.snapshot(paused=self._user_paused)
+
+    def autopilot_held(self) -> bool:
+        """Auto-pilot's detections are held: the user paused it, or a run is
+        in progress. The two reasons are one hold (JobRunner.resume clears
+        every hold on a lane), which is why _sync_autopilot_hold tracks them
+        together."""
+        return self._user_paused or self._run_active
 
     def counts(self) -> dict[str, int]:
         """Chip counts that agree with the row badges (ruling B10):
@@ -669,15 +676,18 @@ class ProjectController(QObject):
 
     # --- run ------------------------------------------------------------------------------
 
-    def startable_files(self, include_flagged: bool = False, *, include_done: bool = False) -> list[str]:
-        """Not skipped, not in the running run, PROPOSED or REVIEWED (FLAGGED
-        too with include_flagged), and not done unless include_done."""
+    def startable_files(self, *, include_done: bool = False) -> list[str]:
+        """Not skipped, not in the running run, PROPOSED or REVIEWED, and not
+        done unless include_done.
+
+        A FLAGGED file is never startable (ruling B6): the way in is to look
+        at what is flagged and mark the file reviewed, which is also what
+        turns its accepted values MANUAL so detection stops changing them."""
         if self._project is None:
             return []
-        states = READY_STATES | ({ReviewState.FLAGGED} if include_flagged else set())
         in_run = set(self._run.snapshot().active_names) if self._run_active else set()
         return [name for name, entry in self._project.files.items()
-                if entry.review in states and not entry.skipped and name not in in_run
+                if entry.review in READY_STATES and not entry.skipped and name not in in_run
                 and (include_done or name not in self._done)]
 
     def files_needing_overwrite(self, names: list[str]) -> list[str]:
