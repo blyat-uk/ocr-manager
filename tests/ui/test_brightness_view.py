@@ -234,6 +234,27 @@ def test_tiles_follow_the_detectors_kind_order_and_end_with_the_pin_tile(loaded)
     assert loaded.grid_widgets()[-1] is loaded.pin_tile()
 
 
+def test_the_pin_tile_is_on_screen_before_any_brightness_evidence_lands(controller):
+    """The state of every file until brightness detection lands, and the
+    permanent state of a file whose detection found no text strips: no tiles
+    at all. The pin tile -- the one thing the user can still do here -- must
+    be IN the grid, not merely in `grid_widgets()`: `_sync_tiles` used to add
+    it only when the tile plan changed, and an empty plan never changes."""
+    give_values(controller, evidence=None)
+    made = BrightnessTab(controller)
+    page = made.page()
+    page.resize(880, 620)
+    page.show()
+    made.set_file(NAME)
+    settle()
+    assert made.tiles() == []
+    pin = made.pin_tile()
+    assert pin.parent() is not None, "the pin tile was never parented into a layout"
+    assert pin.isVisible(), "the tiles area is an empty black rectangle"
+    assert page.rect().contains(pin.geometry()), "the pin tile is not inside the page"
+    page.close()
+
+
 def test_a_kind_the_detector_did_not_choose_is_skipped(controller, fake_runner):
     tiles = {"dark": 10.0, "leaking": 50.0}
     give_values(controller, evidence=brightness_evidence(tiles=tiles))
@@ -534,9 +555,43 @@ def test_the_panel_shows_auto_and_yours(loaded, controller):
     assert loaded.panel.auto_row.value() == "209"
     assert loaded.panel.yours_row.value() == "209"
     assert loaded.panel.yours_row.value_tone() == "acc"
+    assert loaded.panel.preview_text() == ""
+    assert loaded.panel.keep_button.text() == "keep 209"
+
+
+def test_a_dragged_threshold_is_marked_as_a_preview_until_it_is_kept(loaded, controller):
+    """Dragging writes nothing. "Yours 215" would claim the file stores 215
+    while the Detected section 150 px below still reads 209, and a file switch
+    would silently revert it -- so the row names both, and a note says which
+    of the two is kept."""
     loaded.set_preview(215)
     settle()
+    assert loaded.panel.yours_row.value() == "209 → 215"
+    assert loaded.panel.preview_text() == "preview only — 215 is not kept yet"
+    assert loaded.panel.preview_text() in loaded.panel.notes()
+    assert loaded.panel.keep_button.text() == "keep 215"       # still the commit
+
+    loaded.panel.keep_button.click()                           # ... and it commits
+    settle()
+    loaded.refresh()                                           # what the Stage does on file_changed
+    assert controller.entry(NAME).brightness.value == 215
     assert loaded.panel.yours_row.value() == "215"
+    assert loaded.panel.preview_text() == ""
+
+
+def test_a_file_with_nothing_kept_says_its_threshold_is_a_preview(controller):
+    """No stored brightness at all: the curve still starts somewhere, and
+    that somewhere is not a value the file has."""
+    give_values(controller, evidence=brightness_evidence())
+    controller.entry(NAME).brightness = None
+    made = BrightnessTab(controller)
+    made.page().resize(880, 620)
+    made.page().show()
+    made.set_file(NAME)
+    settle()
+    assert made.panel.yours_row.value() == "— → 209"
+    assert made.panel.preview_text() == "preview only — 209 is not kept yet"
+    made.page().close()
 
 
 def test_the_note_names_the_safe_range_the_losing_threshold_and_the_leak(loaded):

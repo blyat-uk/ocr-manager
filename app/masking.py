@@ -1,13 +1,20 @@
-"""The views' bridge to `core/detect`: the detector helpers they call, and
-the pixels they measure with.
+"""The views' bridge to `core`: the detector helpers they call, the pixels
+they measure with, and the model rule that decides what a crop may be.
 
 `tests/ui/test_main_window.py::test_views_import_no_core_modules` rejects any
 `core.*` import in `app/views/*.py`, so a view that needs one of the Qt-free,
-pure detector helpers reaches it through here. This is the whole of that
-bridge -- the Crop tab's box aggregation and mask preview, the Brightness
+pure helpers reaches it through here. This is the whole of that bridge -- the
+Crop tab's box aggregation, crop clamping and mask preview, the Brightness
 tab's strip measurements and the Time ranges tab's speech-in-a-skip check --
 so there is one place to look for what the views take from `core`, and one
-place a detector rename has to reach.
+place a rename has to reach.
+
+`clamp_crop_box` is the one rule here that is not a detector helper: it is
+`core.project.model`'s, the clamp every path that STORES a crop goes through.
+The Crop tab clamps with it before it commits, so the box it draws and
+reports is the box the model keeps -- a second spelling in the view meant the
+model could quietly change a box under it (they differed for a frame smaller
+than MIN_CROP_SIDE, and for a frame whose size is not known yet).
 
 Every wrapper calls through the module object (`_crop.` / `ocr_view.` /
 `_audio.`) rather than a name bound at import time, so a test that
@@ -46,10 +53,13 @@ from core.detect import audio_profile as _audio
 from core.detect import crop as _crop
 from core.detect import ocr_view
 from core.detect.brightness import DEFAULT_BRIGHTNESS, MIN_GLYPH_REGION_PIXELS
+from core.project import model as _model
+from core.project.model import MIN_CROP_SIDE
 
-__all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_T",
+__all__ = ["DEFAULT_BRIGHTNESS", "LOST_ALERT_PERCENT", "LOST_RISE_POINTS", "MAX_T", "MIN_CROP_SIDE",
+           "MIN_T",
            "StripPixels",
-           "aggregate_crop_box", "clip_boxes", "gate_fires", "mask", "mask_region",
+           "aggregate_crop_box", "clamp_crop_box", "clip_boxes", "gate_fires", "mask", "mask_region",
            "normalise_boxes", "speech_in_skips"]
 
 MIN_T = 100                # the thresholds the curve spans; a subtitle threshold
@@ -108,6 +118,13 @@ def aggregate_crop_box(boxes_per_sample, frame_size, settings: dict | None = Non
     box = _crop.aggregate_box(polygons, tuple(int(value) for value in frame_size), settings=settings,
                               sample_times=None if sample_times is None else [float(t) for t in sample_times])
     return None if box is None else tuple(int(value) for value in box)
+
+
+def clamp_crop_box(box, frame_size, minimum: int = MIN_CROP_SIDE) -> tuple[int, int, int, int]:
+    """`core.project.model.clamp_crop_box`, resolved at call time -- the clamp
+    every path that stores a crop goes through, so the Crop tab commits the
+    box the model will keep and not one it has to correct."""
+    return _model.clamp_crop_box(box, frame_size, minimum)
 
 
 def speech_in_skips(speech, skips, min_overlap_sec: float = 2.0) -> list[tuple[float, float]]:

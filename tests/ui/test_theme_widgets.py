@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QLabel, QPushButton
 
 import app
 from app.theme import qss, tokens
+from app.widgets import base
 from app.widgets.base import (
     Badge,
     Button,
@@ -237,6 +238,29 @@ def test_kvrow_set_value_updates_text_and_tone(qapp):
     assert row.property("tone") == "acc"
 
 
+def test_kvrow_only_repolishes_when_the_tone_actually_changes(qapp, monkeypatch):
+    """Every hot refresh path rewrites every row. An unpolish/polish pass per
+    row per refresh -- two of them, row and value -- buys nothing when the
+    tone is what it already was; only the text changed, and a QSS rule does
+    not select on text."""
+    calls = []
+    monkeypatch.setattr(base, "_repolish", lambda widget: calls.append(widget))
+    row = KvRow("Brightness", "209")
+    calls.clear()
+
+    row.set_value("211")                       # same tone, new text
+    assert calls == []
+    assert row.value() == "211"
+
+    row.set_value("211", "warn")               # the tone changed: both repolish
+    assert calls == [row._value_label, row]
+    calls.clear()
+
+    row.set_value("214", "warn")
+    assert calls == []
+    assert row.value_tone() == "warn" and row.property("tone") == "warn"
+
+
 def test_section_header_uppercases_and_holds_trailing_widget(qapp):
     trailing = QPushButton("re-detect")
     header = SectionHeader("Detected", trailing=trailing)
@@ -386,6 +410,27 @@ def test_stylesheet_restates_the_disabled_look_for_button_variants():
     assert 'QPushButton[variant="ghost"]:disabled' in sheet
     # The disabled rule must come after the variant rule it overrides.
     assert sheet.index('QPushButton[variant="primary"]:disabled') > sheet.index('QPushButton[variant="primary"] {')
+
+
+def test_stylesheet_shows_keyboard_focus_on_every_button():
+    """With a stylesheet installed Qt draws no default focus rectangle, so
+    without a rule of its own a focused button is indistinguishable from an
+    unfocused one -- while Space and T step aside for whatever widget has the
+    focus. The sheet paints the same 1 px accent border the folder-settings
+    spin boxes already use."""
+    sheet = qss.build_stylesheet()
+    assert "QPushButton:focus" in sheet
+    rule = sheet[sheet.index("QPushButton:focus"):]
+    assert f"border: 1px solid {tokens.ACC};" in rule[:rule.index("}")]
+    # ... and after the plain QPushButton rule it overrides.
+    assert sheet.index("QPushButton:focus") > sheet.index("QPushButton {")
+    # An ID selector outranks a bare pseudo-class, so the buttons that have
+    # one are named too, or they would keep their own border when focused.
+    for name in ("StageTab", "LogHeader", "SegmentItem"):
+        assert f"QPushButton#{name}:focus" in sheet
+    # The primary variant's fill IS the accent, so its ring is the dark ink.
+    primary = sheet[sheet.index('QPushButton[variant="primary"]:focus'):]
+    assert f"border: 1px solid {tokens.PRIMARY_TEXT};" in primary[:primary.index("}")]
 
 
 def test_chip_radius_is_the_qt_adjusted_token():

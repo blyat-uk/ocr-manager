@@ -386,6 +386,32 @@ def test_queue_filter_counts_and_filtering(mixed_window):
     assert queue.visible_names() == ["a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv"]
 
 
+def test_a_filter_that_matches_nothing_says_so_and_drops_the_selection(mixed_window):
+    """An empty rail while the stage and the inspector still describe a file
+    the rail does not list is a window at odds with itself. Switching filter
+    is navigation, so the selection goes where the filter goes -- nowhere."""
+    window = mixed_window
+    queue = window.queue
+    window.controller.mark_reviewed("b.mkv")                 # nothing needs the user now
+    settle()
+    assert queue.filter.labels()[1] == "Needs you 0"
+    assert queue.empty_label.isHidden()
+
+    queue.filter.findChildren(QPushButton)[1].click()        # "Needs you"
+    settle()
+    assert queue.visible_names() == []
+    assert not queue.empty_label.isHidden()
+    assert queue.empty_label.text() == "No files match this filter."
+    assert queue.selected() is None
+    assert window.stage.current_file() is None
+    assert window.inspector.file_label.full_text() == "No file selected"
+
+    queue.filter.findChildren(QPushButton)[0].click()        # back to "All"
+    settle()
+    assert queue.empty_label.isHidden()
+    assert queue.selected() == "a.mkv"
+
+
 def test_queue_keyboard_moves_marks_and_proves(slay_window, fake_runner):
     window, controller = slay_window, slay_window.controller
     queue = window.queue
@@ -1086,6 +1112,34 @@ def test_an_exception_in_a_slot_is_reported_instead_of_aborting(slay_window, cap
     assert "RuntimeError: boom in a slot" in capsys.readouterr().err
     window.crash_banner.dismiss_button.click()
     assert window.crash_banner.isHidden()
+
+
+def test_the_review_tooltip_names_a_missing_value_rather_than_a_wait(make_window, tmp_project,
+                                                                     fake_runner):
+    """"Mark reviewed" is refused for two different reasons -- detections are
+    still running, or a value the file needs is missing -- and only the first
+    is a wait. A FLAGGED file with no crop was being told "waiting for
+    detections to finish" while nothing was coming."""
+    folder = write_project(tmp_project(["a.mkv"]), [entry("a.mkv", crop=None)])
+    window = make_window()
+    window.open_folder(str(folder))
+    settle()
+    controller, button = window.controller, window.inspector.review_button
+    assert controller.entry("a.mkv").review == ReviewState.PENDING
+    assert button.toolTip() == "waiting for detections to finish"        # ... and here it IS a wait
+
+    crop = fake_runner.last("crop", "a.mkv")                 # the detector found no box
+    fake_runner.finish(crop, crop_result(crop, box=None, flagged="static-content"))
+    controller.drain_events()
+    settle()
+    assert controller.entry("a.mkv").review == ReviewState.FLAGGED
+    assert controller.entry("a.mkv").crop is None
+    assert not button.isEnabled()
+    assert button.toolTip() == "set a crop first"            # nothing is coming; say so
+
+    controller.set_crop("a.mkv", BOX)
+    settle()
+    assert button.isEnabled() and button.toolTip() == ""
 
 
 def test_mark_reviewed_is_disabled_while_the_selected_file_is_pending(make_window, tmp_project, fake_runner):

@@ -59,7 +59,7 @@ from dataclasses import dataclass
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from app.masking import speech_in_skips
 from app.state_text import format_duration
@@ -89,6 +89,16 @@ SKIP_KIND = "skipped"                 # ... and how its warning sentence names i
 TRACK_HEIGHT = 52                     # .track
 LANE_HEIGHT = 16                      # .lane, fused under it
 TIMELINE_HEIGHT = TRACK_HEIGHT + LANE_HEIGHT
+# The stage hands this page about 760 px at 1440x900 for ~180 px of content.
+# The track is the thing being edited -- blocks to read, boundaries to drag,
+# a waveform to aim at -- so it takes what it can use of that before the
+# page centres what is still over. Three times the mockup's own height is
+# where a wider-than-tall strip stops reading as one; the lane under it is a
+# 10 px speech bar and never grows. Compact mode (ruling B5) stays fixed:
+# it is a strip under another tab's stage, not the subject of the page.
+TRACK_MAX_HEIGHT = 3 * TRACK_HEIGHT
+TIMELINE_MAX_HEIGHT = TRACK_MAX_HEIGHT + LANE_HEIGHT
+PAGE_MARGIN = 12                      # the page's own padding, all four sides
 GRIP_WIDTH = 5                        # .grip
 GRIP_ALPHA = 0.85
 GRIP_GRAB = 7                         # how far from a grip a press still takes it
@@ -377,7 +387,12 @@ class Timeline(QWidget):
         self._warnings: list[SpeechWarning] = []
         self._warnings_key: tuple | None = None
         self.setObjectName("Timeline")
-        self.setFixedHeight(TIMELINE_HEIGHT)
+        if self.editable:
+            self.setMinimumHeight(TIMELINE_HEIGHT)
+            self.setMaximumHeight(TIMELINE_MAX_HEIGHT)
+            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        else:
+            self.setFixedHeight(TIMELINE_HEIGHT)
         self.setMouseTracking(self.editable)
         if not self.editable:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -630,8 +645,11 @@ class Timeline(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         width = float(self.width())
-        track = QRectF(0.5, 0.5, max(0.0, width - 1), TRACK_HEIGHT - 1)
-        lane = QRectF(0.5, TRACK_HEIGHT + 0.5, max(0.0, width - 1), LANE_HEIGHT - 1)
+        # The lane keeps its 16 px; whatever the widget has over the mockup's
+        # own height goes to the track (see TRACK_MAX_HEIGHT).
+        track_height = max(float(TRACK_HEIGHT), self.height() - LANE_HEIGHT)
+        track = QRectF(0.5, 0.5, max(0.0, width - 1), track_height - 1)
+        lane = QRectF(0.5, track_height + 0.5, max(0.0, width - 1), LANE_HEIGHT - 1)
         self._paint_track(painter, track)
         self._paint_lane(painter, lane)
         painter.end()
@@ -674,8 +692,10 @@ class Timeline(QWidget):
             return
         middle = rect.center().y()
         step = rect.width() / (len(values) - 1)
+        # The mockup's swing, kept in proportion when the track is taller.
+        amplitude = WAVE_AMPLITUDE * rect.height() / (TRACK_HEIGHT - 1)
         points = [QPointF(rect.left() + index * step,
-                          middle + (1 if index % 2 else -1) * value * WAVE_AMPLITUDE)
+                          middle + (1 if index % 2 else -1) * value * amplitude)
                   for index, value in enumerate(values)]
         painter.save()
         painter.setOpacity(WAVE_ALPHA)
@@ -984,11 +1004,20 @@ class RangesTab:
         self._page.setObjectName("RangesPage")
         self._page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         column = QVBoxLayout(self._page)
-        column.setContentsMargins(12, 12, 12, 12)
+        column.setContentsMargins(PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN, PAGE_MARGIN)
         column.setSpacing(0)
+        # The track grows into a tall stage first (TRACK_MAX_HEIGHT); these
+        # two stretches split whatever is still over, so the page sits in the
+        # middle rather than clinging to the top over a field of black.
+        column.addStretch(1)
         self.timeline = Timeline(controller, mode="edit")
         self.timeline.committed.connect(self.refresh)
-        column.addWidget(self.timeline)
+        # A stretch of its own, or the two margins would take every spare
+        # pixel and the track would never leave its minimum: QBoxLayout
+        # gives a stretch-0 item its size hint whenever anything else has a
+        # stretch factor, Expanding policy or not. Its maximum still caps it,
+        # and what it cannot take goes back to the margins.
+        column.addWidget(self.timeline, 1)
         column.addSpacing(10)
         self._rows_host = QWidget()
         self._rows_layout = QVBoxLayout(self._rows_host)

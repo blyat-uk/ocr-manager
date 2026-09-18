@@ -110,6 +110,12 @@ STALE_REDETECT = "measured on an earlier crop — re-detect to refresh"
 # above is about the stored VALUE, this one about what is on screen.
 TILES_OTHER_CROP = "the tiles and curve show that crop, not the file's current one"
 NO_VALUE = "—"
+# A drag moves a preview, not the file. Until "keep {t}" is pressed the row
+# names both values ("211 → 180") and this line says which of them the file
+# actually has -- otherwise the panel claims 180 while the inspector's
+# Detected section, 150 px below it, still reads 211.
+PREVIEW_ROW = "{stored} → {preview}"
+PREVIEW_NOTE = "preview only — {value} is not kept yet"
 
 # --- geometry (the literal CSS of tabs-hifi.html figure 1) ------------------
 
@@ -724,6 +730,10 @@ class BrightnessInspectorPanel(QWidget):
         self.yours_row = KvRow("Yours", NO_VALUE, tone="acc")
         column.addWidget(self.auto_row)
         column.addWidget(self.yours_row)
+        # Directly under the row it annotates, above the evidence warnings.
+        self.preview_label = note_label()
+        self.preview_label.setProperty("tone", "acc")
+        column.addWidget(self.preview_label)
         self.stale_label = note_label()
         self.stale_label.setProperty("tone", "warn")
         self.flag_label = note_label()
@@ -745,11 +755,21 @@ class BrightnessInspectorPanel(QWidget):
         column.addLayout(buttons)
         column.addStretch(1)
 
-    def set_state(self, *, auto: int | None, value: int | None, note: str, flags: str,
-                  stale: str, crop_note: str) -> None:
+    def set_state(self, *, auto: int | None, value: int | None, stored: int | None,
+                  note: str, flags: str, stale: str, crop_note: str) -> None:
+        """`value` is the threshold on screen (the preview) and `stored` the
+        one the file has. They differ while a drag has not been kept, and
+        then the row shows the move rather than the destination alone."""
+        kept = value is None or value == stored
+        preview = "" if kept else PREVIEW_NOTE.format(value=value)
         self.auto_row.set_value(NO_VALUE if auto is None else str(auto))
-        self.yours_row.set_value(NO_VALUE if value is None else str(value), tone="acc")
-        for label, text in ((self.stale_label, stale), (self.crop_note, crop_note),
+        self.yours_row.set_value(
+            NO_VALUE if value is None else
+            str(value) if kept else
+            PREVIEW_ROW.format(stored=NO_VALUE if stored is None else stored, preview=value),
+            tone="acc")
+        for label, text in ((self.preview_label, preview), (self.stale_label, stale),
+                            (self.crop_note, crop_note),
                             (self.flag_label, flags), (self.note, note)):
             label.setText(text)
             label.setVisible(bool(text))
@@ -762,8 +782,11 @@ class BrightnessInspectorPanel(QWidget):
         """Every note line on show, top to bottom. The series median is NOT
         among them: the cross-file summary belongs to the inspector's
         Detected section (ruling B4, ui-spec §3.7), which shows it once."""
-        return [label.text() for label in (self.stale_label, self.crop_note,
+        return [label.text() for label in (self.preview_label, self.stale_label, self.crop_note,
                                            self.flag_label, self.note) if label.text()]
+
+    def preview_text(self) -> str:
+        return self.preview_label.text()
 
     def flag_text(self) -> str:
         return self.flag_label.text()
@@ -869,6 +892,12 @@ class BrightnessTab:
             self._grid.setColumnStretch(index, 1)
         self.pin_tile_widget = PinTile()
         self.pin_tile_widget.clicked.connect(self._on_pin_clicked)
+        # In the grid from the start, not only when `_sync_tiles` rebuilds
+        # it: a file with no brightness evidence has an empty tile plan, the
+        # plan never changes, and the tab would be a black rectangle with no
+        # way in -- exactly the file (FLAG_NO_TEXT) a user most wants to pin
+        # a frame on. `_sync_tiles` repositions it after the real tiles.
+        self._grid.addWidget(self.pin_tile_widget, 0, 0)
         column.addWidget(self._grid_host, 1)
 
         header_hint = QLabel(CURVE_HINT)
@@ -1092,6 +1121,7 @@ class BrightnessTab:
             return
         for tile in self._tiles:
             self._grid.removeWidget(tile)
+            tile.setParent(None)     # removeWidget alone leaves it parented and painting
             tile.deleteLater()
         self._grid.removeWidget(self.pin_tile_widget)
         self._tiles = []
@@ -1367,6 +1397,7 @@ class BrightnessTab:
 
     def _update_panel(self, entry, evidence, auto: int | None, stored: int | None) -> None:
         self.panel.set_state(auto=auto, value=None if entry is None else self._preview,
+                             stored=stored,
                              note=self._note_text(auto, stored),
                              flags=self._flag_text(evidence),
                              stale=self._stale_text(entry),

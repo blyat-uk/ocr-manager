@@ -26,14 +26,17 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
-from app.views.crop_view import DETECTED_TAG, CropCanvas, CropTab, SampleStrip
+from app.views import crop_view
+from app.views.crop_view import DETECTED_TAG, PAGE_MARGIN, CropCanvas, CropTab, SampleStrip
 from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
 from core.detect import crop as crop_mod
 from core.detect import ocr_view
 from core.jobs.view_jobs import FramesResult
+from core.project.model import clamp_crop_box
 from core.project import (
+    MIN_CROP_SIDE,
     Brightness,
     Crop,
     FileEntry,
@@ -366,6 +369,23 @@ def test_the_box_clamps_to_the_frame_edges(make_tab):
     assert height == canvas.MIN_BOX
 
 
+@pytest.mark.parametrize("box, frame", [
+    ((288, 784, 1344, 55), (1920, 888)),        # already inside: unchanged by both
+    ((-40, 9000, 4000, 4000), (1920, 888)),     # outside on every side
+    ((0, 0, 100, 100), (4, 4)),                 # a frame smaller than MIN_BOX
+    ((0, 0, 100, 100), (0, 0)),                 # no frame size known yet
+    ((10, 10, 2, 2), (1920, 888)),              # smaller than MIN_BOX
+])
+def test_the_views_clamp_is_the_models_clamp(box, frame):
+    """The view clamps before it commits and `core.project` clamps before it
+    stores. Two spellings of one rule meant the view could draw and report a
+    box the model would then quietly change under it -- they differed for a
+    frame under MIN_BOX, and for a frame whose size is not known yet."""
+    assert CropCanvas.MIN_BOX is MIN_CROP_SIDE              # one floor, not two
+    assert crop_view.clamp_box(box, frame, CropCanvas.MIN_BOX) == clamp_crop_box(box, frame)
+    assert crop_view.clamp_box(box, frame) == clamp_crop_box(box, frame)
+
+
 # --------------------------------------------------------------------------
 # Toolbar
 # --------------------------------------------------------------------------
@@ -514,6 +534,24 @@ def test_the_filmstrip_steps_samples_with_the_arrow_keys(make_tab):
     arrow(strip, Qt.Key.Key_Left, shift=True)           # Shift changes nothing on the strip
     assert harness.tab.selected_index() == 1
     assert harness.tab.canvas.box() == BOX              # the strip never nudges the box
+
+
+def test_the_canvas_and_the_filmstrip_paint_a_focus_ring(make_tab):
+    """The arrows mean "nudge the box" on the canvas and "step samples" on
+    the filmstrip, so which of the two holds the keyboard is the difference
+    between two commands. A stylesheet suppresses Qt's own focus rectangle,
+    so each surface paints its own."""
+    harness = make_tab()
+    canvas, strip = harness.tab.canvas, harness.tab.strip
+    canvas.setFocus()
+    canvas.grab(), strip.grab()
+    assert canvas.focus_ring_painted() is True
+    assert strip.focus_ring_painted() is False
+
+    strip.setFocus()
+    canvas.grab(), strip.grab()
+    assert canvas.focus_ring_painted() is False
+    assert strip.focus_ring_painted() is True
 
 
 def test_tab_walks_from_the_canvas_to_the_filmstrip(make_tab):
@@ -666,6 +704,34 @@ def test_the_canvas_tags_name_the_frame_the_crop_and_the_envelope(make_tab):
     assert tags["bottom_right"] == "dashed = text found across all 11 samples"
     harness.tab.envelope_button.click()
     assert "bottom_right" not in harness.tab.canvas.tags()
+
+
+def test_the_envelope_legend_is_left_out_when_there_is_no_envelope(make_tab):
+    """The legend explains a dashed rectangle. With no envelope none is
+    drawn, and "dashed = text found across all 0 samples" points at nothing
+    while telling the user the detector found nothing -- twice over."""
+    harness = make_tab(evidence=crop_evidence(box=None, envelope=None, samples=[]))
+    canvas = harness.tab.canvas
+    assert canvas.overlays()["envelope"] is True        # the toggle is still on
+    assert "bottom_right" not in canvas.tags()
+    canvas.grab()
+
+
+def test_the_page_centres_its_content_instead_of_leaving_a_void_below(make_tab):
+    """The canvas is as tall as its aspect ratio makes it at the stage's
+    width, so the leftover height cannot go into the frame -- a taller canvas
+    would only letterbox it. It is split above and below instead, which at
+    1440x900 turns ~230 px of flat black under the timeline into margin."""
+    harness = make_tab()
+    tab = harness.tab
+    page = tab.page()
+    page.resize(960, 800)
+    QApplication.processEvents()
+    above = tab.canvas.y()
+    below = page.height() - (tab.timeline.y() + tab.timeline.height())
+    assert above > PAGE_MARGIN                      # not pinned to the top any more
+    assert abs(above - below) <= 3
+    assert tab.canvas.height() == tab.canvas.heightForWidth(tab.canvas.width())
 
 
 def test_the_page_mounts_the_compact_timeline_under_the_stage(make_tab):

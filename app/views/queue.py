@@ -23,7 +23,14 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QMenu, QScrollArea, QVBoxLayout, QWidget
 
 from app.run_snapshot import FAILED, QUEUED, RUNNING
-from app.state_text import badge_for, can_mark_reviewed, format_duration, is_pending, is_reviewed
+from app.state_text import (
+    badge_for,
+    can_mark_reviewed,
+    can_run_proof,
+    format_duration,
+    is_pending,
+    is_reviewed,
+)
 from app.theme import tokens
 from app.views.deferred import Deferred
 from app.views.thumbnail import Thumbnail
@@ -34,6 +41,7 @@ FILTER_ALL, FILTER_NEEDS_YOU, FILTER_REVIEWED = 0, 1, 2
 HINT_HTML = (f'↑&nbsp;↓&nbsp;move · <b style="color:{tokens.DIM}">Space</b>&nbsp;mark&nbsp;reviewed · '
              f'<b style="color:{tokens.DIM}">T</b>&nbsp;test&nbsp;OCR')
 RUN_BADGE_STATES = frozenset({QUEUED, RUNNING, FAILED})     # a run's transient badges (ruling B10)
+EMPTY_FILTER_TEXT = "No files match this filter."
 
 
 class QueueRow(QWidget):
@@ -147,6 +155,14 @@ class QueueView(QWidget):
         self._list_layout = QVBoxLayout(self._list)
         self._list_layout.setContentsMargins(6, 6, 6, 6)
         self._list_layout.setSpacing(4)
+        # Why the rail is empty. Added before the stretch, and `rebuild`
+        # inserts rows at 0..n-1, so it always sits under them.
+        self.empty_label = QLabel(EMPTY_FILTER_TEXT)
+        self.empty_label.setObjectName("Note")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setContentsMargins(5, 6, 5, 0)
+        self.empty_label.hide()
+        self._list_layout.addWidget(self.empty_label)
         self._list_layout.addStretch(1)
         self._scroll.setWidget(self._list)
         layout.addWidget(self._scroll, 1)
@@ -186,6 +202,7 @@ class QueueView(QWidget):
         for name in [name for name in self._rows if name not in names]:
             row = self._rows.pop(name)
             self._list_layout.removeWidget(row)
+            row.setParent(None)      # removeWidget alone leaves it parented and painting
             row.deleteLater()
         for name in names:
             if name not in self._rows:
@@ -236,8 +253,15 @@ class QueueView(QWidget):
         counts = self._controller.counts()
         self.filter.set_texts([f"All {len(self._rows)}", f"Needs you {counts['needs_you']}",
                                f"Reviewed {counts['reviewed']}"])
+        visible = 0
         for name, row in self._rows.items():
-            row.setVisible(self._in_filter(name))
+            shown = self._in_filter(name)
+            row.setVisible(shown)
+            visible += shown
+        # An empty rail explains itself rather than reading as a bug. It is
+        # not hidden when the project is: `rebuild` leaves no rows either,
+        # and the open-folder view replaces the whole body then.
+        self.empty_label.setVisible(bool(self._rows) and not visible)
 
     def _in_filter(self, name: str) -> bool:
         current = self.filter.current()
@@ -269,10 +293,17 @@ class QueueView(QWidget):
         self._on_filter_changed(index)
 
     def _on_filter_changed(self, _index: int) -> None:
+        """Switching filter is navigation, so the selection goes where the
+        filter goes -- including nowhere. Leaving it behind left the stage
+        and the inspector describing a file the rail no longer lists.
+
+        Only on an explicit switch: a file that leaves the current filter
+        because the user just marked it reviewed keeps the selection, so
+        they can see what they did (and undo it with Space)."""
         self._refresh_filter()
         visible = self.visible_names()
-        if self._selected not in visible and visible:
-            self.select(visible[0])
+        if self._selected not in visible:
+            self.select(visible[0] if visible else None)
 
     def move_selection(self, step: int) -> None:
         names = list(self._rows)
@@ -314,6 +345,17 @@ class QueueView(QWidget):
     def _toggle_skipped(self, name: str) -> None:
         self._controller.set_skipped(name, not self._controller.entry(name).skipped)
 
+    def _can_proof(self, name: str) -> bool:
+        """T, the inspector's "T run" and this menu item are one command
+        (ruling C4), so the item is live exactly when the command would do
+        something: not while this file's proof is already running (a second
+        one would queue the same window again), and not before the file has
+        been scanned. `can_run_proof` is the same predicate
+        `MainWindow._sync_actions` gates T with -- it asks `proof_window`
+        itself, so all three follow a refusal this view never has to know."""
+        controller = self._controller
+        return not controller.proof_pending(name) and can_run_proof(controller.entry(name))
+
     def context_menu(self, name: str) -> QMenu:
         """The row's menu, built fresh so its texts and enabled states are
         current. The caller shows it (or triggers its actions)."""
@@ -332,7 +374,7 @@ class QueueView(QWidget):
         add("Paste settings onto this file", lambda: controller.paste_settings(name), controller.can_paste())
         menu.addSeparator()
         add("Re-detect", lambda: controller.redetect(name))
-        add("Test OCR (T)", lambda: self.proof_requested.emit(name))
+        add("Test OCR (T)", lambda: self.proof_requested.emit(name), self._can_proof(name))
         add("Open logs", lambda: self.logs_requested.emit(name))
         menu.addSeparator()
         reviewed = is_reviewed(entry)

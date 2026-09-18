@@ -378,10 +378,16 @@ class ListScrollArea(QScrollArea):
         return self.rows.itemAt(index).widget()
 
     def take_first_row(self) -> QWidget:
-        return self.rows.takeAt(0).widget()
+        """The row, out of the layout AND off the content widget: taking it
+        out of the layout alone leaves it a child, at whatever size it had,
+        painting over the rows beneath it until it is really deleted."""
+        widget = self.rows.takeAt(0).widget()
+        widget.setParent(None)
+        return widget
 
     def remove_row(self, widget: QWidget) -> None:
         self.rows.removeWidget(widget)
+        widget.setParent(None)           # ... see take_first_row
 
 
 class FeedLine(QWidget):

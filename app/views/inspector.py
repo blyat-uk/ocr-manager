@@ -33,10 +33,12 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from app.state_text import (
-    REVIEW_WAIT_TOOLTIP,
+    PROOF_WAIT_TOOLTIP,
     can_mark_reviewed,
+    can_run_proof,
     is_manual,
     is_reviewed,
+    mark_reviewed_tooltip,
     media_text,
     proof_window_clock,
     series_median_brightness,
@@ -226,7 +228,10 @@ class Inspector(QWidget):
         self.review_button.setText(UNREVIEW_TEXT if reviewed else REVIEW_TEXT)
         self.review_button.set_variant("default" if reviewed else "primary")
         self.review_button.setEnabled(reviewable)
-        self.review_button.setToolTip("" if reviewable else REVIEW_WAIT_TOOLTIP)
+        # Not one sentence: "Mark reviewed" is refused either because the
+        # detections are still running or because a value the file needs is
+        # missing, and only the first is a wait (`mark_reviewed_tooltip`).
+        self.review_button.setToolTip(mark_reviewed_tooltip(entry))
         self.skip_button.setText("include file" if entry.skipped else "skip file")
         self._refresh_offer()
 
@@ -289,10 +294,15 @@ class Inspector(QWidget):
 
     def _show_proof(self) -> None:
         name = self._file
-        if name is None or name not in self._controller.names():
+        entry = None if name is None or name not in self._controller.names() \
+            else self._controller.entry(name)
+        # Ruling C4: the button, T and the queue's menu item are one command,
+        # so they are one predicate. Set before the presentation, which reads
+        # it back through `_reset`.
+        self.proof.set_runnable(entry is not None and can_run_proof(entry), PROOF_WAIT_TOOLTIP)
+        if entry is None:
             self.proof.show_nothing()
         elif self._controller.proof_pending(name):
-            entry = self._controller.entry(name)
             self.proof.show_running(proof_window_clock(entry.sample_time, entry.media.duration))
         elif (result := self._controller.proof_result(name)) is not None:
             self.proof.show_result(result, stale=name in self._stale_proofs)
