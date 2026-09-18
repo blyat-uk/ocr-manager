@@ -213,6 +213,9 @@ def _no_evidence(source: Source | None, blocking: bool) -> tuple[str, float, str
     return _NO_EVIDENCE_KEPT, 0.0, ("warn" if blocking else "default")
 
 
+NO_SAMPLES_CAPTION = "no samples measured"
+
+
 def crop_caption(evidence: dict | None, source: Source | None, *,
                   blocking: bool = False) -> tuple[str, float, str]:
     """(caption, bar fraction, tone) for the Detected section's Crop row.
@@ -230,7 +233,11 @@ def crop_caption(evidence: dict | None, source: Source | None, *,
         return _no_evidence(source, blocking)
     agreed = int(evidence.get("agreed") or 0)
     probes_used = int(evidence.get("probes_used") or 0)
-    bar = (agreed / probes_used) if probes_used else 0.0
+    if not probes_used:
+        # Evidence that counts no probes measured nothing, so "0 of 0 samples
+        # agree" would read as a confident zero. Say what happened instead.
+        return NO_SAMPLES_CAPTION, 0.0, "warn"
+    bar = agreed / probes_used
     ok = only_informational(evidence.get("flagged"), _crop.INFORMATIONAL_FLAGS) and not blocking
     return f"{agreed} of {probes_used} samples agree", bar, ("ok" if ok else "warn")
 

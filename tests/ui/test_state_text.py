@@ -418,9 +418,28 @@ def test_crop_caption_evidence_blocking_flag_is_warn():
     assert tone == "warn"
 
 
+def test_crop_evidence_that_measured_nothing_says_so_rather_than_zero_of_zero():
+    """Evidence counting no probes is not a confident zero. "0 of 0 samples
+    agree" in the ok tone is the shape every review of this project kept
+    catching: a sentence that reads like a measurement where none was made."""
+    caption, bar, tone = state_text.crop_caption({"agreed": 0, "probes_used": 0, "flagged": None},
+                                                 Source.DETECTED)
+    assert caption == state_text.NO_SAMPLES_CAPTION
+    assert (bar, tone) == (0.0, "warn")
+    assert state_text.crop_caption({}, Source.DETECTED)[0] == state_text.NO_SAMPLES_CAPTION
+    # A real measurement is untouched, and a missing evidence dict still takes
+    # the provenance branch rather than this one.
+    assert state_text.crop_caption({"agreed": 11, "probes_used": 12, "flagged": None},
+                                   Source.DETECTED)[0] == "11 of 12 samples agree"
+    assert state_text.crop_caption(None, Source.DETECTED)[0] != state_text.NO_SAMPLES_CAPTION
+
+
 def test_crop_caption_zero_probes_used_avoids_division_by_zero():
+    """No ZeroDivisionError -- and no confident zero either: the caption now
+    names what happened (see the test above), so this pins only that the
+    division is never attempted."""
     evidence = {"agreed": 0, "probes_used": 0, "flagged": None}
-    assert state_text.crop_caption(evidence, Source.DETECTED) == ("0 of 0 samples agree", 0.0, "ok")
+    assert state_text.crop_caption(evidence, Source.DETECTED) == (state_text.NO_SAMPLES_CAPTION, 0.0, "warn")
 
 
 # --------------------------------------------------------------------------
