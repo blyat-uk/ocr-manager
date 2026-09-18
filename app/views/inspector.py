@@ -1,5 +1,7 @@
-"""The file inspector (`.insp`, ruling B4, ui-spec §3.7): one 322 px
-column about the selected episode only, scrolling vertically. Top to bottom:
+"""The file inspector (`.insp`, ruling B4, ui-spec §3.7): one
+`tokens.INSPECTOR_WIDTH` column (the mockup's 322 px at the current UI
+scale) about the selected episode only, scrolling vertically. Top to
+bottom:
 
 1. header -- "◆ THIS EPISODE ONLY", the file name, its media line;
 2. the active stage tab's `inspector_panel()`, swapped on `tab_changed`;
@@ -90,7 +92,7 @@ class Inspector(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedWidth(tokens.INSPECTOR_WIDTH)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(1, 0, 0, 0)                 # the 1 px left border
+        outer.setContentsMargins(1, 0, 0, 0)                 # room for the stylesheet's 1 px left border
         outer.setSpacing(0)
 
         scroll = QScrollArea()
@@ -119,9 +121,9 @@ class Inspector(QWidget):
         self.media_label = QLabel()
         self.media_label.setObjectName("InspectorSub")
         head.body.addWidget(self.scope_label)
-        head.body.addSpacing(3)
+        head.body.addSpacing(tokens.px(3))
         head.body.addWidget(self.file_label)
-        head.body.addSpacing(2)
+        head.body.addSpacing(tokens.px(2))
         head.body.addWidget(self.media_label)
         column.addWidget(head)
 
@@ -145,8 +147,8 @@ class Inspector(QWidget):
         footer.setObjectName("InspectorFooter")
         footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(12, 10, 12, 10)
-        footer_layout.setSpacing(6)
+        footer_layout.setContentsMargins(tokens.px(12), tokens.px(10), tokens.px(12), tokens.px(10))
+        footer_layout.setSpacing(tokens.px(6))
         self.review_button = Button(REVIEW_TEXT, "primary")
         self.skip_button = Button("skip file", "ghost")
         for button in (self.review_button, self.skip_button):

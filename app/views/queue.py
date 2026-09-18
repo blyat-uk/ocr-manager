@@ -37,7 +37,7 @@ from app.views.thumbnail import Thumbnail
 from app.widgets.base import Badge, ElidedLabel, SegmentedControl, repolish
 
 FILTER_ALL, FILTER_NEEDS_YOU, FILTER_REVIEWED = 0, 1, 2
-# Non-breaking spaces inside each hint, so the 246 px rail wraps between hints, never inside one.
+# Non-breaking spaces inside each hint, so the rail wraps between hints, never inside one.
 HINT_HTML = (f'↑&nbsp;↓&nbsp;move · <b style="color:{tokens.DIM}">Space</b>&nbsp;mark&nbsp;reviewed · '
              f'<b style="color:{tokens.DIM}">T</b>&nbsp;test&nbsp;OCR')
 RUN_BADGE_STATES = frozenset({QUEUED, RUNNING, FAILED})     # a run's transient badges (ruling B10)
@@ -59,19 +59,19 @@ class QueueRow(QWidget):
         self.setProperty("selected", False)
         self.setProperty("skipped", False)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(7, 7, 7, 7)
-        layout.setSpacing(9)
+        layout.setContentsMargins(tokens.px(7), tokens.px(7), tokens.px(7), tokens.px(7))
+        layout.setSpacing(tokens.px(9))
         self.thumb = Thumbnail()
         layout.addWidget(self.thumb, 0, Qt.AlignmentFlag.AlignVCenter)
         meta = QVBoxLayout()
         meta.setContentsMargins(0, 0, 0, 0)
-        meta.setSpacing(2)
+        meta.setSpacing(tokens.px(2))
         self.name_label = ElidedLabel(name)
         self.name_label.setObjectName("QueueName")
         meta.addWidget(self.name_label)
         sub = QHBoxLayout()
         sub.setContentsMargins(0, 0, 0, 0)
-        sub.setSpacing(7)
+        sub.setSpacing(tokens.px(7))
         self.duration_label = QLabel()
         self.duration_label.setObjectName("QueueSub")
         self.badge = Badge()
@@ -128,14 +128,14 @@ class QueueView(QWidget):
         self.setFixedWidth(tokens.RAIL_WIDTH)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 1, 0)        # the 1 px right border
+        layout.setContentsMargins(0, 0, 1, 0)        # room for the stylesheet's 1 px right border
         layout.setSpacing(0)
 
         head = QWidget()
         head.setObjectName("QueueHead")
         head.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         head_layout = QHBoxLayout(head)
-        head_layout.setContentsMargins(11, 9, 11, 7)
+        head_layout.setContentsMargins(tokens.px(11), tokens.px(9), tokens.px(11), tokens.px(7))
         self.filter = SegmentedControl(["All 0", "Needs you 0", "Reviewed 0"])
         for button in self.filter.findChildren(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -153,14 +153,14 @@ class QueueView(QWidget):
         self._list = QWidget()
         self._list.setObjectName("QueueList")
         self._list_layout = QVBoxLayout(self._list)
-        self._list_layout.setContentsMargins(6, 6, 6, 6)
-        self._list_layout.setSpacing(4)
+        self._list_layout.setContentsMargins(tokens.px(6), tokens.px(6), tokens.px(6), tokens.px(6))
+        self._list_layout.setSpacing(tokens.px(4))
         # Why the rail is empty. Added before the stretch, and `rebuild`
         # inserts rows at 0..n-1, so it always sits under them.
         self.empty_label = QLabel(EMPTY_FILTER_TEXT)
         self.empty_label.setObjectName("Note")
         self.empty_label.setWordWrap(True)
-        self.empty_label.setContentsMargins(5, 6, 5, 0)
+        self.empty_label.setContentsMargins(tokens.px(5), tokens.px(6), tokens.px(5), 0)
         self.empty_label.hide()
         self._list_layout.addWidget(self.empty_label)
         self._list_layout.addStretch(1)
@@ -170,7 +170,7 @@ class QueueView(QWidget):
         self.hint_label = QLabel(HINT_HTML)
         self.hint_label.setObjectName("QueueHint")
         self.hint_label.setTextFormat(Qt.TextFormat.RichText)
-        self.hint_label.setWordWrap(True)                # two lines at 246 px rather than clipped
+        self.hint_label.setWordWrap(True)                # two lines in the rail rather than clipped
         layout.addWidget(self.hint_label)
 
         controller.project_opened.connect(self.rebuild)
@@ -284,7 +284,7 @@ class QueueView(QWidget):
         for row_name, row in self._rows.items():
             row.set_selected(row_name == name)
         if name is not None:
-            self._scroll.ensureWidgetVisible(self._rows[name], 0, 6)
+            self._scroll.ensureWidgetVisible(self._rows[name], 0, tokens.px(6))
         if name != previous:
             self.selection_changed.emit(name)
 

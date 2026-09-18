@@ -1,6 +1,11 @@
 """A queue row's 56×32 thumbnail (`.thumb`): the file's frame, or the
 mockup's gradient placeholder, with the crop box drawn in miniature at its
-true position (`.thumb i`)."""
+true position (`.thumb i`).
+
+56×32 is the mockup's size; the widget takes `tokens.THUMB_WIDTH/HEIGHT`,
+which is that size at the current UI scale. Everything painted here is
+either derived from the widget's own rect (so it scales with it) or routed
+through `tokens.px`."""
 from __future__ import annotations
 
 import math
@@ -14,6 +19,7 @@ from app.theme import tokens
 GRADIENT_DEGREES = 160           # linear-gradient(160deg, THUMB_TOP, THUMB_BOTTOM 70%)
 GRADIENT_END_STOP = 0.7
 BOX_OUTLINE_ALPHA = 0.9          # border:1px solid rgba(255,194,71,.9)
+BOX_OUTLINE_WIDTH = 1            # ... that border's width, in mockup px (scaled)
 BOX_FILL_ALPHA = 0.10            # background:rgba(255,194,71,.10)
 PENDING_BOX_OPACITY = 0.3        # a pending row's box fades (.thumb i opacity .3)
 SKIPPED_OPACITY = 0.5            # a skipped row is dimmed (ruling B10)
@@ -109,8 +115,10 @@ class Thumbnail(QWidget):
         if box is not None:
             if self._pending:
                 painter.setOpacity(painter.opacity() * PENDING_BOX_OPACITY)
-            painter.setPen(QPen(_with_alpha(tokens.ACC, BOX_OUTLINE_ALPHA), 1))
+            width = max(1, tokens.px(BOX_OUTLINE_WIDTH))
+            inset = width / 2                    # the stroke straddles the path: keep it inside the box
+            painter.setPen(QPen(_with_alpha(tokens.ACC, BOX_OUTLINE_ALPHA), width))
             painter.setBrush(_with_alpha(tokens.ACC, BOX_FILL_ALPHA))
-            painter.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), tokens.RADIUS_THUMB_BOX,
+            painter.drawRoundedRect(box.adjusted(inset, inset, -inset, -inset), tokens.RADIUS_THUMB_BOX,
                                     tokens.RADIUS_THUMB_BOX, Qt.SizeMode.AbsoluteSize)
         painter.end()

@@ -13,12 +13,15 @@ a queue row).
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont, QGuiApplication, QTextCursor
 from PyQt6.QtWidgets import QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from app.logbook import FIRST_KEYS, LOG_LIMIT
+from app.theme import tokens
 
 LOGS_TITLE = "Logs"
+# Mockup pixels, scaled at every use: bigger type needs a bigger window and
+# taller log bodies to show the same amount of text.
 LOGS_SIZE = (700, 500)
 BODY_MIN_HEIGHT, BODY_MAX_HEIGHT = 120, 300
 SCROLL_SETTLE_MS = 250          # how long show_key waits for the layout to make room before giving up
@@ -27,6 +30,18 @@ _FIRST = {key: index for index, key in enumerate(FIRST_KEYS)}     # "Pipeline", 
 
 def key_order(key: str) -> tuple[int, str]:
     return _FIRST.get(key, len(_FIRST)), key
+
+
+def default_size() -> tuple[int, int]:
+    """LOGS_SIZE at the current UI scale, never larger than the screen has
+    room for -- at a high scale the scaled window would otherwise open taller
+    than the desktop."""
+    width, height = (tokens.px(value) for value in LOGS_SIZE)
+    screen = QGuiApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        width, height = min(width, available.width()), min(height, available.height())
+    return width, height
 
 
 class LogSection(QWidget):
@@ -91,13 +106,15 @@ class LogSection(QWidget):
             self._scroll_to_end()
 
     def _fit_height(self) -> None:
-        """As tall as the text, between BODY_MIN_HEIGHT and BODY_MAX_HEIGHT; a
-        fixed height, so the list scrolls instead of squeezing the bodies."""
+        """As tall as the text, between BODY_MIN_HEIGHT and BODY_MAX_HEIGHT
+        (both scaled); a fixed height, so the list scrolls instead of
+        squeezing the bodies."""
         lines = self.body.document().blockCount()
         margins = self.body.contentsMargins()
         wanted = (lines * self.body.fontMetrics().lineSpacing() + margins.top() + margins.bottom()
                   + 2 * self.body.document().documentMargin() + 2 * self.body.frameWidth())
-        self.body.setFixedHeight(max(BODY_MIN_HEIGHT, min(BODY_MAX_HEIGHT, int(wanted))))
+        self.body.setFixedHeight(max(tokens.px(BODY_MIN_HEIGHT),
+                                     min(tokens.px(BODY_MAX_HEIGHT), int(wanted))))
 
     def _scroll_to_end(self) -> None:
         bar = self.body.verticalScrollBar()
@@ -122,7 +139,7 @@ class LogsWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setWindowTitle(LOGS_TITLE)
         self.setWindowModality(Qt.WindowModality.NonModal)
-        self.resize(*LOGS_SIZE)
+        self.resize(*default_size())
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -135,8 +152,8 @@ class LogsWindow(QWidget):
         self._container = QWidget()
         self._container.setObjectName("LogsList")
         self._layout = QVBoxLayout(self._container)
-        self._layout.setContentsMargins(6, 6, 6, 6)
-        self._layout.setSpacing(4)
+        self._layout.setContentsMargins(tokens.px(6), tokens.px(6), tokens.px(6), tokens.px(6))
+        self._layout.setSpacing(tokens.px(4))
         self._layout.addStretch(1)
         self.scroll_area.setWidget(self._container)
 

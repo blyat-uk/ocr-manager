@@ -21,13 +21,13 @@ from app.main_window import MainWindow
 from app.state_text import series_median_brightness
 from app.theme import tokens
 from app.views.inspector_sections import (
-    BUTTON_TEXT_BUDGET,
     NO_LINES_TEXT,
     PROOF_LINES_SHOWN,
     SECTION_MARGIN_X,
     SHOW_ALL_TEXT,
     STALE_TEXT,
     VALUES_NOTE,
+    button_text_budget,
     hint_text,
     wrap_to_width,
 )
@@ -473,21 +473,23 @@ def test_a_hint_button_with_nothing_to_re_detect_says_so_in_its_own_words(make_w
 
 
 def test_the_hint_buttons_wrap_instead_of_widening_the_column(window):
-    """The one-line copy is wider than the whole 322 px inspector, which used
+    """The one-line copy is wider than the whole inspector column, which used
     to push the scroll content out and clip every section. It is measured and
-    wrapped, so the section -- and with it the column -- still fits."""
+    wrapped, so the section -- and with it the column -- still fits. Every
+    length here comes from the tokens, so the rule holds at any UI scale."""
     controller, inspector = window.controller, window.inspector
     name = NAMES[0]
     controller.set_crop(name, (290, 780, 1340, 60))
     controller.set_brightness(name, 214)
     settle()
 
-    limit = tokens.INSPECTOR_WIDTH - 1 - 2 * SECTION_MARGIN_X          # the inspector's 1 px border
+    budget = button_text_budget()
+    limit = tokens.INSPECTOR_WIDTH - 1 - 2 * tokens.px(SECTION_MARGIN_X)    # the inspector's 1 px border
     for what, button in inspector.hint_buttons.items():
-        assert button.fontMetrics().horizontalAdvance(hint_text(4, what)) > BUTTON_TEXT_BUDGET or \
+        assert button.fontMetrics().horizontalAdvance(hint_text(4, what)) > budget or \
             "\n" not in button.text()                                  # only wrapped when it must be
         for line in button.text().split("\n"):
-            assert button.fontMetrics().horizontalAdvance(line) <= BUTTON_TEXT_BUDGET
+            assert button.fontMetrics().horizontalAdvance(line) <= budget
         assert button.sizeHint().width() <= limit
     assert inspector.offer_section.minimumSizeHint().width() <= tokens.INSPECTOR_WIDTH - 1
     assert inspector.minimumSizeHint().width() <= tokens.INSPECTOR_WIDTH
@@ -496,13 +498,18 @@ def test_the_hint_buttons_wrap_instead_of_widening_the_column(window):
 def test_wrap_to_width_keeps_the_words_and_balances_the_lines(window):
     metrics = window.inspector.hint_buttons["crop"].fontMetrics()
     text = hint_text(4, "brightness")
-    wrapped = wrap_to_width(text, metrics, BUTTON_TEXT_BUDGET)
+    # A budget taken from the text itself, not from the column: whether this
+    # particular sentence needs two lines depends on the UI scale (the type
+    # and the column grow at the same rate but round differently), and what
+    # is being tested is the wrapping, not the fit.
+    budget = metrics.horizontalAdvance(text) * 2 // 3
+    wrapped = wrap_to_width(text, metrics, budget)
     assert wrapped.replace("\n", " ") == text                          # nothing added or lost
     lines = wrapped.split("\n")
     assert len(lines) == 2
-    assert all(metrics.horizontalAdvance(line) <= BUTTON_TEXT_BUDGET for line in lines)
+    assert all(metrics.horizontalAdvance(line) <= budget for line in lines)
     assert len(lines[-1].split(" ")) > 1                               # no single-word last line
-    assert wrap_to_width("short enough", metrics, BUTTON_TEXT_BUDGET) == "short enough"
+    assert wrap_to_width("short enough", metrics, button_text_budget()) == "short enough"
 
 
 def test_apply_to_this_file_only_hides_the_offer(window):

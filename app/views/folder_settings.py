@@ -4,15 +4,16 @@ workbench-hifi.html figure 3): everything that applies to the whole folder.
 Presentation (B8)
     A child overlay of the window's central widget, anchored to its right
     edge between the top bar and the activity strip (the top and height of
-    `anchor`, the window's body), `min(760, window width − 246)` wide so the
-    review queue stays visible. It slides in, follows every resize, and is
-    neither modal nor backed by a scrim. "✕" closes it; so does Esc, but
-    only while focus is inside the sheet.
+    `anchor`, the window's body), `min(760 scaled, window width − the rail)`
+    wide so the review queue stays visible -- the 760 is a mockup length and
+    grows with `tokens.UI_SCALE`, the window's own width does not. It slides
+    in, follows every resize, and is neither modal nor backed by a scrim.
+    "✕" closes it; so does Esc, but only while focus is inside the sheet.
 
 Layout
     Its own header row ("⚙ Folder settings", "applies to all N files in
-    {folder}", "✕"); a 150 px nav of the five sections; on the right one
-    scrolling column of `.sec` blocks. A nav click scrolls its section to the
+    {folder}", "✕"); a 150 px (scaled) nav of the five sections; on the
+    right one scrolling column of `.sec` blocks. A nav click scrolls its section to the
     top and scrolling moves the nav's highlight. The Labels section and its
     nav entry are hidden entirely while labels are off.
 
@@ -72,13 +73,15 @@ from app.views.folder_settings_fields import (
 from app.widgets.base import Button, ElidedLabel, SegmentedControl, Toggle
 
 TITLE = "⚙ Folder settings"
+# Lengths below are the mockup's own pixels; every use goes through
+# `tokens.px()`, so the sheet grows with the rest of the window.
 MAX_WIDTH = 760
 NAV_WIDTH = 150
 CONTENT_MARGIN = 12
-COMMIT_IDLE_MS = 400
-SLIDE_MS = 160
 EDITOR_WIDTH = 84
 LANGUAGE_WIDTH = 128
+COMMIT_IDLE_MS = 400          # milliseconds, not pixels: never scaled
+SLIDE_MS = 160
 MASKS_TEXT = "{count} drawn · draw on the Crop tab"
 
 
@@ -111,7 +114,7 @@ class FolderSettingsSheet(QWidget):
         self.hide()
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(1, 0, 0, 0)                 # the 1 px accent edge
+        outer.setContentsMargins(1, 0, 0, 0)                 # the stylesheet's 1 px accent edge
         outer.setSpacing(0)
         outer.addWidget(self._build_head())
         body = QHBoxLayout()
@@ -149,8 +152,8 @@ class FolderSettingsSheet(QWidget):
         head.setObjectName("FolderSettingsHead")
         head.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         row = QHBoxLayout(head)
-        row.setContentsMargins(14, 9, 14, 9)
-        row.setSpacing(14)
+        row.setContentsMargins(tokens.px(14), tokens.px(9), tokens.px(14), tokens.px(9))
+        row.setSpacing(tokens.px(14))
         self.title_label = QLabel(TITLE)
         self.title_label.setObjectName("FolderSettingsTitle")
         self.scope_label = ElidedLabel()
@@ -167,9 +170,10 @@ class FolderSettingsSheet(QWidget):
         self.nav_panel = QWidget()
         self.nav_panel.setObjectName("FolderSettingsNav")
         self.nav_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.nav_panel.setFixedWidth(NAV_WIDTH)
+        self.nav_panel.setFixedWidth(tokens.px(NAV_WIDTH))
         column = QVBoxLayout(self.nav_panel)
-        column.setContentsMargins(8, 8, 9, 8)                # 8 px padding plus the 1 px rule on the right
+        # 8 px of padding, plus room for the stylesheet's 1 px rule on the right
+        column.setContentsMargins(tokens.px(8), tokens.px(8), tokens.px(8) + 1, tokens.px(8))
         column.setSpacing(0)
         self.nav = SegmentedControl([title for title, _fields, _note in SECTIONS],
                                     orientation=Qt.Orientation.Vertical)
@@ -188,7 +192,8 @@ class FolderSettingsSheet(QWidget):
         content = QWidget()
         content.setObjectName("FolderSettingsContent")
         column = QVBoxLayout(content)
-        column.setContentsMargins(CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN, CONTENT_MARGIN)
+        margin = tokens.px(CONTENT_MARGIN)
+        column.setContentsMargins(margin, margin, margin, margin)
         column.setSpacing(0)
         for index, (title, fields, note) in enumerate(SECTIONS):
             section = Section(title, first=index == 0)
@@ -207,7 +212,7 @@ class FolderSettingsSheet(QWidget):
                 self.warning_label.setProperty("tone", "warn")
                 self.warning_label.hide()
                 section.body.addWidget(self.warning_label)
-                section.body.addSpacing(4)
+                section.body.addSpacing(tokens.px(4))
             if note:
                 section.add_note(note)
             self._sections.append(section)
@@ -230,7 +235,7 @@ class FolderSettingsSheet(QWidget):
             combo.setEditable(True)
             combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
             combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            combo.setFixedWidth(LANGUAGE_WIDTH)
+            combo.setFixedWidth(tokens.px(LANGUAGE_WIDTH))
             combo.lineEdit().textEdited.connect(lambda _text, name=field.name: self._mark_pending(name))
             combo.lineEdit().editingFinished.connect(self._commit_language_text)
             combo.activated.connect(self._on_language_activated)
@@ -244,7 +249,7 @@ class FolderSettingsSheet(QWidget):
         spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        spin.setFixedWidth(EDITOR_WIDTH)
+        spin.setFixedWidth(tokens.px(EDITOR_WIDTH))
         timer = QTimer(self)
         timer.setSingleShot(True)
         timer.setInterval(COMMIT_IDLE_MS)
@@ -289,11 +294,12 @@ class FolderSettingsSheet(QWidget):
 
     def target_geometry(self) -> QRect:
         """Right edge of the host, the anchor's top and height,
-        min(760, window width − 246) wide."""
+        min(the scaled 760, window width − the rail) wide: the sheet's own
+        width scales, the window it sits in does not."""
         host = self.parentWidget()
         if host is None:
             return self.geometry()
-        width = max(0, min(MAX_WIDTH, self.window().width() - tokens.RAIL_WIDTH))
+        width = max(0, min(tokens.px(MAX_WIDTH), self.window().width() - tokens.RAIL_WIDTH))
         if self._anchor is not None:
             top, height = self._anchor.mapTo(host, QPoint(0, 0)).y(), self._anchor.height()
         else:
@@ -372,7 +378,7 @@ class FolderSettingsSheet(QWidget):
     # --- nav ------------------------------------------------------------------------------
 
     def _section_top(self, section: Section) -> int:
-        return max(0, section.y() - CONTENT_MARGIN)
+        return max(0, section.y() - tokens.px(CONTENT_MARGIN))
 
     def _visible_sections(self) -> list[tuple[int, Section]]:
         return [(index, section) for index, section in enumerate(self._sections) if not section.isHidden()]
@@ -398,12 +404,22 @@ class FolderSettingsSheet(QWidget):
         self.nav.set_current(current)
 
     def _update_filler(self) -> None:
-        """Room below the last section, so every section can scroll to the top."""
+        """Room below the last section, so every section can scroll to the top.
+
+        The last section's REAL height, not its size hint: a word-wrapped
+        note ("These tune detections that start after a change…") hints at
+        the height it would take on its own and is laid out a line shorter,
+        which left the scroll range a line short of the last section's top --
+        so the nav could never highlight it. `activate()` makes sure the
+        column has been laid out at its current width before it is measured."""
         visible = self._visible_sections()
         if not visible:
             return
+        content = self.scroll.widget()
+        if content.layout() is not None:
+            content.layout().activate()
         last = visible[-1][1]
-        spare = self.scroll.viewport().height() - last.sizeHint().height() - 2 * CONTENT_MARGIN
+        spare = self.scroll.viewport().height() - last.height() - 2 * tokens.px(CONTENT_MARGIN)
         self._filler.setFixedHeight(max(0, spare))
 
     # --- commits --------------------------------------------------------------------------

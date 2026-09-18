@@ -32,6 +32,7 @@ from app.run_snapshot import (
     eta_seconds,
     run_status_text,
 )
+from app.theme import tokens
 from app.views import run_view as run_view_module
 from app.views.logs import LogSection
 from app.views.run_view import LIVE_NOTE, feed_time, parse_gpu_utilisation, phase_text
@@ -524,7 +525,8 @@ def test_the_live_feed_follows_the_newest_file_and_the_menu_switches(window, fak
     assert view.live_title.full_text() == "LIVE"
     assert view.note_label.text() == LIVE_NOTE == ("You can keep reviewing other episodes while this runs — nothing "
                                                   "is blocked, and edits apply to files that haven't started yet.")
-    assert view.live_panel.minimumWidth() == view.live_panel.maximumWidth() == 300
+    assert (view.live_panel.minimumWidth() == view.live_panel.maximumWidth()
+            == tokens.px(run_view_module.LIVE_WIDTH))       # the mockup's 300 px at the current UI scale
 
     fake_runner.emit(run, "run_file_started", file="ep01.mkv")
     fake_runner.emit(run, "run_subtitle", file="ep01.mkv", result=(578.0, 580.0, "你竟掌握了鲲鹏道法"))

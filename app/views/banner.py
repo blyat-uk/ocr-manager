@@ -6,6 +6,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from app.theme import tokens
 from app.widgets.base import Button, repolish
 
 
@@ -19,10 +20,10 @@ class Banner(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setProperty("tone", "warn")
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 7, 14, 7)
-        layout.setSpacing(10)
+        layout.setContentsMargins(tokens.px(14), tokens.px(7), tokens.px(14), tokens.px(7))
+        layout.setSpacing(tokens.px(10))
         texts = QVBoxLayout()
-        texts.setSpacing(2)
+        texts.setSpacing(tokens.px(2))
         self._title = QLabel()
         self._title.setObjectName("BannerTitle")
         self._text = QLabel()
