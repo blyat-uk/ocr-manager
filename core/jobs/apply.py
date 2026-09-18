@@ -63,6 +63,11 @@ Review
     Those count whoever set the value, until the user answers them by marking
     the file reviewed or writing the field again (see _counts_flagged).
 
+    Functions here do not know which jobs are still pending. When they
+    clear REVIEWED, they store PENDING as a placeholder. The model owner
+    follows applies and edits with recompute_all(), which derives every
+    non-reviewed file's real state.
+
 Crops the frame can hold
     A stored crop is always a box the file's frame can hold, because the OCR
     pass clamps differently (videocr.video.infer_crop_region narrows the box
@@ -73,10 +78,6 @@ Crops the frame can hold
     box when the frame size first becomes known and cuts it then. A crop that
     had to be cut is not the value the caller gave, so the file is flagged
     FLAG_CROP_CLAMPED and un-reviewed.
-    Functions here do not know which jobs are still pending. When they
-    clear REVIEWED, they store PENDING as a placeholder. The model owner
-    follows applies and edits with recompute_all(), which derives every
-    non-reviewed file's real state.
 """
 from __future__ import annotations
 
@@ -188,9 +189,6 @@ def counts_as_missing(entry: FileEntry, name: str) -> bool:
     return getattr(entry, name) is None or (name == "brightness" and brightness_is_stale(entry))
 
 
-_counts_as_missing = counts_as_missing        # the old private spelling, still used below
-
-
 def _source_independent(entry: FileEntry, name: str) -> set[str]:
     """The reasons in `entry.flags[name]` that describe the stored value
     itself, so they count whatever its source is."""
@@ -219,7 +217,7 @@ def _set_own_flag(entry: FileEntry, name: str, reason: str, on: bool) -> None:
     reasons in the string untouched."""
     existing = entry.flags.get(name) or ""
     flag = compose_flag(existing, reason) if on else remove_flag(existing, reason)
-    if flag or name in entry.flags:
+    if flag or name in entry.flags:     # never store "" for a field that had no flags at all
         entry.flags[name] = flag
 
 
@@ -520,7 +518,7 @@ def mark_reviewed(project: Project, file: str, reviewed: bool = True) -> None:
             entry.review = ReviewState.PENDING
         return
     for name in _flagged_fields(project.folder, entry):
-        if not _counts_as_missing(entry, name):
+        if not counts_as_missing(entry, name):
             value = getattr(entry, name)
             setattr(entry, name, replace(value, source=Source.MANUAL))
             # A reason about the stored value itself (a crop cut to fit, a
@@ -595,7 +593,7 @@ def apply_folder_change(project: Project, old: FolderSettings, new: FolderSettin
     for entry in project.files.values():
         if entry.review != ReviewState.REVIEWED:
             continue
-        if any(_counts_as_missing(entry, name) or _counts_flagged(entry, name) for name in newly_required):
+        if any(counts_as_missing(entry, name) or _counts_flagged(entry, name) for name in newly_required):
             _store_computed_state(new, entry)
 
 
@@ -628,7 +626,7 @@ def compute_review_state(entry: FileEntry, folder: FolderSettings, *,
     """
     required = _required(folder)
     for name in required:
-        if _counts_as_missing(entry, name):
+        if counts_as_missing(entry, name):
             return ReviewState.PENDING if name in detections_pending else ReviewState.FLAGGED
     if entry.review == ReviewState.REVIEWED:
         return ReviewState.REVIEWED
