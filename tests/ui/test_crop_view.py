@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
+from app.views import crop_view
 from app.views.crop_view import DETECTED_TAG, PAGE_MARGIN, CropCanvas, CropTab, SampleStrip
 from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
@@ -33,7 +34,9 @@ from app.views.tabs import evidence_tabs
 from core.detect import crop as crop_mod
 from core.detect import ocr_view
 from core.jobs.view_jobs import FramesResult
+from core.project.model import clamp_crop_box
 from core.project import (
+    MIN_CROP_SIDE,
     Brightness,
     Crop,
     FileEntry,
@@ -364,6 +367,23 @@ def test_the_box_clamps_to_the_frame_edges(make_tab):
     gesture(canvas, start, canvas.to_widget(BOX[0], -4000))      # drag the bottom edge above the top
     _x, _y, _w, height = canvas.box()
     assert height == canvas.MIN_BOX
+
+
+@pytest.mark.parametrize("box, frame", [
+    ((288, 784, 1344, 55), (1920, 888)),        # already inside: unchanged by both
+    ((-40, 9000, 4000, 4000), (1920, 888)),     # outside on every side
+    ((0, 0, 100, 100), (4, 4)),                 # a frame smaller than MIN_BOX
+    ((0, 0, 100, 100), (0, 0)),                 # no frame size known yet
+    ((10, 10, 2, 2), (1920, 888)),              # smaller than MIN_BOX
+])
+def test_the_views_clamp_is_the_models_clamp(box, frame):
+    """The view clamps before it commits and `core.project` clamps before it
+    stores. Two spellings of one rule meant the view could draw and report a
+    box the model would then quietly change under it -- they differed for a
+    frame under MIN_BOX, and for a frame whose size is not known yet."""
+    assert CropCanvas.MIN_BOX is MIN_CROP_SIDE              # one floor, not two
+    assert crop_view.clamp_box(box, frame, CropCanvas.MIN_BOX) == clamp_crop_box(box, frame)
+    assert crop_view.clamp_box(box, frame) == clamp_crop_box(box, frame)
 
 
 # --------------------------------------------------------------------------

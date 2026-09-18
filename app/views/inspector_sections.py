@@ -239,8 +239,9 @@ class ProofSection(Section):
     the Inspector from the controller's proof state: nothing yet, running,
     a result (fresh or stale), and a refusal ("Can't run yet: ...").
 
-    The "T run" button is disabled exactly while that file's proof runs, and
-    so is the T key that shares its command (ruling 5)."""
+    The "T run" button is disabled exactly while that file's proof runs, or
+    while the file has not been scanned and so has no window to run on
+    (`set_runnable`), and so is the T key that shares its command (ruling 5)."""
 
     run_requested = pyqtSignal()
 
@@ -275,7 +276,18 @@ class ProofSection(Section):
         self.body.addWidget(self.note_label)
         self._result = None
         self._expanded = False
+        self._runnable = True
         self.show_nothing()
+
+    def set_runnable(self, runnable: bool, reason: str = "") -> None:
+        """Whether this file can be proved at all (`state_text.can_run_proof`
+        -- the predicate T and the queue's menu item use). Independent of
+        whether a proof is running: `show_running` disables the button on top
+        of this, and `_reset` restores it to this."""
+        self._runnable = runnable
+        self.run_button.setToolTip("" if runnable else reason)
+        if not self._pulse.state():                  # not mid-run: apply it now
+            self.run_button.setEnabled(runnable)
 
     # --- the four presentations ------------------------------------------------
 
@@ -328,7 +340,7 @@ class ProofSection(Section):
         self._pulse.stop()
         self._pulse_effect.setOpacity(1.0)
         self.status_label.hide()
-        self.run_button.setEnabled(True)
+        self.run_button.setEnabled(self._runnable)
         self._show_lines([])
 
     def _show_all(self) -> None:

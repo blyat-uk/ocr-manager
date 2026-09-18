@@ -23,7 +23,14 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QMenu, QScrollArea, QVBoxLayout, QWidget
 
 from app.run_snapshot import FAILED, QUEUED, RUNNING
-from app.state_text import badge_for, can_mark_reviewed, format_duration, is_pending, is_reviewed
+from app.state_text import (
+    badge_for,
+    can_mark_reviewed,
+    can_run_proof,
+    format_duration,
+    is_pending,
+    is_reviewed,
+)
 from app.theme import tokens
 from app.views.deferred import Deferred
 from app.views.thumbnail import Thumbnail
@@ -342,10 +349,12 @@ class QueueView(QWidget):
         """T, the inspector's "T run" and this menu item are one command
         (ruling C4), so the item is live exactly when the command would do
         something: not while this file's proof is already running (a second
-        one would queue the same window again), and not before its duration
-        has been measured -- `controller.run_proof` refuses without one."""
+        one would queue the same window again), and not before the file has
+        been scanned. `can_run_proof` is the same predicate
+        `MainWindow._sync_actions` gates T with -- it asks `proof_window`
+        itself, so all three follow a refusal this view never has to know."""
         controller = self._controller
-        return not controller.proof_pending(name) and controller.entry(name).media.duration > 0
+        return not controller.proof_pending(name) and can_run_proof(controller.entry(name))
 
     def context_menu(self, name: str) -> QMenu:
         """The row's menu, built fresh so its texts and enabled states are

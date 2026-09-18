@@ -257,6 +257,35 @@ def test_the_queue_menu_disables_test_ocr_when_the_proof_cannot_run(window, fake
     assert not menu_actions(window.queue.context_menu(name))["Test OCR (T)"].isEnabled()
 
 
+def test_the_three_ways_to_test_ocr_are_offered_by_one_rule(window, fake_runner):
+    """Ruling C4: T, the inspector's "T run" and the queue's menu item are
+    one command, so they are one predicate -- `state_text.can_run_proof`,
+    which asks `proof_window` itself rather than second-guessing it. All
+    three agree at every step, and the two that can carry a tooltip say why."""
+    controller, inspector, name = window.controller, window.inspector, NAMES[0]
+    activate(window)
+    window.queue.select(name)
+    settle()
+
+    def offered() -> set[bool]:
+        window._sync_actions()
+        inspector.set_file(name)
+        return {window.proof_action.isEnabled(),
+                inspector.proof_button.isEnabled(),
+                menu_actions(window.queue.context_menu(name))["Test OCR (T)"].isEnabled()}
+
+    assert offered() == {True}
+    assert inspector.proof_button.toolTip() == ""
+
+    controller.entry(name).media = Media()               # never scanned
+    assert offered() == {False}
+    assert inspector.proof_button.toolTip() == "this file hasn't been scanned yet"
+
+    controller.entry(name).media = Media(1920, 888, DURATION, 25.0)
+    assert offered() == {True}
+    assert inspector.proof_button.toolTip() == ""
+
+
 def test_a_finished_proof_shows_its_lines_the_count_and_a_show_all_link(window, fake_runner):
     inspector = window.inspector
     name = NAMES[0]

@@ -1114,6 +1114,34 @@ def test_an_exception_in_a_slot_is_reported_instead_of_aborting(slay_window, cap
     assert window.crash_banner.isHidden()
 
 
+def test_the_review_tooltip_names_a_missing_value_rather_than_a_wait(make_window, tmp_project,
+                                                                     fake_runner):
+    """"Mark reviewed" is refused for two different reasons -- detections are
+    still running, or a value the file needs is missing -- and only the first
+    is a wait. A FLAGGED file with no crop was being told "waiting for
+    detections to finish" while nothing was coming."""
+    folder = write_project(tmp_project(["a.mkv"]), [entry("a.mkv", crop=None)])
+    window = make_window()
+    window.open_folder(str(folder))
+    settle()
+    controller, button = window.controller, window.inspector.review_button
+    assert controller.entry("a.mkv").review == ReviewState.PENDING
+    assert button.toolTip() == "waiting for detections to finish"        # ... and here it IS a wait
+
+    crop = fake_runner.last("crop", "a.mkv")                 # the detector found no box
+    fake_runner.finish(crop, crop_result(crop, box=None, flagged="static-content"))
+    controller.drain_events()
+    settle()
+    assert controller.entry("a.mkv").review == ReviewState.FLAGGED
+    assert controller.entry("a.mkv").crop is None
+    assert not button.isEnabled()
+    assert button.toolTip() == "set a crop first"            # nothing is coming; say so
+
+    controller.set_crop("a.mkv", BOX)
+    settle()
+    assert button.isEnabled() and button.toolTip() == ""
+
+
 def test_mark_reviewed_is_disabled_while_the_selected_file_is_pending(make_window, tmp_project, fake_runner):
     names = ["a.mkv", "b.mkv"]
     folder = write_project(tmp_project(names), [entry("a.mkv", crop=None, brightness=None, review=ReviewState.PENDING),

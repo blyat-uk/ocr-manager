@@ -63,7 +63,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.imaging import bgr_to_qimage
-from app.masking import aggregate_crop_box, mask_region
+from app.masking import MIN_CROP_SIDE, aggregate_crop_box, clamp_crop_box, mask_region
 from app.state_text import clock, crop_caption, crop_flag_summary
 from app.theme import tokens
 from app.views.inspector_sections import Section, note_label
@@ -136,21 +136,19 @@ def _with_alpha(colour: str, alpha: float) -> QColor:
     return result
 
 
-def clamp_box(box, video_size, minimum: int) -> tuple[int, int, int, int]:
+def clamp_box(box, video_size, minimum: int = MIN_CROP_SIDE) -> tuple[int, int, int, int]:
     """`box` as the frame can actually hold it: inside (0, 0, w, h) and at
     least `minimum` on each side.
 
-    Every path that stores a crop goes through this. The OCR pass slices
-    `frame[y:y + h, x:x + w]` and numpy clips a slice that runs past the
-    edge without a word, so a stored box the frame cannot hold would quietly
-    OCR a smaller region than the value says -- and than this view draws.
+    The model's own rule (`core.project.model.clamp_crop_box`, through
+    `app/masking.py` -- views import no `core`), not a second spelling of it.
+    Every path that STORES a crop clamps with it, so the box this view draws,
+    reports and commits is the box that is kept; the two used to disagree for
+    a frame smaller than `minimum` and for a frame whose size is not known
+    yet, and the model would then silently correct what the user had just
+    placed. The name stays local so the view's call sites read the same.
     """
-    video_width, video_height = video_size
-    width = _clamp(int(box[2]), minimum, max(minimum, int(video_width)))
-    height = _clamp(int(box[3]), minimum, max(minimum, int(video_height)))
-    x = _clamp(int(box[0]), 0, max(0, int(video_width) - width))
-    y = _clamp(int(box[1]), 0, max(0, int(video_height) - height))
-    return (x, y, width, height)
+    return clamp_crop_box(box, video_size, minimum)
 
 
 @dataclass(frozen=True)
@@ -245,7 +243,7 @@ class CropCanvas(QWidget):
     HANDLES = ("tl", "tr", "bl", "br", "tc", "bc")
     HANDLE_SIZE = 7                # `.cropbox b`: a 7x7 amber square per handle
     HANDLE_GRAB = 13               # the square is small; this is what the mouse actually hits
-    MIN_BOX = 8                    # video pixels
+    MIN_BOX = MIN_CROP_SIDE        # video pixels; the model's own floor, so the two cannot drift
     MIN_MASK = 6                   # a right-drag smaller than this counts as a click
     GRID_DIVISIONS = 10            # the "grid" overlay: every 10%
     GRID_ALPHA = 0.45
