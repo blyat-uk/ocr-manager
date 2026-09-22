@@ -8,8 +8,8 @@ Events
     The runner's listener only puts each JobEvent on a queue.SimpleQueue and
     returns: it never calls the runner and never blocks. A 30 ms QTimer drains
     the queue on the GUI thread (drain_events). For each terminal event of an
-    auto-pilot kind (metadata, thumbnail, crop, brightness, ranges,
-    audio_profile), in this order (AutoPilot's owner protocol):
+    auto-pilot kind (metadata, thumbnail, crop, brightness, confirm, ranges,
+    audio_profile, lines), in this order (AutoPilot's owner protocol):
       1. current = autopilot.is_current(event), before anything else;
       2. when current, the result is applied by type with core.jobs.apply
          (a thumbnail becomes an in-memory QImage copy); a superseded result
@@ -18,7 +18,10 @@ Events
          the applied values;
       4. recompute_all(project, pending=..., ranges_pending=...);
       5. signals, and a debounced save.
-    Proof, run and view (frames/strips) events have their own branches.
+    A "started" event of an auto-pilot kind goes to autopilot.on_job_event
+    too (it only records that the job runs: request_lines leaves a running
+    draw alone). Proof, run and view (frames/strips) events have their own
+    branches.
     Events of any other kind are logged to "Pipeline". A failed detection is
     logged under "Detections", never retried: re-detect is the user's retry.
     An apply that raises is logged to "Pipeline" and steps 3-4 still run, so
@@ -40,9 +43,55 @@ Frames and strips
     markers included, is dropped per file when the file disappears, its
     strips when its crop box changes, and all of it when the folder closes.
 
+    Behind that RAM cache the jobs keep an on-disk one
+    (core/jobs/view_cache.py), which is what makes a processed folder open
+    instantly: the detectors measure their evidence and throw the pixels
+    away, so without it every file switch paid ~3 s to decode frames the
+    folder had already decoded once. AutoPilot warms it file by file
+    (WarmJob) once a file's detection is done. Strips are stored losslessly
+    and are always exact; frames are stored lossy, which the crop view's
+    "masked" preview cannot use -- it filters on real pixel levels -- so
+    request_frames / frame take `exact`, and the cache entry remembers which
+    kind it holds. Nothing else on the canvas cares.
+
     These jobs are deliberately kept out of the ActivityTracker: a view
     repainting must not put "frames" in the activity strip or push the
-    detectors out of its five-deep history.
+    detectors out of its five-deep history. Warming is likewise invisible:
+    it is not a VIEW_KIND (set_view_file never cancels it -- it belongs to
+    the folder, not to the file on screen) and not a DETECTION_KIND (it holds
+    no review state, badge or chip), but AutoPilot holds it with detection,
+    so a run never waits behind it.
+
+Brightness confirmation ("confirm")
+    A file whose brightness the detector measured but doubted is FLAGGED and
+    badges "check brightness". The confirm stage masks one strip the file is
+    known to hold a subtitle on and asks the OCR engine to read it
+    (core/detect/confirm.py); a file it confirms simply becomes PROPOSED and
+    badges "ready". The controller treats it as any other auto-pilot kind --
+    apply the result (rules.apply_confirm), tell AutoPilot, recompute -- and
+    that recompute is the whole user-visible feature: apply_confirm clears
+    the brightness flag, compute_review_state then reads FLAGGED off nothing
+    and answers PROPOSED.
+
+    Where a confirm is named, and where it deliberately is not:
+    - the activity strip and its "... done N s ago" trail name it, like any
+      other job the machine is busy with (app/activity.py KIND_LABELS,
+      app/views/activity.py DONE_LABELS). It is GPU work that can run for
+      minutes across a folder of flagged files, and a strip that said "idle"
+      through it would be lying;
+    - a failed confirm lands in "Detections" with the other failed detection
+      jobs, through the same branch, and is never retried: re-detect is the
+      user's retry;
+    - nothing else. A confirm gives no file a pending badge: AutoPilot's
+      pending() never reports it (its UNREPORTED_KINDS), compute_review_state
+      only ever asks whether "crop" or "brightness" is pending anyway, and
+      badge_for names a running detector only for a file that is PENDING --
+      a file being confirmed is FLAGGED. It is not a DETECTION_KIND either,
+      so the top bar's "detecting" dot stays dark through it. That is the
+      point: a confirmed file must be indistinguishable from one the
+      detectors got right first time (no new badge text, no new chip, no
+      marker), and an unconfirmed one must go on saying exactly what it said
+      before.
 
 Sessions
     One runner lives as long as the controller. Closing a folder cancels its
@@ -102,11 +151,14 @@ from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
 from core.jobs import apply as rules
+from core.jobs import view_cache
 from core.jobs.autopilot import AUTOPILOT_KINDS, DETECTION_KINDS, AutoPilot
 from core.jobs.detect_jobs import (
     AudioProfileResult,
     BrightnessJobResult,
+    ConfirmJobResult,
     CropJobResult,
+    LinesJobResult,
     MetadataResult,
     ProofOcrJob,
     ProofResult,
@@ -138,7 +190,21 @@ _BADGE_BUCKETS = {ReviewState.REVIEWED: "reviewed", ReviewState.FLAGGED: "needs_
 # brightness and time-range views. Not auto-pilot kinds -- the controller
 # submits them itself -- and not activity: a view repainting must not push the
 # detectors out of the activity strip.
+# Worker threads on the CPU lane: metadata, thumbnails, audio profiles, the
+# ranges analysis, the views' own frame/strip fetches and the view-cache warm
+# pass. It was 2, which on a folder of hundreds of 4K episodes meant thumbnails
+# alone took minutes. Measured on this corpus (0.93 s a thumbnail cold), the
+# lane is latency-bound rather than bandwidth-bound and scales almost linearly:
+# 2.0x at 2 workers, 4.1x at 4, 5.8x at 8, 9.4x at 16. Peak RSS is what bounds
+# it -- 8 concurrent 4K decoders reach ~2.3 GB, 16 reach ~5.2 GB -- so 8 buys
+# most of the speed-up at a third of the memory, and is capped by the machine
+# so a small box does not get 8 decoders either.
+CPU_WORKERS = max(2, min(8, (os.cpu_count() or 4) // 2))
 VIEW_KINDS = frozenset({"frames", "strips"})
+# core.jobs.view_jobs.WarmJob.kind. An AutoPilot kind (it schedules the chain)
+# but not a detection one: it carries no result to apply and no state to
+# recompute, so it gets its own branch rather than the detection one.
+WARM_KIND = "warm"
 MAX_EVENTS_PER_DRAIN = 2000
 MAX_DRAINS_AT_CLOSE = 50                 # close/shutdown apply what arrived, without chasing a busy runner forever
 NOTIFY_TIMEOUT_SECONDS = 10
@@ -146,7 +212,7 @@ _FOLDER_FIELDS = frozenset(field.name for field in dataclasses.fields(FolderSett
 
 
 def default_runner_factory(on_event: Callable[[JobEvent], None]) -> JobRunner:
-    return JobRunner(on_event, cpu_workers=2)
+    return JobRunner(on_event, cpu_workers=CPU_WORKERS)
 
 
 def _box(crop) -> tuple[int, int, int, int] | None:
@@ -179,8 +245,9 @@ def _non_empty_file(path: str) -> bool:
 
 
 class ProjectController(QObject):
-    # Job kinds that are detections (crop, brightness, ranges, audio_profile): what "pause auto-pilot"
-    # holds and what the top bar's "detecting" dot means (ruling B7). Metadata and thumbnails are not.
+    # Job kinds that are detections (crop, brightness, ranges, audio_profile, lines): what "pause
+    # auto-pilot" holds and what the top bar's "detecting" dot means (ruling B7). Metadata and
+    # thumbnails are not.
     DETECTION_KINDS = DETECTION_KINDS
 
     project_opened = pyqtSignal(str)            # folder path
@@ -232,8 +299,8 @@ class ProjectController(QObject):
     def _reset_session(self) -> None:
         self._thumbnails: dict[str, QImage] = {}
         self._frames = FrameCache()
-        self._frame_inflight: set[tuple] = set()        # cache keys a frames/strips job is fetching
-        self._view_jobs: dict[str, list[tuple]] = {}    # job key -> the cache keys it was submitted for
+        self._frame_inflight: set[tuple] = set()        # (cache key, exact) a frames/strips job is fetching
+        self._view_jobs: dict[str, list[tuple]] = {}    # job key -> the in-flight entries it was submitted for
         self._proof_results: dict[str, ProofResult] = {}
         self._proof_outstanding: dict[str, int] = {}
         self._proof_stale: dict[str, int] = {}          # proofs of removed entries, still to end: never reported
@@ -279,6 +346,7 @@ class ProjectController(QObject):
         self._project = project
         self._autopilot = AutoPilot(self._runner, self._current_project)
         self._refresh_done(notify=False)
+        self._prune_view_cache()            # videos that left while the folder was closed
         self._folder_watch.watch(path)
         self._emit_files = self._emit_folder = self._emit_activity = True
         self._autopilot.on_open()
@@ -419,8 +487,16 @@ class ProjectController(QObject):
 
     # --- frames and strips for the review views ---------------------------------------
 
-    def set_view_file(self, name: str | None) -> None:
+    def set_view_file(self, name: str | None, upcoming: list[str] | None = None) -> None:
         """The file the review views are showing, from the window's selection.
+
+        `upcoming` is the queue's own order from `name` onwards -- its visible
+        order, so a filter such as "Needs you" gives the scattered handful the
+        user is actually working through. It goes to AutoPilot.boost_warm, so
+        the view cache is warmed ahead of the cursor instead of plodding
+        through the folder in name order, which is the order the user is
+        precisely not in. Without it the file the user opens next has to
+        decode its strips live: measured at 2-4 s a file on 4K.
 
         Frames and strips are submitted at VIEW_PRIORITY, above every
         priority AutoPilot gives its CPU work, on a lane with two workers for
@@ -435,8 +511,11 @@ class ProjectController(QObject):
         if self._project is None or self._shut_down:
             return
         self._runner.cancel_where(lambda job: job.kind in VIEW_KINDS and job.file != name)
+        ahead = [file for file in (upcoming or ([name] if name else [])) if file in self._project.files]
+        self._autopilot.boost_warm(ahead)
+        self._flush()
 
-    def request_frames(self, name: str, times: list[float]) -> None:
+    def request_frames(self, name: str, times: list[float], exact: bool = False) -> None:
         """Fetch `name`'s whole frames at `times` for the crop views.
 
         Only the times that are worth fetching are: the ones not cached, not
@@ -446,6 +525,15 @@ class ProjectController(QObject):
         (the view draws its placeholder) and is not asked for again until the
         file or the folder is reopened.
 
+        `exact` asks for the decoder's own pixels rather than the on-disk view
+        cache's lossy copy, for the crop view's "masked" preview: that filters
+        on real levels, and a WebP round trip moves them by up to ~58. A frame
+        already held exactly satisfies both kinds of request; a lossy one
+        satisfies only the plain kind, so an exact request re-fetches it even
+        though it is cached, and the frame that comes back upgrades the entry
+        for everyone. A plain request is satisfied by an exact fetch already
+        on its way, but not the other way round.
+
         A view asks from paintEvent, so with no folder open (or after
         shutdown) this does nothing rather than raise. An unknown file, while
         a folder is open, is a bug: KeyError.
@@ -453,15 +541,20 @@ class ProjectController(QObject):
         project = self._view_project(name)
         if project is None:
             return
-        wanted, keys = self._missing_times(times, lambda time_value: _frame_key(name, time_value))
+        wanted, entries = self._missing_times(times, lambda time_value: _frame_key(name, time_value),
+                                              exact=exact)
         if wanted:
-            self._submit_view_job(FrameJob(project.path, name, wanted), keys)
+            self._submit_view_job(FrameJob(project.path, name, wanted, exact=exact), entries)
 
-    def frame(self, name: str, time: float) -> np.ndarray | None:
+    def frame(self, name: str, time: float, exact: bool = False) -> np.ndarray | None:
         """The cached whole frame at `time` (a BGR numpy array), or None --
         for a time not fetched yet, one still on its way, and one that could
-        not be read."""
-        return self._frames.get(_frame_key(name, time))
+        not be read.
+
+        `exact=True` also answers None for a frame that came from the lossy
+        on-disk cache: the caller needs the decoder's own levels and must wait
+        for the fetch `request_frames(..., exact=True)` started."""
+        return self._frames.get(_frame_key(name, time), exact=exact)
 
     def request_strips(self, name: str, crop_box: tuple[int, int, int, int], times: list[float]) -> None:
         """Fetch `name`'s OCR-exact crop strips at `times`, for `crop_box`.
@@ -477,31 +570,61 @@ class ProjectController(QObject):
         if project is None:
             return
         box = tuple(int(value) for value in crop_box)
-        wanted, keys = self._missing_times(times, lambda time_value: _strip_key(name, box, time_value))
+        wanted, entries = self._missing_times(times, lambda time_value: _strip_key(name, box, time_value))
         if wanted:
-            self._submit_view_job(StripJob(project.path, name, box, wanted), keys)
+            self._submit_view_job(StripJob(project.path, name, box, wanted), entries)
 
     def strip(self, name: str, crop_box: tuple[int, int, int, int], time: float) -> np.ndarray | None:
         """The cached OCR-exact strip at `time` for `crop_box`, or None (same
         three cases as frame())."""
         return self._frames.get(_strip_key(name, crop_box, time))
 
-    def _missing_times(self, times: list[float],
-                       key_of: Callable[[float], tuple]) -> tuple[list[float], list[tuple]]:
+    def strip_unavailable(self, name: str, crop_box: tuple[int, int, int, int], time: float) -> bool:
+        """True once a strip job has come back without the strip at `time`
+        for `crop_box`: it will not be asked for again this session, so a
+        view waiting for it would wait for ever."""
+        return self._frames.is_unavailable(_strip_key(name, crop_box, time))
+
+    def _missing_times(self, times: list[float], key_of: Callable[[float], tuple],
+                       exact: bool = False) -> tuple[list[float], list[tuple]]:
         """The times of `times` that are worth fetching -- not cached, not
-        already being fetched and not known to be unreadable -- with their
-        cache keys, marked as being fetched now. A repeated time counts
-        once."""
-        wanted, keys = [], []
+        already being fetched and not known to be unreadable -- with the
+        in-flight entries they were marked with, a `(cache key, exact)` pair
+        each. A repeated time counts once.
+
+        Exactness is part of the in-flight entry rather than of the cache key,
+        because both kinds of fetch fill the same cache entry: they differ in
+        what will satisfy them, not in where the frame lands. A plain request
+        is answered by an exact fetch under way, an exact one is not answered
+        by a plain fetch, and a time already known unreadable is not asked for
+        again either way -- the decoder that could not read it would not read
+        it exactly either.
+        """
+        wanted, entries = [], []
         for value in times:
             time_value = float(value)
             key = key_of(time_value)
-            if self._frames.knows(key) or key in self._frame_inflight:
+            if self._knows_frame(key, exact) or self._fetching(key, exact):
                 continue
-            self._frame_inflight.add(key)
+            entry = (key, exact)
+            self._frame_inflight.add(entry)
             wanted.append(time_value)
-            keys.append(key)
-        return wanted, keys
+            entries.append(entry)
+        return wanted, entries
+
+    def _knows_frame(self, key: tuple, exact: bool) -> bool:
+        """This frame has been fetched well enough for a request of this kind:
+        cached (exactly, when `exact`), or known to be unreadable."""
+        if self._frames.is_unavailable(key):
+            return True
+        if exact:
+            return self._frames.get(key, exact=True) is not None
+        return self._frames.knows(key)
+
+    def _fetching(self, key: tuple, exact: bool) -> bool:
+        """A fetch under way that will satisfy a request of this kind: one of
+        the same kind, or -- for a plain request -- an exact one."""
+        return (key, True) in self._frame_inflight or (not exact and (key, False) in self._frame_inflight)
 
     def _view_project(self, name: str) -> Project | None:
         """The open project, or None when there is nothing to fetch from: no
@@ -514,15 +637,15 @@ class ProjectController(QObject):
             raise KeyError(name)
         return self._project
 
-    def _submit_view_job(self, job, keys: list[tuple]) -> None:
+    def _submit_view_job(self, job, entries: list[tuple]) -> None:
         try:
             self._runner.submit(job)
         except BaseException:
-            self._frame_inflight.difference_update(keys)
+            self._frame_inflight.difference_update(entries)
             raise
         # Extend rather than replace: should two requests ever share a key
         # (the same file and times), one terminal event releases both sets.
-        self._view_jobs.setdefault(job.key, []).extend(keys)
+        self._view_jobs.setdefault(job.key, []).extend(entries)
 
     # --- edits ------------------------------------------------------------------------
 
@@ -580,6 +703,43 @@ class ProjectController(QObject):
             self._crop_box_changed(name)
         self._after_edit(name)
         return True
+
+    def bulk_targets(self, name: str) -> list[str]:
+        """The files "apply to all" from `name` would write: `name` and every
+        file not skipped, in name order (core.jobs.apply.bulk_targets)."""
+        return rules.bulk_targets(self._require()[0], name)
+
+    def apply_brightness_to_all(self, name: str, value: int) -> list[str]:
+        """One MANUAL brightness for every bulk target (see
+        core.jobs.apply.apply_brightness_to_all); the files written."""
+        project, _ = self._require()
+        if name not in project.files:
+            raise KeyError(name)
+        targets = rules.apply_brightness_to_all(project, name, value)
+        self._after_bulk_edit(targets)
+        return targets
+
+    def apply_crop_to_all(self, name: str, box: tuple[int, int, int, int]) -> list[str]:
+        """One MANUAL crop box for every bulk target, cut to each file's
+        frame (core.jobs.apply.apply_crop_to_all); the files written. Each
+        file whose box moved is a crop change like any other: what was
+        measured on the old box is re-measured and its strips dropped."""
+        project, _ = self._require()
+        if name not in project.files:
+            raise KeyError(name)
+        before = {target: _box(project.files[target].crop) for target in rules.bulk_targets(project, name)}
+        targets = rules.apply_crop_to_all(project, name, box)
+        for target in targets:
+            if _box(project.files[target].crop) != before[target]:
+                self._crop_box_changed(target)
+        self._after_bulk_edit(targets)
+        return targets
+
+    def _after_bulk_edit(self, names: list[str]) -> None:
+        self._emit_changed.update(names)
+        self._recompute()
+        self._schedule_save()
+        self._flush()
 
     def update_folder(self, **changes) -> None:
         """Replace FolderSettings fields. TypeError for an unknown field;
@@ -643,6 +803,36 @@ class ProjectController(QObject):
 
     def hint_targets(self, name: str, what: str) -> list[str]:
         return self._require()[1].hint_targets(name, what)
+
+    def request_lines(self, name: str) -> None:
+        """The Brightness tab is showing `name`: move its gallery lines to the
+        front of the GPU queue when they are missing or stale. Idempotent, so
+        the tab may call it on every refresh; a file with current lines, or
+        whose lines job is already boosted or running, changes nothing
+        (AutoPilot.boost_lines). With no folder open, after shutdown, or for
+        a file that is not in the folder, nothing happens: a view refreshes
+        on its own schedule."""
+        if self._shut_down or self._project is None or name not in self._project.files:
+            return
+        self._autopilot.boost_lines(name)
+        self._recompute()
+        self._flush()
+
+    def shuffle_lines(self, name: str) -> None:
+        """Draw new random gallery lines for `name`, away from the ones it
+        shows now: the current lines' times and the detector's tile times
+        are excluded."""
+        project, autopilot = self._require()
+        if name not in project.files:
+            raise KeyError(name)
+        evidence = project.files[name].evidence
+        lines = evidence.get("lines") or {}
+        tiles = (evidence.get("brightness") or {}).get("tiles") or {}
+        exclude = [float(sample["time"]) for sample in lines.get("samples") or () if "time" in sample]
+        exclude += [float(time) for time in tiles.values()]
+        autopilot.shuffle_lines(name, exclude)
+        self._recompute()
+        self._flush()
 
     def run_proof(self, name: str) -> None:
         """Real OCR of a 30 s window (ruling C4). ValueError while the file's
@@ -811,6 +1001,9 @@ class ProjectController(QObject):
         if event.kind in VIEW_KINDS:                    # a view's own fetches are not activity
             self._on_view_event(event)
             return
+        if event.kind == WARM_KIND:                     # nor is warming the disk behind them
+            self._on_warm_event(event)
+            return
         if self._activity.on_event(event, time.monotonic()):
             self._emit_activity = True
         if event.kind == "run":
@@ -822,9 +1015,49 @@ class ProjectController(QObject):
         else:
             self._log(PIPELINE_LOG, f"Unexpected {event.type!r} event from job {event.key} (kind {event.kind!r})")
 
+    def _prune_view_cache(self) -> None:
+        """Drop the cached pixels of videos that are no longer in the folder.
+
+        The warm pass trims within each file's own directory, which cannot
+        reach a file that has gone: its directory is named after something
+        nothing will ask for again. So the folder's own two moments of truth
+        do it -- opening it (videos may have left while it was closed) and
+        reconciling away a removal. Cheap either way: one scandir.
+        """
+        project = self._project
+        if project is None:
+            return
+        gone = view_cache.prune(project.path, project.files)
+        if gone:
+            logger.debug("Dropped the view cache of %d file(s) no longer in %s", gone, project.path)
+
+    def _on_warm_event(self, event: JobEvent) -> None:
+        """A warm job ended: tell AutoPilot, and nothing else.
+
+        Warming writes pixels to `.ocr-cache/view/` and changes no value, no
+        review state and no badge, so there is nothing to apply and nothing to
+        recompute -- and running a recompute per file would make a
+        hundred-file folder's warm pass cost more in the GUI thread than it
+        saves. It stays out of the activity strip for the same reason the
+        view's own fetches do: it must not push the detectors out of the
+        five-deep history.
+
+        AutoPilot still hears every event, terminal or not, because its warm
+        chain advances on them. A failure is logged once and never retried on
+        the same evidence; there is nothing for the user to do about it, and
+        the only cost is that this file opens as slowly as it used to.
+        """
+        if event.type == "failed":
+            self._log(PIPELINE_LOG, f"Could not warm the view cache for {event.file}: {event.message}")
+        if event.type == "started" or event.type in TERMINAL_EVENTS:
+            self._autopilot.on_job_event(event)
+
     def _on_detection_event(self, event: JobEvent) -> None:
         if event.type == "log":
             self._log(event.file or PIPELINE_LOG, event.message)
+            return
+        if event.type == "started":
+            self._autopilot.on_job_event(event)          # records that it runs; nothing else
             return
         if event.type not in TERMINAL_EVENTS:
             return
@@ -864,11 +1097,22 @@ class ProjectController(QObject):
         elif isinstance(result, BrightnessJobResult):
             rules.apply_brightness(project, result)
             touched = [result.file]
+        elif isinstance(result, ConfirmJobResult):
+            # The OCR confirmation of a doubted brightness. It changes one
+            # file's flag (and, when a lower rung passed, its value), so it
+            # is applied exactly like the measurement it answers -- the
+            # _recompute() our caller runs next is what turns the cleared
+            # flag into PROPOSED and the badge into "ready".
+            rules.apply_confirm(project, result)
+            touched = [result.file]
         elif isinstance(result, RangesJobResult):
             rules.apply_ranges(project, result)
             touched = list(result.analysis.durations)
         elif isinstance(result, AudioProfileResult):
             rules.apply_audio_profile(project, result)
+            touched = [result.file]
+        elif isinstance(result, LinesJobResult):
+            rules.apply_lines(project, result)
             touched = [result.file]
         else:
             self._log(PIPELINE_LOG, f"Unexpected job result {type(result).__name__}")
@@ -888,8 +1132,8 @@ class ProjectController(QObject):
         if event.type not in TERMINAL_EVENTS:
             return
         requested = self._view_jobs.pop(event.key, [])
-        for key in requested:
-            self._frame_inflight.discard(key)
+        for entry in requested:
+            self._frame_inflight.discard(entry)
         if event.type == "failed":
             self._log(PIPELINE_LOG, f"Could not load {event.kind} for {event.file}: {event.message}")
         result, files = event.result, self._project.files
@@ -897,7 +1141,10 @@ class ProjectController(QObject):
         if isinstance(result, FramesResult) and result.file in files:
             for time_value, image in result.frames.items():
                 key = _frame_key(result.file, time_value)
-                self._frames.put(key, image)
+                # A frame the job read back from the on-disk view cache is
+                # lossy; one it decoded is exact, whether or not the job then
+                # wrote a lossy copy of it out.
+                self._frames.put(key, image, lossy=float(time_value) in result.lossy)
                 arrived.add(key)
                 self._emit_frames.append((result.file, float(time_value)))
         elif isinstance(result, StripsResult) and result.file in files and result.strips:
@@ -909,7 +1156,7 @@ class ProjectController(QObject):
         if event.type != "cancelled" and event.file in files:
             # What is missing comes from the RESULT, never from what is still
             # in the cache: the last put of a batch may have evicted the first.
-            for key in requested:
+            for key, _exact in requested:
                 if key not in arrived:
                     self._frames.mark_unavailable(key)
 
@@ -1150,6 +1397,7 @@ class ProjectController(QObject):
                 self._proof_stale[name] = self._proof_stale.get(name, 0) + outstanding
         if removed:
             autopilot.on_files_removed(removed)
+            self._prune_view_cache()
         if added:
             autopilot.on_files_added(added)
         self._refresh_done()

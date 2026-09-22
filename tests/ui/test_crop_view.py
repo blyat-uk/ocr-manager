@@ -27,14 +27,21 @@ from app import masking
 from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.views import crop_view, ranges_view
-from app.views.crop_view import DETECTED_TAG, PAGE_MARGIN, CropCanvas, CropTab, SampleStrip
+from app.views.crop_view import (
+    APPLY_ALL_CROP_TEXT,
+    APPLY_ALL_TITLE,
+    DETECTED_TAG,
+    PAGE_MARGIN,
+    CropCanvas,
+    CropTab,
+    SampleStrip,
+)
 from app.views.ranges_view import Timeline
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
 from core.detect import crop as crop_mod
 from core.detect import ocr_view
 from core.jobs.view_jobs import FramesResult
-from core.project.model import clamp_crop_box
 from core.project import (
     MIN_CROP_SIDE,
     Brightness,
@@ -48,6 +55,7 @@ from core.project import (
     TimeRanges,
     save_project,
 )
+from core.project.model import clamp_crop_box
 
 NAMES = ["ZS2_-_11_[1080p]TXHBR.mp4", "ZS2_-_12_[1080p]TXHBR.mp4"]
 FRAME_SIZE = (1920, 888)
@@ -649,6 +657,95 @@ def test_an_unreadable_time_is_asked_for_once(make_tab):
 
 
 # --------------------------------------------------------------------------
+# Exact frames for the masked preview
+# --------------------------------------------------------------------------
+
+def _frames_jobs(harness, *, exact: bool):
+    return [s for s in harness.runner.of_kind("frames", harness.name) if s.job.exact is exact]
+
+
+def _deliver(harness, submissions, value: int, *, lossy: bool) -> None:
+    """Answer `submissions` with a flat frame of `value`, as the on-disk view
+    cache would (lossy) or as the decoder would (exact)."""
+    for submission in submissions:
+        if harness.runner.ended(submission):
+            continue
+        times = submission.job.times
+        array = np.full((720, 1557, 3), value, dtype=np.uint8)
+        harness.runner.finish(submission,
+                              FramesResult(harness.name, dict.fromkeys(times, array),
+                                           lossy=frozenset(times) if lossy else frozenset()))
+    harness.controller.drain_events()
+    QApplication.processEvents()
+
+
+def test_no_exact_frame_is_fetched_while_masked_is_off(make_tab):
+    """The canvas is a picture to look at: the lossy cached frame is all it
+    needs, and asking for exact pixels would decode for nothing."""
+    harness = make_tab()
+    assert _frames_jobs(harness, exact=True) == []
+
+
+def test_turning_masked_on_asks_for_the_current_frame_exactly(make_tab):
+    """Only the canvas frame: the filmstrip is never masked, so its
+    thumbnails stay on the cheap cached copies."""
+    harness = make_tab()
+    _deliver(harness, _frames_jobs(harness, exact=False), 100, lossy=True)
+
+    harness.tab.masked_button.click()
+
+    exact = _frames_jobs(harness, exact=True)
+    assert len(exact) == 1
+    assert exact[0].job.times == (harness.tab.current_time(),)
+
+
+def test_a_frame_already_held_exactly_is_not_fetched_again_for_masking(make_tab):
+    """A frame the decoder produced this session is already exact, whatever
+    the disk cache holds: turning masking on has nothing to fetch."""
+    harness = make_tab()
+    harness.deliver_frames()                            # decoded, so exact
+
+    harness.tab.masked_button.click()
+
+    assert _frames_jobs(harness, exact=True) == []
+
+
+def test_the_masked_preview_uses_the_lossy_frame_until_the_exact_one_lands(make_tab, monkeypatch):
+    """Blanking the canvas for the half second a decode takes would make the
+    toggle look broken, so the cached frame stands in and is re-masked when
+    the exact one arrives."""
+    harness = make_tab()
+    _deliver(harness, _frames_jobs(harness, exact=False), 100, lossy=True)
+    levels = []
+    real = ocr_view.mask
+
+    def spy(region, threshold):
+        levels.append(int(region.max()))
+        return real(region, threshold)
+
+    monkeypatch.setattr(ocr_view, "mask", spy)
+    harness.tab.masked_button.click()
+    harness.tab.canvas.grab()
+    assert levels == [100]                              # the lossy frame, masked meanwhile
+
+    _deliver(harness, _frames_jobs(harness, exact=True), 200, lossy=False)
+    harness.tab.canvas.grab()
+    assert levels[-1] == 200                            # the decoder's own pixels took over
+
+
+def test_the_exact_frame_is_not_refetched_once_it_is_held(make_tab):
+    harness = make_tab()
+    _deliver(harness, _frames_jobs(harness, exact=False), 100, lossy=True)
+    harness.tab.masked_button.click()
+    _deliver(harness, _frames_jobs(harness, exact=True), 200, lossy=False)
+
+    before = len(_frames_jobs(harness, exact=True))
+    harness.tab.refresh()
+    harness.tab.canvas.grab()
+    assert len(_frames_jobs(harness, exact=True)) == before
+
+
+# --------------------------------------------------------------------------
 # Inspector panel
 # --------------------------------------------------------------------------
 
@@ -703,9 +800,15 @@ def test_without_evidence_the_panel_names_the_source(make_tab):
 
 
 def test_a_detection_that_differs_from_your_box_is_shown_as_the_detection(make_tab):
+    """Ruling C2 wants a panel row naming both boxes. Two boxes on one row
+    do not fit the inspector column, so they are two rows -- each of which
+    fits, so neither elides."""
     harness = make_tab(crop=(300, 800, 1300, 60), source=Source.MANUAL)
     rows = dict(harness.tab.panel.rows())
-    assert rows["detected"] == "288, 784 · 1344 × 55 · yours 300, 800 · 1300 × 60"
+    assert rows["detected"] == "288, 784 · 1344 × 55"
+    assert rows["yours"] == "300, 800 · 1300 × 60"
+    assert harness.tab.panel.row_tone("detected") == "warn"
+    assert harness.tab.panel.row_tone("yours") == "warn"
     assert harness.tab.canvas.detected_box() == BOX
     assert harness.tab.canvas.box() == (300, 800, 1300, 60)
 
@@ -1218,3 +1321,35 @@ def test_the_last_typed_field_survives_whenever_the_frame_can_hold_it(make_tab):
         assert box_width >= CropCanvas.MIN_BOX and box_height >= CropCanvas.MIN_BOX
         origin, size = (x, box_width) if horizontal else (y, box_height)
         assert (origin if origin_field else size) == typed      # the typed field survived
+
+
+# --------------------------------------------------------------------------
+# Apply to all files
+# --------------------------------------------------------------------------
+
+def test_apply_crop_to_all_commits_a_typed_box_first_then_writes_every_file(make_tab):
+    harness = make_tab()
+    asked = []
+    harness.tab.confirm = lambda title, text: asked.append((title, text)) or True
+    harness.tab.panel.set_spin_values(300, 1300, 800, 60)      # still waiting for its debounce
+    harness.tab.panel.all_button.click()
+    QApplication.processEvents()
+    assert asked == [(APPLY_ALL_TITLE, APPLY_ALL_CROP_TEXT.format(x=300, y=800, width=1300, height=60,
+                                                                  n=len(NAMES)))]
+    assert f"all {len(NAMES)} files" in asked[0][1]
+    for name in NAMES:
+        assert harness.controller.entry(name).crop == Crop(300, 800, 1300, 60, Source.MANUAL)
+
+
+def test_saying_no_to_apply_crop_to_all_leaves_the_other_files_alone(make_tab):
+    harness = make_tab()
+    harness.tab.confirm = lambda title, text: False
+    harness.tab.panel.set_spin_values(300, 1300, 800, 60)
+    harness.tab.panel.all_button.click()
+    QApplication.processEvents()
+    assert harness.controller.entry(NAMES[1]).crop == Crop(*BOX, Source.MANUAL)
+
+
+def test_apply_crop_to_all_needs_a_crop(make_tab):
+    assert make_tab().tab.panel.all_button.isEnabled() is True
+    assert make_tab(crop=None).tab.panel.all_button.isEnabled() is False

@@ -10,11 +10,12 @@ through `tokens.px`, so at UI_SCALE 1.25 that track is 65 px on screen.
 
 Two modes, one widget (ruling B5). The Time ranges tab hosts the editable
 one; the Crop and Brightness tabs mount the same widget read-only and
-compact under their stage, with the crop samples ticked on it. Compact mode
-has no grips and never writes: it reports where it was clicked
-(`seek_requested`) or double-clicked (`pin_requested`) and lets the tab
-decide what that means -- the Crop tab jumps to the nearest sample, the
-Brightness tab pins a tile. Nothing here knows about either.
+compact under their stage, ticked with the times the tab is showing -- the
+crop samples unless the tab says otherwise (`set_marks`; the Brightness tab
+ticks its gallery tiles). Compact mode has no grips and never writes: it
+reports where it was clicked (`seek_requested`) and lets the tab decide what
+that means -- the Crop tab jumps to the nearest sample, the Brightness tab
+highlights the nearest tile. Nothing here knows about either.
 
 What it draws
     The keep spans are the file's own `entry.time_ranges` (whole file when
@@ -46,6 +47,11 @@ Editing (edit mode only)
     open start, so the stored value says "to the end of the file" rather
     than pinning a duration the metadata may still refine.
 
+    A right-click on the track (`context_menu`) deletes the keep range under
+    it, or adds a range in the skipped block under it (`with_range_at`),
+    through the same commit. A drag never removes a range: a boundary stops
+    MIN_SPAN short of its neighbour.
+
 Ruling C3: no hint offer for time ranges -- an intro's length is the
 folder's business (the detector already shares fingerprints across it), not
 something one episode hints to the others.
@@ -61,7 +67,7 @@ from dataclasses import dataclass
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QMenu, QSizePolicy, QVBoxLayout, QWidget
 
 from app.masking import speech_in_skips
 from app.state_text import format_duration
@@ -80,6 +86,9 @@ EXTEND_TEXT = "extend keep →"
 ADD_TEXT = "+ add range"
 WHOLE_FILE_TEXT = "use whole file"
 REMOVE_TEXT = "✕"
+DELETE_RANGE_TEXT = "Delete range"       # the track's right-click menu, on a keep span ...
+ADD_HERE_TEXT = "Add range here"         # ... and on a skip span
+EDIT_NOTE = "Drag an edge to move it. Right-click a range to delete it, or a skipped block to add one there."
 KEEP_KEY = "Keep"
 WHOLE_FILE_VALUE = "whole file"
 LANE_LABEL = "speech"
@@ -309,6 +318,27 @@ def with_added_range(keeps, duration: float) -> list[tuple[float, float]]:
     return sorted([*keeps, (float(start), float(end))])
 
 
+def with_range_at(keeps, time: float, duration: float) -> list[tuple[float, float]]:
+    """`keeps` plus a keep of up to ADD_RANGE_SECONDS centred on `time`, the
+    track's "Add range here". It is trimmed to the skipped gap `time` falls
+    in and kept MIN_SPAN clear of the keeps either side -- touching one would
+    merge into it, leaving no block and no grips of its own -- but reaches
+    the file's start or end when the gap does, so it is stored open there.
+    `keeps` comes back untouched when `time` is not in a gap, or the gap
+    cannot hold MIN_SPAN."""
+    gap = next(((start, end) for start, end in complement(keeps, duration) if start <= time <= end), None)
+    if gap is None:
+        return list(keeps)
+    gap_start, gap_end = gap
+    low = math.ceil(gap_start) + MIN_SPAN if gap_start > 0 else 0.0
+    high = math.floor(gap_end) - MIN_SPAN if gap_end < duration else duration
+    first = round(float(time) - ADD_RANGE_SECONDS / 2)
+    start, end = max(low, first), min(high, first + ADD_RANGE_SECONDS)
+    if end - start < MIN_SPAN:
+        return list(keeps)
+    return sorted([*keeps, (float(start), float(end))])
+
+
 def _merged(keeps) -> list[tuple[float, float]]:
     merged: list[tuple[float, float]] = []
     for start, end in sorted(keeps):
@@ -382,12 +412,10 @@ class Timeline(QWidget):
     read-only and compact (`mode="compact"`, ruling B5).
 
     It draws the file and, in edit mode, edits it; it decides nothing about
-    the tab it is mounted in. A compact click and double-click leave as
-    `seek_requested` / `pin_requested`, and `position()` remembers the last
-    click for a tab that asks later (the Brightness tab's pin tile)."""
+    the tab it is mounted in. A compact click leaves as `seek_requested`,
+    and `position()` remembers it (the marker drawn at it)."""
 
     seek_requested = pyqtSignal(float)        # compact click: "the user pointed at t"
-    pin_requested = pyqtSignal(float)         # compact double-click
     committed = pyqtSignal()                  # an edit reached the controller
 
     def __init__(self, controller, mode: str = "edit", parent: QWidget | None = None):
@@ -405,6 +433,7 @@ class Timeline(QWidget):
         self._envelope: list[float] = []
         self._speech: list[tuple[float, float]] = []
         self._marks: list[float] = []
+        self._mark_override: list[float] | None = None   # set_marks; None: the crop samples
         self._drag: int | None = None
         self._position: float | None = None
         self._warnings: list[SpeechWarning] = []
@@ -445,7 +474,20 @@ class Timeline(QWidget):
         self._blocks = [block for block in (ranges.get("blocks") or []) if _block_span(block)]
         self._envelope = [float(value) for value in (audio.get("envelope") or [])]
         self._speech = [(float(start), float(end)) for start, end in (audio.get("speech") or [])]
-        self._marks = _sample_times(crop)
+        self._marks = _sample_times(crop) if self._mark_override is None else list(self._mark_override)
+        self.update()
+
+    def set_marks(self, times) -> None:
+        """Tick `times` (seconds) instead of the crop samples; None goes back
+        to the crop samples. Kept across refreshes and files: the tab that
+        set it keeps it current."""
+        self._mark_override = None if times is None else sorted({float(time) for time in times})
+        if self._mark_override is None:
+            entry = self._entry()
+            evidence = (entry.evidence if entry is not None else {}) or {}
+            self._marks = _sample_times(evidence.get("crop") or {})
+        else:
+            self._marks = list(self._mark_override)
         self.update()
 
     def duration(self) -> float:
@@ -469,6 +511,7 @@ class Timeline(QWidget):
         return list(self._speech)
 
     def sample_marks(self) -> list[float]:
+        """The times ticked on the track, in order (compact mode draws them)."""
         return list(self._marks)
 
     def lane_label(self) -> str:
@@ -612,12 +655,39 @@ class Timeline(QWidget):
         if keeps != self._drawn_keeps():
             self.commit(keeps)
 
-    def mouseDoubleClickEvent(self, event) -> None:
-        if self.editable or event.button() != Qt.MouseButton.LeftButton:
+    def context_menu(self, x: float) -> QMenu | None:
+        """The right-click menu at `x`, built fresh so it reads what is
+        stored now; the caller shows it (or triggers its actions).
+
+        On a keep span, "Delete range" -- what that range's ✕ in the panel
+        does, so the last one leaves the whole file. On a skip span, "Add
+        range here" (`with_range_at`), disabled when the gap is too narrow
+        to hold one. None where there is nothing to offer: compact mode
+        (strictly read-only, ruling B5), mid-drag, no duration yet, or the
+        whole file kept with nothing stored to delete and no skip to add to."""
+        if not self.editable or self._drag is not None or self._duration <= 0 or not self._keeps:
+            return None
+        time = self.time_at(x)
+        keeps = list(self._keeps)
+        menu = QMenu(self)
+        index = next((i for i, (start, end) in enumerate(keeps) if start <= time <= end), None)
+        if index is not None:
+            action = menu.addAction(DELETE_RANGE_TEXT)
+            action.triggered.connect(lambda _checked=False: self.commit([*keeps[:index], *keeps[index + 1:]]))
+        else:
+            added = with_range_at(keeps, time, self._duration)
+            action = menu.addAction(ADD_HERE_TEXT)
+            action.setEnabled(added != keeps)
+            action.triggered.connect(lambda _checked=False: self.commit(added))
+        return menu
+
+    def contextMenuEvent(self, event) -> None:
+        menu = self.context_menu(event.pos().x())
+        if menu is None:
+            super().contextMenuEvent(event)
             return
-        self._position = self.time_at(event.position().x())
-        self.update()
-        self.pin_requested.emit(self._position)
+        menu.exec(event.globalPos())
+        menu.deleteLater()
 
     def commit(self, keeps) -> None:
         """Store `keeps` as this file's time ranges (MANUAL) and redraw from
@@ -979,6 +1049,8 @@ class RangesInspectorPanel(Section):
         buttons.addWidget(self.whole_file_button)
         buttons.addStretch(1)
         self.body.addWidget(self._buttons)
+        self.edit_note = note_label(EDIT_NOTE)       # the track's gestures say nothing on their own
+        self.body.addWidget(self.edit_note)
         self.body.addStretch(1)
 
     def set_ranges(self, keeps, duration: float, *, unreadable: bool = False) -> None:

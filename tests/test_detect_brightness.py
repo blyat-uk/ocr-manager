@@ -1518,16 +1518,38 @@ def test_cheap_path_landing_exactly_on_the_folder_plateaus_start_is_not_narrow(m
     assert result.auto_applicable
 
 
-@pytest.mark.parametrize("folder", [(220, 235), (215, 255)])
-def test_cheap_path_never_goes_below_the_folder_plateau_and_says_so(monkeypatch, folder):
+def test_cheap_path_never_goes_below_the_folder_plateau_and_says_so(monkeypatch):
+    """A folder plateau narrower than the margin cannot give any pick one,
+    so every file measured against it is worth a look."""
     dim = _glyph_strip(core=(235,) * 3)   # seed 227; 227 - 20 = 207 would leave the plateau
+    _fake_source(monkeypatch, _interleave([dim] * 3, [_ramp_strip()] * 3))
+
+    result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
+                                 folder_plateau=(220, 235))       # 15 wide: narrower than the margin
+
+    assert result.value == 220
+    assert result.flagged == "narrow-plateau?"
+
+
+@pytest.mark.parametrize("folder", [(215, 255), (217, 237)])
+def test_cheap_path_clamping_inside_a_wide_enough_folder_plateau_is_not_narrow(monkeypatch, folder):
+    """"narrow-plateau?" is a fact about the plateau, as it is on the full
+    path -- not about where this file's seed sat in it.
+
+    The rule used to read the seed: `seed - PICK_BELOW_TOP < lo`, which on a
+    folder plateau exactly PICK_BELOW_TOP wide is every seed but the one at
+    its very top. On a real 432-file folder (plateau (217, 237)) that flagged
+    192 of 208 cheap results for review -- all of them carrying the identical
+    value 217, which the flag does not change."""
+    dim = _glyph_strip(core=(235,) * 3)   # seed 227; 227 - 20 = 207, under both plateaus
     _fake_source(monkeypatch, _interleave([dim] * 3, [_ramp_strip()] * 3))
 
     result = B.detect_brightness("v.mp4", CROP, None, _FakeDet(), _ExplodingOCR(),
                                  folder_plateau=folder)
 
-    assert result.value == folder[0]
-    assert result.flagged == "narrow-plateau?"
+    assert result.value == folder[0]      # the clamp still bites; the value is unchanged
+    assert result.flagged is None
+    assert result.auto_applicable
 
 
 def test_cheap_path_escalates_when_the_seed_is_outside_the_folder_plateau(monkeypatch):

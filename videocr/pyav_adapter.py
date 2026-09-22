@@ -459,7 +459,13 @@ class FFmpegNVDECCapture:
         return self._last_pts
 
     def get_stream_start_time(self) -> float:
-        """Container-level start_time in seconds (0 for most MKV, non-zero for some MP4)."""
+        """The container's start_time in seconds: time 0 of the output, as
+        PyAVCapture.get_stream_start_time() explains.
+
+        read() counts PTS from the same place: ffmpeg's pipe begins at the
+        container start, padding with copies of the first frame when the
+        video starts later, so the real frames keep their true PTS.
+        """
         return getattr(self, "_container_start_time", 0.0)
 
 
@@ -1159,13 +1165,23 @@ class PyAVCapture:
         return self._last_pts
 
     def get_stream_start_time(self) -> float:
-        """Get the container-level start_time in seconds.
+        """The container's start_time in seconds: time 0 of the output.
 
-        Players use PTS values directly for playback, offset only by the
-        container start_time (not the stream start_time). For MKV this is
-        typically 0; for MP4 it can be non-zero due to edit lists.
-        Stream start_time merely indicates when the first sample appears
-        and is NOT a playback offset to subtract.
+        Subtitle times are frame PTS minus this, so every line lands on the
+        frame it was read from *as the player paints it*. A player's zero is
+        the container start -- libavformat's format start_time, the earliest
+        of all the streams -- which is what mpv rebases to under its default
+        --rebase-start-time=yes. The video stream's start_time is NOT that
+        zero: it merely says when the first frame arrives, and subtracting it
+        shifts every line earlier by (video start - container start).
+
+        In "Tales of Demon and Gods - 173 [4K].mkv" the audio and the
+        container start at 0.015999 s while the first frame starts at
+        0.100994 s, and counting from the frame put every line 85 ms -- two
+        frames -- early: rendered through mpv, the line was on screen two
+        frames before the hardsub it was read from. Counting from the
+        container puts them on the same frame. For MKV this is typically 0;
+        for MP4 it can be non-zero due to edit lists.
         """
         if not PYAV_AVAILABLE or self.container is None:
             return 0.0

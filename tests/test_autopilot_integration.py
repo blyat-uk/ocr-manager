@@ -16,7 +16,8 @@ undelivered, the folder must be at rest: nothing pending or outstanding in
 AutoPilot, no stale brightness, and no file left PENDING. A file is FLAGGED at
 rest only for a reason: a hint re-detection disagreed, or the user cancelled
 one of its jobs; otherwise it is PROPOSED or REVIEWED, never stuck without its
-values.
+values. Every file whose gallery lines are wanted has them, drawn on its
+current crop, unless the user skipped it or cancelled one of its jobs.
 
 Idle is exact, not timed: the owner counts every job from its "queued" event
 (delivered to the queue before submit returns) to its terminal event, and
@@ -37,6 +38,7 @@ import pytest
 from core.detect import audio_profile as audio_profile_module
 from core.detect import brightness as brightness_module
 from core.detect import crop as crop_module
+from core.detect import lines as lines_module
 from core.detect import ocr_view
 from core.detect.brightness import BrightnessResult, StripSample
 from core.detect.crop import CropResult, CropSample
@@ -62,6 +64,7 @@ APPLY = {
     "brightness": apply.apply_brightness,
     "ranges": apply.apply_ranges,
     "audio_profile": apply.apply_audio_profile,
+    "lines": apply.apply_lines,
 }
 DURATION = 1500.0
 FRAME = (1920, 1080)
@@ -93,6 +96,7 @@ class Fakes:
         monkeypatch.setattr(ranges_module, "analyse_detailed", self.analyse_detailed)
         monkeypatch.setattr(ranges_module, "default_cache_dir", lambda project_dir: None)
         monkeypatch.setattr(audio_profile_module, "audio_profile", self.audio_profile)
+        monkeypatch.setattr(lines_module, "sample_lines", self.sample_lines)
         monkeypatch.setattr(engine_registry, "_build_ocr_engine", lambda *args: object())
         monkeypatch.setattr(engine_registry, "_build_detection_engine", lambda *args: object())
 
@@ -139,6 +143,15 @@ class Fakes:
         return ranges_module.RangesAnalysis(keep={f.name: [("1:30", "23:00")] for f in files}, blocks={},
                                             durations={f.name: DURATION for f in files})
 
+    def sample_lines(self, video_path, crop_box, time_ranges, speech, det_engine, *, count=lines_module.LINE_COUNT,
+                     seed, exclude=(), cancel_check=None):
+        for _ in range(2):
+            self._step()
+            if cancel_check and cancel_check():
+                return lines_module.LinesResult((), 0, seed, cancelled=True)
+        samples = tuple(lines_module.LineSample(100.0 * (i + 1), ((1, 1, 10, 10),), 1) for i in range(count))
+        return lines_module.LinesResult(samples, 2 * count, seed)
+
     def audio_profile(self, path, duration, cancel_check=None):
         self._step()
         return audio_profile_module.AudioProfile(duration, [0.0] * 4, [])
@@ -170,6 +183,7 @@ class Owner:
         self.problems: list = []
         self.removed: list[str] = []         # removed names that may be added back
         self.cancelled: set[str] = set()     # files the user cancelled a job of
+        self.skipped: set[str] = set()       # files the user skipped at some point (lines are not drawn then)
 
     def recompute(self) -> None:
         apply.recompute_all(self.project, pending=self.autopilot.pending(),
@@ -235,8 +249,9 @@ def _act(owner: Owner, rnd: random.Random, counter, *, removals: bool, cancels: 
         apply.mark_reviewed(project, name, rnd.random() < 0.7)
     elif action == "skip":
         apply.set_skipped(project, name, not project.files[name].skipped)
+        owner.skipped.add(name)
     elif action == "cancel":
-        kind = rnd.choice(["crop", "brightness", "metadata", "audio_profile", "thumbnail", "ranges"])
+        kind = rnd.choice(["crop", "brightness", "metadata", "audio_profile", "thumbnail", "ranges", "lines"])
         runner.cancel("ranges:*" if kind == "ranges" else f"{kind}:{name}")
         owner.cancelled.add(name)
     elif action == "remove":
@@ -292,6 +307,9 @@ def assert_at_rest(owner: Owner) -> None:
     for name, entry in project.files.items():
         assert not apply.brightness_is_stale(entry), (name, entry.crop, entry.evidence.get("brightness"))
         assert entry.review != ReviewState.PENDING, (name, entry)
+        if entry.crop is not None and name not in owner.skipped and name not in owner.cancelled:
+            drawn_on = (entry.evidence.get("lines") or {}).get("crop_box")
+            assert drawn_on == [entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height], (name, entry)
         if entry.review == ReviewState.FLAGGED:                # only for a reason, never stuck
             hint_disagreed = any(apply.FLAG_DIFFERS_FROM_HINT in (entry.flags.get(kind) or "")
                                  for kind in ("crop", "brightness"))

@@ -7,12 +7,29 @@ cancellation convention), and every apply_* function ignores it.
 
 Detection never overrides the user (rulings C1/C2)
     A detection result writes a value only into an empty field, or over a
-    value whose own source is DETECTED or HINT, and only when the result is
-    auto_applicable. MANUAL and IMPORTED values are never written by
-    detection. The detector's evidence and flags are stored either way, so
-    the inspector can show "detected X, yours Y". Hint-driven results (a
-    crop consensus seeded from an edit, a brightness re-detect checked
-    against an edited value) are written with source HINT.
+    value whose own source is DETECTED or HINT. MANUAL and IMPORTED values
+    are never written by detection. The detector's evidence and flags are
+    stored either way, so the inspector can show "detected X, yours Y".
+    Hint-driven results (a crop consensus seeded from an edit, a brightness
+    re-detect checked against an edited value) are written with source HINT.
+
+Detection stores what it measured, flags and all
+    The test is `measured` (a crop box, a brightness reading of this file),
+    NOT `auto_applicable`. A result the detector doubts -- a box built from
+    one subtitle frame, a plateau with no safe margin -- is stored with its
+    blocking flag, which sends the file to FLAGGED ("check crop"), and the
+    user accepts it with mark_reviewed, which turns it MANUAL. Withholding
+    the value instead left the file with nothing to accept: the views draw
+    the box from the evidence either way, so the user saw a correct box that
+    "Mark reviewed" refused ("set a crop first"), and brightness, which
+    needs a crop, never ran.
+
+    Nothing is applied unreviewed that was not before. auto_applicable still
+    decides FLAGGED vs PROPOSED (via the stored flags), and a FLAGGED file
+    is never startable (ruling B6), so a doubted value cannot reach a run
+    without the user accepting it. A result that measured nothing -- no box,
+    or a brightness carrying DEFAULT_BRIGHTNESS because there was no crop,
+    no keep range or no text -- still writes no value.
 
 Stale brightness
     A brightness result is dropped entirely (no value, evidence or flag)
@@ -25,6 +42,29 @@ Stale brightness
     detected or hinted brightness whose value_crop_box is no longer the
     file's crop (the crop was re-detected or edited since) counts as missing
     (brightness_is_stale). MANUAL and IMPORTED brightness is never stale.
+
+Confirmed brightness
+    apply_confirm retires a brightness doubt the OCR engine answered: the
+    ladder of core.detect.confirm read one of the file's own subtitle strips
+    at the stored value, or at a lower rung, so the file no longer needs the
+    user. It writes the passing rung (keeping the value's own source, HINT
+    stays HINT) and drops the field's flags, except the
+    SOURCE_INDEPENDENT_FLAGS reasons, which are about the stored value and
+    not about the detection this answered. It is not a measurement and adds
+    no flag of its own: a confirmed file looks exactly like one the detectors
+    got right, and the doubt it retired stays readable in
+    evidence["brightness"]["flagged"]. The record of the probe is stored
+    under evidence["brightness"]["confirm"] whether the ladder passed or
+    failed -- a failed ladder changes nothing else at all.
+
+Gallery lines
+    apply_lines stores the Brightness tab's random subtitle lines as
+    evidence["lines"], with the crop they were grabbed on, and only while the
+    file still has that crop (a result for another crop is dropped entirely,
+    as a stale brightness result is). Lines are view evidence, not a value:
+    applying them never touches a value, a source, a flag, the review state
+    or sample_time, and a "lines" job pending never holds a review state
+    (compute_review_state only waits for DIALOGUE_DETECTORS).
 
 Hints
     "differs-from-hint?" (blocking) is added to the file's flags when a hint
@@ -46,6 +86,10 @@ Review
       only when no required field still holds a detected or hinted value with
       a blocking flag; otherwise they store the computed state (the file stays
       FLAGGED until the user accepts or edits that field).
+    - apply_brightness_to_all / apply_crop_to_all review the file the user
+      is on as set_manual_* does; every other file they write keeps the
+      review mark it has and gains none (a crop cut to fit a file's frame
+      clears it: the stored box is not the one chosen).
     - apply_folder_change un-reviews files whose newly required values are
       missing, stale or flagged when the folder starts extracting dialogue.
     - An apply clears REVIEWED when it changes a value (a detected or hinted
@@ -84,12 +128,15 @@ from __future__ import annotations
 from dataclasses import replace
 
 from core.detect import brightness as _brightness
+from core.detect import confirm as _confirm
 from core.detect import crop as _crop
 from core.detect.flags import compose_flag, only_informational, remove_flag
 from core.jobs.detect_jobs import (
     AudioProfileResult,
     BrightnessJobResult,
+    ConfirmJobResult,
     CropJobResult,
+    LinesJobResult,
     MetadataResult,
     RangesJobResult,
     detector_cancelled,
@@ -212,6 +259,22 @@ def _counts_flagged(entry: FileEntry, name: str) -> bool:
     return _is_detected(getattr(entry, name)) and _blocking(entry, name)
 
 
+def counts_flagged(entry: FileEntry, name: str) -> bool:
+    """Whether `entry.flags[name]` counts against the file -- THE test for
+    that question, and the only one compute_review_state() derives FLAGGED
+    from. See _counts_flagged, which this is a public name for.
+
+    The rule is subtle enough that deriving it twice is how a badge and the
+    store come to disagree about one file, and it already happened once:
+    app.state_text._flag_blocks_detected_value re-derives it by hand, and its
+    docstring says so. Callers outside this module need it -- the window, to
+    say why a file is flagged, and AutoPilot, to find the files whose doubt
+    a confirm probe could retire and the ones already carrying a reason no
+    probe may withdraw -- so they ask here rather than reimplement it.
+    """
+    return _counts_flagged(entry, name)
+
+
 def _set_own_flag(entry: FileEntry, name: str, reason: str, on: bool) -> None:
     """Add or drop one source-independent reason, leaving the detector's own
     reasons in the string untouched."""
@@ -320,7 +383,7 @@ def apply_crop(project: Project, r: CropJobResult | None) -> None:
     entry.flags["crop"] = flag
 
     written = False
-    if _detection_may_write(entry.crop) and result.box is not None and result.auto_applicable:
+    if _detection_may_write(entry.crop) and result.measured:
         source = Source.HINT if r.hint is not None else Source.DETECTED
         _write_detected(entry, "crop", Crop(*_crop_tuple(result.box), source))
         written = True
@@ -380,7 +443,7 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
     entry.flags["brightness"] = flag
 
     written = False
-    if _detection_may_write(entry.brightness) and result.auto_applicable:
+    if _detection_may_write(entry.brightness) and result.measured:
         source = Source.HINT if r.hint_value is not None else Source.DETECTED
         _write_detected(entry, "brightness", Brightness(int(result.value), source), old_stale=old_stale)
         evidence["value_crop_box"] = list(_crop_tuple(r.crop_box))
@@ -389,6 +452,116 @@ def apply_brightness(project: Project, r: BrightnessJobResult | None) -> None:
         for reason in kept:
             _set_own_flag(entry, "brightness", reason, True)
     _unreview_on_blocking_flag(project, entry, "brightness")
+
+
+def apply_confirm(project: Project, r: ConfirmJobResult | None) -> None:
+    """Store one file's OCR confirmation of its brightness, and retire the
+    detector's doubt when the ladder passed.
+
+    core.detect.confirm masks ONE strip the file is known to hold a subtitle
+    on and asks the OCR engine to read it -- at the stored value first, then
+    at lower rungs down to its hard stop. A rung that reads the line at the
+    folder's own conf_threshold answers the only question the detector's
+    doubt raised, "would a run read this file's subtitles at this
+    threshold?", so the value is good enough to run with and the file stops
+    asking for the user.
+
+    A confirmed file is deliberately indistinguishable from any file the
+    detectors got right first time: no flag of its own, no marker, nothing
+    extra on screen. It simply becomes PROPOSED and badges "ready", and the
+    detector's original doubt stays readable in
+    evidence["brightness"]["flagged"], which BrightnessResult.to_evidence()
+    already wrote.
+
+    Dropped entirely -- no record, no value, no flag change -- whenever the
+    world moved between the job being submitted and its result arriving,
+    because every one of those makes the ladder an answer to a question
+    nobody is asking any more:
+    - the result was cancelled, or the file is gone from the project;
+    - the file's crop is no longer r.crop_box: the strip was cut from a
+      region the file does not use (the same rule as apply_brightness's, and
+      compared the same way);
+    - its brightness is gone, or is MANUAL or IMPORTED: the user's value is
+      no more detection's to confirm than to overwrite (rulings C1/C2);
+    - its value is no longer r.start_value: the ladder started from a value
+      nobody stores now;
+    - its value is stale (brightness_is_stale: measured on a crop the file no
+      longer has). A stale value must be re-measured, not confirmed -- the
+      ladder read a strip from today's crop, but the value it judged belongs
+      to yesterday's.
+
+    Otherwise the record goes into evidence["brightness"]["confirm"] whether
+    the ladder passed or failed, because it is two things at once: what the
+    Brightness tab can quote, and the memo that stops the folder re-probing
+    the same failed ladder on every open (core.detect.confirm.matches reads
+    it). setdefault, not assignment into a dict assumed to be there: evidence
+    lives in the disposable .ocr-cache/ and can legitimately be missing while
+    the value and its flags (in .ocr.json) are perfectly good.
+
+    A failed ladder stops there. It proved nothing, so the value, the flags
+    and the review state all stand and the file goes on saying "check
+    brightness". A passing ladder writes its rung when that is not the stored
+    value already, keeping the source the detector gave it (a HINT value
+    stays HINT) and going through _write_detected, so the change follows the
+    same un-review rule as any other detected write; it records the crop the
+    stored value now belongs to, exactly as apply_brightness does when it
+    writes a value; and it clears the field's flag -- except the
+    SOURCE_INDEPENDENT_FLAGS reasons, which describe the stored VALUE rather
+    than a detection and so are never this stage's to withdraw. AutoPilot
+    does not even submit a job for a file carrying one, but flags can move
+    between submit and apply, so this is checked here too.
+
+    The review state is not set here: the model owner follows every apply
+    with recompute_all(), which is what turns the cleared flag into PROPOSED.
+    """
+    if r is None or r.result.cancelled:
+        return
+    entry = project.files.get(r.file)
+    if entry is None:
+        return
+    if entry.crop is None or r.crop_box is None or _value_key(entry.crop) != _crop_tuple(r.crop_box):
+        return
+    if not _is_detected(entry.brightness) or entry.brightness.value != r.start_value:
+        return
+    if brightness_is_stale(entry):
+        return
+
+    evidence = entry.evidence.setdefault("brightness", {})
+    evidence["confirm"] = _confirm.record(r.result, start_value=r.start_value,
+                                          conf_threshold=r.conf_threshold, crop_box=r.crop_box)
+    if not r.result.confirmed:
+        return
+
+    if r.result.value != entry.brightness.value:
+        _write_detected(entry, "brightness", Brightness(int(r.result.value), entry.brightness.source))
+        evidence["value_crop_box"] = list(_crop_tuple(r.crop_box))
+    # The doubt is retired. Keep only the reasons about the stored value
+    # itself, in the order they were composed in; the detector's own doubt
+    # about its reading is exactly what the engine just answered.
+    kept = _source_independent(entry, "brightness")
+    flag = "+".join(reason for reason in (entry.flags.get("brightness") or "").split("+") if reason in kept)
+    if flag or "brightness" in entry.flags:     # never store "" for a field that had no flags at all
+        entry.flags["brightness"] = flag
+
+
+def apply_lines(project: Project, r: LinesJobResult | None) -> None:
+    """Store the gallery lines as evidence["lines"]: the sampler's evidence
+    (seed, tried, samples) plus "crop_box", the crop they were grabbed on.
+
+    Dropped entirely when the file is gone, has no crop, or its crop is not
+    r.crop_box (the crop changed while the lines were drawn: they show
+    another region). A new draw replaces the previous lines, and a draw that
+    found none is stored too (the tab says so). Nothing else about the file
+    changes: lines are view evidence, not a value."""
+    if r is None or r.result.cancelled:
+        return
+    entry = project.files.get(r.file)
+    if entry is None or entry.crop is None or r.crop_box is None:
+        return
+    box = _crop_tuple(r.crop_box)
+    if _value_key(entry.crop) != box:
+        return
+    entry.evidence["lines"] = {**r.result.to_evidence(), "crop_box": list(box)}
 
 
 def apply_ranges(project: Project, r: RangesJobResult | None) -> None:
@@ -577,6 +750,56 @@ def paste_settings(project: Project, target: str, clip: dict) -> None:
         pasted = True
     if pasted:
         _review_after_edit(project, entry)
+
+
+def bulk_targets(project: Project, source: str) -> list[str]:
+    """The files a bulk edit from `source` writes, in name order: `source`
+    (the file the user is on, skipped or not) and every file not skipped."""
+    return sorted(name for name, entry in project.files.items() if name == source or not entry.skipped)
+
+
+def apply_brightness_to_all(project: Project, source: str, value: int) -> list[str]:
+    """One MANUAL brightness for every bulk target; the targets, in name order.
+
+    `source` is edited exactly as set_manual_brightness edits it (the user is
+    looking at it: REVIEWED unless flagged). The other targets get the value
+    and nothing else: a REVIEWED mark they have stays -- the user chose the
+    value for them -- but none is added, since nobody looked at their other
+    fields; recompute_all derives their state. Their crop, time ranges,
+    flags and evidence are left alone."""
+    targets = bulk_targets(project, source)
+    for name in targets:
+        if name == source:
+            set_manual_brightness(project, name, value)
+        else:
+            project.files[name].brightness = Brightness(int(value), Source.MANUAL)
+    return targets
+
+
+def apply_crop_to_all(project: Project, source: str, box: tuple[int, int, int, int]) -> list[str]:
+    """One MANUAL crop box for every bulk target; the targets, in name order.
+
+    `source` is edited exactly as set_manual_crop edits it; the others get
+    the box `source` ends up with, each cut to its own frame (a folder can
+    mix resolutions). A file whose box had to be cut is flagged
+    FLAG_CROP_CLAMPED and loses a REVIEWED mark -- what is stored is not the
+    box the user chose -- and, as with any crop edit, a DETECTED brightness
+    measured on the old box is now stale (the owner re-measures it: see
+    AutoPilot.on_crop_changed). Otherwise as apply_brightness_to_all: a
+    REVIEWED mark stays, none is added, nothing else changes."""
+    targets = bulk_targets(project, source)
+    set_manual_crop(project, source, box)
+    chosen = _value_key(project.files[source].crop)
+    for name in targets:
+        if name == source:
+            continue
+        entry = project.files[name]
+        fitted, cut = _fitted_crop(entry, chosen)
+        entry.crop = Crop(*fitted, Source.MANUAL)
+        _set_own_flag(entry, "crop", FLAG_CROP_CLAMPED, cut)
+        if cut:
+            _unreview(entry)
+    return targets
 
 
 def apply_folder_change(project: Project, old: FolderSettings, new: FolderSettings) -> None:

@@ -14,6 +14,13 @@ returns one widget holding them and the stage mounts it there, swapping it
 on every tab change. A tab that returns None -- or, for a tab written before
 this existed, one with no `toolbar` attribute at all -- leaves the head with
 nothing but its tab buttons.
+
+`set_active(bool)` is optional too. The stage calls it on every tab that has
+it, once when it is built and again on every tab switch: True for the tab
+now showing, False for the others. A tab that does work only for the user's
+eyes uses it -- the Brightness tab asks the controller to fetch the shown
+file's gallery lines first, and a tab nobody is looking at must not jump the
+GPU queue. Tabs without it are simply not told.
 """
 from __future__ import annotations
 
@@ -88,6 +95,7 @@ class Stage(QWidget):
         layout.addWidget(self._pages, 1)
 
         self._show_toolbar(self._current)
+        self._activate(self._current)
 
         controller.file_changed.connect(self._on_file_changed)
         controller.files_changed.connect(self._refresh_tabs)
@@ -119,6 +127,15 @@ class Stage(QWidget):
         for other in self._toolbars:
             other.setVisible(other is bar)
 
+    def _activate(self, index: int) -> None:
+        """Tell each tab that has `set_active` whether it is the one showing
+        (see the module docstring); `getattr` for the same reason as
+        `_show_toolbar`."""
+        for position, tab in enumerate(self._tabs):
+            setter = getattr(tab, "set_active", None)
+            if callable(setter):
+                setter(position == index)
+
     def page_host(self) -> QStackedWidget:
         return self._pages
 
@@ -143,6 +160,7 @@ class Stage(QWidget):
             button.setProperty("on", position == index)
             repolish(button)
         self._show_toolbar(index)
+        self._activate(index)
         self.tab_changed.emit(index)
 
     def set_file(self, name: str | None) -> None:

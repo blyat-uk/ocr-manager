@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import QApplication, QLineEdit, QPushButton, QSpinBox, QVBo
 
 from app.controller import ProjectController
 from app.controller import UnsupportedProjectVersion
-from app.main_window import OPEN_FAILED_TITLE, SAVE_FAILED_TITLE, MainWindow
+from app.main_window import WARM_LOOKAHEAD, OPEN_FAILED_TITLE, SAVE_FAILED_TITLE, MainWindow
 from app.theme import tokens
 from app.views import folder_settings, folder_settings_fields, open_folder as open_folder_module, run_view
 from app.views.inspector_sections import button_text_budget
@@ -525,7 +525,13 @@ def test_moving_the_selection_hands_the_new_file_to_the_controller(slay_window):
 
     QTest.keyClick(queue, Qt.Key.Key_Down)
     QTest.keyClick(queue, Qt.Key.Key_Down)
-    assert view_files.calls == [(SLAY_NAMES[1],), (SLAY_NAMES[2],)]
+    assert [call[0] for call in view_files.calls] == [SLAY_NAMES[1], SLAY_NAMES[2]]
+    # ... and the files that selection is heading towards, so the view cache
+    # warms ahead of the cursor instead of in name order (AutoPilot.boost_warm).
+    assert [call[1] for call in view_files.calls] == [
+        queue.visible_names()[1:1 + 1 + WARM_LOOKAHEAD],
+        queue.visible_names()[2:2 + 1 + WARM_LOOKAHEAD],
+    ]
 
 
 def test_clicking_a_row_selects_it(slay_window):
@@ -1268,7 +1274,7 @@ def test_detecting_dot_ignores_metadata_and_thumbnail_jobs(slay_window, fake_run
 
 
 def test_controller_names_the_detection_kinds(controller):
-    assert controller.DETECTION_KINDS == frozenset({"crop", "brightness", "ranges", "audio_profile"})
+    assert controller.DETECTION_KINDS == frozenset({"crop", "brightness", "ranges", "audio_profile", "lines"})
     assert controller.is_detection_kind("audio_profile") and not controller.is_detection_kind("thumbnail")
 
 

@@ -24,6 +24,9 @@ from app.theme import tokens
 from app.views import ranges_view
 from app.views.crop_view import CropTab
 from app.views.ranges_view import (
+    ADD_HERE_TEXT,
+    DELETE_RANGE_TEXT,
+    EDIT_NOTE,
     NO_DURATION_TEXT,
     NOTE_TEXT,
     PAGE_MARGIN,
@@ -35,10 +38,11 @@ from app.views.ranges_view import (
     Timeline,
     WarningRow,
     with_added_range,
+    with_range_at,
 )
 from app.views.stage import Stage, StageTab
 from app.views.tabs import evidence_tabs
-from core.project import Source, TimeRange, TimeRanges
+from core.project import Crop, Source, TimeRange, TimeRanges
 from core.project.ocr_kwargs import ocr_call_for
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -632,6 +636,87 @@ def test_use_whole_file_commits_none(tab, controller):
     assert controller.entry(NAME).time_ranges.ranges == []
 
 
+def test_the_panel_says_how_to_edit_the_track(tab):
+    assert tab.inspector_panel().edit_note.text() == EDIT_NOTE
+
+
+# --------------------------------------------------------------------------
+# The track's right-click menu
+# --------------------------------------------------------------------------
+
+def menu_actions(menu) -> dict:
+    return {action.text(): action for action in menu.actions() if not action.isSeparator()}
+
+
+def test_right_clicking_a_keep_range_deletes_it(controller):
+    give_values(controller, keep=((INTRO_END, 600.0), (700.0, OUTRO_START)))
+    made = RangesTab(controller)
+    made.set_file(NAME)
+    made.timeline.resize(800, 68)
+    settle()
+    calls = Calls(controller, "set_time_ranges")
+    actions = menu_actions(made.timeline.context_menu(made.timeline.x_for(400.0)))
+    assert list(actions) == [DELETE_RANGE_TEXT]
+    actions[DELETE_RANGE_TEXT].trigger()
+    assert calls.calls == [(NAME, [("11:40", "23:05")])]
+    assert made.inspector_panel().keep_rows() == [("Keep", "11:40 → 23:05")]
+
+
+def test_deleting_the_only_range_keeps_the_whole_file_as_the_x_does(tab, controller):
+    calls = Calls(controller, "set_time_ranges")
+    menu_actions(tab.timeline.context_menu(tab.timeline.x_for(600.0)))[DELETE_RANGE_TEXT].trigger()
+    assert calls.calls == [(NAME, None)]
+
+
+def test_right_clicking_a_skipped_block_adds_a_minute_centred_on_the_click(tab, controller):
+    calls = Calls(controller, "set_time_ranges")
+    actions = menu_actions(tab.timeline.context_menu(tab.timeline.x_for(1500.4)))
+    assert list(actions) == [ADD_HERE_TEXT]
+    assert actions[ADD_HERE_TEXT].isEnabled()
+    actions[ADD_HERE_TEXT].trigger()
+    assert calls.calls == [(NAME, [("2:33", "23:05"), ("24:30", "25:30")])]
+
+
+def test_a_range_added_at_the_start_of_the_file_has_an_open_start(tab, controller):
+    calls = Calls(controller, "set_time_ranges")
+    menu_actions(tab.timeline.context_menu(tab.timeline.x_for(10.0)))[ADD_HERE_TEXT].trigger()
+    assert calls.calls == [(NAME, [(None, "0:40"), ("2:33", "23:05")])]
+
+
+def test_a_range_added_near_a_keep_stays_a_second_clear_of_it():
+    """Touching the keep would merge into it: no block of its own, no grips."""
+    assert with_range_at([(153.0, 1385.0)], 1390.0, 1628.0) == [(153.0, 1385.0), (1386.0, 1420.0)]
+    assert with_range_at([(153.0, 1385.0)], 140.0, 1628.0) == [(110.0, 152.0), (153.0, 1385.0)]
+
+
+def test_a_range_added_near_the_end_reaches_the_end(controller):
+    assert with_range_at([(153.0, 1385.0)], 1620.0, 1628.44) == [(153.0, 1385.0), (1590.0, 1628.44)]
+
+
+def test_a_skip_too_narrow_to_hold_a_range_offers_add_disabled(controller):
+    keeps = [(0.0, 100.0), (101.5, 200.0)]
+    assert with_range_at(keeps, 100.7, 200.0) == keeps
+    give_values(controller, keep=((0.0, 100.0), (102.0, OUTRO_START)))
+    made = Timeline(controller, mode="edit")
+    made.set_file(NAME)
+    made.resize(800, 68)
+    assert not menu_actions(made.context_menu(made.x_for(101.0)))[ADD_HERE_TEXT].isEnabled()
+
+
+def test_the_whole_file_kept_offers_no_menu(controller):
+    """Nothing is stored to delete, and no skipped block to add into."""
+    give_values(controller, keep=())
+    made = Timeline(controller, mode="edit")
+    made.set_file(NAME)
+    made.resize(800, 68)
+    assert made.context_menu(made.x_for(600.0)) is None
+
+
+def test_the_compact_timeline_offers_no_menu(bare_compact):
+    assert bare_compact.context_menu(bare_compact.x_for(600.0)) is None
+    assert bare_compact.context_menu(bare_compact.x_for(1500.0)) is None
+
+
 # --------------------------------------------------------------------------
 # The header
 # --------------------------------------------------------------------------
@@ -705,6 +790,19 @@ def test_compact_mode_marks_the_crop_samples(compact):
     assert compact.sample_marks() == [120.0, 600.0, 1200.0]
 
 
+def test_a_tab_can_mark_its_own_times_and_hand_the_marks_back(compact, controller):
+    """The Brightness tab marks its gallery tiles instead of the crop samples;
+    None gives the crop samples back, and a refresh keeps whichever is set."""
+    compact.set_marks([900.0, 300.0, 300.0])
+    assert compact.sample_marks() == [300.0, 900.0]
+    compact.refresh()
+    assert compact.sample_marks() == [300.0, 900.0]
+    compact.set_marks([])
+    assert compact.sample_marks() == []
+    compact.set_marks(None)
+    assert compact.sample_marks() == [120.0, 600.0, 1200.0]
+
+
 def test_compact_mode_is_read_only(compact, controller):
     calls = Calls(controller, "set_time_ranges")
     drag_grip(compact, INTRO_END, compact.x_for(300.0))
@@ -720,11 +818,15 @@ def test_a_compact_click_asks_for_a_seek_and_remembers_the_position(compact):
     assert compact.position() == pytest.approx(900.0, abs=3.0)
 
 
-def test_a_compact_double_click_asks_for_a_pin(compact):
-    pins: list[float] = []
-    compact.pin_requested.connect(pins.append)
+def test_a_compact_double_click_asks_for_nothing(compact):
+    """Pinning a frame from the timeline went with the Brightness tab's pin
+    tile (brightness-gallery spec, decision 5): a double-click is two clicks,
+    each a seek, and nothing more."""
+    seeks: list[float] = []
+    compact.seek_requested.connect(seeks.append)
     double_click(compact, QPointF(compact.x_for(640.0), 26.0))
-    assert pins == [pytest.approx(640.0, abs=3.0)]
+    assert not hasattr(compact, "pin_requested")
+    assert all(seek == pytest.approx(640.0, abs=3.0) for seek in seeks)
 
 
 def test_the_edit_timeline_ignores_clicks_away_from_a_grip(tab):
@@ -756,33 +858,31 @@ def test_the_crop_tab_selects_the_nearest_sample_on_a_seek(controller):
     assert crop_tab.selected_index() == 0                     # 120 s
 
 
-def test_the_brightness_tab_pins_a_tile_on_a_double_click(controller):
+def test_the_crop_tab_keeps_marking_its_samples(controller):
     give_values(controller, crop=True)
-    tabs = evidence_tabs(controller)
-    brightness_tab = tabs[1]
+    crop_tab = evidence_tabs(controller)[0]
+    crop_tab.set_file(NAME)
+    settle()
+    assert crop_tab.timeline.sample_marks() == [120.0, 600.0, 1200.0]
+
+
+def test_the_brightness_tab_marks_its_tiles_and_highlights_the_nearest_on_a_seek(controller):
+    give_values(controller, crop=True)
+    entry = controller.entry(NAME)
+    entry.crop = Crop(288, 786, 1344, 55, Source.DETECTED)
+    entry.evidence["lines"] = {"crop_box": [288, 786, 1344, 55], "seed": 1, "tried": 12,
+                               "samples": [{"time": t, "boxes": [[10, 5, 100, 30]], "lines": 1}
+                                           for t in (300.0, 900.0, 1500.0)]}
+    brightness_tab = evidence_tabs(controller)[1]
     brightness_tab.page().resize(880, 620)
     brightness_tab.set_file(NAME)
     timeline = brightness_tab.timeline_slot()
     timeline.resize(800, 68)
     settle()
-    double_click(timeline, QPointF(timeline.x_for(640.0), 26.0))
+    assert timeline.sample_marks() == [300.0, 900.0, 1500.0]    # not the crop samples
+    click_at(timeline, 1000.0)
     settle()
-    assert brightness_tab.pinned_times() == [pytest.approx(640.0, abs=3.0)]
-
-
-def test_the_brightness_pin_tile_uses_the_timelines_last_click(controller):
-    give_values(controller, crop=True)
-    tabs = evidence_tabs(controller)
-    brightness_tab = tabs[1]
-    brightness_tab.page().resize(880, 620)
-    brightness_tab.set_file(NAME)
-    timeline = brightness_tab.timeline_slot()
-    timeline.resize(800, 68)
-    settle()
-    click_at(timeline, 420.0)
-    brightness_tab.pin_tile().clicked.emit()
-    settle()
-    assert brightness_tab.pinned_times() == [pytest.approx(420.0, abs=3.0)]
+    assert brightness_tab.highlighted_tile().time == 900.0
 
 
 def test_evidence_tabs_ends_with_the_real_time_ranges_tab(controller):
@@ -932,14 +1032,15 @@ assert c.SampleStrip.LABEL_WIDTH == px(46)
 assert c.PAGE_MARGIN == px(12)
 assert c.FOCUS_RING_WIDTH == 1.5 * scale         # a pen is not a whole pixel
 
-assert (b.GLYPHS_HEIGHT, b.CAPTION_HEIGHT) == (px(96), px(18))
-assert b.TILE_HEIGHT == b.GLYPHS_HEIGHT + b.CAPTION_HEIGHT
-assert (b.CONTEXT_HEIGHT, b.TILE_GAP) == (px(26), px(9))
+assert (b.GLYPHS_MIN_HEIGHT, b.CAPTION_HEIGHT) == (px(24), px(18))
+assert b.TILE_MIN_HEIGHT == b.GLYPHS_MIN_HEIGHT + b.CAPTION_HEIGHT
+assert b.TILE_GAP == px(6)
 assert (b.PLOT_HEIGHT, b.LEGEND_HEIGHT) == (px(64), px(16))
 assert b.MARKER_Y + b.MARKER_RADIUS <= b.PLOT_HEIGHT       # the dot is on the plot
-# A preset is a measurement, not a size: "100%" is one strip pixel per
-# device pixel at every scale (tests/ui/test_brightness_view.py).
-assert b.PRESET_FACTORS == {"100%": 1.0, "300%": 3.0, "600%": 6.0}
+# The wheel's bounds are a measurement, not a size: 12 DEVICE pixels per
+# strip pixel at every scale, a notch is x1.25, and the fit's margin is in
+# strip pixels (tests/ui/test_brightness_view.py).
+assert (b.MAX_DEVICE_ZOOM, b.WHEEL_STEP, b.FIT_MARGIN) == (12.0, 1.25, 6)
 
 # --- what is STORED does not ------------------------------------------
 assert c.CropCanvas.MIN_BOX == MIN_CROP_SIDE, c.CropCanvas.MIN_BOX
@@ -948,12 +1049,12 @@ assert (r.SNAP_SECONDS, r.MIN_SPAN, r.ADD_RANGE_SECONDS) == (1, 1.0, 60.0)
 assert c.NUDGE_SMALL == 1 and c.NUDGE_LARGE == 10
 assert (b.MIN_T, b.MAX_T) == (100, 255)
 assert c.CropCanvas.GRID_ALPHA == 0.45 and r.WAVE_ALPHA == 0.45   # alphas are not lengths
-assert c.CropCanvas.GRID_DIVISIONS == 10 and b.TILE_COLUMNS == 3   # ... nor are counts
+assert c.CropCanvas.GRID_DIVISIONS == 10 and b.GALLERY_SIZE == 6   # ... nor are counts
 
 # --- and at 1.0 nothing moved at all -----------------------------------
 if scale == 1.0:
     assert (r.TRACK_HEIGHT, r.TIMELINE_HEIGHT) == (52, 68)
-    assert (b.TILE_HEIGHT, b.CONTEXT_HEIGHT) == (114, 26)
+    assert (b.TILE_MIN_HEIGHT, b.TILE_GAP) == (42, 6)
     assert c.CropCanvas.HANDLE_SIZE == 7
 print("ok")
 """

@@ -266,3 +266,138 @@ def test_the_default_budget_stays_in_the_hundreds_of_megabytes():
     assert 128 * 1024**2 <= DEFAULT_MAX_BYTES <= 256 * 1024**2
     frame_bytes = 1280 * 720 * 3
     assert 45 <= DEFAULT_MAX_BYTES // frame_bytes <= 95      # a handful of files' worth of frames
+
+
+# --------------------------------------------------------------------------
+# FrameCache: exact pixels vs. the lossy disk cache
+# --------------------------------------------------------------------------
+
+def test_a_lossy_frame_is_a_miss_for_a_reader_that_needs_exact_pixels():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+
+    cache.put(key, _frame(1), lossy=True)
+
+    assert cache.get(key, exact=True) is None
+
+
+def test_a_lossy_frame_is_still_the_frame_everything_else_draws():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    frame = _frame(1)
+
+    cache.put(key, frame, lossy=True)
+
+    assert cache.get(key) is frame                      # the canvas is happy with it
+    assert key in cache and cache.knows(key)
+    assert not cache.is_unavailable(key)                # it was read, just not exactly
+
+
+def test_an_exact_frame_answers_a_reader_that_needs_exact_pixels():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    frame = _frame(1)
+
+    cache.put(key, frame)                               # the decoder's own pixels
+
+    assert cache.get(key, exact=True) is frame
+
+
+def test_an_exact_put_upgrades_a_lossy_entry():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    cache.put(key, _frame(1), lossy=True)
+    decoded = _frame(2)
+
+    cache.put(key, decoded)                             # re-fetched from the decoder
+
+    assert cache.get(key, exact=True) is decoded
+    assert cache.nbytes == 100                          # the lossy one went with it
+
+
+def test_a_lossy_put_never_downgrades_an_exact_entry():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    decoded = _frame(1)
+    cache.put(key, decoded)
+
+    cache.put(key, _frame(2), lossy=True)               # the warm job's disk copy arrives late
+
+    assert cache.get(key, exact=True) is decoded        # the better pixels stay
+    assert cache.nbytes == 100
+
+
+def test_an_exact_miss_keeps_the_lossy_frame():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    lossy = _frame(1)
+    cache.put(key, lossy, lossy=True)
+
+    assert cache.get(key, exact=True) is None
+
+    assert cache.get(key) is lossy                      # the miss dropped nothing
+    assert len(cache) == 1 and cache.nbytes == 100
+
+
+def test_an_exact_miss_does_not_make_the_entry_recent():
+    cache = FrameCache(max_bytes=250)
+    oldest, newer = ("a.mp4", "frame", 0.0), ("a.mp4", "frame", 1.0)
+    cache.put(oldest, _frame(0), lossy=True)
+    cache.put(newer, _frame(1))
+
+    cache.get(oldest, exact=True)                       # answered None: nothing was read
+    cache.put(("a.mp4", "frame", 2.0), _frame(2))       # ... so the oldest is still the oldest
+
+    assert cache.get(oldest) is None
+    assert cache.get(newer) is not None
+
+
+def test_eviction_forgets_that_an_entry_was_lossy():
+    cache = FrameCache(max_bytes=150)
+    key = ("a.mp4", "frame", 0.0)
+    cache.put(key, _frame(0), lossy=True)
+    cache.put(("a.mp4", "frame", 1.0), _frame(1))       # pushes the lossy one out
+    assert key not in cache
+
+    fresh = _frame(9)
+    cache.put(key, fresh)                               # re-put says exact, so it is
+
+    assert cache.get(key, exact=True) is fresh
+
+
+def test_clear_file_forgets_that_an_entry_was_lossy():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    cache.put(key, _frame(1), lossy=True)
+
+    cache.clear_file("a.mp4")
+    fresh = _frame(9)
+    cache.put(key, fresh)
+
+    assert cache.get(key, exact=True) is fresh
+
+
+def test_clearing_the_cache_forgets_that_an_entry_was_lossy():
+    cache = FrameCache()
+    key = ("a.mp4", "frame", 1.0)
+    cache.put(key, _frame(1), lossy=True)
+
+    cache.clear()
+    fresh = _frame(9)
+    cache.put(key, fresh)
+
+    assert cache.get(key, exact=True) is fresh
+
+
+def test_the_lossy_markers_never_outlive_their_entries():
+    """Provenance is bookkeeping about entries the cache holds, so it is
+    bounded by them -- unlike the unavailable markers, which are the point of
+    themselves. This one reads the private set: a leak here is invisible from
+    outside until the process grows."""
+    cache = FrameCache(max_bytes=150)
+
+    for index in range(1000):
+        cache.put(("a.mp4", "frame", float(index)), _frame(index % 256), lossy=True)
+
+    assert len(cache) == 1
+    assert len(cache._lossy) <= len(cache)

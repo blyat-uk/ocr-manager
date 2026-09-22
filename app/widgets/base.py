@@ -157,7 +157,15 @@ class KvRow(QWidget):
     `tone`: None | "warn" | "ok" | "bad" | "acc" colours the value text;
     warn/bad additionally colour the row's own border (ui-spec §2.5's
     warn-tinted kv rows -- `TAG_BAD_BORDER` is bad's equivalent, the same
-    token `.ztile.bad`/bad-tinted tags use)."""
+    token `.ztile.bad`/bad-tinted tags use).
+
+    The value elides. Rows live in the inspector, a fixed `INSPECTOR_WIDTH`
+    column whose scroll area has no horizontal bar, so a row wide enough to
+    outgrow the viewport is not scrolled to -- it is clipped, and its right
+    border and the tail of its value fall off the edge of the window. A
+    value therefore contributes nothing to the row's minimum width: it takes
+    the space the key leaves and elides into it, with the whole of it in its
+    tooltip when (and only when) it did not fit."""
 
     def __init__(self, key: str, value: str, tone: str | None = None,
                  parent: QWidget | None = None):
@@ -169,15 +177,15 @@ class KvRow(QWidget):
         layout.setSpacing(tokens.px(8))
         self._key_label = QLabel(key)
         self._key_label.setProperty("kvRole", "key")
-        self._value_label = QLabel()
+        self._value_label = ElidedLabel(tip_when_elided=True)
         self._value_label.setProperty("kvRole", "value")
+        self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self._key_label)
-        layout.addStretch(1)
-        layout.addWidget(self._value_label)
+        layout.addWidget(self._value_label, 1)      # the stretch the value right-aligns in
         self.set_value(value, tone)
 
     def value(self) -> str:
-        return self._value_label.text()
+        return self._value_label.full_text()
 
     def value_tone(self) -> str:
         return self._value_label.property("tone")
@@ -191,7 +199,7 @@ class KvRow(QWidget):
         property changed, so it is only worth doing when one did: this runs
         for every row of every section on every refresh, and a rewritten
         value with the tone it already had selects no different rule."""
-        self._value_label.setText(value)
+        self._value_label.set_full_text(value)
         tone_prop = tone or ""
         row_tone = tone_prop if tint_border else ""
         if self._value_label.property("tone") != tone_prop:
@@ -480,13 +488,20 @@ class MiniProgress(QWidget):
 class ElidedLabel(QLabel):
     """A single-line label that elides its text to fit its width (a long
     file name or path), keeping the full text in `full_text()` and its
-    tooltip. `mode`: Qt.TextElideMode (right by default)."""
+    tooltip. `mode`: Qt.TextElideMode (right by default).
+
+    `tip_when_elided=True` gives the tooltip only while the text does not
+    fit. A file name is worth spelling out on hover whether or not it was
+    cut, but a kv row whose value is fully visible gains nothing from a
+    tooltip repeating it -- and every row of the inspector sprouting one
+    would be noise."""
 
     def __init__(self, text: str = "", mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, *, tip_when_elided: bool = False):
         super().__init__(parent)
         self._full = ""
         self._mode = mode
+        self._tip_when_elided = tip_when_elided
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.set_full_text(text)
 
@@ -495,7 +510,8 @@ class ElidedLabel(QLabel):
 
     def set_full_text(self, text: str) -> None:
         self._full = text
-        self.setToolTip(text)
+        if not self._tip_when_elided:
+            self.setToolTip(text)
         self._elide()
 
     def sizeHint(self):
@@ -523,6 +539,8 @@ class ElidedLabel(QLabel):
         text = self._full if width <= 0 else self.fontMetrics().elidedText(self._full, self._mode, width)
         if text != super().text():
             super().setText(text)
+        if self._tip_when_elided:
+            self.setToolTip("" if text == self._full else self._full)
 
 
 class Toggle(QAbstractButton):

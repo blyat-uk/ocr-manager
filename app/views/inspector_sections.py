@@ -17,7 +17,7 @@ the controller: `Inspector` decides what to show and when.
 from __future__ import annotations
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, pyqtSignal
-from PyQt6.QtWidgets import QGraphicsOpacityEffect, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox, QVBoxLayout, QWidget
 
 from app.state_text import (
     brightness_caption,
@@ -43,6 +43,8 @@ VALUES_NOTE = "Values belong to this file."
 SHOW_ALL_TEXT = "show all"
 STALE_TEXT = "settings changed — run again"
 NO_LINES_TEXT = "No subtitles recognised in this window — check crop and brightness."
+# "Apply to all files" (the Crop and Brightness panels): the one question it asks.
+APPLY_ALL_TITLE = "Apply to all files"
 RUNNING_TEXT = "running on {window}…"
 RUNNING_UNKNOWN_TEXT = "running…"            # defensive: run_proof refuses an unknown duration
 HINT_TEXT = "↻ re-detect the other {count} using this {what} as a hint"
@@ -121,6 +123,14 @@ def small_button(text: str, variant: str = "default") -> Button:
     button = Button(text, variant, small=True)
     button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
     return button
+
+
+def ask_yes_no(parent: QWidget | None, title: str, text: str) -> bool:
+    """One Yes/No question, default No -- the style of the window's other
+    prompts (MainWindow._ask). A panel keeps it as a replaceable `confirm`
+    attribute, so a test answers without a modal."""
+    answers = QMessageBox.StandardButton
+    return QMessageBox.question(parent, title, text, answers.Yes | answers.No, answers.No) == answers.Yes
 
 
 def note_label(text: str = "") -> QLabel:

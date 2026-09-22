@@ -466,9 +466,10 @@ class Video:
             if hasattr(v, 'configure_crop'):
                 v.configure_crop(graph_crop)
 
-            # Get the container-level start_time for PTS normalization.
-            # Players offset PTS only by container start_time (0 for MKV,
-            # possibly non-zero for MP4). Stream start_time is not used.
+            # The container's start_time: output times count from it, so
+            # each line lands on the frame it was read from as the player
+            # paints it (see get_stream_start_time()). Not the video
+            # stream's start_time -- that is not the player's zero.
             self._stream_start_time = v.get_stream_start_time() if hasattr(v, 'get_stream_start_time') else 0.0
 
             # Seek to the actual frame we want
@@ -580,14 +581,14 @@ class Video:
         prev_lines = {}  # text -> index in entries
         frame_duration = 1.0 / self.fps  # Duration of one frame in seconds
 
-        # Get container-level start_time offset (set during run_ocr)
-        # This normalizes PTS values relative to playback time
+        # The container start_time (set during run_ocr): output times
+        # count from it, which is where the player's clock starts.
         stream_offset = getattr(self, '_stream_start_time', 0.0)
 
         for sub in self.pred_subs:
             # Prefer PTS-based timestamps (canonical) over frame-index-based
             if sub.pts_start is not None and sub.pts_end is not None:
-                # Normalize PTS by subtracting container start_time offset
+                # Count from the player's zero, the container start
                 adjusted_start = max(0, sub.pts_start - stream_offset)
                 adjusted_end = max(0, sub.pts_end - stream_offset) + frame_duration
                 start = utils.get_ass_timestamp_from_seconds(adjusted_start)

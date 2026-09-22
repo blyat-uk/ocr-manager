@@ -1,6 +1,14 @@
 """Qt-free detectors: crop box (crop), brightness threshold (brightness), keep
-ranges (ranges), and the frame sources they read (crop's fetch layer,
-ocr_view, vad).
+ranges (ranges), random subtitle lines for the Brightness gallery (lines),
+OCR-confirmation of a doubted brightness (confirm), and the frame sources
+they read (crop's fetch layer, ocr_view, vad).
+
+`confirm` is the odd one out: it measures nothing. It re-reads ONE strip a
+file's own evidence already named as subtitle-bearing, at the file's stored
+threshold and then at rungs below it, and answers a single yes/no -- does the
+OCR engine read this at the folder's confidence threshold? It can lower a
+value or retire a doubt; it can never raise a value, widen a plateau or add
+a flag.
 
 Reference for callers (Stage 3's job runner and review UI). Read it before
 re-fetching a frame a detector reported, cancelling a detector, or applying
@@ -14,6 +22,8 @@ a result without review.
 | crop.detect_crop | CropResult.sample_pts, hit_pts, samples[i].time: the REQUESTED probe times (samples[i].boxes are full-frame native pixels, not grab_frames' band coordinates) | crop.grab_frames(video, times) (either fetch path) | first frame at or after the time rounded to whole ms, container-relative (crop._seek_seconds). May precede the frame's own PTS by up to one frame; never re-fetch with the PTS. |
 | OCR pass (videocr.video.Video.run_ocr) | ASS times from each frame's PTS minus the container start | range starts/ends are "MM:SS" strings: videocr.utils.get_frame_index truncates int(t * fps), then Capture.set(CAP_PROP_POS_FRAMES) | index -> first frame whose round(PTS * fps) reaches it |
 | ocr_view.grab_ocr_strips_at (brightness sampling and neighbours; BrightnessResult.strips[].time) | the times it was given | ocr_view.grab_ocr_strips_at(video, crop_box, times) | index round(t * fps) (rounds, where the OCR pass truncates), then the same Capture.set as the OCR pass; pixels identical to what the OCR pass masks |
+| lines.sample_lines (the Brightness gallery; LinesResult.samples[].time, evidence["lines"]["samples"][].time) | the times it drew and grabbed, rounded to the millisecond before grabbing | ocr_view.grab_ocr_strips_at(video, evidence["lines"]["crop_box"], times) | as the ocr_view row: the stored time is the time grabbed, so a re-fetch returns the strip its boxes were measured on |
+| confirm.confirm_brightness (ConfirmResult.probe_time, evidence["brightness"]["confirm"]["probe_time"]) | the one time it was given -- a time lines or brightness recorded, never a time of its own | ocr_view.grab_ocr_strips(video, crop_box, [time]) | as the ocr_view row. The caller normally hands the pixels in instead (core.jobs.view_cache holds that strip losslessly, keyed by crop box and time), and cached or decoded they are the same strip. |
 | label scanner phase 1 | PTS from Capture.get_last_pts() | Capture.seek_to_pts(pts) | first frame whose PTS is at or after it: exactly that frame |
 | label scanner phases 3-4 | decision times t | Capture.seek_to_display_time(t) | the frame on screen at t: last frame whose PTS <= t (the first frame if t precedes it) |
 | ranges.analyse | keep ranges as "MM:SS" strings (None for an open end) | the OCR pass's time_ranges | as the OCR pass row |
@@ -33,13 +43,23 @@ a result without review.
 |---|---|---|
 | crop.detect_crop | cancel_check callable, polled during audio extraction (every 0.1 s), between probe batches and between rounds | a CropResult, not an exception: flagged gains "cancelled", and `box` is whatever the evidence so far gives -- possibly clipped, possibly None. auto_applicable is False. |
 | brightness.detect_brightness | cancel_check callable, polled before each sampling round, before OCR verification, and before each OCR batch / neighbour grab of the dim-text check | a BrightnessResult with flagged == "cancelled", value DEFAULT_BRIGHTNESS (nothing measured), plateau None, curve [], strips [], clutter_curve []. auto_applicable is False. |
+| lines.sample_lines | cancel_check callable, polled before each round of grabs | a LinesResult with cancelled=True and no samples (a round already detected is not trusted); tried counts the strips detected so far. core.jobs.detect_jobs.LinesJob turns it into a None result. |
+| confirm.confirm_brightness | cancel_check callable, polled before each of its (at most two) OCR batches | a ConfirmResult with cancelled=True, value None and no rungs. Nothing about it is to be applied -- `confirmed` is False, and core.jobs.detect_jobs.ConfirmJob turns it into a None result. |
 | ranges.pipeline.analyse | cancel callable, polled between files and between phases | raises ranges.pipeline.AnalysisCancelled (no partial result). core.jobs.detect_jobs.RangesJob turns it into a None result. |
 
-(c) Flags and auto_applicable. Both detectors join reasons with "+"
-    (`flagged` is None when clean) and expose `auto_applicable`: True only
-    when there is a result to apply and EVERY flag on it is informational.
-    Any other flag -- or one a caller does not recognise -- means review
-    before applying.
+(c) Flags, auto_applicable and measured. Both detectors join reasons with
+    "+" (`flagged` is None when clean) and expose two properties over them:
+
+    - `auto_applicable`: True only when there is a result to apply and EVERY
+      flag on it is informational. Any other flag -- or one a caller does
+      not recognise -- means review before applying.
+    - `measured`: True when the result holds a reading of this file at all
+      (crop: a box; brightness: anything but NOTHING_MEASURED_FLAGS, whose
+      `value` is the DEFAULT_BRIGHTNESS placeholder or a cheap seed a full
+      run replaces). Weaker than auto_applicable, and the one core.jobs.apply
+      stores by: a doubted reading is stored WITH its blocking flag, so the
+      file goes to review with something the user can accept, rather than to
+      review with nothing at all.
 
 | detector | informational (still auto-applicable) | blocking |
 |---|---|---|
@@ -57,4 +77,12 @@ a result without review.
 | crop | FolderSettings.label_max_duration (5.0 s) | WATERMARK_MIN_SPAN_SEC = it + 1.0 s: the span identical extents must cover before a box is rejected as a watermark (static-content) rather than kept as static-content? | a user who raised label_max_duration still gets the 6 s watermark span |
 | brightness | FolderSettings.ocr_lang ("ch") | _reading() joins OCR words the way the OCR pass does for that language (no spaces for "ch") | for another OCR language, readings are joined without spaces, so modal agreement compares differently joined text than that OCR pass emits |
 | brightness | ocr_kwargs.DEFAULT_BRIGHTNESS (230) | DEFAULT_BRIGHTNESS: the value reported when nothing was measured | none: such results are flagged and never auto-applicable |
+| confirm | FolderSettings.ocr_lang ("ch"), through brightness._reading() | joining the OCR words of the one strip it reads | the same as the brightness row: for another OCR language the reading is joined without spaces, so its text (though not its confidence, which is what the pass rule tests) differs from that OCR pass's |
+
+    confirm is NOT in the flag tables above: it produces no flags at all. It
+    answers yes ("the engine reads this strip at the folder's confidence
+    threshold, at this value or a lower one") or no, and core.jobs.apply turns
+    a yes into a cleared brightness flag -- never into a new one. The folder's
+    conf_threshold, unlike everything in this table, IS the user's setting and
+    is passed in by the caller (core.jobs.detect_jobs.ConfirmJob).
 """

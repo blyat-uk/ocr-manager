@@ -418,8 +418,23 @@ class CropResult:
         | static-content          | None    | blocking      | Confirmed watermark; no box. |
         | ceiling-exceeded        | None    | blocking      | Union taller than MAX_CROP_HEIGHT_FRAC; no box. |
         | unknown-rejection       | None    | blocking      | Safety net: no box and no specific flag. |
+
+        Stronger than `measured`: a box may be stored for the user to accept
+        (measured) without being safe to apply unreviewed (auto_applicable).
         """
         return self.box is not None and only_informational(self.flagged, INFORMATIONAL_FLAGS)
+
+    @property
+    def measured(self) -> bool:
+        """True when probing produced a box -- the "kept" and "partial" rows
+        of the table above. That box is what core.jobs.apply stores, flags
+        and all, so a file the detector doubts still has something on screen
+        the user can accept.
+
+        The "None" rows measured no box and store none: there is nothing to
+        show and nothing to accept. Cancellation is not judged here (the box
+        may be clipped); core.jobs.apply drops a cancelled result whole."""
+        return self.box is not None
 
 
 # --------------------------------------------------------------------------

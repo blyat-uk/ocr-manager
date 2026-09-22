@@ -100,6 +100,35 @@ def synthetic_subtitle_video(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def delayed_video_subtitle_clip(tmp_path_factory) -> Path:
+    """synthetic_subtitle_video's picture (75 frames, the white bar on frames
+    25-49) muxed into MKV with its first frame at 0.080 s, while the audio and
+    the container start at 0 -- the layout of Jinwu Guard episodes 07, 08,
+    09, 12 and 15. No B-frames, so no muxer shift moves the audio too."""
+    out = tmp_path_factory.mktemp("media") / "delayed.mkv"
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-itsoffset", "0.08",
+        "-f", "lavfi", "-i", "color=c=#202020:size=640x360:rate=25:duration=3,"
+                             "drawbox=x=160:y=300:w=320:h=30:color=white@1.0:t=fill:"
+                             "enable='between(n,25,49)'",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3.2",
+        "-map", "0:v", "-map", "1:a",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-bf", "0", "-g", "25",
+        "-c:a", "pcm_s16le", str(out),
+    ])
+    probe = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=start_time:stream=codec_type,start_time", "-of", "json", str(out)],
+        capture_output=True, text=True, check=True,
+    ).stdout)
+    starts = {s["codec_type"]: float(s["start_time"]) for s in probe["streams"]}
+    assert float(probe["format"]["start_time"]) == 0.0, probe
+    assert starts == {"video": pytest.approx(0.08, abs=1e-6), "audio": 0.0}, probe
+    return out
+
+
+@pytest.fixture(scope="session")
 def synthetic_audio_video(tmp_path_factory) -> Path:
     """10 s, 320x240, with 1 kHz tone bursts at 1-3 s, 5-6 s and 8-9 s."""
     out = tmp_path_factory.mktemp("media") / "audio.mp4"

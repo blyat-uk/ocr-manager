@@ -239,9 +239,8 @@ def test_badge_matches_apply_rules_when_a_flagged_detected_value_becomes_manual(
     assert entry.crop == Crop(*box2, Source.DETECTED)
     assert apply_mod.brightness_is_stale(entry)
 
-    # 4. A later re-detect on box2 disagrees (low-agreement) -- NOT
-    #    auto-applicable, so the box is untouched, but the blocking flag is
-    #    stored.
+    # 4. A later re-detect on box2 doubts it (low-agreement). The box is
+    #    stored -- it is the same box2 -- and so is the blocking flag.
     apply_mod.apply_crop(project, CropJobResult(
         file=entry.name,
         result=CropResult(box=box2, agreed=3, probes_used=12, flagged="low-agreement", frame_size=(1920, 1080)),
@@ -250,14 +249,14 @@ def test_badge_matches_apply_rules_when_a_flagged_detected_value_becomes_manual(
     assert entry.crop == Crop(*box2, Source.DETECTED)
     assert entry.flags["crop"] == "low-agreement"
 
-    # 5. A hint re-detect on brightness disagrees too ("dim-text?" is not
-    #    auto-applicable either), so the stored value (still measured on
-    #    box1) is untouched, but "differs-from-hint?" is composed onto
+    # 5. A hint re-detect on brightness finds no text on box2, so it
+    #    measured nothing: the stored value (still measured on box1) is
+    #    untouched, but "differs-from-hint?" is composed onto
     #    entry.flags["brightness"].
     apply_mod.apply_brightness(project, BrightnessJobResult(
         file=entry.name,
         result=BrightnessResult(value=210, plateau=None, seed=210, gate_floor=180,
-                                flagged="dim-text?", curve=[]),
+                                flagged="no-text", curve=[]),
         tiles={}, hint_value=150, crop_box=box2,
     ))
     assert entry.brightness == Brightness(210, Source.DETECTED)
@@ -278,15 +277,15 @@ def test_badge_ignores_leftover_flag_on_a_manual_value():
     entry = FileEntry(name="ep02.mp4")
     project = _project(entry)
 
-    # A low-agreement crop result is never auto-applicable, so nothing is
-    # written -- entry.crop stays None, but the blocking flag is stored.
+    # A low-agreement crop result is stored with its blocking flag: the
+    # detector measured a box, it just does not vouch for it.
     apply_mod.apply_crop(project, CropJobResult(
         file=entry.name,
         result=CropResult(box=(10, 780, 1300, 60), agreed=2, probes_used=12,
                           flagged="low-agreement", frame_size=(1920, 1080)),
         hint=None,
     ))
-    assert entry.crop is None
+    assert entry.crop == Crop(10, 780, 1300, 60, Source.DETECTED)
     assert entry.flags["crop"] == "low-agreement"
 
     # The user sets the crop by hand; core/jobs/apply.py never clears the

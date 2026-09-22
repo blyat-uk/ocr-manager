@@ -67,27 +67,74 @@ class FrameCache:
 
     Evicting an entry is not the same as marking it unavailable: an evicted
     frame is simply unknown again, and asking for it fetches it once more.
+
+    Entries also carry their provenance, because not every reader can use
+    every frame. Whole frames are kept on disk as WebP at quality 90
+    (core/jobs/view_cache.py): a fine canvas to look at, and ~84 KB instead
+    of 571 KB, but the round trip moves pixel levels by up to ~58 at the text
+    edges that matter. The crop view's "masked" toggle previews the OCR
+    brightness filter, which thresholds on those very levels, so it may only
+    draw a frame that came from the decoder -- while the canvas, the
+    filmstrip and everything else on screen are happy with the disk copy.
+    `get(key, exact=True)` is how that one reader says so: a lossy entry
+    answers None, exactly as if it were not held, and the caller fetches the
+    time again from the decoder.
+
+    Provenance is bookkeeping about entries, not a fact about times, so it
+    lives and dies with the entry: eviction, `clear_file` and `clear` drop it,
+    and a key that comes back starts from whatever that put says. That is the
+    opposite of the unavailable markers, which outlive any entry on purpose.
     """
 
     def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES):
         self.max_bytes = int(max_bytes)
         self._items: OrderedDict[tuple, np.ndarray] = OrderedDict()
         self._missing: set[tuple] = set()
+        self._lossy: set[tuple] = set()
         self._bytes = 0
 
-    def get(self, key) -> np.ndarray | None:
-        """The cached array for `key`, which becomes the most recent entry."""
+    def get(self, key, exact: bool = False) -> np.ndarray | None:
+        """The cached array for `key`, which becomes the most recent entry.
+
+        `exact=True` treats a frame that came from the lossy disk cache as a
+        miss, so the caller re-fetches the decoder's own pixels: the crop
+        view's "masked" preview filters on real pixel levels, and a WebP
+        round trip at quality 90 moves them by up to ~58.
+
+        That miss leaves the cache exactly as it was -- the entry stays, and
+        it does not become the most recent one. The frame is still the right
+        thing for every other reader, and an exact reader that could not use
+        it read nothing, so it has no claim to be keeping anything alive.
+        """
         image = self._items.get(key)
         if image is None:
+            return None
+        if exact and key in self._lossy:
             return None
         self._items.move_to_end(key)
         return image
 
-    def put(self, key, image: np.ndarray) -> None:
+    def put(self, key, image: np.ndarray, lossy: bool = False) -> None:
+        """Hold `image` for `key`, as the most recent entry.
+
+        `lossy=True` says these pixels came back out of the on-disk WebP
+        cache rather than the decoder, so an exact reader must not be given
+        them. Provenance only ever improves: an exact put over a lossy entry
+        upgrades it (the re-decode the exact reader asked for has arrived),
+        and a lossy put over an exact entry is ignored rather than allowed to
+        downgrade it. An exact frame in hand is strictly better than the disk
+        copy of the same frame, and re-marking it lossy would throw it away
+        and send the crop view off to decode a time it already had.
+        """
+        if lossy and key in self._items and key not in self._lossy:
+            self._items.move_to_end(key)        # the better pixels stay; only recency moves
+            return
         self._drop(key)
         self._missing.discard(key)              # it could be read after all
         self._items[key] = image
         self._bytes += int(image.nbytes)
+        if lossy:
+            self._lossy.add(key)
         while self._bytes > self.max_bytes and len(self._items) > 1:
             self._drop(next(iter(self._items)))
 
@@ -124,6 +171,7 @@ class FrameCache:
     def clear(self) -> None:
         self._items.clear()
         self._missing.clear()
+        self._lossy.clear()
         self._bytes = 0
 
     @property
@@ -137,6 +185,10 @@ class FrameCache:
         return len(self._items)
 
     def _drop(self, key) -> None:
+        """Forget one entry, pixels and provenance together: the single way
+        an entry leaves, so the lossy markers cannot outlive what they
+        describe, whether the entry was evicted, cleared or replaced."""
         image = self._items.pop(key, None)
+        self._lossy.discard(key)
         if image is not None:
             self._bytes -= int(image.nbytes)

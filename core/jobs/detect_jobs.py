@@ -1,4 +1,4 @@
-"""Detector, metadata, thumbnail and proof-OCR jobs for core.jobs.runner.
+"""Detector, metadata, thumbnail, gallery-lines and proof-OCR jobs for core.jobs.runner.
 
 Each job captures only immutable inputs when it is constructed: paths, copies
 of the settings it needs, and, for the proof, the exact OCR call. run()
@@ -10,18 +10,20 @@ Identity
     key       f"{kind}:{file}"; the folder-wide ranges analysis is "ranges:*"
               (file None). A second submit with the same key replaces a
               queued job and waits behind a running one (see the runner).
-    lane      GPU: crop, brightness, proof (they lease OCR engines).
+    lane      GPU: crop, brightness, lines, proof (they lease OCR engines).
               CPU: metadata, thumbnail, ranges, audio_profile.
     priority  0; the proof is PROOF_PRIORITY (100), above every priority
-              AutoPilot gives (at most 15, a boosted re-detect's metadata),
+              AutoPilot gives (at most core.jobs.autopilot.LINES_BOOST, 20:
+              the gallery lines of the file the Brightness tab shows),
               because the user is waiting for it.
 
 Engines (ruling A1)
-    CropJob, BrightnessJob and ProofOcrJob reach engines only through
-    videocr.engine_registry leases. The detector jobs hold theirs for the
-    whole detector call; get_subtitles takes its own. Engine keys match the
-    OCR pass's (default model dirs, the folder's use_gpu, and, for the full
-    OCR engine, the folder's language), so the pool reuses the same instances.
+    CropJob, BrightnessJob, LinesJob and ProofOcrJob reach engines only
+    through videocr.engine_registry leases. The detector jobs hold theirs for
+    the whole detector call; get_subtitles takes its own. Engine keys match
+    the OCR pass's (default model dirs, the folder's use_gpu, and, for the
+    full OCR engine, the folder's language), so the pool reuses the same
+    instances. LinesJob runs text detection only: it leases no OCR engine.
 
 Fidelity
     Detectors get exactly the documented arguments and nothing else.
@@ -41,6 +43,8 @@ Cancellation convention: a cancelled job returns None
       result (the "cancelled" flag). The job returns None instead of that
       result. CropJob also catches AudioExtractionCancelled, which
       detect_crop handles itself today, as a safety net.
+    - LinesJob: sample_lines reports it in LinesResult.cancelled, and the
+      job returns None instead of that result.
     - RangesJob: AnalysisCancelled (and AudioExtractionCancelled) is caught.
     - AudioProfileJob: AudioExtractionCancelled is caught.
     - ProofOcrJob: get_subtitles stops at cancel_event. If the event is set
@@ -64,13 +68,16 @@ from core import ass_qafix as _qafix
 from core.ass_qafix import ASS_TAG_RE
 from core.detect import audio_profile as _audio_profile
 from core.detect import brightness as _brightness
+from core.detect import confirm as _confirm
 from core.detect import crop as _crop
+from core.detect import lines as _lines
 from core.detect import ocr_view as _ocr_view
 from core.detect import tiles as _tiles
 from core.detect import vad as _vad
 from core.detect.ranges import pipeline as _ranges
 from core.detect.ranges.config import MatchConfig, RangesConfig
 from core.detect.ranges.pipeline import FileEntry as RangesFile
+from core.jobs import view_cache as _view_cache
 from core.jobs.runner import JobContext, Lane
 from core.project.ocr_kwargs import ocr_call_for
 from videocr import api as _api
@@ -83,7 +90,9 @@ if TYPE_CHECKING:
 
     from core.detect.audio_profile import AudioProfile
     from core.detect.brightness import BrightnessResult
+    from core.detect.confirm import ConfirmResult
     from core.detect.crop import CropResult
+    from core.detect.lines import LinesResult
     from core.detect.ranges.pipeline import ProgressEvent, RangesAnalysis
     from core.project.model import FileEntry, FolderSettings
 
@@ -131,6 +140,25 @@ class BrightnessJobResult:
     hint_value: int | None               # the edited file's value this re-detection checks against
     crop_box: tuple[int, int, int, int] | None   # the crop the result was measured with; apply drops it
                                                  # when the file's crop is no longer this box
+
+
+@dataclass(frozen=True)
+class LinesJobResult:
+    file: str
+    result: LinesResult
+    crop_box: tuple[int, int, int, int]   # the crop the lines were grabbed on; apply drops them when the
+                                          # file's crop is no longer this box
+
+
+@dataclass(frozen=True)
+class ConfirmJobResult:
+    file: str
+    result: ConfirmResult
+    crop_box: tuple[int, int, int, int]   # the crop the strip was cut with; apply drops the result when the
+                                          # file's crop is no longer this box
+    start_value: int                      # the brightness the ladder started from; apply drops the result
+                                          # when the stored value is no longer this one
+    conf_threshold: int                   # the folder's confidence threshold the rungs were judged by
 
 
 @dataclass(frozen=True)
@@ -203,7 +231,14 @@ class MetadataJob:
 class ThumbnailJob:
     """One whole frame at `time`, THUMB_HEIGHT rows high, through the crop
     detector's fetch layer. These are not OCR pixels (see
-    core/detect/__init__.py); fine for a queue thumbnail."""
+    core/detect/__init__.py); fine for a queue thumbnail.
+
+    Disk-first, like the view jobs and for the same reason: the window held
+    thumbnails only in memory, so opening a folder of hundreds of 4K episodes
+    re-decoded every one of them at about 0.9 s each -- on every launch, not
+    just the first. A thumbnail is a few KB, so `core.jobs.view_cache` keeps
+    it beside the file's other view pixels and a reopen costs a WebP read.
+    """
 
     kind = "thumbnail"
     lane = Lane.CPU
@@ -212,14 +247,24 @@ class ThumbnailJob:
     def __init__(self, project_dir: str, file: str, time: float):
         self.file = file
         self.key = f"{self.kind}:{file}"
+        self.project_dir = project_dir
         self.video_path = os.path.join(project_dir, file)
         self.time = float(time)
 
     def run(self, ctx: JobContext) -> ThumbnailResult | None:
         if ctx.cancelled():
             return None
+        cache = _view_cache.FileViewCache(self.project_dir, self.file, self.video_path)
+        cached = cache.read_thumbnail(self.time)
+        if cached is not None:
+            return ThumbnailResult(self.file, self.time, cached)
         frames = _crop.grab_frames(self.video_path, [self.time], band_frac=1.0, target_height=THUMB_HEIGHT)
-        return ThumbnailResult(self.file, self.time, frames[0] if frames else None)
+        if ctx.cancelled():
+            return None
+        image = frames[0] if frames else None
+        if image is not None:
+            cache.write_thumbnail(self.time, image)
+        return ThumbnailResult(self.file, self.time, image)
 
 
 class RangesJob:
@@ -370,6 +415,172 @@ class BrightnessJob:
             return None
         tiles = _tiles.choose_tiles(result.strips, result.value)
         return BrightnessJobResult(self.file, result, tiles, self.hint_value, self.crop_box)
+
+
+class LinesJob:
+    """sample_lines on one file: random subtitle lines for the Brightness
+    tab's gallery (docs/superpowers/specs/2026-09-18-brightness-gallery-
+    design.md), with a detection engine leased for the whole call.
+
+    Lines are view evidence, not a value: strips grabbed exactly as the OCR
+    pass sees them, kept where text detection finds a subtitle. The job
+    captures the crop, the keep ranges, the speech spans (the file's
+    evidence["audio"]["speech"], None without a profile), the seed and the
+    times to stay away from (`exclude`, a shuffle's current lines) at
+    construction. The result carries the crop box, so lines that arrive after
+    the crop changed are dropped on apply. A crop is required: lines are
+    grabbed from it.
+    """
+
+    kind = "lines"
+    lane = Lane.GPU
+    priority = 0
+
+    def __init__(self, project_dir: str, file: str, crop_box: tuple[int, int, int, int],
+                 time_ranges: list[tuple[str | None, str | None]] | None, speech, folder: FolderSettings,
+                 *, seed: int, exclude=()):
+        if crop_box is None:
+            raise ValueError("gallery lines are grabbed from the file's crop: pass its crop box")
+        self.file = file
+        self.key = f"{self.kind}:{file}"
+        self.video_path = os.path.join(project_dir, file)
+        self.crop_box = tuple(int(value) for value in crop_box)
+        self.time_ranges = None if time_ranges is None else tuple((start, end) for start, end in time_ranges)
+        self.speech = None if speech is None else tuple((float(start), float(end)) for start, end in speech)
+        self.seed = int(seed)
+        self.exclude = tuple(float(value) for value in exclude)
+        self.use_gpu = folder.use_gpu
+
+    def run(self, ctx: JobContext) -> LinesJobResult | None:
+        time_ranges = None if self.time_ranges is None else list(self.time_ranges)
+        speech = None if self.speech is None else [[start, end] for start, end in self.speech]
+        with engine_registry.lease_detection_engine(None, self.use_gpu) as det_engine:
+            result = _lines.sample_lines(self.video_path, self.crop_box, time_ranges, speech, det_engine,
+                                         seed=self.seed, exclude=list(self.exclude),
+                                         cancel_check=ctx.cancel_check())
+        if result.cancelled:
+            return None
+        return LinesJobResult(self.file, result, self.crop_box)
+
+
+def probe_time_for(entry: FileEntry) -> float | None:
+    """The time of the strip a ConfirmJob probes, or None when the file has
+    no strip known to hold a subtitle.
+
+    In order of preference, all of them times the file's own evidence already
+    names as subtitle-bearing:
+
+    1. the Brightness gallery's first line (`evidence["lines"]["samples"]`) --
+       text detection confirmed a subtitle there, and it is a strip
+       `core.jobs.view_cache` holds, so probing it usually costs no decode;
+    2. the brightness review tab's zoom tiles
+       (`evidence["brightness"]["tiles"]`), also cached -- minus "leaking",
+       which is chosen among the strips with NO text (core.detect.tiles) and
+       would fail every rung by construction;
+    3. the earliest text strip the detector sampled
+       (`evidence["brightness"]["strips"]`), which is not cached and costs a
+       decode.
+
+    Evidence is a disposable cache that may come back partial or junk, so
+    every key is read defensively and anything malformed simply contributes
+    no candidate.
+    """
+    evidence = entry.evidence if isinstance(entry.evidence, dict) else {}
+
+    for sample in _evidence_list(_evidence_dict(evidence, "lines"), "samples"):
+        if isinstance(sample, dict):
+            time = _evidence_time(sample.get("time"))
+            if time is not None:
+                return time
+
+    brightness = _evidence_dict(evidence, "brightness")
+    tiles = brightness.get("tiles")
+    if isinstance(tiles, dict):
+        for kind in _tiles.TILE_KINDS:
+            if kind == "leaking":            # an EMPTY strip: nothing to read there
+                continue
+            time = _evidence_time(tiles.get(kind))
+            if time is not None:
+                return time
+
+    for sample in _evidence_list(brightness, "strips"):
+        if isinstance(sample, dict) and sample.get("is_text"):
+            time = _evidence_time(sample.get("time"))
+            if time is not None:
+                return time
+    return None
+
+
+def _evidence_dict(evidence: dict, key: str) -> dict:
+    """`evidence[key]` when it is a dict, else an empty one. Evidence comes
+    back from the disposable `.ocr-cache/` and may be anything at all, so a
+    key of the wrong type contributes nothing rather than raising: an
+    exception here would fail the AutoPilot call that is merely asking
+    whether this file has a strip worth probing."""
+    value = evidence.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _evidence_list(evidence: dict, key: str) -> tuple:
+    """`evidence[key]` when it is a list or tuple, else empty. A string is
+    deliberately NOT a list here: iterating one would hand each character to
+    the caller as if it were a sample."""
+    value = evidence.get(key)
+    return tuple(value) if isinstance(value, (list, tuple)) else ()
+
+
+def _evidence_time(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+class ConfirmJob:
+    """confirm_brightness on one file: does the OCR engine read one of this
+    file's subtitle strips at its stored brightness, or at a lower rung?
+
+    The strip comes from the view cache when it holds it (lossless, keyed by
+    crop box and time -- a warmed file costs no decode at all) and from a
+    decode otherwise. Only an OCR engine is leased: the strip is a time the
+    file's evidence already named, so no text detection is needed.
+
+    The crop box, the starting value and the confidence threshold are
+    captured here and travel with the result, so a result that arrives after
+    the user moved the crop, set the brightness by hand, or changed the
+    folder's threshold is dropped on apply rather than applied to a question
+    nobody asked.
+    """
+
+    kind = "confirm"
+    lane = Lane.GPU
+    priority = 0
+
+    def __init__(self, project_dir: str, file: str, crop_box: tuple[int, int, int, int],
+                 probe_time: float, start_value: int, folder: FolderSettings):
+        if crop_box is None:
+            raise ValueError("the confirm strip is cut from the file's crop: pass its crop box")
+        self.file = file
+        self.key = f"{self.kind}:{file}"
+        self.project_dir = project_dir
+        self.video_path = os.path.join(project_dir, file)
+        self.crop_box = tuple(int(value) for value in crop_box)
+        self.probe_time = float(probe_time)
+        self.start_value = int(start_value)
+        self.conf_threshold = int(folder.conf_threshold)
+        self.ocr_lang = folder.ocr_lang
+        self.use_gpu = folder.use_gpu
+
+    def run(self, ctx: JobContext) -> ConfirmJobResult | None:
+        cache = _view_cache.FileViewCache(self.project_dir, self.file, self.video_path)
+        strip = cache.read_strip(self.crop_box, self.probe_time) if cache.readable else None
+        with engine_registry.lease_ocr_engine(self.ocr_lang, None, None, self.use_gpu) as ocr_engine:
+            result = _confirm.confirm_brightness(self.video_path, self.crop_box, self.probe_time,
+                                                 self.start_value, self.conf_threshold, ocr_engine,
+                                                 strip=strip, cancel_check=ctx.cancel_check())
+        if result.cancelled:
+            return None
+        return ConfirmJobResult(self.file, result, self.crop_box, self.start_value, self.conf_threshold)
 
 
 def proof_window(sample_time: float | None, duration: float) -> tuple[float, float]:

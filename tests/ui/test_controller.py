@@ -22,21 +22,26 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
 
 from app.activity import ActivitySnapshot
-from app.controller import VIEW_KINDS, ProjectController, default_runner_factory
+from app.controller import CPU_WORKERS, VIEW_KINDS, ProjectController, default_runner_factory
 from app.logbook import LOG_LIMIT, LogBook
 from app.run_snapshot import RunSnapshot, RunTracker, notification_for, notify_duration
 from app.state_text import badge_for
 from core.detect.audio_profile import AudioProfile
-from core.detect.brightness import BrightnessResult
+from core.detect.brightness import FLAG_DIM_TEXT, BrightnessResult
+from core.detect.confirm import ConfirmResult, Rung, ladder
 from core.detect.crop import FLAG_LOW_AGREEMENT, CropResult
+from core.detect.lines import LineSample, LinesResult
 from core.detect.ranges.pipeline import RangesAnalysis
 from core.jobs import apply as apply_mod
-from core.jobs.autopilot import AutoPilot, is_detection_job
+from core.jobs.autopilot import LINES_BOOST, AutoPilot, is_held_job
 from core.jobs.detect_jobs import (
     PROOF_PRIORITY,
     AudioProfileResult,
     BrightnessJobResult,
+    ConfirmJobResult,
     CropJobResult,
+    LinesJob,
+    LinesJobResult,
     MetadataResult,
     ProofOcrJob,
     ProofResult,
@@ -45,7 +50,8 @@ from core.jobs.detect_jobs import (
 )
 from core.jobs.run import RunFile, RunJob, RunSummary
 from core.jobs.runner import JobRunner, Lane
-from core.jobs.view_jobs import FramesResult, StripsResult
+from core.jobs.view_cache import wanted
+from core.jobs.view_jobs import FramesResult, StripsResult, WarmJob, WarmResult
 from core.project import (
     Brightness,
     Crop,
@@ -553,7 +559,7 @@ def test_activity_follows_queued_running_and_finished_jobs(make_controller, fake
 
     controller.pause_autopilot()
     assert controller.activity().paused
-    assert {lane for lane, only in fake_runner.pauses if only is is_detection_job} == {Lane.GPU, Lane.CPU}
+    assert {lane for lane, only in fake_runner.pauses if only is is_held_job} == {Lane.GPU, Lane.CPU}
     controller.resume_autopilot()
     assert not controller.activity().paused
     assert set(fake_runner.resumes) == {Lane.GPU, Lane.CPU}
@@ -626,6 +632,69 @@ def test_set_crop_on_a_detected_brightness_asks_autopilot_to_remeasure(
     assert remeasure.job.crop_box == OTHER_BOX
     # recomputed after the submission: the stale brightness is being measured again
     assert controller.entry("ep01.mkv").review == ReviewState.PENDING
+
+
+def test_bulk_targets_are_every_file_not_skipped(make_controller, fake_runner, tmp_project):
+    folder = edit_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    assert controller.bulk_targets("ep01.mkv") == ["ep01.mkv", "ep02.mkv"]
+    controller.set_skipped("ep02.mkv", True)
+    assert controller.bulk_targets("ep01.mkv") == ["ep01.mkv"]
+
+
+def test_apply_brightness_to_all_writes_every_target_and_saves(make_controller, fake_runner, tmp_project):
+    folder = edit_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    changed = Spy(controller.file_changed)
+
+    assert controller.apply_brightness_to_all("ep01.mkv", 185) == ["ep01.mkv", "ep02.mkv"]
+
+    for name in ("ep01.mkv", "ep02.mkv"):
+        assert controller.entry(name).brightness == Brightness(185, Source.MANUAL)
+    assert controller.entry("ep01.mkv").review == ReviewState.REVIEWED
+    assert controller.entry("ep02.mkv").review == ReviewState.FLAGGED      # its crop is still flagged
+    assert set(changed.firsts) >= {"ep01.mkv", "ep02.mkv"}
+    assert wait_for(lambda: all(saved(folder)["files"][name]["brightness"] == {"value": 185, "source": "manual"}
+                                for name in ("ep01.mkv", "ep02.mkv")), WAIT_MS)
+
+
+def test_apply_crop_to_all_re_measures_and_drops_strips_per_file(
+        make_controller, fake_runner, tmp_project, monkeypatch):
+    crop_changes = []
+    spy_method(monkeypatch, AutoPilot, "on_crop_changed", crop_changes)
+    folder = edit_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    controller.request_strips("ep02.mkv", BOX, [10.0])
+    fake_runner.finish(fake_runner.last("strips", "ep02.mkv"), StripsResult("ep02.mkv", BOX, {10.0: _frame(3)}))
+    controller.drain_events()
+    changed = Spy(controller.file_changed)
+
+    assert controller.apply_crop_to_all("ep01.mkv", OTHER_BOX) == ["ep01.mkv", "ep02.mkv"]
+
+    for name in ("ep01.mkv", "ep02.mkv"):
+        assert controller.entry(name).crop == Crop(*OTHER_BOX, Source.MANUAL)
+        assert fake_runner.last("brightness", name).job.crop_box == OTHER_BOX   # the detected value is stale
+    assert sorted(crop_changes) == [("ep01.mkv",), ("ep02.mkv",)]
+    assert controller.strip("ep02.mkv", BOX, 10.0) is None
+    assert set(changed.firsts) >= {"ep01.mkv", "ep02.mkv"}
+
+
+def test_apply_crop_to_all_leaves_a_file_already_on_that_box_alone(
+        make_controller, fake_runner, tmp_project, monkeypatch):
+    crop_changes = []
+    spy_method(monkeypatch, AutoPilot, "on_crop_changed", crop_changes)
+    folder = edit_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    controller.set_crop("ep02.mkv", OTHER_BOX)
+    crop_changes.clear()
+
+    controller.apply_crop_to_all("ep01.mkv", OTHER_BOX)
+
+    assert crop_changes == [("ep01.mkv",)]                    # ep02's box did not move: nothing to re-measure
 
 
 def test_copy_and_paste_settings(make_controller, fake_runner, tmp_project, monkeypatch):
@@ -782,6 +851,411 @@ def test_hint_redetects_and_proof(make_controller, fake_runner, tmp_project):
     controller.drain_events()
     assert controller.proof_result("ep01.mkv") == result
     assert finished.calls == [("ep01.mkv",)] and not controller.proof_pending("ep01.mkv")
+
+
+# --------------------------------------------------------------------------
+# Gallery lines (the Brightness tab's random subtitle lines)
+# --------------------------------------------------------------------------
+
+def lines_result(submission, times=(512.0, 900.0), tried=24) -> LinesJobResult:
+    job = submission.job
+    samples = tuple(LineSample(float(t), ((10, 5, 200, 30),), 1) for t in times)
+    return LinesJobResult(job.file, LinesResult(samples, tried, job.seed), job.crop_box)
+
+
+def lines_project(tmp_project, names=("ep01.mkv",), **folder):
+    """Files ready to run (MANUAL crop and brightness, reviewed, the user's
+    whole file as ranges), with no audio profile yet."""
+    entries = [make_entry(name, crop=BOX, brightness=209, ranges=[], review=ReviewState.REVIEWED)
+               for name in names]
+    return tmp_project(list(names), config=v2_config(entries, **folder))
+
+
+def test_lines_results_are_applied_as_evidence_and_saved(make_controller, fake_runner, tmp_project):
+    name = "ep01.mkv"
+    folder = lines_project(tmp_project)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    assert fake_runner.of_kind("lines") == []                   # the draw waits for the audio profile
+    assert "lines" in controller.pending_detectors()[name]
+    audio = fake_runner.last("audio_profile", name)
+    fake_runner.finish(audio, AudioProfileResult(name, AudioProfile(DURATION, [0.0], [(10.0, 20.0)])))
+    controller.drain_events()
+    lines = fake_runner.last("lines", name)
+    assert isinstance(lines.job, LinesJob) and lines.job.crop_box == BOX and lines.job.priority == 1
+    assert [tuple(span) for span in lines.job.speech] == [(10.0, 20.0)]
+    changed = Spy(controller.file_changed)
+
+    fake_runner.finish(lines, lines_result(lines))
+    controller.drain_events()
+
+    entry = controller.entry(name)
+    assert entry.evidence["lines"]["crop_box"] == list(BOX)
+    assert [sample["time"] for sample in entry.evidence["lines"]["samples"]] == [512.0, 900.0]
+    assert name in changed.firsts
+    assert entry.review == ReviewState.REVIEWED
+    assert "lines" not in controller.pending_detectors().get(name, set())
+    assert wait_for(lambda: "lines" in store.load_project(str(folder)).files[name].evidence, WAIT_MS)
+
+
+def test_lines_drawn_on_an_old_crop_are_dropped(make_controller, fake_runner, tmp_project):
+    name = "ep01.mkv"
+    controller = make_controller()
+    controller.open_folder(str(lines_project(tmp_project, autopilot_enabled=False)))
+    controller.request_lines(name)
+    old = fake_runner.last("lines", name)
+    fake_runner.start(old)
+    controller.drain_events()
+    controller.set_crop(name, OTHER_BOX)                        # the user's draw follows the crop
+    new = fake_runner.last("lines", name)
+    assert new is not old and new.job.crop_box == OTHER_BOX and new.job.priority == LINES_BOOST
+
+    fake_runner.finish(old, lines_result(old))
+    controller.drain_events()
+    assert "lines" not in controller.entry(name).evidence       # superseded: not applied
+    fake_runner.finish(new, lines_result(new, times=(33.0,)))
+    controller.drain_events()
+    assert controller.entry(name).evidence["lines"]["crop_box"] == list(OTHER_BOX)
+
+
+def test_request_lines_boosts_the_draw_once(make_controller, fake_runner, tmp_project, monkeypatch):
+    boosts = []
+    spy_method(monkeypatch, AutoPilot, "boost_lines", boosts)
+    name = "ep01.mkv"
+    controller = make_controller()
+    controller.open_folder(str(lines_project(tmp_project)))
+    assert fake_runner.of_kind("lines") == []
+
+    controller.request_lines(name)                              # does not wait for the audio profile
+    (boosted,) = fake_runner.of_kind("lines", name)
+    assert boosted.job.priority == LINES_BOOST and boosted.job.crop_box == BOX
+    controller.request_lines(name)                              # the tab may ask on every refresh
+    controller.request_lines(name)
+    assert boosts == [(name,)] * 3
+    assert fake_runner.of_kind("lines", name) == [boosted]
+    assert controller.entry(name).review == ReviewState.REVIEWED
+
+    controller.request_lines("missing.mkv")                     # a view never raises from a refresh
+    assert boosts == [(name,)] * 3
+
+
+def test_request_lines_leaves_a_running_draw_alone(make_controller, fake_runner, tmp_project):
+    name = "ep01.mkv"
+    controller = make_controller()
+    controller.open_folder(str(lines_project(tmp_project)))
+    audio = fake_runner.last("audio_profile", name)
+    fake_runner.finish(audio, AudioProfileResult(name, AudioProfile(DURATION, [0.0], [])))
+    controller.drain_events()
+    auto = fake_runner.last("lines", name)
+    fake_runner.start(auto)
+    controller.drain_events()
+    assert controller.activity().current[:2] == ("lines", name)
+    assert controller.activity().current[3] == "finding subtitle lines"
+    assert controller.running_detectors(name) == {"lines"}
+
+    controller.request_lines(name)
+    assert fake_runner.of_kind("lines", name) == [auto]
+
+
+def test_request_lines_without_a_folder_or_after_shutdown_does_nothing(make_controller, fake_runner, tmp_project):
+    controller = make_controller()
+    controller.request_lines("ep01.mkv")
+    controller.open_folder(str(lines_project(tmp_project)))
+    controller.shutdown(timeout=0.5)
+    controller.request_lines("ep01.mkv")
+    assert fake_runner.of_kind("lines") == []
+
+
+def test_shuffle_lines_excludes_the_lines_and_tiles_shown_now(make_controller, fake_runner, tmp_project,
+                                                              monkeypatch):
+    shuffles = []
+    spy_method(monkeypatch, AutoPilot, "shuffle_lines", shuffles)
+    name = "ep01.mkv"
+    controller = make_controller()
+    controller.open_folder(str(lines_project(tmp_project, autopilot_enabled=False)))
+    entry = controller.entry(name)
+    entry.evidence["lines"] = {"crop_box": list(BOX), "seed": 3, "tried": 12,
+                               "samples": [{"time": 512.0, "boxes": [], "lines": 1},
+                                           {"time": 900.5, "boxes": [], "lines": 1}]}
+    entry.evidence["brightness"] = {"tiles": {"dark": 120.0, "bright": 640.0}}
+
+    controller.shuffle_lines(name)
+
+    assert shuffles == [(name, [512.0, 900.5, 120.0, 640.0])]
+    (shuffled,) = fake_runner.of_kind("lines", name)
+    assert shuffled.job.exclude == (512.0, 900.5, 120.0, 640.0)
+    assert shuffled.job.priority == LINES_BOOST and shuffled.job.crop_box == BOX
+    controller.shuffle_lines(name)                              # every shuffle is a new draw
+    first, second = fake_runner.of_kind("lines", name)
+    assert first.job.seed != second.job.seed                    # fresh seeds (31 random bits each)
+    with pytest.raises(KeyError):
+        controller.shuffle_lines("missing.mkv")
+
+
+def test_shuffle_lines_needs_an_open_folder(make_controller):
+    with pytest.raises(RuntimeError):
+        make_controller().shuffle_lines("ep01.mkv")
+
+
+def test_lines_never_change_review_states_badges_or_counts(make_controller, fake_runner, tmp_project):
+    folder, names = counts_project(tmp_project)                # every row has a crop: a draw for each
+    controller = make_controller()
+    controller.open_folder(str(folder))
+
+    def seen():
+        return ({name: controller.entry(name).review for name in names},
+                {name: badge_for(controller.entry(name), running_detectors=controller.running_detectors(name),
+                                 done=controller.is_done(name), run_state=None) for name in names},
+                controller.counts())
+
+    controller.redetect(names[0])                               # a real pending state among them
+    before = seen()
+    assert {state for state in before[0].values()} >= {ReviewState.PENDING, ReviewState.FLAGGED}
+
+    for name in names:
+        controller.request_lines(name)
+    draws = fake_runner.of_kind("lines")
+    assert len(draws) == len(names)
+    assert all("lines" in controller.pending_detectors()[name] for name in names)
+    assert seen() == before                                     # queued
+    for draw in draws:
+        fake_runner.start(draw)
+    controller.drain_events()
+    assert all("lines" in controller.running_detectors(name) for name in names)
+    assert seen() == before                                     # running
+    for draw in draws:
+        fake_runner.finish(draw, lines_result(draw))
+    controller.drain_events()
+    assert all("lines" in controller.entry(name).evidence for name in names)
+    assert seen() == before                                     # applied
+
+
+# --------------------------------------------------------------------------
+# Confirming a doubted brightness (the "confirm" stage)
+# --------------------------------------------------------------------------
+# The detector measures a threshold it then doubts, so the file is FLAGGED and
+# the queue badges it "check brightness". AutoPilot answers most of those
+# doubts without the user: one masked strip, read by the OCR engine at the
+# folder's own conf_threshold, stepping the threshold down until it reads
+# (core/detect/confirm.py). A confirmed file becomes PROPOSED and badges
+# "ready" -- there is deliberately no badge, chip or marker of its own, so
+# these tests pin the absence of one as hard as the presence of "ready".
+
+CONFIRM_TIME = 512.0              # the gallery line's time: what probe_time_for picks
+
+
+def draw_lines(entry, time: float = CONFIRM_TIME, box=BOX) -> None:
+    """Give `entry` the one piece of evidence a confirm needs: a gallery line
+    on the file's own crop, which `detect_jobs.probe_time_for` reads the probe
+    strip's time from. It also settles the file's lines, which a confirm waits
+    for like any other detection of its own.
+
+    Set on the loaded entry rather than written into the folder, because
+    evidence lives in the disposable `.ocr-cache/` and `v2_config` (to_json
+    with include_evidence=False) does not carry it."""
+    entry.evidence["lines"] = {"crop_box": list(box), "seed": 7, "tried": 12,
+                               "samples": [{"time": float(time), "boxes": [], "lines": 1}]}
+
+
+def doubted_project(tmp_project, names=("ep01.mkv",), *, value=209, **folder):
+    """A folder of files the brightness detector measured and then doubted: a
+    DETECTED brightness measured on the file's own crop, flagged "dim-text?"
+    -- a reason that doubts a reading which WAS taken, which is exactly what a
+    confirm can retire -- and everything else (crop, ranges) already settled by
+    the user."""
+    entries = [make_entry(name, crop=BOX, brightness=value, brightness_source=Source.DETECTED,
+                          ranges=[], flags={"brightness": FLAG_DIM_TEXT})
+               for name in names]
+    return tmp_project(list(names), config=v2_config(entries, **folder))
+
+
+def open_doubted(make_controller, fake_runner, tmp_project, names=("ep01.mkv",), **kwargs):
+    """(controller, folder) on a doubted-brightness folder, with the confirm
+    chain free to run: the thumbnail and audio-profile jobs the open submits
+    are finished and the gallery lines are already drawn, because AutoPilot
+    never confirms a file that still has a detection of its own outstanding
+    (its values, and the strip the probe reads, are still moving)."""
+    folder = doubted_project(tmp_project, names, **kwargs)
+    controller = make_controller()
+    controller.open_folder(str(folder))
+    for name in controller.names():
+        draw_lines(controller.entry(name))
+    for submission in [*fake_runner.of_kind("thumbnail"), *fake_runner.of_kind("audio_profile")]:
+        if submission.job.kind == "thumbnail":
+            fake_runner.finish(submission, ThumbnailResult(submission.job.file, submission.job.time, None))
+        else:
+            fake_runner.finish(submission, AudioProfileResult(submission.job.file,
+                                                              AudioProfile(DURATION, [0.0], [])))
+    controller.drain_events()
+    return controller, folder
+
+
+def confirm_result(submission, *, value=None, text="第一行") -> ConfirmJobResult:
+    """What `core.detect.confirm.confirm_brightness` returns for this job:
+    every rung of the ladder down to `value`, which is the one that read the
+    strip. `value=None` is a ladder that passed nowhere."""
+    job = submission.job
+    rungs = []
+    for threshold in ladder(job.start_value):
+        passed = threshold == value
+        rungs.append(Rung(threshold=threshold, gated=True, text=text if passed else "",
+                          confidence=0.97 if passed else 0.0, passed=passed))
+        if passed:
+            break                             # the rungs below the one that passed are never probed
+    result = ConfirmResult(value=value, probe_time=job.probe_time, rungs=tuple(rungs))
+    return ConfirmJobResult(job.file, result, job.crop_box, job.start_value, job.conf_threshold)
+
+
+def badge(controller, name) -> tuple[str, str]:
+    return badge_for(controller.entry(name), running_detectors=controller.running_detectors(name),
+                     done=controller.is_done(name), run_state=None)
+
+
+def test_a_confirm_result_is_applied_on_the_gui_thread_when_the_drain_runs(make_controller, fake_runner,
+                                                                           tmp_project, monkeypatch):
+    """The runner's listener only enqueues: a confirm reaches
+    core.jobs.apply.apply_confirm when drain_events() runs, never from the
+    worker thread that finished the job."""
+    applied = []
+    original = apply_mod.apply_confirm
+
+    def spy(project, r):
+        applied.append(r)
+        return original(project, r)
+
+    monkeypatch.setattr(apply_mod, "apply_confirm", spy)
+    name = "ep01.mkv"
+    controller, _folder = open_doubted(make_controller, fake_runner, tmp_project)
+
+    confirm = fake_runner.last("confirm", name)
+    assert confirm.job.crop_box == BOX and confirm.job.probe_time == CONFIRM_TIME
+    assert confirm.job.start_value == 209
+
+    fake_runner.finish(confirm, confirm_result(confirm, value=209))
+    assert applied == []                                        # queued, not applied
+    assert controller.entry(name).review == ReviewState.FLAGGED
+
+    controller.drain_events()
+
+    assert [r.file for r in applied] == [name]
+    assert controller.entry(name).review == ReviewState.PROPOSED
+
+
+def test_a_confirmed_file_stops_asking_for_the_user_and_badges_ready(make_controller, fake_runner, tmp_project):
+    """The whole point of the stage, end to end through the controller: a file
+    FLAGGED on a doubted brightness that the engine reads at the stored value
+    becomes PROPOSED, badges "ready" and moves from the "needs you" chip to
+    the "ready" one. Its value is untouched -- the ladder passed on the first
+    rung -- and nothing on screen says it was confirmed."""
+    name = "ep01.mkv"
+    controller, folder = open_doubted(make_controller, fake_runner, tmp_project)
+    assert controller.entry(name).review == ReviewState.FLAGGED
+    assert badge(controller, name) == ("check brightness", "warn")
+    assert controller.counts()["needs_you"] == 1 and controller.counts()["ready"] == 0
+    changed = Spy(controller.file_changed)
+
+    confirm = fake_runner.last("confirm", name)
+    fake_runner.finish(confirm, confirm_result(confirm, value=209))
+    controller.drain_events()
+
+    entry = controller.entry(name)
+    assert entry.brightness == Brightness(209, Source.DETECTED)     # the rung that passed was the stored one
+    assert entry.flags["brightness"] == ""                          # the doubt is retired
+    assert entry.review == ReviewState.PROPOSED
+    assert badge(controller, name) == ("ready", "default")
+    assert controller.counts()["needs_you"] == 0 and controller.counts()["ready"] == 1
+    assert name in changed.firsts
+    assert controller.startable_files() == [name]                   # a FLAGGED file never was
+    assert wait_for(lambda: saved(folder)["files"][name]["review"] == "proposed", WAIT_MS)
+
+
+def test_a_confirm_that_passed_lower_down_leaves_the_lower_brightness(make_controller, fake_runner, tmp_project):
+    """The ladder steps down by 10 until the engine reads the line, and the
+    rung that read it is the file's value from then on -- still DETECTED, so
+    the file reads as a detected value the user never had to touch."""
+    name = "ep01.mkv"
+    controller, folder = open_doubted(make_controller, fake_runner, tmp_project)
+    confirm = fake_runner.last("confirm", name)
+    assert ladder(209)[:3] == [209, 199, 189]
+
+    fake_runner.finish(confirm, confirm_result(confirm, value=189))
+    controller.drain_events()
+
+    entry = controller.entry(name)
+    assert entry.brightness == Brightness(189, Source.DETECTED)
+    assert entry.review == ReviewState.PROPOSED
+    assert badge(controller, name) == ("ready", "default")
+    assert wait_for(lambda: saved(folder)["files"][name]["brightness"]["value"] == 189, WAIT_MS)
+
+
+def test_a_failed_confirm_leaves_the_file_flagged_and_still_checking_brightness(make_controller, fake_runner,
+                                                                                tmp_project):
+    """A ladder that passes nowhere proved nothing: the value, the flag and
+    the badge are exactly as the detector left them, and the file still waits
+    for the user."""
+    name = "ep01.mkv"
+    controller, _folder = open_doubted(make_controller, fake_runner, tmp_project)
+    confirm = fake_runner.last("confirm", name)
+
+    fake_runner.finish(confirm, confirm_result(confirm, value=None))
+    controller.drain_events()
+
+    entry = controller.entry(name)
+    assert entry.brightness == Brightness(209, Source.DETECTED)
+    assert entry.flags["brightness"] == FLAG_DIM_TEXT
+    assert entry.review == ReviewState.FLAGGED
+    assert badge(controller, name) == ("check brightness", "warn")
+    assert controller.counts()["needs_you"] == 1 and controller.startable_files() == []
+
+
+def test_applying_a_confirm_schedules_the_save(make_controller, fake_runner, tmp_project):
+    """Every applied confirm is saved, as every other applied result is. The
+    failing ladder is the test case that isolates it: it changes no value and
+    no review state, so the record in evidence["brightness"]["confirm"] -- the
+    memo that stops the folder re-probing the same ladder on every open -- is
+    the only thing there is to write."""
+    name = "ep01.mkv"
+    controller, folder = open_doubted(make_controller, fake_runner, tmp_project)
+    confirm = fake_runner.last("confirm", name)
+
+    fake_runner.finish(confirm, confirm_result(confirm, value=None))
+    controller.drain_events()
+
+    def recorded():
+        evidence = store.load_project(str(folder)).files[name].evidence
+        return (evidence.get("brightness") or {}).get("confirm")
+
+    assert wait_for(lambda: recorded() is not None, WAIT_MS)
+    assert recorded()["start_value"] == 209 and recorded()["value"] is None
+    assert recorded()["probe_time"] == CONFIRM_TIME
+    assert saved(folder)["files"][name]["review"] == "flagged"
+
+
+def test_a_running_confirm_shows_in_the_activity_strip_but_changes_no_badge(make_controller, fake_runner,
+                                                                            tmp_project):
+    """A confirm is named where the machine's work is named, and nowhere else.
+
+    The activity strip says "checking brightness" because it is real GPU work
+    that a folder of flagged files spends minutes in, and a strip reading
+    "idle" through it would be a lie. But it is not a pending detection: it
+    gives the file no pending badge and does not appear in
+    pending_detectors(), so a folder of 180 flagged rows does not churn
+    through a transient "waiting" that tells the user nothing."""
+    name = "ep01.mkv"
+    controller, _folder = open_doubted(make_controller, fake_runner, tmp_project)
+    before = badge(controller, name)
+    confirm = fake_runner.last("confirm", name)
+
+    fake_runner.start(confirm)
+    controller.drain_events()
+
+    assert controller.activity().current[:2] == ("confirm", name)
+    assert controller.activity().current[3] == "checking brightness"
+    assert controller.running_detectors(name) == {"confirm"}     # an auto-pilot kind, so it is counted
+    assert "confirm" not in controller.pending_detectors().get(name, set())
+    assert not controller.is_detection_kind("confirm")           # the top bar's "detecting" dot stays dark
+    assert badge(controller, name) == before == ("check brightness", "warn")
+    assert controller.entry(name).review == ReviewState.FLAGGED
 
 
 # --------------------------------------------------------------------------
@@ -943,8 +1417,8 @@ def test_start_run_submits_a_snapshot_and_holds_autopilot(make_controller, fake_
                               for name in ["ep01.mkv", "ep02.mkv"])
     assert job.files[1].call.time_ranges == [("1:00", "2:00"), ("3:00", "")]
     assert job.parallel == 3 and job.project_dir == project.path
-    assert {(lane, only) for lane, only in fake_runner.pauses} == {(Lane.GPU, is_detection_job),
-                                                                   (Lane.CPU, is_detection_job)}
+    assert {(lane, only) for lane, only in fake_runner.pauses} == {(Lane.GPU, is_held_job),
+                                                                   (Lane.CPU, is_held_job)}
     snapshot = controller.run_snapshot()
     assert isinstance(snapshot, RunSnapshot)
     assert [(row.name, row.state) for row in snapshot.files] == [("ep01.mkv", "queued"), ("ep02.mkv", "queued")]
@@ -1397,11 +1871,16 @@ def test_logbook_caps_each_key_like_todays_log_store():
     assert book.keys() == ["Detections"] and book.text("a.mkv") == ""
 
 
-def test_default_runner_factory_builds_a_job_runner_with_two_cpu_workers():
+def test_default_runner_factory_builds_a_job_runner_with_cpu_workers_for_the_machine():
+    """One GPU worker and one run worker, whatever the machine; the CPU lane
+    scales with it (CPU_WORKERS), because thumbnails, audio profiles and the
+    views' own fetches all queue there and the lane is latency-bound."""
     runner = default_runner_factory(lambda event: None)
     try:
         assert isinstance(runner, JobRunner)
-        assert sorted(t.name for t in runner._threads) == ["jobs-cpu-0", "jobs-cpu-1", "jobs-gpu-0", "jobs-run-0"]
+        assert 2 <= CPU_WORKERS <= 8
+        names = sorted(t.name for t in runner._threads)
+        assert names == sorted([f"jobs-cpu-{i}" for i in range(CPU_WORKERS)] + ["jobs-gpu-0", "jobs-run-0"])
     finally:
         assert runner.shutdown(timeout=2.0)
 
@@ -1549,6 +2028,174 @@ def test_a_cancelled_frame_job_lets_a_later_request_try_again(make_controller, f
 
     controller.request_frames("ep01.mkv", [10.0])
     assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 2
+
+
+# --------------------------------------------------------------------------
+# Warming the view cache
+# --------------------------------------------------------------------------
+
+def _warm(controller, fake_runner, folder, name="ep01.mkv", **finish):
+    """Submit and end a warm job for `name`, the way AutoPilot's chain does."""
+    fake_runner.submit(WarmJob(str(folder), name, wanted(controller.entry(name))))
+    fake_runner.finish(fake_runner.last("warm", name),
+                       finish.pop("result", WarmResult(name, 3, 2, 0)), **finish)
+    controller.drain_events()
+
+
+def test_warming_never_shows_up_as_activity(make_controller, fake_runner, tmp_project):
+    """It must not push the detectors out of the five-deep history, any more
+    than a view's own fetches do."""
+    controller, folder = _frames_controller(make_controller, tmp_project)
+    before = controller.activity()
+
+    _warm(controller, fake_runner, folder)
+
+    after = controller.activity()
+    assert after.current == before.current
+    assert after.running == before.running
+    assert [kind for kind, _file, _at in after.recent] == [kind for kind, _file, _at in before.recent]
+
+
+def test_a_warm_event_is_handled_without_an_internal_error(make_controller, fake_runner, tmp_project):
+    """drain_events swallows and logs a handler that raises, so a routing
+    mistake here would be invisible: pin that nothing was logged."""
+    controller, folder = _frames_controller(make_controller, tmp_project)
+
+    _warm(controller, fake_runner, folder)
+
+    assert "Internal error" not in controller.log_text("Pipeline")
+    assert "Unexpected" not in controller.log_text("Pipeline")
+
+
+def test_a_failed_warm_job_is_logged_and_changes_no_state(make_controller, fake_runner, tmp_project):
+    controller, folder = _frames_controller(make_controller, tmp_project)
+    before = controller.entry("ep01.mkv").review
+
+    _warm(controller, fake_runner, folder, result=None, event_type="failed", message="disk full")
+
+    assert "Could not warm the view cache for ep01.mkv" in controller.log_text("Pipeline")
+    assert controller.entry("ep01.mkv").review is before
+
+
+def test_warming_reports_no_pending_detector(make_controller, fake_runner, tmp_project):
+    """Warming is not detection: it must not make a file look busy."""
+    controller, folder = _frames_controller(make_controller, tmp_project)
+    fake_runner.submit(WarmJob(str(folder), "ep01.mkv", wanted(controller.entry("ep01.mkv"))))
+    fake_runner.start(fake_runner.last("warm", "ep01.mkv"))
+    controller.drain_events()
+
+    assert "warm" not in controller.pending_detectors().get("ep01.mkv", set())
+    assert "warm" not in controller.running_detectors("ep01.mkv")
+    assert not controller.is_detection_kind("warm")
+
+
+# --------------------------------------------------------------------------
+# Exact frames: the crop view's "masked" preview vs. the lossy disk cache
+# --------------------------------------------------------------------------
+
+def _finish_frames(fake_runner, controller, times, lossy=(), file="ep01.mkv"):
+    """Answer the outstanding frames job for `file` with a frame per time,
+    `lossy` naming the ones the job read back from the on-disk view cache."""
+    frames = {time: _frame(int(time)) for time in times}
+    fake_runner.finish(fake_runner.last("frames", file),
+                       FramesResult(file, frames, lossy=frozenset(lossy)))
+    controller.drain_events()
+
+
+def test_an_exact_request_carries_exact_to_the_job(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+
+    job = fake_runner.last("frames", "ep01.mkv").job
+    assert job.exact is True and job.times == (10.0,)
+
+
+def test_a_lossy_frame_is_refetched_for_an_exact_request(make_controller, fake_runner, tmp_project):
+    """The masked preview filters on pixel levels, and the disk cache's WebP
+    moved them: a cached lossy frame is a miss for `exact`."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    _finish_frames(fake_runner, controller, [10.0], lossy=[10.0])
+
+    assert controller.frame("ep01.mkv", 10.0) is not None          # good enough to look at
+    assert controller.frame("ep01.mkv", 10.0, exact=True) is None  # not to filter
+
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+    jobs = [s.job for s in fake_runner.of_kind("frames", "ep01.mkv")]
+    assert len(jobs) == 2 and jobs[1].exact is True
+
+
+def test_an_exact_frame_satisfies_both_kinds_of_request(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    _finish_frames(fake_runner, controller, [10.0])                # decoded, so exact
+
+    assert controller.frame("ep01.mkv", 10.0, exact=True) is not None
+
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 1     # nothing to fetch
+
+
+def test_an_exact_fetch_under_way_answers_a_plain_request(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+    controller.request_frames("ep01.mkv", [10.0])                  # exact is strictly better: wait for it
+
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 1
+
+
+def test_a_plain_fetch_under_way_does_not_answer_an_exact_request(
+        make_controller, fake_runner, tmp_project):
+    """The other way round does not hold: the plain fetch may answer off the
+    disk, and the masked preview cannot use that."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+
+    controller.request_frames("ep01.mkv", [10.0])
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+
+    jobs = [s.job for s in fake_runner.of_kind("frames", "ep01.mkv")]
+    assert len(jobs) == 2 and [job.exact for job in jobs] == [False, True]
+    assert jobs[0].key != jobs[1].key             # or the runner would replace one with the other
+
+
+def test_an_exact_frame_upgrades_the_cached_lossy_one(make_controller, fake_runner, tmp_project):
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    _finish_frames(fake_runner, controller, [10.0], lossy=[10.0])
+
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+    _finish_frames(fake_runner, controller, [10.0])
+
+    assert controller.frame("ep01.mkv", 10.0, exact=True) is not None
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 2     # nothing left to fetch
+
+
+def test_a_time_known_unreadable_is_not_asked_for_exactly_either(
+        make_controller, fake_runner, tmp_project):
+    """A decoder that could not read the time would not read it exactly
+    either: the once-per-session rule holds for both kinds of request."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0])
+    _finish_frames(fake_runner, controller, [])                    # finished without the frame
+
+    controller.request_frames("ep01.mkv", [10.0], exact=True)
+    assert len(fake_runner.of_kind("frames", "ep01.mkv")) == 1
+
+
+def test_a_mixed_result_marks_only_the_disk_sourced_frames_lossy(
+        make_controller, fake_runner, tmp_project):
+    """One job may answer some times off the disk and decode the rest; only
+    the former are lossy."""
+    controller, _ = _frames_controller(make_controller, tmp_project)
+    controller.request_frames("ep01.mkv", [10.0, 20.0])
+    _finish_frames(fake_runner, controller, [10.0, 20.0], lossy=[10.0])
+
+    assert controller.frame("ep01.mkv", 10.0, exact=True) is None
+    assert controller.frame("ep01.mkv", 20.0, exact=True) is not None
 
 
 def test_a_cancelled_strip_job_lets_a_later_request_try_again(make_controller, fake_runner, tmp_project):

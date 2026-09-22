@@ -464,6 +464,29 @@ def test_elided_label_keeps_the_full_text(qapp):
     label.close()
 
 
+def test_a_long_kvrow_value_never_widens_its_column(qapp):
+    """The inspector is a fixed `INSPECTOR_WIDTH` column whose scroll area
+    has no horizontal bar, so a row that insists on being wider than the
+    viewport is not scrolled to -- it is clipped, taking its right border
+    and the tail of its value off the edge of the window. No value may
+    dictate the column's width: the row's minimum is its key's, and the
+    value elides into whatever is left, with the whole of it on hover."""
+    long_value = "576, 1876 · 2688 × 159 · yours 579, 1876 · 2688 × 159"
+    row = KvRow("detected", long_value, tone="warn")
+    row.show()
+
+    # Font-independent: the value contributes nothing to the minimum, so a
+    # row cannot be pushed wider by what is written in it.
+    assert row.minimumSizeHint().width() == KvRow("detected", "—").minimumSizeHint().width()
+    row.resize(tokens.INSPECTOR_WIDTH, row.sizeHint().height())
+    qapp.processEvents()
+    assert row.value() == long_value                     # read back whole
+    assert row._value_label.toolTip() == long_value      # and readable on hover
+    assert row._value_label.text().endswith("…")         # but drawn elided
+    assert (row._value_label.x() + row._value_label.width()) <= row.width()
+    row.close()
+
+
 def test_stylesheet_restates_the_disabled_look_for_button_variants():
     sheet = qss.build_stylesheet()
     assert 'QPushButton[variant="primary"]:disabled' in sheet

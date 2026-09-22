@@ -24,6 +24,16 @@ KIND_LABELS = {
     "brightness": "measuring brightness",
     "ranges": "matching intro/outro",
     "audio_profile": "audio analysis",
+    "lines": "finding subtitle lines",
+    # The brightness confirm stage (core/detect/confirm.py): one OCR read of
+    # one masked strip, to see whether a doubted threshold would actually
+    # read the file's subtitles. It is named here because it is real GPU
+    # work -- a folder of 180 flagged files spends minutes in it -- and a
+    # strip reading "idle" while the machine is busy would be a lie. Naming
+    # a job in the strip says nothing about review: the badges, the chips and
+    # the top bar's "detecting" dot are driven by the review state and
+    # DETECTION_KINDS, and a confirm joins neither.
+    "confirm": "checking brightness",
     "proof": "test OCR",
 }
 

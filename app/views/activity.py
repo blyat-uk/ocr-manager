@@ -29,6 +29,13 @@ DONE_LABELS = {
     "brightness": "brightness",
     "ranges": "intro/outro matching",
     "audio_profile": "audio analysis",
+    "lines": "subtitle lines",
+    # The brightness confirm stage, as a noun: "brightness check done 4 s
+    # ago". Deliberately not "brightness" -- that is the measurement, this is
+    # the OCR read that answers a doubt about it, and one file can show both
+    # in the same trail. Saying a confirm finished claims nothing about the
+    # file's review state; the queue badge is the only thing that does.
+    "confirm": "brightness check",
     "proof": "test OCR",
 }
 

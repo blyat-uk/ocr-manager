@@ -22,12 +22,14 @@ from core.detect import crop as crop_mod
 from core.detect.audio_profile import AudioProfile
 from core.detect.brightness import FLAG_ESCALATE, BrightnessResult
 from core.detect.crop import CONSENSUS_MIN_ENTRIES, CropResult
+from core.detect.lines import LineSample, LinesResult
 from core.detect.ranges.pipeline import RangesAnalysis
 from core.jobs.apply import (
     apply_audio_profile,
     apply_brightness,
     apply_crop,
     apply_folder_change,
+    apply_lines,
     apply_metadata,
     apply_ranges,
     recompute_all,
@@ -35,14 +37,19 @@ from core.jobs.apply import (
     set_manual_crop,
 )
 from core.jobs.autopilot import (
+    AUTOPILOT_KINDS,
     DETECTION_KINDS,
+    HELD_KINDS,
+    LINES_BOOST,
     PRIORITY,
     REDETECT_BOOST,
+    THUMBNAIL_FRACTION,
     AutoPilot,
     crop_consensus,
     intersect_plateaus,
     is_autopilot_job,
     is_detection_job,
+    is_held_job,
 )
 from core.jobs.detect_jobs import (
     PROOF_PRIORITY,
@@ -50,8 +57,11 @@ from core.jobs.detect_jobs import (
     AudioProfileResult,
     BrightnessJob,
     BrightnessJobResult,
+    ConfirmJob,
     CropJob,
     CropJobResult,
+    LinesJob,
+    LinesJobResult,
     MetadataJob,
     MetadataResult,
     RangesJob,
@@ -60,6 +70,8 @@ from core.jobs.detect_jobs import (
     ThumbnailResult,
 )
 from core.jobs.runner import JobEvent, Lane
+from core.jobs.view_cache import wanted
+from core.jobs.view_jobs import WARM_PRIORITY, WarmJob
 from core.project import (
     Brightness,
     Crop,
@@ -100,16 +112,20 @@ class Submission:
 
 
 class FakeRunner:
-    """Records submit/pause/resume; job ids are assigned like the runner's."""
+    """Records submit/cancel/pause/resume; job ids are assigned like the runner's."""
 
     def __init__(self):
         self.submissions: list[Submission] = []
         self.pauses: list[tuple[Lane, object]] = []
         self.resumes: list[Lane] = []
+        self.cancelled_keys: list[str] = []
         self._ids = itertools.count(1)
 
     def submit(self, job):
         self.submissions.append(Submission(job, next(self._ids)))
+
+    def cancel(self, key: str):
+        self.cancelled_keys.append(key)
 
     def pause(self, lane, *, only=None):
         self.pauses.append((lane, only))
@@ -124,16 +140,19 @@ APPLY = {
     "brightness": apply_brightness,
     "ranges": apply_ranges,
     "audio_profile": apply_audio_profile,
+    "lines": apply_lines,
 }
 
 
 class Owner:
-    """The model owner, driving AutoPilot as the class docstring prescribes."""
+    """The model owner, driving AutoPilot as the class docstring prescribes.
+    Lines seeds are 1, 2, 3, ... in submission order."""
 
     def __init__(self, project: Project):
         self.project = project
         self.runner = FakeRunner()
-        self.autopilot = AutoPilot(self.runner, lambda: self.project)
+        self.seeds = itertools.count(1)
+        self.autopilot = AutoPilot(self.runner, lambda: self.project, seed_source=lambda: next(self.seeds))
         self._seen = 0
 
     def take(self) -> list[Submission]:
@@ -145,6 +164,10 @@ class Owner:
     def event(self, submission: Submission, result=None, type="finished") -> JobEvent:
         job = submission.job
         return JobEvent(type, job.key, job.kind, job.file, job_id=submission.job_id, result=result)
+
+    def start(self, submission: Submission) -> None:
+        """Drain the job's "started" event (the owner passes it on too)."""
+        self.autopilot.on_job_event(self.event(submission, type="started"))
 
     def deliver(self, submission: Submission, result=None, type="finished") -> bool:
         """Drain one terminal event; True when its result was applied."""
@@ -222,6 +245,11 @@ def audio_done(sub: Submission) -> AudioProfileResult:
     return AudioProfileResult(sub.job.file, AudioProfile(duration=DURATION, envelope=[0.0, 1.0], speech=[]))
 
 
+def lines_done(sub: Submission, times=(512.0, 900.0), tried: int = 24) -> LinesJobResult:
+    samples = tuple(LineSample(float(t), ((10, 5, 200, 30),), 1) for t in times)
+    return LinesJobResult(sub.job.file, LinesResult(samples, tried, sub.job.seed), sub.job.crop_box)
+
+
 def thumbnail_done(sub: Submission) -> ThumbnailResult:
     return ThumbnailResult(sub.job.file, sub.job.time, None)
 
@@ -233,6 +261,24 @@ def finish_side_jobs(owner: Owner, submissions: list[Submission]) -> None:
             owner.deliver(sub, thumbnail_done(sub))
         elif sub.job.kind == "audio_profile":
             owner.deliver(sub, audio_done(sub))
+
+
+def drain_warm(owner: Owner, type: str = "finished") -> list[Submission]:
+    """Deliver the view-cache warm jobs until the chain runs dry, and return
+    them in submission order. Nothing but warm jobs may follow a warm event,
+    and never more than one at a time: that is the chain. A warm result holds
+    no value (APPLY has none), so delivering it only moves the chain on --
+    the jobs themselves are never run here."""
+    drained = []
+    for _ in range(len(owner.project.files) + 1):     # a drain warms each file at most once
+        new = owner.take()
+        assert of_kind(new, "warm") == new, pairs(new)
+        if not new:
+            return drained
+        assert len(new) == 1, pairs(new)
+        drained += new
+        owner.deliver(new[0], None, type=type)
+    raise AssertionError(f"the warm chain never ran dry: {pairs(drained)}")
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +338,14 @@ def test_open_on_a_fresh_folder_submits_every_detection_in_dependency_order(tmp_
 
     keep = {names[0]: [("02:00", "20:00")], names[3]: [("01:30", None)]}
     owner.deliver(ranges, ranges_done(ranges, keep=keep))
-    full = owner.take()
+    released = owner.take()
+    # The gallery lines waited for the ranges too; they are view evidence and change no state.
+    lines = lines_of(released)
+    assert pairs(lines) == [("lines", name) for name in names]
+    assert [(s.job.crop_box, s.job.priority) for s in lines] == [(boxes[name], 1) for name in names]
+    assert [s.job.time_ranges for s in lines] == [(("02:00", "20:00"),), None, None, (("01:30", None),), None]
+    full = of_kind(released, "brightness")
+    assert len(full) + len(lines) == len(released)
     assert pairs(full) == [("brightness", name) for name in names[:3]]
     for sub in full:
         assert sub.job.folder_plateau is None and sub.job.hint_value is None
@@ -314,6 +367,11 @@ def test_open_on_a_fresh_folder_submits_every_detection_in_dependency_order(tmp_
     for sub in cheap:
         owner.deliver(sub, brightness_done(sub, value=205, plateau=(190, 225)))
     assert owner.take() == []
+    assert {owner.state(name) for name in names} == {ReviewState.PROPOSED}   # whatever the lines do
+    for sub in lines:
+        owner.deliver(sub, lines_done(sub))
+    # Every file has evidence to draw now, so the view cache warms: one job at a time, in name order.
+    assert pairs(drain_warm(owner)) == [("warm", name) for name in names]
     assert len(of_kind(owner.runner.submissions, "ranges")) == 1
     assert {owner.state(name) for name in names} == {ReviewState.PROPOSED}
     assert owner.autopilot.pending() == {}
@@ -331,8 +389,13 @@ def test_an_imported_project_gets_only_thumbnails_and_audio_profiles(tmp_path):
         [("thumbnail", name) for name in SLAY_NAMES] + [("audio_profile", name) for name in SLAY_NAMES])
     for sub in of_kind(submitted, "thumbnail"):
         assert sub.job.time == project.files[sub.job.file].sample_time
+    assert all("lines" in owner.autopilot.pending()[name] for name in SLAY_NAMES)   # behind the audio profiles
     finish_side_jobs(owner, submitted)
-    assert owner.take() == []
+    lines = owner.take()                                   # the gallery lines: view evidence, no value
+    assert pairs(lines) == [("lines", name) for name in SLAY_NAMES]
+    for sub in lines:
+        owner.deliver(sub, lines_done(sub))
+    assert pairs(drain_warm(owner)) == [("warm", name) for name in SLAY_NAMES]
     assert {owner.state(name) for name in SLAY_NAMES} == {ReviewState.REVIEWED}
 
 
@@ -443,7 +506,8 @@ def test_opening_twice_submits_nothing_new(tmp_path):
     owner.autopilot.on_open()
     opened = owner.take()
     assert sorted(pairs(opened)) == sorted([("brightness", "a.mkv"), ("brightness", "b.mkv"),
-                                            ("thumbnail", "a.mkv"), ("thumbnail", "b.mkv")])   # audio already known
+                                            ("thumbnail", "a.mkv"), ("thumbnail", "b.mkv"),
+                                            ("lines", "a.mkv"), ("lines", "b.mkv")])   # audio already known
     owner.autopilot.on_open()
     assert owner.take() == []
 
@@ -466,7 +530,7 @@ def test_a_full_run_measured_on_a_replaced_crop_does_not_set_the_folder_plateau(
     set_manual_brightness(project, "a.mkv", 215)
     set_manual_crop(project, "a.mkv", OTHER_BOX)
     owner.autopilot.on_crop_changed("a.mkv")               # the user's brightness: nothing to re-measure
-    assert owner.take() == []
+    assert pairs(owner.take()) == [("lines", "a.mkv")]      # (the gallery lines follow the crop)
     assert owner.deliver(full, brightness_done(full, plateau=(10, 20))) is True
     (next_full,) = owner.take()
     assert next_full.job.file == "b.mkv" and next_full.job.folder_plateau is None
@@ -1195,21 +1259,33 @@ def test_the_proof_outranks_every_auto_pilot_priority(tmp_path):
 # Pause, pending and superseded results
 # --------------------------------------------------------------------------
 
-def test_pause_and_resume_hold_only_detection_jobs_on_the_gpu_and_cpu_lanes(tmp_path):
+def test_pause_and_resume_hold_detection_and_warm_jobs_on_the_gpu_and_cpu_lanes(tmp_path):
     owner = Owner(_project(tmp_path, ["a.mkv"]))
     owner.autopilot.pause()
     owner.autopilot.pause()                               # idempotent
     assert [lane for lane, _ in owner.runner.pauses] == [Lane.GPU, Lane.CPU]
     for _, only in owner.runner.pauses:
-        assert only is is_detection_job
+        assert only is is_held_job
     folder = FolderSettings()
-    held = [AudioProfileJob("/p", "a", 10.0), RangesJob("/p", ["a", "b"], folder),
-            CropJob("/p", "a", 10.0, [], folder), BrightnessJob("/p", "a", BOX, None, folder)]
-    assert all(is_detection_job(job) for job in held)
-    assert {job.kind for job in held} == DETECTION_KINDS
+    detection = [AudioProfileJob("/p", "a", 10.0), RangesJob("/p", ["a", "b"], folder),
+                 CropJob("/p", "a", 10.0, [], folder), BrightnessJob("/p", "a", BOX, None, folder),
+                 LinesJob("/p", "a", BOX, None, None, folder, seed=1)]
+    assert all(is_detection_job(job) for job in detection)
+    assert {job.kind for job in detection} == DETECTION_KINDS
+    # Warming is held with them, and is not detection: it holds no value and no review state.
+    # A brightness confirm is held too, for the other reason: it moves a value, but only ever
+    # by REMOVING a doubt, so it holds no review state either (core/jobs/autopilot.py's
+    # "Confirming a doubted brightness"). Both are GPU/CPU work a run must never wait behind.
+    warm = WarmJob("/p", "a", wanted(FileEntry(name="a")))
+    confirm = ConfirmJob("/p", "a", BOX, 10.0, 230, folder)
+    held = detection + [confirm, warm]
+    assert all(is_held_job(job) for job in held)
+    assert {job.kind for job in held} == HELD_KINDS
+    assert not is_detection_job(warm) and is_autopilot_job(warm)
+    assert not is_detection_job(confirm) and is_autopilot_job(confirm)
     never_held = [MetadataJob("/p", "a"), ThumbnailJob("/p", "a", 1.0),
                   SimpleNamespace(kind="proof", lane=Lane.GPU), SimpleNamespace(kind="run", lane=Lane.RUN)]
-    assert not any(is_detection_job(job) for job in never_held)
+    assert not any(is_detection_job(job) or is_held_job(job) for job in never_held)
     assert is_autopilot_job(never_held[0]) and is_autopilot_job(never_held[1])
     assert not is_autopilot_job(never_held[2])
 
@@ -1239,14 +1315,19 @@ def test_pending_tracks_queued_running_and_finished_jobs(tmp_path):
     owner.deliver(crop, crop_done(crop))
     after_crop = owner.take()
     assert of_kind(after_crop, "brightness") == []                      # waits for the ranges
-    assert autopilot.pending()["a.mkv"] == {"thumbnail", "audio_profile", "brightness"}
+    assert lines_of(after_crop) == []                                   # so do the gallery lines
+    assert autopilot.pending()["a.mkv"] == {"thumbnail", "audio_profile", "brightness", "lines"}
     assert owner.state("a.mkv") == ReviewState.PENDING
     owner.deliver(ranges, ranges_done(ranges))
     assert autopilot.ranges_pending() is False
     (brightness,) = of_kind(owner.take(), "brightness")
-    assert autopilot.pending()["a.mkv"] == {"thumbnail", "audio_profile", "brightness"}
+    assert autopilot.pending()["a.mkv"] == {"thumbnail", "audio_profile", "brightness", "lines"}
     owner.deliver(brightness, brightness_done(brightness))
     finish_side_jobs(owner, after + after_crop)
+    (lines,) = owner.take()                                             # the audio profile was the last wait
+    assert autopilot.pending() == {"a.mkv": {"lines"}}
+    assert owner.state("a.mkv") == ReviewState.PROPOSED                 # lines hold no state
+    owner.deliver(lines, lines_done(lines))
     assert autopilot.pending() == {}
     assert owner.state("a.mkv") == ReviewState.PROPOSED
 
@@ -1271,8 +1352,9 @@ def test_a_superseded_result_is_not_current_and_keeps_the_kind_pending(tmp_path)
     assert owner.deliver(new, crop_done(new, box=BOX)) is True
     assert project.files["a.mkv"].crop == Crop(*BOX, Source.DETECTED)
     assert "crop" not in owner.autopilot.pending().get("a.mkv", set())
-    (brightness,) = owner.take()
+    brightness, lines = owner.take()
     assert brightness.job.kind == "brightness" and brightness.job.priority == 12   # the re-detect's
+    assert (lines.job.kind, lines.job.crop_box) == ("lines", BOX)
 
 
 def test_a_queued_job_replaced_by_a_newer_one_is_not_current(tmp_path):
@@ -1334,7 +1416,7 @@ def test_a_redetect_cancelled_while_the_older_crop_runs_has_no_brightness_step(t
     assert owner.deliver(newer, None, type="cancelled") is False
     assert owner.deliver(older, crop_done(older)) is True
     after = owner.take()
-    assert pairs(after) == [("crop", "d.mkv")]                 # no priority-12 brightness for c
+    assert pairs(after) == [("lines", "c.mkv"), ("crop", "d.mkv")]   # no priority-12 brightness for c
     assert "brightness" in owner.autopilot.pending()["c.mkv"]  # c waits for the full tier as usual
 
 
@@ -1660,7 +1742,8 @@ def test_a_removed_files_brightness_waiting_for_ranges_is_dropped(tmp_path):
     assert owner.take() == [] and owner.autopilot.ranges_pending() is True
 
     assert owner.deliver(fresh, ranges_done(fresh)) is True
-    assert pairs(owner.take()) == [("brightness", "a.mkv"), ("brightness", "b.mkv")]
+    assert pairs(owner.take()) == [("brightness", "a.mkv"), ("brightness", "b.mkv"),
+                                   ("lines", "a.mkv"), ("lines", "b.mkv")]
 
 
 def test_removing_a_file_leaves_fewer_than_two_ranges_are_not_analysed_again(tmp_path):
@@ -1672,7 +1755,7 @@ def test_removing_a_file_leaves_fewer_than_two_ranges_are_not_analysed_again(tmp
     _remove(owner, ["b.mkv"])
     assert owner.take() == []
     assert owner.deliver(ranges, ranges_done(ranges)) is True
-    assert pairs(owner.take()) == [("brightness", "a.mkv")]
+    assert pairs(owner.take()) == [("brightness", "a.mkv"), ("lines", "a.mkv")]
 
 
 def test_removing_a_file_after_the_ranges_ended_submits_no_analysis(tmp_path):
@@ -1833,6 +1916,825 @@ def test_a_readded_file_removed_again_is_not_scheduled(tmp_path):
     owner.deliver(meta_a, None, type="cancelled")
     assert of_kind(owner.take(), "metadata") == []
     assert "a.mkv" not in owner.autopilot.pending()
+
+
+# --------------------------------------------------------------------------
+# Gallery lines (the Brightness tab's random subtitle lines)
+# --------------------------------------------------------------------------
+
+SPEECH = [[10.0, 20.0], [30.0, 45.5]]
+
+
+def _lines_folder(tmp_path, names, folder: FolderSettings | None = None, *, open_ranges: bool = False,
+                  audio: bool = True) -> Project:
+    """Files with known media, a detected crop and the user's brightness (so
+    no brightness job is in the way). Unless `open_ranges`, every file's
+    ranges are the user's whole file (no ranges analysis); unless `audio` is
+    False, every file has its audio profile."""
+    project = _project(tmp_path, names, folder)
+    for entry in project.files.values():
+        _media(entry).crop = Crop(*BOX, Source.DETECTED)
+        entry.brightness = Brightness(209, Source.MANUAL)
+        entry.sample_time = 300.0
+        if audio:
+            entry.evidence["audio"] = {"envelope": [0.0], "speech": [list(span) for span in SPEECH],
+                                       "duration": DURATION}
+        if not open_ranges:
+            entry.time_ranges = TimeRanges([], Source.MANUAL)
+    return project
+
+
+def _current_lines(entry: FileEntry, box=BOX) -> None:
+    entry.evidence["lines"] = {"crop_box": list(box), "seed": 99, "tried": 12, "samples": []}
+
+
+def lines_of(submissions: list[Submission], file: str | None = None) -> list[Submission]:
+    return [s for s in of_kind(submissions, "lines") if file is None or s.job.file == file]
+
+
+def test_lines_are_drawn_for_every_file_once_its_crop_is_known(tmp_path):
+    names = ["a.mkv", "b.mkv"]
+    owner = Owner(_lines_folder(tmp_path, names))
+    owner.autopilot.on_open()
+    lines = lines_of(owner.take())
+    assert pairs(lines) == [("lines", name) for name in names]
+    for seed, sub in enumerate(lines, start=1):
+        job = sub.job
+        assert (job.priority, job.lane, job.crop_box, job.seed, job.exclude) == (1, Lane.GPU, BOX, seed, ())
+        assert job.time_ranges is None                      # the user's whole file
+        assert [list(span) for span in job.speech] == SPEECH
+    assert PRIORITY["lines"] == 1
+    assert all("lines" in owner.autopilot.pending()[name] for name in names)
+    owner.recompute()
+    assert {owner.state(name) for name in names} == {ReviewState.PROPOSED}   # lines are no value to wait for
+
+    for sub in lines:
+        assert owner.deliver(sub, lines_done(sub)) is True
+    assert all(owner.project.files[name].evidence["lines"]["crop_box"] == list(BOX) for name in names)
+    assert owner.take() == []
+    assert owner.autopilot.pending() == {"a.mkv": {"thumbnail"}, "b.mkv": {"thumbnail"}}
+    owner.autopilot.on_open()
+    assert lines_of(owner.take()) == []                      # drawn: not wanted again
+
+
+def test_lines_take_the_files_keep_ranges_and_no_speech_without_an_audio_profile(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv", "b.mkv"])
+    project.files["a.mkv"].time_ranges = TimeRanges([TimeRange("01:30", "20:00")], Source.MANUAL)
+    project.files["b.mkv"].evidence["audio"] = {}
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    a, b = lines_of(owner.take())
+    assert a.job.time_ranges == (("01:30", "20:00"),) and b.job.speech is None
+
+
+def _not_wanted_no_duration(project):
+    project.files["a.mkv"].media = Media()
+
+
+def _not_wanted_no_crop(project):
+    project.files["a.mkv"].crop = None
+
+
+def _not_wanted_skipped(project):
+    project.files["a.mkv"].skipped = True
+
+
+def _not_wanted_current(project):
+    _current_lines(project.files["a.mkv"])
+
+
+def _wanted_stale(project):
+    _current_lines(project.files["a.mkv"], OTHER_BOX)
+
+
+def _wanted_no_crop_box(project):
+    project.files["a.mkv"].evidence["lines"] = {"seed": 1, "tried": 12, "samples": []}
+
+
+@pytest.mark.parametrize("setup, wanted", [
+    (lambda project: None, True),
+    (_not_wanted_no_duration, False),
+    (_not_wanted_no_crop, False),
+    (_not_wanted_skipped, False),
+    (_not_wanted_current, False),
+    (_wanted_stale, True),
+    (_wanted_no_crop_box, True),
+])
+def test_lines_are_wanted_with_a_crop_a_duration_and_no_current_lines(tmp_path, setup, wanted):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    setup(project)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    assert bool(lines_of(owner.take(), "a.mkv")) is wanted
+    owner.autopilot.boost_lines("a.mkv")                     # the tab's boost follows the same rule
+    assert bool(lines_of(owner.take(), "a.mkv")) is wanted
+
+
+def test_a_labels_only_folder_draws_no_lines(tmp_path):
+    folder = FolderSettings(dialogue_enabled=False, labels_enabled=True)
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv"], folder))
+    owner.autopilot.on_open()
+    owner.autopilot.boost_lines("a.mkv")
+    assert lines_of(owner.take()) == []
+    assert "lines" not in owner.autopilot.pending().get("a.mkv", set())
+
+
+def test_lines_wait_for_the_ranges_and_the_audio_profile(tmp_path):
+    names = ["a.mkv", "b.mkv"]
+    owner = Owner(_lines_folder(tmp_path, names, open_ranges=True, audio=False))
+    owner.autopilot.on_open()
+    opened = owner.take()
+    assert lines_of(opened) == []
+    assert all("lines" in owner.autopilot.pending()[name] for name in names)     # waiting
+    (ranges,) = of_kind(opened, "ranges")
+    audio = {s.job.file: s for s in of_kind(opened, "audio_profile")}
+
+    owner.deliver(audio["a.mkv"], AudioProfileResult("a.mkv", AudioProfile(DURATION, [0.0], [(5.0, 9.0)])))
+    assert lines_of(owner.take()) == []                      # the ranges still run
+    owner.deliver(ranges, ranges_done(ranges, keep={"a.mkv": [("01:00", "20:00")]}))
+    (a,) = lines_of(owner.take())
+    assert a.job.file == "a.mkv" and a.job.time_ranges == (("01:00", "20:00"),)
+    assert [tuple(span) for span in a.job.speech] == [(5.0, 9.0)]
+    assert "lines" in owner.autopilot.pending()["b.mkv"]      # its audio profile is still outstanding
+
+    owner.deliver(audio["b.mkv"], type="failed")             # a failed profile does not hold the lines
+    (b,) = lines_of(owner.take())
+    assert b.job.file == "b.mkv" and b.job.speech is None
+
+
+def test_lines_follow_the_crop_detection(tmp_path):
+    project = _project(tmp_path, ["a.mkv", "b.mkv"])
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.brightness = Brightness(209, Source.MANUAL)
+        entry.time_ranges = TimeRanges([], Source.MANUAL)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (crop_a,) = of_kind(owner.take(), "crop")
+    owner.deliver(crop_a, crop_done(crop_a))
+    after = owner.take()
+    (lines,) = lines_of(after)
+    assert lines.job.file == "a.mkv" and lines.job.crop_box == BOX
+    (crop_b,) = of_kind(after, "crop")
+    owner.deliver(crop_b, crop_done(crop_b, box=None, flagged=crop_mod.FLAG_LOW_AGREEMENT))
+    assert lines_of(owner.take()) == []                      # no crop, no lines
+
+
+def test_lines_follow_the_metadata(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    project.files["a.mkv"].media = Media()
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (metadata,) = of_kind(owner.take(), "metadata")
+    owner.deliver(metadata, metadata_done(metadata))
+    assert pairs(lines_of(owner.take())) == [("lines", "a.mkv")]
+
+
+@pytest.mark.parametrize("autopilot_enabled", [True, False])
+def test_a_crop_edit_redraws_the_lines_on_the_new_box(tmp_path, autopilot_enabled):
+    project = _lines_folder(tmp_path, ["a.mkv"], FolderSettings(autopilot_enabled=autopilot_enabled))
+    _current_lines(project.files["a.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    owner.take()
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("a.mkv")
+    redrawn = lines_of(owner.take())
+    if not autopilot_enabled:                                # the tab's boost draws them when it shows
+        assert redrawn == []
+        return
+    assert [(s.job.crop_box, s.job.priority) for s in redrawn] == [(OTHER_BOX, 1)]
+    owner.autopilot.on_crop_changed("a.mkv")                 # already drawing on this box
+    assert owner.take() == []
+
+
+def test_a_crop_change_supersedes_lines_drawn_on_the_old_box(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (old,) = lines_of(owner.take())
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("a.mkv")
+    (new,) = lines_of(owner.take())
+    assert new.job.crop_box == OTHER_BOX and new.job.seed == old.job.seed + 1
+
+    assert owner.deliver(old, lines_done(old)) is False      # superseded: not applied
+    assert "lines" not in project.files["a.mkv"].evidence
+    assert "lines" in owner.autopilot.pending()["a.mkv"]
+    assert owner.take() == []
+    assert owner.deliver(new, lines_done(new, times=(77.0,))) is True
+    assert project.files["a.mkv"].evidence["lines"]["crop_box"] == list(OTHER_BOX)
+    assert "lines" not in owner.autopilot.pending().get("a.mkv", set())
+
+
+def test_an_applied_crop_result_redraws_the_lines(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv", "b.mkv"])
+    for entry in project.files.values():
+        _current_lines(entry)
+    project.files["b.mkv"].crop = Crop(*OTHER_BOX, Source.MANUAL)
+    _current_lines(project.files["b.mkv"], OTHER_BOX)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    assert lines_of(owner.take()) == []
+    owner.autopilot.redetect_others_with_crop_hint("b.mkv")
+    (crop,) = owner.take()
+    owner.deliver(crop, crop_done(crop, box=OTHER_BOX))
+    assert [(s.job.file, s.job.crop_box) for s in lines_of(owner.take())] == [("a.mkv", OTHER_BOX)]
+
+
+def test_a_crop_change_while_the_ranges_run_waits_and_drops_the_old_lines(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv", "b.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    old = {s.job.file: s for s in lines_of(owner.take())}
+    project.files["c.mkv"] = _media(FileEntry(name="c.mkv"))
+    owner.autopilot.on_files_added(["c.mkv"])               # a new ranges analysis starts
+    assert of_kind(owner.take(), "ranges")
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("a.mkv")
+    assert lines_of(owner.take()) == []                      # the redraw waits for the ranges
+
+    assert owner.deliver(old["a.mkv"], lines_done(old["a.mkv"])) is True
+    assert "lines" not in project.files["a.mkv"].evidence    # drawn on the old box: dropped
+    assert "lines" in owner.autopilot.pending()["a.mkv"]     # still waiting
+    (ranges,) = of_kind(owner.runner.submissions, "ranges")
+    owner.deliver(ranges, ranges_done(ranges))
+    assert [(s.job.file, s.job.crop_box) for s in lines_of(owner.take())] == [("a.mkv", OTHER_BOX)]
+
+
+def test_a_failed_draw_is_not_retried_on_the_same_crop(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv", "b.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (a, _b) = lines_of(owner.take())
+    owner.deliver(a, type="failed")
+    assert owner.take() == []
+    assert "lines" not in owner.autopilot.pending().get("a.mkv", set())
+    owner.autopilot.boost_lines("a.mkv")                     # the tab may ask on every refresh: no loop
+    owner.autopilot.on_crop_changed("a.mkv")
+    assert owner.take() == []
+
+    owner.autopilot.shuffle_lines("a.mkv", [])               # the user's explicit retry
+    (retry,) = lines_of(owner.take())
+    assert retry.job.priority == LINES_BOOST
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.deliver(retry, type="failed")
+    owner.autopilot.on_crop_changed("a.mkv")                 # a new crop: drawn again
+    assert [s.job.crop_box for s in lines_of(owner.take())] == [OTHER_BOX]
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "finished"])
+def test_a_lines_event_submits_nothing(tmp_path, outcome):
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv"]))
+    owner.autopilot.on_open()
+    (lines,) = lines_of(owner.take())
+    owner.deliver(lines, lines_done(lines) if outcome == "finished" else None, type=outcome)
+    assert owner.take() == []
+    assert "lines" not in owner.autopilot.pending().get("a.mkv", set())
+
+
+# --- autopilot_enabled ------------------------------------------------------------
+
+def test_autopilot_off_draws_no_lines_on_its_own(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv", "b.mkv"], FolderSettings(autopilot_enabled=False))
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    assert lines_of(owner.take()) == []
+    assert all("lines" not in kinds for kinds in owner.autopilot.pending().values())
+
+    owner.autopilot.boost_lines("a.mkv")                     # explicit: not gated
+    owner.autopilot.shuffle_lines("b.mkv", [12.0])
+    assert [(s.job.file, s.job.priority) for s in lines_of(owner.take())] == [("a.mkv", LINES_BOOST),
+                                                                              ("b.mkv", LINES_BOOST)]
+
+
+def test_turning_autopilot_on_draws_the_missing_lines(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv", "b.mkv"], FolderSettings(autopilot_enabled=False))
+    _current_lines(project.files["b.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    owner.take()
+    old = replace(project.folder)
+    project.folder = replace(project.folder, autopilot_enabled=True)
+    owner.autopilot.on_folder_changed(old, project.folder)
+    assert pairs(lines_of(owner.take())) == [("lines", "a.mkv")]
+
+
+def test_turning_dialogue_on_draws_the_lines(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"], FolderSettings(dialogue_enabled=False, labels_enabled=True))
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    assert lines_of(owner.take()) == []
+    old = replace(project.folder)
+    project.folder = replace(project.folder, dialogue_enabled=True)
+    apply_folder_change(project, old, project.folder)
+    owner.autopilot.on_folder_changed(old, project.folder)
+    assert pairs(lines_of(owner.take())) == [("lines", "a.mkv")]
+
+
+# --- boost ----------------------------------------------------------------------------
+
+def test_lines_boost_outranks_every_other_auto_pilot_priority_and_not_the_proof():
+    assert LINES_BOOST > max(PRIORITY.values()) + REDETECT_BOOST
+    assert LINES_BOOST < PROOF_PRIORITY
+    assert "lines" in AUTOPILOT_KINDS and "lines" in DETECTION_KINDS
+
+
+def test_boost_moves_a_queued_draw_to_the_front_once(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (auto,) = lines_of(owner.take())
+    owner.autopilot.boost_lines("a.mkv")
+    (boosted,) = owner.take()
+    assert (boosted.job.kind, boosted.job.priority, boosted.job.crop_box) == ("lines", LINES_BOOST, BOX)
+    for _ in range(3):                                       # idempotent: the tab calls it on every refresh
+        owner.autopilot.boost_lines("a.mkv")
+    assert owner.take() == []
+
+    assert owner.deliver(auto, None, type="cancelled") is False   # replaced in the runner's queue
+    assert owner.deliver(boosted, lines_done(boosted)) is True
+    assert project.files["a.mkv"].evidence["lines"]["seed"] == boosted.job.seed
+    owner.autopilot.boost_lines("a.mkv")                     # current lines: nothing to do
+    assert owner.take() == []
+
+
+def test_boost_leaves_a_running_draw_alone(tmp_path):
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv"]))
+    owner.autopilot.on_open()
+    (auto,) = lines_of(owner.take())
+    owner.start(auto)
+    owner.autopilot.boost_lines("a.mkv")
+    assert owner.take() == []
+    assert owner.deliver(auto, lines_done(auto)) is True
+
+
+def test_boost_redraws_when_the_running_draw_is_on_another_crop(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"], FolderSettings(autopilot_enabled=False))
+    owner = Owner(project)
+    owner.autopilot.boost_lines("a.mkv")
+    (first,) = owner.take()
+    owner.start(first)
+    set_manual_crop(project, "a.mkv", OTHER_BOX)
+    owner.autopilot.on_crop_changed("a.mkv")                 # the user's draw follows the crop
+    (second,) = owner.take()
+    assert (second.job.crop_box, second.job.priority) == (OTHER_BOX, LINES_BOOST)
+    owner.autopilot.boost_lines("a.mkv")
+    assert owner.take() == []
+    assert owner.deliver(first, lines_done(first)) is False
+    assert owner.deliver(second, lines_done(second)) is True
+
+
+def test_boost_does_not_wait_for_the_ranges_or_the_audio_profile(tmp_path):
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv", "b.mkv"], open_ranges=True, audio=False))
+    owner.autopilot.on_open()
+    assert lines_of(owner.take()) == []
+    owner.autopilot.boost_lines("b.mkv")
+    (boosted,) = owner.take()
+    assert (boosted.job.file, boosted.job.priority) == ("b.mkv", LINES_BOOST)
+    assert boosted.job.speech is None                        # no profile yet: uniform over the keep spans
+    assert "lines" in owner.autopilot.pending()["a.mkv"] and "lines" in owner.autopilot.pending()["b.mkv"]
+
+    (ranges,) = of_kind(owner.runner.submissions, "ranges")
+    owner.deliver(ranges, ranges_done(ranges))
+    for sub in of_kind(owner.runner.submissions, "audio_profile"):
+        owner.deliver(sub, audio_done(sub))
+    assert pairs(lines_of(owner.take())) == [("lines", "a.mkv")]   # b's boosted draw is still outstanding
+
+
+@pytest.mark.parametrize("name", ["missing.mkv", "a.mkv"])
+def test_boost_of_a_file_without_wanted_lines_does_nothing(tmp_path, name):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    project.files["a.mkv"].crop = None
+    owner = Owner(project)
+    owner.autopilot.boost_lines(name)
+    owner.autopilot.shuffle_lines(name, [1.0])               # a shuffle needs a crop too
+    assert lines_of(owner.take()) == []
+
+
+# --- shuffle ----------------------------------------------------------------------------
+
+def test_shuffle_draws_new_lines_away_from_the_excluded_times(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    _current_lines(project.files["a.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    assert lines_of(owner.take()) == []
+    owner.autopilot.shuffle_lines("a.mkv", [512.0, 900.0, 12.5])
+    (first,) = owner.take()
+    assert (first.job.kind, first.job.priority, first.job.crop_box) == ("lines", LINES_BOOST, BOX)
+    assert first.job.exclude == (512.0, 900.0, 12.5) and first.job.seed == 1
+    owner.autopilot.shuffle_lines("a.mkv", [512.0])          # every shuffle is a new draw
+    (second,) = owner.take()
+    assert second.job.seed == 2 and second.job.exclude == (512.0,)
+    assert "lines" in owner.autopilot.pending()["a.mkv"]
+
+    assert owner.deliver(first, lines_done(first, times=(1.0,))) is False
+    assert project.files["a.mkv"].evidence["lines"]["seed"] == 99       # superseded: the old lines stay
+    assert owner.deliver(second, lines_done(second, times=(2.0,))) is True
+    assert project.files["a.mkv"].evidence["lines"]["seed"] == 2
+    assert "lines" not in owner.autopilot.pending().get("a.mkv", set())
+
+
+def test_shuffle_while_a_draw_runs_supersedes_it(tmp_path):
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv"]))
+    owner.autopilot.on_open()
+    (auto,) = lines_of(owner.take())
+    owner.start(auto)
+    owner.autopilot.shuffle_lines("a.mkv", [])
+    (shuffled,) = owner.take()
+    assert owner.deliver(auto, lines_done(auto)) is False
+    assert owner.deliver(shuffled, lines_done(shuffled)) is True
+
+
+def test_shuffle_is_a_user_request_whatever_the_file(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"], FolderSettings(autopilot_enabled=False))
+    project.files["a.mkv"].skipped = True
+    owner = Owner(project)
+    owner.autopilot.shuffle_lines("a.mkv", [])
+    assert pairs(owner.take()) == [("lines", "a.mkv")]
+
+
+# --- pause, pending and superseded events ------------------------------------------------
+
+def test_pause_holds_lines_jobs(tmp_path):
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv"]))
+    owner.autopilot.on_open()
+    (auto,) = lines_of(owner.take())
+    owner.autopilot.pause()
+    assert all(only is is_held_job for _lane, only in owner.runner.pauses)
+    assert is_detection_job(auto.job) and is_held_job(auto.job) and is_autopilot_job(auto.job)
+    owner.autopilot.boost_lines("a.mkv")                     # a boosted draw is a detection job too
+    (boosted,) = owner.take()
+    assert is_detection_job(boosted.job)
+
+
+def test_pending_lines_never_change_a_review_state(tmp_path):
+    names = ["a.mkv", "b.mkv", "c.mkv"]
+    project = _lines_folder(tmp_path, names, open_ranges=True, audio=False)
+    project.files["a.mkv"].crop = Crop(*BOX, Source.MANUAL)
+    project.files["a.mkv"].time_ranges = TimeRanges([], Source.MANUAL)
+    project.files["b.mkv"].flags["crop"] = crop_mod.FLAG_LOW_AGREEMENT
+    project.files["c.mkv"].review = ReviewState.REVIEWED
+    owner = Owner(project)
+    owner.recompute()
+    before = {name: owner.state(name) for name in names}
+    assert set(before.values()) == {ReviewState.PROPOSED, ReviewState.FLAGGED, ReviewState.REVIEWED}
+
+    owner.autopilot.boost_lines("a.mkv")
+    owner.autopilot.shuffle_lines("b.mkv", [])
+    owner.autopilot.shuffle_lines("c.mkv", [])
+    submitted = lines_of(owner.take())
+    assert all(owner.autopilot.pending()[name] == {"lines"} for name in names)
+    owner.recompute()
+    assert {name: owner.state(name) for name in names} == before
+    for sub in submitted:
+        owner.start(sub)
+        owner.recompute()
+        assert {name: owner.state(name) for name in names} == before
+    for sub in submitted:
+        owner.deliver(sub, lines_done(sub))
+        assert {name: owner.state(name) for name in names} == before
+
+
+def test_a_newer_draw_cancelled_while_an_older_one_runs_leaves_the_older_one_current(tmp_path):
+    project = _lines_folder(tmp_path, ["a.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    (older,) = lines_of(owner.take())
+    owner.start(older)
+    owner.autopilot.shuffle_lines("a.mkv", [])
+    (newer,) = owner.take()
+    assert owner.deliver(newer, None, type="cancelled") is False
+    assert "lines" in owner.autopilot.pending()["a.mkv"]
+    assert owner.deliver(older, lines_done(older)) is True
+    assert project.files["a.mkv"].evidence["lines"]["seed"] == older.job.seed
+    assert owner.autopilot.pending() == {"a.mkv": {"thumbnail"}}
+
+
+def test_a_removed_files_draw_ends_without_a_trace_and_a_readded_file_draws_again(tmp_path):
+    owner = Owner(_lines_folder(tmp_path, ["a.mkv", "b.mkv"]))
+    owner.autopilot.on_open()
+    old = {s.job.file: s for s in lines_of(owner.take())}
+    _remove(owner, ["a.mkv"])
+    assert "a.mkv" not in owner.autopilot.pending()
+    owner.autopilot.boost_lines("a.mkv")
+    assert owner.take() == []
+
+    owner.project.files["a.mkv"] = _media(FileEntry(name="a.mkv", crop=Crop(*BOX, Source.DETECTED),
+                                                    time_ranges=TimeRanges([], Source.MANUAL)))
+    owner.project.files["a.mkv"].evidence["audio"] = {}
+    owner.project.files["a.mkv"].sample_time = 300.0
+    owner.autopilot.on_files_added(["a.mkv"])
+    (again,) = lines_of(owner.take())                        # the new entry's own draw
+    assert again.job.file == "a.mkv"
+    assert owner.deliver(old["a.mkv"], None, type="cancelled") is False   # the owner cancelled it at removal
+    assert owner.deliver(again, lines_done(again)) is True
+    assert owner.project.files["a.mkv"].evidence["lines"]["seed"] == again.job.seed
+
+
+# --------------------------------------------------------------------------
+# Warming the view cache
+# --------------------------------------------------------------------------
+
+CROP_SAMPLES = [{"time": 120.0, "boxes": [], "kept": True, "lines": 1},
+                {"time": 300.0, "boxes": [], "kept": False, "lines": 0}]
+
+
+def _warm_folder(tmp_path, names, folder: FolderSettings | None = None) -> Project:
+    """Files with nothing left to detect (media, a crop, the user's
+    brightness and ranges, an audio profile and current gallery lines) whose
+    evidence names pixels the tabs will draw: the crop samples' frames and
+    the gallery lines' strips."""
+    project = _lines_folder(tmp_path, names, folder)
+    for entry in project.files.values():
+        entry.evidence["crop"] = {"box": list(BOX), "samples": [dict(sample) for sample in CROP_SAMPLES]}
+        entry.evidence["lines"] = {"crop_box": list(BOX), "seed": 99, "tried": 12,
+                                   "samples": [{"time": 512.0, "boxes": [], "lines": 1}]}
+    return project
+
+
+def _opened(owner: Owner) -> None:
+    """Open the folder and finish the thumbnails it always submits: after
+    this nothing of any file's own is pending."""
+    owner.autopilot.on_open()
+    opened = owner.take()
+    assert of_kind(opened, "warm") == [], pairs(opened)   # never before the file's own jobs
+    finish_side_jobs(owner, opened)
+
+
+def test_warming_ranks_under_every_detection_and_is_an_auto_pilot_kind_only():
+    assert WARM_PRIORITY < min(PRIORITY.values())
+    assert "warm" in AUTOPILOT_KINDS and "warm" in HELD_KINDS
+    assert "warm" not in DETECTION_KINDS and HELD_KINDS == DETECTION_KINDS | {"confirm", "warm"}
+
+
+def test_a_file_is_warmed_once_nothing_of_its_own_is_pending(tmp_path):
+    project = _warm_folder(tmp_path, ["a.mkv"])
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    opened = owner.take()
+    assert pairs(opened) == [("thumbnail", "a.mkv")]     # warming waits behind the file's own job
+    finish_side_jobs(owner, opened)
+
+    (warm,) = owner.take()
+    job = warm.job
+    assert (job.kind, job.file, job.lane, job.priority) == ("warm", "a.mkv", Lane.CPU, WARM_PRIORITY)
+    assert job.key == "warm:a.mkv" and job.project_dir == project.path
+    entry = project.files["a.mkv"]
+    assert job.keep.frame_times == (120.0, 300.0)        # the crop evidence's samples
+    assert job.keep.strip_times == (512.0,) and job.keep.crop_box == BOX
+    # The queue thumbnail is named too, though no warm pass produces one:
+    # trim would otherwise delete the thumbnail ThumbnailJob just cached. The
+    # applied crop moved sample_time to its first hit, and the thumbnail
+    # follows it rather than the duration fraction.
+    assert entry.sample_time == 300.0 != THUMBNAIL_FRACTION * entry.media.duration
+    assert job.keep.thumbnail_time == entry.sample_time
+    assert job.keep == wanted(entry, entry.sample_time)
+    assert owner.autopilot.pending() == {}               # warming is not detection
+    assert owner.deliver(warm, None) is True
+    assert owner.take() == []                            # warm for this Wanted: not submitted again
+
+
+def test_a_file_is_not_warmed_while_a_detection_of_its_own_is_pending(tmp_path):
+    project = _warm_folder(tmp_path, ["a.mkv", "b.mkv"])
+    project.files["b.mkv"].crop = None                   # b still needs its crop detected
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    opened = owner.take()
+    assert sorted(pairs(opened)) == [("crop", "b.mkv"), ("thumbnail", "a.mkv"), ("thumbnail", "b.mkv")]
+    finish_side_jobs(owner, opened)
+
+    (warm,) = owner.take()                               # a is settled, b is pending "crop"
+    assert warm.job.file == "a.mkv" and "crop" in owner.autopilot.pending()["b.mkv"]
+    owner.deliver(warm, None)
+    assert owner.take() == []
+
+    (crop,) = of_kind(opened, "crop")
+    owner.deliver(crop, crop_done(crop))
+    assert pairs(owner.take()) == [("warm", "b.mkv")]    # its detection is done: now it is warmed
+
+
+def test_warm_jobs_run_one_at_a_time_in_name_order(tmp_path):
+    names = [f"ep{index:02d}.mkv" for index in range(1, 5)]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    for name in names:
+        outstanding = owner.take()
+        assert pairs(outstanding) == [("warm", name)]    # one job for the whole folder, in name order
+        owner.deliver(outstanding[0], None)
+    assert owner.take() == []
+
+
+def test_boost_warm_takes_the_files_the_user_is_heading_towards_first(tmp_path):
+    """Name order is the order the user is NOT working in: a filter such as
+    "Needs you" picks a scattered handful, and those must be warmed first."""
+    names = [f"ep{index:02d}.mkv" for index in range(1, 7)]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    running = owner.take()
+    assert pairs(running) == [("warm", "ep01.mkv")]      # name order, until the user picks
+
+    owner.autopilot.boost_warm(["ep04.mkv", "ep06.mkv"])
+    owner.deliver(running[0], None, type="cancelled")    # its worker went to the boosted files
+
+    for name in ("ep04.mkv", "ep06.mkv"):
+        outstanding = owner.take()
+        assert pairs(outstanding) == [("warm", name)]
+        owner.deliver(outstanding[0], None)
+    # ... and then the rest of the folder in name order, the displaced ep01
+    # first, since being cancelled taught nothing about it.
+    assert pairs(owner.take()) == [("warm", "ep01.mkv")]
+
+
+def test_boost_warm_frees_the_worker_from_a_file_nobody_is_heading_towards(tmp_path):
+    names = [f"ep{index:02d}.mkv" for index in range(1, 5)]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    running = owner.take()
+    assert pairs(running) == [("warm", "ep01.mkv")]
+
+    owner.autopilot.boost_warm(["ep03.mkv"])
+
+    assert owner.runner.cancelled_keys == ["warm:ep01.mkv"]
+    owner.deliver(running[0], None, type="cancelled")
+    assert pairs(owner.take()) == [("warm", "ep03.mkv")]
+
+
+def test_a_displaced_warm_job_is_warmed_again_later(tmp_path):
+    """It learned nothing about its file, so the file must not be lost to the
+    memo -- unlike every other cancellation, which keeps it (that is what
+    bounds resubmission)."""
+    names = ["ep01.mkv", "ep02.mkv"]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    running = owner.take()
+    assert pairs(running) == [("warm", "ep01.mkv")]
+
+    owner.autopilot.boost_warm(["ep02.mkv"])
+    owner.deliver(running[0], None, type="cancelled")
+    boosted = owner.take()
+    assert pairs(boosted) == [("warm", "ep02.mkv")]
+    owner.deliver(boosted[0], None)
+
+    assert pairs(owner.take()) == [("warm", "ep01.mkv")]   # the displaced file comes back
+
+
+def test_boost_warm_does_not_disturb_a_file_it_is_already_warming(tmp_path):
+    """Idempotent enough for a view to call on every selection: the file on
+    screen is the one being warmed, so nothing is cancelled or resubmitted."""
+    names = ["ep01.mkv", "ep02.mkv"]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    running = owner.take()
+    assert pairs(running) == [("warm", "ep01.mkv")]
+
+    owner.autopilot.boost_warm(["ep01.mkv", "ep02.mkv"])
+    owner.autopilot.boost_warm(["ep01.mkv", "ep02.mkv"])
+
+    assert owner.runner.cancelled_keys == []
+    assert owner.take() == []                            # still the same job, not resubmitted
+
+
+def test_boost_warm_ignores_files_that_have_left_the_folder(tmp_path):
+    names = ["ep01.mkv", "ep02.mkv"]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    owner.deliver(owner.take()[0], None)
+
+    owner.autopilot.boost_warm(["gone.mkv", "ep02.mkv"])
+
+    assert pairs(owner.take()) == [("warm", "ep02.mkv")]
+
+
+@pytest.mark.parametrize("outcome", ["finished", "failed", "cancelled"])
+def test_the_warm_chain_advances_on_every_terminal_event(tmp_path, outcome):
+    names = ["a.mkv", "b.mkv", "c.mkv"]
+    owner = Owner(_warm_folder(tmp_path, names))
+    _opened(owner)
+    assert pairs(drain_warm(owner, type=outcome)) == [("warm", name) for name in names]
+    owner.autopilot.on_open()                            # a job that did not land is not retried either
+    assert owner.take() == []
+
+
+def test_a_file_with_nothing_to_cache_is_never_warmed(tmp_path):
+    project = _warm_folder(tmp_path, ["a.mkv", "b.mkv"])
+    a = project.files["a.mkv"]
+    del a.evidence["crop"]                               # no frames to hold ...
+    a.evidence["lines"] = {"crop_box": list(BOX), "seed": 99, "tried": 12, "samples": []}   # ... and no strips
+    assert not wanted(a)
+    owner = Owner(project)
+    _opened(owner)
+    assert pairs(drain_warm(owner)) == [("warm", "b.mkv")]
+
+
+def test_a_skipped_file_is_never_warmed(tmp_path):
+    project = _warm_folder(tmp_path, ["a.mkv", "b.mkv"])
+    project.files["a.mkv"].skipped = True
+    owner = Owner(project)
+    _opened(owner)
+    assert pairs(drain_warm(owner)) == [("warm", "b.mkv")]
+
+
+def test_a_file_is_warmed_again_when_its_crop_box_moves_and_not_otherwise(tmp_path):
+    # Auto-pilot off: warming is not detection, so it runs whatever that says.
+    project = _warm_folder(tmp_path, ["a.mkv"], FolderSettings(autopilot_enabled=False))
+    owner = Owner(project)
+    _opened(owner)
+    (first,) = owner.take()
+    assert first.job.keep.crop_box == BOX
+    owner.deliver(first, None)
+
+    for _ in range(3):                                   # the same Wanted: the file is warm already
+        owner.autopilot.on_open()
+        owner.autopilot.on_crop_changed("a.mkv")
+        owner.autopilot.on_folder_changed(project.folder, project.folder)
+    assert owner.take() == []
+
+    set_manual_crop(project, "a.mkv", OTHER_BOX)         # the strips are keyed by the box
+    owner.autopilot.on_crop_changed("a.mkv")
+    (second,) = owner.take()
+    assert second.job.file == "a.mkv" and second.job.keep.crop_box == OTHER_BOX
+    owner.deliver(second, None)
+    assert owner.take() == []
+
+
+def test_warming_is_never_resubmitted_however_many_events_arrive(tmp_path):
+    names = ["a.mkv", "b.mkv", "c.mkv"]
+    project = _warm_folder(tmp_path, names)
+    owner = Owner(project)
+    _opened(owner)
+    for _ in range(20):
+        drain_warm(owner)
+        owner.autopilot.on_open()
+        owner.autopilot.on_files_added([])
+        owner.autopilot.on_files_removed([])
+        owner.autopilot.on_folder_changed(project.folder, project.folder)
+        for name in names:
+            owner.autopilot.on_crop_changed(name)
+        owner.recompute()
+    assert pairs(of_kind(owner.runner.submissions, "warm")) == [("warm", name) for name in names]
+
+
+def test_pending_never_reports_warm_and_warming_moves_no_review_state(tmp_path):
+    names = ["a.mkv", "b.mkv"]
+    project = _warm_folder(tmp_path, names)
+    project.files["b.mkv"].review = ReviewState.REVIEWED
+    owner = Owner(project)
+    _opened(owner)
+    owner.recompute()
+    before = {name: owner.state(name) for name in names}
+    assert set(before.values()) == {ReviewState.PROPOSED, ReviewState.REVIEWED}
+
+    (warm,) = owner.take()
+    assert owner.autopilot.pending() == {}               # queued
+    owner.start(warm)
+    owner.recompute()
+    assert owner.autopilot.pending() == {}               # running
+    assert {name: owner.state(name) for name in names} == before
+    owner.deliver(warm, None)
+    assert all("warm" not in kinds for kinds in owner.autopilot.pending().values())
+    assert {name: owner.state(name) for name in names} == before
+    drain_warm(owner)
+    assert owner.autopilot.pending() == {}
+
+
+def test_pause_holds_warm_jobs(tmp_path):
+    owner = Owner(_warm_folder(tmp_path, ["a.mkv"]))
+    _opened(owner)
+    (warm,) = owner.take()
+    owner.autopilot.pause()
+    assert all(only is is_held_job for _lane, only in owner.runner.pauses)
+    assert is_held_job(warm.job) and is_autopilot_job(warm.job)
+    assert not is_detection_job(warm.job)
+
+
+def test_a_removed_files_warm_job_does_not_stall_the_chain(tmp_path):
+    owner = Owner(_warm_folder(tmp_path, ["a.mkv", "b.mkv"]))
+    _opened(owner)
+    (warm_a,) = owner.take()
+    assert warm_a.job.file == "a.mkv"
+    _remove(owner, ["a.mkv"])                            # the owner cancels the removed file's jobs
+    (warm_b,) = owner.take()
+    assert warm_b.job.file == "b.mkv"
+    assert owner.deliver(warm_a, None, type="cancelled") is True   # the removed entry's job, ending late
+    assert owner.take() == []
+    assert owner.deliver(warm_b, None) is True
+    assert owner.take() == []
+
+
+def test_a_file_that_comes_back_is_warmed_again(tmp_path):
+    owner = Owner(_warm_folder(tmp_path, ["a.mkv", "b.mkv"]))
+    _opened(owner)
+    assert pairs(drain_warm(owner)) == [("warm", "a.mkv"), ("warm", "b.mkv")]
+    entry = owner.project.files["a.mkv"]
+    _remove(owner, ["a.mkv"])
+    owner.project.files["a.mkv"] = entry                 # back: another copy on disk, no view cache of its own
+    owner.autopilot.on_files_added(["a.mkv"])
+    added = owner.take()
+    assert pairs(added) == [("thumbnail", "a.mkv")]
+    finish_side_jobs(owner, added)
+    assert pairs(drain_warm(owner)) == [("warm", "a.mkv")]
 
 
 def test_autopilot_module_imports_no_qt():

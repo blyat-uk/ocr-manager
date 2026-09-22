@@ -57,3 +57,8 @@ tests/goldens/*.actual.ass
 
 # Git worktrees for parallel branches.
 .worktrees/
+
+# Local tooling and build environments.
+.build-venv/
+.claude/
+.ruff_cache/

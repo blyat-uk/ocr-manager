@@ -33,22 +33,26 @@ import pytest
 from core.detect import audio_profile as audio_profile_mod
 from core.detect import brightness as brightness_mod
 from core.detect import crop as crop_mod
+from core.detect import lines as lines_mod
 from core.detect import ocr_view, vad
 from core.detect.audio_profile import AudioProfile
 from core.detect.brightness import BrightnessResult, StripSample
 from core.detect.crop import CropResult, CropSample
+from core.detect.lines import LineSample, LinesResult
 from core.detect.ranges import pipeline as ranges_pipeline
 from core.detect.ranges.config import MatchConfig, RangesConfig
 from core.detect.ranges.pipeline import Block, ProgressEvent, RangesAnalysis
 from core.detect.ranges.pipeline import FileEntry as RangesFile
 from core.detect.tiles import choose_tiles
 from core.jobs import JobContext, JobRunner, Lane
+from core.jobs import view_cache
 from core.jobs.apply import (
     FLAG_DIFFERS_FROM_HINT,
     apply_audio_profile,
     apply_brightness,
     apply_crop,
     apply_folder_change,
+    apply_lines,
     apply_metadata,
     apply_ranges,
     brightness_is_stale,
@@ -70,6 +74,8 @@ from core.jobs.detect_jobs import (
     BrightnessJobResult,
     CropJob,
     CropJobResult,
+    LinesJob,
+    LinesJobResult,
     MetadataJob,
     MetadataResult,
     ProofOcrJob,
@@ -216,23 +222,46 @@ def test_apply_crop_writes_a_box_whose_flags_are_all_informational(flagged):
     assert entry.flags["crop"] == flagged
 
 
-@pytest.mark.parametrize("box, flagged", [
-    (NEW_BOX, "low-agreement"),
-    (NEW_BOX, "multiple-positions?"),
-    (NEW_BOX, "top-positioned?"),
-    (NEW_BOX, "no-speech+outlier-discarded?"),
-    (None, "static-content"),
-    (None, "ceiling-exceeded"),
+@pytest.mark.parametrize("flagged", [
+    "low-agreement",
+    "multiple-positions?",
+    "top-positioned?",
+    "no-speech+outlier-discarded?",
 ])
 @pytest.mark.parametrize("prior_source", [None, Source.DETECTED])
-def test_apply_crop_never_writes_a_result_that_is_not_auto_applicable(box, flagged, prior_source):
+def test_apply_crop_writes_a_box_it_measured_but_doubts_and_flags_the_file(flagged, prior_source):
+    """A blocking flag is doubt about the box, not a reason to withhold it.
+    The box is stored (the views drew it from the evidence either way) and
+    the file goes to review with something the user can accept -- withheld,
+    the file was FLAGGED with no crop, and "Mark reviewed" refused it."""
+    project = _project()
+    entry = project.files["a.mp4"]
+    _complete(entry)
+    entry.crop = None if prior_source is None else Crop(*OLD_BOX, prior_source)
+    r = _crop_job_result(flagged=flagged, hit_pts=(12.0, 30.0))
+    assert r.result.measured and not r.result.auto_applicable
+
+    apply_crop(project, r)
+
+    assert entry.crop == Crop(*NEW_BOX, Source.DETECTED)
+    assert entry.flags["crop"] == flagged
+    assert entry.evidence["crop"] == r.result.to_evidence()
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+@pytest.mark.parametrize("flagged", ["static-content", "ceiling-exceeded", "unknown-rejection"])
+@pytest.mark.parametrize("prior_source", [None, Source.DETECTED])
+def test_apply_crop_writes_nothing_when_no_box_was_measured(flagged, prior_source):
+    """The detector's three no-box outcomes: a confirmed watermark, a union
+    too tall for a subtitle, and the safety net. Nothing was measured, so
+    there is nothing to store and nothing to accept."""
     project = _project()
     entry = project.files["a.mp4"]
     _complete(entry)
     entry.crop = None if prior_source is None else Crop(*OLD_BOX, prior_source)
     before = entry.crop
-    r = _crop_job_result(box=box, flagged=flagged, hit_pts=(12.0, 30.0) if box else ())
-    assert not r.result.auto_applicable
+    r = _crop_job_result(box=None, flagged=flagged, hit_pts=())
+    assert not r.result.measured
 
     apply_crop(project, r)
 
@@ -451,14 +480,36 @@ def test_brightness_with_only_the_informational_flag_is_written():
     assert entry.flags["brightness"] == "no-clean-threshold"
 
 
-@pytest.mark.parametrize("flagged", ["escalate", "no-plateau?", "narrow-plateau?", "dim-text?",
-                                     "no-clean-threshold+thin-evidence?", "needs-crop"])
-def test_brightness_that_is_not_auto_applicable_is_stored_as_evidence_only(flagged):
+@pytest.mark.parametrize("flagged", ["no-plateau?", "narrow-plateau?", "dim-text?",
+                                     "no-clean-threshold+thin-evidence?", "coloured-text?"])
+def test_brightness_it_measured_but_doubts_is_stored_and_flags_the_file(flagged):
+    """These reasons doubt a reading the detector really took -- unverified,
+    or verified without a safe margin. The value is stored so the user has
+    one to accept, and the blocking flag sends the file to review."""
     project = _project()
     entry = project.files["a.mp4"]
     _complete(entry)
     r = _brightness_job_result(value=215, plateau=None, flagged=flagged)
-    assert not r.result.auto_applicable
+    assert r.result.measured and not r.result.auto_applicable
+
+    apply_brightness(project, r)
+
+    assert entry.brightness == Brightness(215, Source.DETECTED)
+    assert entry.flags["brightness"] == flagged
+    assert entry.evidence["brightness"]["value"] == 215
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+
+@pytest.mark.parametrize("flagged", ["escalate", "needs-crop", "no-text", "ranges-empty?"])
+def test_brightness_that_measured_nothing_is_stored_as_evidence_only(flagged):
+    """needs-crop, ranges-empty? and no-text carry DEFAULT_BRIGHTNESS -- a
+    placeholder, not a reading -- and an "escalate" seed is a cheap attempt
+    a full run is about to replace. None is the file's value."""
+    project = _project()
+    entry = project.files["a.mp4"]
+    _complete(entry)
+    r = _brightness_job_result(value=215, plateau=None, flagged=flagged)
+    assert not r.result.measured
 
     apply_brightness(project, r)
 
@@ -697,7 +748,8 @@ def test_apply_audio_profile_stores_envelope_speech_and_duration_as_evidence():
 # Cancelled results
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("apply", [apply_metadata, apply_crop, apply_brightness, apply_ranges, apply_audio_profile])
+@pytest.mark.parametrize("apply", [apply_metadata, apply_crop, apply_brightness, apply_ranges, apply_audio_profile,
+                                   apply_lines])
 def test_every_apply_ignores_a_cancelled_job_result(apply):
     project = _project()
     before = to_json(project)
@@ -861,7 +913,7 @@ def test_mark_reviewed_accepts_a_flagged_detected_crop_too():
     project = _project()
     entry = project.files["a.mp4"]
     _complete(entry)
-    apply_crop(project, _crop_job_result(box=OLD_BOX, flagged="low-agreement"))
+    apply_crop(project, _crop_job_result(flagged="low-agreement"))
     mark_reviewed(project, "a.mp4")
     assert entry.crop == Crop(*NEW_BOX, Source.MANUAL)
     assert entry.brightness == Brightness(OTHER_BRIGHTNESS, Source.DETECTED)
@@ -1182,8 +1234,8 @@ def test_an_unapplied_brightness_result_does_not_hide_that_the_value_is_stale():
     apply_crop(project, _crop_job_result(box=OLD_BOX))
     assert brightness_is_stale(entry)
 
-    apply_brightness(project, _brightness_job_result(value=230, plateau=None, flagged="no-plateau?",
-                                                     crop_box=OLD_BOX))       # not applied
+    apply_brightness(project, _brightness_job_result(value=230, plateau=None, flagged="no-text",
+                                                     crop_box=OLD_BOX))       # measured nothing
     assert entry.brightness == Brightness(NEW_BRIGHTNESS, Source.DETECTED)
     assert entry.evidence["brightness"]["crop_box"] == list(OLD_BOX)          # the latest result
     assert entry.evidence["brightness"]["value_crop_box"] == list(NEW_BOX)    # the stored value
@@ -1233,7 +1285,7 @@ def test_a_manual_crop_edit_makes_a_detected_brightness_stale():
 
 # --- S1-S3: REVIEWED never hides a missing value ------------------------------------------
 
-@pytest.mark.parametrize("flagged", ["no-plateau?", "thin-evidence?"])
+@pytest.mark.parametrize("flagged", ["no-text", "ranges-empty?"])
 def test_s1_manual_crop_then_an_unapplied_brightness_is_not_reviewed(flagged):
     project = _project()
     entry = project.files["a.mp4"]
@@ -1247,6 +1299,24 @@ def test_s1_manual_crop_then_an_unapplied_brightness_is_not_reviewed(flagged):
 
     apply_brightness(project, _brightness_job_result())         # the value arrives: confirm again
     assert _state(project, "a.mp4") == ReviewState.PROPOSED
+
+
+@pytest.mark.parametrize("flagged", ["no-plateau?", "thin-evidence?"])
+def test_s1_manual_crop_then_a_doubted_brightness_is_stored_but_not_reviewed(flagged):
+    """The other half of S1: this brightness WAS measured, so it is stored
+    -- but its blocking flag still keeps the file out of PROPOSED until the
+    user accepts it."""
+    project = _project()
+    entry = project.files["a.mp4"]
+    set_manual_crop(project, "a.mp4", NEW_BOX)
+
+    apply_brightness(project, _brightness_job_result(value=230, plateau=None, flagged=flagged))
+    assert entry.brightness == Brightness(230, Source.DETECTED)
+    assert _state(project, "a.mp4") == ReviewState.FLAGGED
+
+    mark_reviewed(project, "a.mp4")
+    assert entry.brightness == Brightness(230, Source.MANUAL)
+    assert _state(project, "a.mp4") == ReviewState.REVIEWED
 
 
 def test_s2_a_crop_without_a_box_then_a_manual_brightness_is_not_reviewed():
@@ -1295,8 +1365,8 @@ def test_s5_a_flagged_re_detection_beside_a_detected_crop_un_reviews():
     entry = project.files["a.mp4"]
     _complete(entry)
     entry.review = ReviewState.REVIEWED
-    apply_crop(project, _crop_job_result(box=OLD_BOX, flagged="low-agreement"))
-    assert entry.crop == Crop(*NEW_BOX, Source.DETECTED)
+    apply_crop(project, _crop_job_result(flagged="low-agreement"))
+    assert entry.crop == Crop(*NEW_BOX, Source.DETECTED)     # same box, now doubted
     assert entry.review != ReviewState.REVIEWED
     assert _state(project, "a.mp4") == ReviewState.FLAGGED
 
@@ -1327,7 +1397,7 @@ def test_a_blocking_flag_on_a_field_labels_only_does_not_need_keeps_review():
     entry = project.files["a.mp4"]
     _complete(entry)
     entry.review = ReviewState.REVIEWED
-    apply_crop(project, _crop_job_result(box=OLD_BOX, flagged="low-agreement"))
+    apply_crop(project, _crop_job_result(flagged="low-agreement"))
     apply_brightness(project, _brightness_job_result(value=180, plateau=None, flagged="escalate"))
     assert entry.review == ReviewState.REVIEWED
     assert _state(project, "a.mp4") == ReviewState.REVIEWED
@@ -1712,6 +1782,8 @@ def _entry_for_proof(**kwargs) -> FileEntry:
     (lambda f: AudioProfileJob(PROJECT_DIR, "a.mp4", 1418.0), "audio_profile:a.mp4", "audio_profile",
      Lane.CPU, "a.mp4", 0),
     (lambda f: ProofOcrJob(PROJECT_DIR, _entry_for_proof(), f), "proof:a.mp4", "proof", Lane.GPU, "a.mp4", 100),
+    (lambda f: LinesJob(PROJECT_DIR, "a.mp4", NEW_BOX, None, None, f, seed=7), "lines:a.mp4", "lines", Lane.GPU,
+     "a.mp4", 0),
 ])
 def test_job_identity(make, key, kind, lane, file, priority):
     job = make(FolderSettings())
@@ -1969,6 +2041,127 @@ def test_a_brightness_job_returns_none_when_the_detector_was_cancelled(monkeypat
     assert job.run(ctx) is None
 
 
+# --- LinesJob -------------------------------------------------------------------------
+
+def _lines_result(seed=7, cancelled=False) -> LinesResult:
+    samples = () if cancelled else (LineSample(512.3, ((10, 5, 200, 30),), 1),
+                                    LineSample(900.0, ((10, 5, 200, 30), (12, 40, 180, 30)), 2))
+    return LinesResult(samples=samples, tried=24, seed=seed, cancelled=cancelled)
+
+
+def test_lines_job_calls_sample_lines_with_the_documented_arguments(monkeypatch, fake_engines):
+    result = _lines_result()
+
+    def during(call):
+        # The detection lease is held for the whole sampler call.
+        assert call["det_engine"] not in _idle(engine_registry._idle_detection_engines)
+
+    fake = Recording(lines_mod.sample_lines, returns=result, during=during)
+    monkeypatch.setattr(lines_mod, "sample_lines", fake)
+    folder = FolderSettings(use_gpu=False)
+    box = list(NEW_BOX)
+    ranges = [("02:33", "21:20"), ("22:00", None)]
+    speech = [[10.0, 12.5], [30.0, 31.0]]
+    exclude = [100.0, 200.0]
+    job = LinesJob(PROJECT_DIR, "a.mp4", box, ranges, speech, folder, seed=7, exclude=exclude)
+    # Inputs are captured at construction.
+    box[0] = 0
+    ranges.append(("23:00", None))
+    speech[0][0] = 99.0
+    speech.append([40.0, 41.0])
+    exclude.append(300.0)
+    folder.use_gpu = True
+    ctx = _ctx(job)
+
+    out = job.run(ctx)
+
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["video_path"] == "/proj/a.mp4"
+    assert tuple(call["crop_box"]) == NEW_BOX
+    assert [tuple(pair) for pair in call["time_ranges"]] == [("02:33", "21:20"), ("22:00", None)]
+    assert [tuple(span) for span in call["speech"]] == [(10.0, 12.5), (30.0, 31.0)]
+    assert call["count"] == lines_mod.LINE_COUNT
+    assert call["seed"] == 7
+    assert list(call["exclude"]) == [100.0, 200.0]
+    assert [e.args for e in fake_engines["det"]] == [(None, False)]
+    assert call["det_engine"] is fake_engines["det"][0]
+    assert fake_engines["ocr"] == []                       # text detection only: no OCR engine
+    assert _idle(engine_registry._idle_detection_engines) == [fake_engines["det"][0]]
+    cancel = call["cancel_check"]
+    assert cancel() is False
+    ctx.cancel_event.set()
+    assert cancel() is True
+    assert out == LinesJobResult(file="a.mp4", result=result, crop_box=NEW_BOX)
+
+
+@pytest.mark.parametrize("time_ranges, speech", [(None, None), ([], [])])
+def test_a_lines_job_passes_no_ranges_and_no_speech_through(monkeypatch, fake_engines, time_ranges, speech):
+    fake = Recording(lines_mod.sample_lines, returns=_lines_result())
+    monkeypatch.setattr(lines_mod, "sample_lines", fake)
+    job = LinesJob(PROJECT_DIR, "a.mp4", NEW_BOX, time_ranges, speech, FolderSettings(), seed=1)
+    job.run(_ctx(job))
+    call = fake.calls[0]
+    assert call["time_ranges"] == time_ranges and call["speech"] == speech
+    assert list(call["exclude"]) == []
+
+
+def test_a_lines_job_needs_a_crop():
+    with pytest.raises(ValueError):
+        LinesJob(PROJECT_DIR, "a.mp4", None, None, None, FolderSettings(), seed=1)
+
+
+def test_a_lines_job_returns_none_when_the_sampler_was_cancelled(monkeypatch, fake_engines):
+    def during(call):
+        assert call["cancel_check"]() is True
+        return _lines_result(cancelled=True)
+
+    monkeypatch.setattr(lines_mod, "sample_lines", Recording(lines_mod.sample_lines, during=during))
+    job = LinesJob(PROJECT_DIR, "a.mp4", NEW_BOX, None, None, FolderSettings(), seed=1)
+    ctx = _ctx(job)
+    ctx.cancel_event.set()
+    assert job.run(ctx) is None
+    assert _idle(engine_registry._idle_detection_engines) == fake_engines["det"]
+
+
+def test_a_lines_job_that_finished_before_the_cancel_returns_its_result(monkeypatch, fake_engines):
+    result = _lines_result()
+    monkeypatch.setattr(lines_mod, "sample_lines", Recording(lines_mod.sample_lines, returns=result))
+    job = LinesJob(PROJECT_DIR, "a.mp4", NEW_BOX, None, None, FolderSettings(), seed=1)
+    ctx = _ctx(job)
+    ctx.cancel_event.set()                                 # the sampler did not look: its result stands
+    assert job.run(ctx) == LinesJobResult("a.mp4", result, NEW_BOX)
+
+
+def test_a_failing_sampler_fails_the_lines_job_and_returns_the_lease(monkeypatch, fake_engines):
+    def during(call):
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr(lines_mod, "sample_lines", Recording(lines_mod.sample_lines, during=during))
+    job = LinesJob(PROJECT_DIR, "a.mp4", NEW_BOX, None, None, FolderSettings(), seed=1)
+    with pytest.raises(RuntimeError):
+        job.run(_ctx(job))
+    assert _idle(engine_registry._idle_detection_engines) == fake_engines["det"]
+
+
+def test_lines_drawn_on_a_crop_the_file_no_longer_has_are_dropped(monkeypatch, fake_engines):
+    monkeypatch.setattr(lines_mod, "sample_lines", Recording(lines_mod.sample_lines, returns=_lines_result()))
+    project = _project()
+    entry = project.files["a.mp4"]
+    entry.crop = Crop(*NEW_BOX, Source.DETECTED)
+    job = LinesJob(PROJECT_DIR, "a.mp4", NEW_BOX, None, None, project.folder, seed=1)
+    out = job.run(_ctx(job))
+
+    set_manual_crop(project, "a.mp4", OLD_BOX)             # the user edits the crop while the job runs
+    before = to_json(project)
+    apply_lines(project, out)
+    assert to_json(project) == before and "lines" not in entry.evidence
+
+    set_manual_crop(project, "a.mp4", NEW_BOX)             # and back: the lines are of this crop again
+    apply_lines(project, out)
+    assert entry.evidence["lines"]["crop_box"] == list(NEW_BOX)
+
+
 # --- RangesJob -----------------------------------------------------------------------
 
 def test_ranges_job_calls_analyse_detailed_with_the_documented_arguments(monkeypatch):
@@ -2096,6 +2289,76 @@ def test_a_thumbnail_that_could_not_be_grabbed_has_no_image(monkeypatch):
     job = ThumbnailJob(PROJECT_DIR, "a.mp4", 99999.0)
     out = job.run(_ctx(job))
     assert out == ThumbnailResult("a.mp4", 99999.0, None)
+
+
+def _thumb_project(tmp_path, name="a.mp4"):
+    """A project directory whose video the view cache can stat (it never opens
+    it) -- enough for FileViewCache to be readable and writable."""
+    (tmp_path / name).write_bytes(b"\0" * 4096)
+    return str(tmp_path), name
+
+
+def test_a_decoded_thumbnail_is_written_to_the_view_cache(tmp_path, monkeypatch):
+    project, name = _thumb_project(tmp_path)
+    image = np.dstack([np.arange(128 * THUMB_HEIGHT, dtype=np.uint8).reshape(THUMB_HEIGHT, 128)] * 3)
+    monkeypatch.setattr(crop_mod, "grab_frames", Recording(crop_mod.grab_frames, returns=[image]))
+    job = ThumbnailJob(project, name, 407.4)
+
+    out = job.run(_ctx(job))
+
+    assert out.image is image
+    cached = view_cache.FileViewCache(project, name, os.path.join(project, name)).read_thumbnail(407.4)
+    # Lossless: the queue shows hundreds of these at the size artefacts show most.
+    assert cached is not None and np.array_equal(cached, image)
+
+
+def test_a_cached_thumbnail_never_reaches_the_decoder(tmp_path, monkeypatch):
+    """The point of the cache: reopening a folder of hundreds of episodes must
+    not decode a single frame."""
+    project, name = _thumb_project(tmp_path)
+    image = np.full((THUMB_HEIGHT, 128, 3), 77, dtype=np.uint8)
+    view_cache.FileViewCache(project, name, os.path.join(project, name)).write_thumbnail(407.4, image)
+    fake = Recording(crop_mod.grab_frames, returns=[])
+    monkeypatch.setattr(crop_mod, "grab_frames", fake)
+    job = ThumbnailJob(project, name, 407.4)
+
+    out = job.run(_ctx(job))
+
+    assert fake.calls == []
+    assert np.array_equal(out.image, image)
+
+
+def test_a_thumbnail_at_another_time_is_a_miss(tmp_path, monkeypatch):
+    """A crop result moves sample_time, and the row must show the new frame."""
+    project, name = _thumb_project(tmp_path)
+    view_cache.FileViewCache(project, name, os.path.join(project, name)).write_thumbnail(
+        407.4, np.full((THUMB_HEIGHT, 128, 3), 77, dtype=np.uint8))
+    fresh = np.full((THUMB_HEIGHT, 128, 3), 99, dtype=np.uint8)
+    monkeypatch.setattr(crop_mod, "grab_frames", Recording(crop_mod.grab_frames, returns=[fresh]))
+    job = ThumbnailJob(project, name, 512.0)
+
+    assert np.array_equal(job.run(_ctx(job)).image, fresh)
+
+
+def test_a_thumbnail_that_could_not_be_grabbed_caches_nothing(tmp_path, monkeypatch):
+    project, name = _thumb_project(tmp_path)
+    monkeypatch.setattr(crop_mod, "grab_frames", Recording(crop_mod.grab_frames, returns=[]))
+    job = ThumbnailJob(project, name, 99999.0)
+
+    assert job.run(_ctx(job)).image is None
+    cache = view_cache.FileViewCache(project, name, os.path.join(project, name))
+    assert cache.read_thumbnail(99999.0) is None
+
+
+def test_a_project_that_cannot_be_written_still_yields_a_thumbnail(tmp_path, monkeypatch):
+    """A cache may cost a decode; it may never fail a job."""
+    project, name = _thumb_project(tmp_path)
+    image = np.full((THUMB_HEIGHT, 128, 3), 5, dtype=np.uint8)
+    monkeypatch.setattr(crop_mod, "grab_frames", Recording(crop_mod.grab_frames, returns=[image]))
+    monkeypatch.setattr(view_cache.FileViewCache, "write_thumbnail", lambda *a, **k: False)
+    job = ThumbnailJob(project, name, 407.4)
+
+    assert job.run(_ctx(job)).image is image
 
 
 def test_thumbnail_job_on_a_real_file(synthetic_video):

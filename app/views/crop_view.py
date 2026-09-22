@@ -15,6 +15,15 @@ Pixels
     here tunes a brightness threshold -- that is the Brightness tab's job,
     and it uses `ocr_view` strips.
 
+    Frames normally come back from the on-disk view cache
+    (`core/jobs/view_cache.py`), where they are stored lossily: at the size
+    this canvas draws them, nobody can see the difference, and it is what
+    makes a processed folder open a file in milliseconds instead of seconds.
+    The "masked" overlay is the one thing here that reads pixel LEVELS
+    rather than looking at them, so while it is on the canvas asks for its
+    one frame with `exact=True` and gets the decoder's own pixels
+    (`_request_frames`, `_canvas_frame`).
+
 Evidence is a disposable cache: every `evidence["crop"]` key is read with
 `.get` and missing keys fall back to the no-evidence presentation.
 
@@ -40,7 +49,7 @@ has labels off.
 Ruling C2: a detection never overwrites a MANUAL/IMPORTED value, but its
 evidence still replaces `evidence["crop"]`. When the two differ, the amber
 box stays the stored value and the detection is drawn separately, dashed and
-labelled, with a panel row naming both.
+labelled, with a pair of panel rows -- "detected" and "yours" -- naming both.
 
 Views import no `core` module (tests/ui/test_main_window.py), so the two
 pure detector helpers this view needs -- `crop.aggregate_box` and
@@ -48,7 +57,9 @@ pure detector helpers this view needs -- `crop.aggregate_box` and
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
@@ -74,15 +85,30 @@ from app.imaging import bgr_to_qimage
 from app.masking import MIN_CROP_SIDE, aggregate_crop_box, clamp_crop_box, mask_region
 from app.state_text import clock, crop_caption, crop_flag_summary
 from app.theme import tokens
-from app.views.inspector_sections import Section, note_label
+from app.views.inspector_sections import (
+    APPLY_ALL_TITLE,
+    Section,
+    ask_yes_no,
+    note_label,
+    small_button,
+)
 from app.views.ranges_view import Timeline
 from app.views.thumbnail import GRADIENT_DEGREES, GRADIENT_END_STOP, css_gradient
 from app.widgets.base import Button, KvRow, SectionHeader
+
+if TYPE_CHECKING:
+    import numpy as np                      # only for the frame annotations
 
 COMMIT_DEBOUNCE_MS = 400          # one command per gesture: nudges and spin-box edits
 DEFAULT_BRIGHTNESS = 230          # core.config.Config's default, for a file with no value yet
 NUDGE_SMALL, NUDGE_LARGE = 1, 10  # video pixels, plain and with Shift
 NUDGE_NOTE = "Arrow keys nudge 1 px, ⇧ arrows nudge 10. Free rectangle — no forced centring."
+# "apply this crop to all files": the file's box, as MANUAL, for every file not
+# skipped (controller.apply_crop_to_all), after one question.
+APPLY_ALL_TEXT = "apply this crop to all files"
+APPLY_ALL_CROP_TEXT = ("Set the crop {x}, {y} · {width} × {height} on all {n} files?\n\n"
+                       "Each file's own crop is replaced; a file of another size gets the box cut "
+                       "to fit and is flagged. Skipped files are left alone.")
 COVERED_NOTE = "The amber box already covers it. Click the warned sample to inspect."
 OUTSIDE_NOTE = "This sample falls outside the box."
 ARROW_HINT = "◀ ▶ arrow keys"
@@ -1293,6 +1319,7 @@ class CropInspectorPanel(Section):
 
     box_edited = pyqtSignal(tuple)
     sample_requested = pyqtSignal(int)
+    apply_all = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1304,6 +1331,13 @@ class CropInspectorPanel(Section):
             self.body.addWidget(row)
         self.nudge_label = note_label(NUDGE_NOTE)
         self.body.addWidget(self.nudge_label)
+        bulk = QHBoxLayout()
+        bulk.setContentsMargins(0, 0, 0, 0)
+        self.all_button = small_button(APPLY_ALL_TEXT, "ghost")
+        self.all_button.clicked.connect(self.apply_all)
+        bulk.addWidget(self.all_button)
+        bulk.addStretch(1)
+        self.body.addLayout(bulk)
         self.body.addSpacing(PANEL_SECTION_GAP)
         self.evidence_header = SectionHeader("Evidence")
         self.body.addWidget(self.evidence_header)
@@ -1547,6 +1581,9 @@ class CropTab:
         self.strip.stepped.connect(self.step)
         self.panel.box_edited.connect(self._commit_box)
         self.panel.sample_requested.connect(self.select)
+        self.panel.apply_all.connect(self._apply_to_all)
+        # "apply this crop to all files" asks first; a test replaces this to answer.
+        self.confirm: Callable[[str, str], bool] = lambda title, text: ask_yes_no(self._page, title, text)
         controller.frame_ready.connect(self._on_frame_ready)
 
     def _toggle(self, text: str, key: str, *, on: bool = False) -> Button:
@@ -1587,6 +1624,7 @@ class CropTab:
             self._page.setEnabled(False)
             self.strip.set_state([], -1, set(), {})
             self.panel.set_state(None, (1, 1), [], "")
+            self.panel.all_button.setEnabled(False)
             return
         self._page.setEnabled(True)
         evidence = entry.evidence.get("crop") or {}
@@ -1701,6 +1739,10 @@ class CropTab:
                   "grid": self.grid_button}[key]
         button.set_toggled(on)
         button.set_variant("default" if on else "ghost")
+        if key == "masked" and on:
+            # Turning it on is what asks for the exact frame (_request_frames);
+            # the canvas keeps showing the cached one until that arrives.
+            self._request_frames()
 
     def fit_to_samples(self) -> None:
         """Re-run the detector's aggregation over the kept samples' boxes,
@@ -1750,6 +1792,21 @@ class CropTab:
         self._controller.set_label_masks([tuple(int(value) for value in mask) for mask in masks])
         self.refresh()
 
+    def _apply_to_all(self) -> None:
+        """The file's box for every file not skipped, after one question
+        naming it and the file count. An edit still waiting for its debounce
+        is committed first: the box shown is the box applied."""
+        self._flush()
+        entry = self._entry()
+        if entry is None or entry.crop is None:
+            return
+        box = (entry.crop.x, entry.crop.y, entry.crop.width, entry.crop.height)
+        count = len(self._controller.bulk_targets(self._file))
+        text = APPLY_ALL_CROP_TEXT.format(x=box[0], y=box[1], width=box[2], height=box[3], n=count)
+        if self.confirm(APPLY_ALL_TITLE, text):
+            self._controller.apply_crop_to_all(self._file, box)
+            self.refresh()
+
     def _flush(self) -> None:
         """Commit anything still waiting for its debounce -- a key nudge on
         the canvas and a typed value in the panel."""
@@ -1765,6 +1822,14 @@ class CropTab:
     # --- frames --------------------------------------------------------------------------
 
     def _request_frames(self) -> None:
+        """The canvas frame and every filmstrip thumbnail, plus -- while the
+        "masked" overlay is on -- the canvas frame again, exactly.
+
+        Frames come back from the on-disk view cache lossily, which is all a
+        picture to look at needs; the masked overlay is not that. It runs the
+        OCR pass's brightness filter over real pixel levels, so it asks for
+        the one frame it filters with `exact=True` and the decoder answers.
+        The filmstrip is never masked, so its thumbnails stay cheap."""
         name = self._file
         if name is None:
             return
@@ -1774,6 +1839,8 @@ class CropTab:
             times.append(current)
         if times:
             self._controller.request_frames(name, times)
+        if self.canvas.overlays()["masked"]:
+            self._controller.request_frames(name, [current], exact=True)
 
     def _on_frame_ready(self, name: str, _time: float) -> None:
         """One job brings back many frames, so the signal arrives in bursts:
@@ -1815,7 +1882,22 @@ class CropTab:
         self.canvas.set_meta(self.current_time(), sum(1 for s in self._samples if s.kept))
         folder = self._controller.project.folder
         self.canvas.set_masks(folder.label_mask_crops, folder.labels_enabled)
-        self.canvas.set_frame(self._controller.frame(self._file, self.current_time()))
+        self.canvas.set_frame(self._canvas_frame())
+
+    def _canvas_frame(self) -> np.ndarray | None:
+        """The frame the canvas draws: the exact one while "masked" is on,
+        falling back to the cached lossy one until the exact fetch lands.
+
+        The fallback is deliberate. Blanking the canvas for the half second a
+        decode takes would make the toggle feel broken, and the mask over a
+        lossy frame is wrong only at the edges the compression moved. The
+        mask is cached on the frame's identity, so the exact frame arriving
+        re-masks it by itself."""
+        time = self.current_time()
+        if not self.canvas.overlays()["masked"]:
+            return self._controller.frame(self._file, time)
+        frame = self._controller.frame(self._file, time, exact=True)
+        return frame if frame is not None else self._controller.frame(self._file, time)
 
     def _sync_strip(self, evidence) -> None:
         warned = set(self._disagreeing(evidence))
@@ -1835,6 +1917,9 @@ class CropTab:
         box = self.canvas.box()
         rows, note = self._panel_rows(entry, evidence, box)
         self.panel.set_state(box, video_size, rows, note)
+        # The canvas can show a box the file does not have yet (a proposal
+        # before the first commit); only a stored crop can be applied.
+        self.panel.all_button.setEnabled(entry.crop is not None)
 
     def _panel_rows(self, entry, evidence, box) -> tuple[list[tuple], str]:
         """(rows, note). A row is (row_id, key, value, tone, sample index):
@@ -1855,8 +1940,11 @@ class CropTab:
             rows.append(("flagged", "Detection", text, "warn" if blocking else None, None))
         detected = _read_box(evidence.get("box"))
         if detected is not None and detected != box:
-            rows.append(("detected", "detected",
-                         f"{_box_text(detected)} · yours {_box_text(box)}", "warn", None))
+            # Ruling C2's "a panel row naming both" is two rows: the pair on
+            # one row runs past the inspector's column, and a value that does
+            # not fit is elided, which would cut a box mid-number.
+            rows.append(("detected", "detected", _box_text(detected), "warn", None))
+            rows.append(("yours", "yours", _box_text(box), "warn", None))
         covered, disagreeing = True, self._disagreeing(evidence)
         for index in disagreeing:
             sample = self._samples[index]

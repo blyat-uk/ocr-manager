@@ -1,57 +1,104 @@
-"""The Brightness review tab (ui-spec §3.5, ruling B1; `tabs-hifi.html`
-figure 1 is canonical).
+"""The Brightness review tab (ui-spec §3.5, ruling B1 as amended by
+docs/superpowers/specs/2026-09-18-brightness-gallery-design.md).
 
 The threshold decides which pixels the OCR pass ever sees, and at fit-width
 a 1344 px strip squeezes each glyph to about 8 px: broken strokes are
-invisible at that scale. So this tab magnifies. Five tiles the detector
-chose (`core/detect/tiles.py`: the darkest scene, the brightest background,
-the thinnest strokes, a two-line subtitle and a text-free frame whose
-clutter still trips the OCR pass's gate) plus a sixth the user pins show the
-same region of each strip at 100/300/600%, nearest-neighbour, and re-mask
-live as the threshold moves. "Show lost pixels" tints every glyph pixel the
-current threshold throws away, so erosion is seen, not inferred.
+invisible at that scale. So this tab is a gallery of subtitle lines, each
+masked at the threshold and each zoomable on its own, and every one of them
+re-masks live while the threshold curve is dragged. "Show lost pixels" tints
+every glyph pixel the current threshold throws away, so erosion is seen, not
+inferred.
+
+The gallery (`gallery_plan`)
+    Up to GALLERY_SIZE tiles, one column, each spanning the stage's width (a
+    1344x61 strip is ~22:1, so a grid would only waste height). First the
+    brightness detector's own picks (`core/detect/tiles.py`) in the order
+    dark, bright, thin, two_line -- the frames a threshold is most likely to
+    break on -- when that evidence was measured on the file's current crop.
+    Then the file's subtitle lines (`evidence["lines"]`, drawn at random by
+    `core/detect/lines.py`, cached, re-drawn by "↻ shuffle") in time order,
+    skipping any within MIN_GAP_SEC of a pick, until the gallery is full.
+    Lines count only when they were drawn on the file's current crop.
+
+    A file whose brightness was IMPORTED or MANUAL is never measured, so it
+    has no picks and no curve: its gallery is lines alone, which is the
+    point -- every such file used to be an empty page. The detector's
+    text-free "leaking" pick is not a gallery tile; the curve's clutter line
+    still covers what it showed.
+
+    Every strip is requested for the file's OWN crop, so a tile's boxes (a
+    pick's come from `evidence["brightness"]["strips"]` at its time, a
+    line's from its lines sample) are in the same pixel frame as its pixels.
+    Evidence measured on another crop cannot be put on these strips, which
+    is why it is left out of the gallery rather than shown on the wrong box.
+
+Per-tile zoom (`ZoomTile`)
+    A tile opens at *fit*: the union of its text boxes plus FIT_MARGIN fills
+    the tile, limited by width and height; without boxes the whole strip
+    fits. The wheel zooms the tile under the cursor, around the cursor,
+    x WHEEL_STEP per notch, from "the whole strip fits" up to
+    MAX_DEVICE_ZOOM device pixels per strip pixel. Drag pans; a double-click
+    returns to fit. Always nearest-neighbour. The zoom is the tile's own:
+    it survives threshold drags and re-renders, and resets when the file
+    changes (the tiles are rebuilt).
 
 Pixels
     Every pixel here is OCR-exact: the strips come from the controller's
     `request_strips` / `strip` (`core.detect.ocr_view.grab_ocr_strips_at`)
     for the file's crop box, and are masked with the OCR pass's own filter
     through `app/masking.py` (`app/views/*` may not import `core` -- see
-    tests/ui/test_main_window.py's import check). `core.detect.crop`'s own
-    frame grabber is not an OCR-pixel source (it reads a full-width band
-    through a different filter order, see the frame-addressing table in
-    `core/detect/__init__.py`) and nothing here goes near it.
+    tests/ui/test_main_window.py's import check; the two numbers this view
+    shares with `core.detect.lines` are mirrored below with their source
+    named). `core.detect.crop`'s own frame grabber is not an OCR-pixel
+    source (it reads a full-width band through a different filter order,
+    see the frame-addressing table in `core/detect/__init__.py`) and nothing
+    here goes near it.
 
 Live, not generated
-    Masking one strip costs about 0.07 ms, so dragging the slider or the
-    curve re-renders every tile synchronously on the GUI thread: no
-    debounce, no Generate button. A drag only moves a *preview* threshold;
-    "use {auto}" and "keep {yours}" are what write a value, through
-    `controller.set_brightness` (MANUAL).
+    Masking one strip costs about 0.07 ms, so dragging the curve re-renders
+    every tile synchronously on the GUI thread: no debounce, no Generate
+    button, one mask per tile per threshold change -- and none for a zoom
+    or a pan, which only re-slice the strip already masked. The file takes
+    the dragged value when the mouse is let go, through
+    `controller.set_brightness` (MANUAL): one write per gesture, as the crop
+    box and the time ranges commit theirs. "use {auto}" writes the detected
+    value back.
+
+Lines are asked for, not waited on
+    While this tab is the visible one (`set_active`, which the Stage calls
+    on every tab switch) and the file's lines are missing or were drawn on
+    another crop, the tab calls `controller.request_lines(file)`, which
+    boosts the file's lines job to the front of the GPU queue. It is
+    idempotent, and a tab nobody is looking at never calls it. Until lines
+    arrive the gallery says what is happening instead of promising frames:
+    no crop, finding lines, none found in N frames, or nothing drawn yet.
 
 Evidence is disposable
-    `evidence["brightness"]` may hold nothing but `value_crop_box` after the
-    cache was deleted, so every key is read with `.get` and the view falls
-    back to its no-evidence presentation: no tiles, no curve, the markers
-    and "not verified on this file".
+    `evidence["brightness"]` and `evidence["lines"]` may be partial or gone
+    after the cache was deleted, so every key is read with `.get` and junk
+    is skipped: no picks, no curve, the markers and "not verified on this
+    file".
 
 Layout (ruling B4 moves `tabs-hifi`'s 230 px side panel into the one
-persistent inspector, so the stage keeps the full width). The zoom presets
-and the two toggles are `toolbar()`, which the Stage mounts in the stage
-head (ruling B3); the page below it is:
+persistent inspector, so the stage keeps the full width). "↻ shuffle" and
+the two toggles are `toolbar()`, which the Stage mounts in the stage head
+(ruling B3); the page below it is:
 
-    ContextStrip   the whole strip, 26 px, with the draggable amber window
-    tiles          3-column grid of ZoomTile, then the dashed PinTile
+    gallery        one column of ZoomTile sharing the height, or a centred
+                   line saying why there is none
     ThresholdCurve the two curves, the plateau band and both markers
-    Timeline       the compact, read-only timeline (ruling B5): a click on
-                   it picks the frame the pin tile offers, a double-click
-                   pins one straight away
+    Timeline       the compact, read-only timeline (ruling B5), ticked at
+                   the gallery tiles' times; a click highlights the nearest
+                   tile
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
-from PyQt6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QRect, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QFont,
@@ -81,88 +128,114 @@ from app.masking import (
 )
 from app.state_text import brightness_flag_text, brightness_is_stale, clock
 from app.theme import tokens
-from app.views.inspector_sections import note_label, small_button
+from app.views.inspector_sections import (
+    APPLY_ALL_TITLE,
+    ask_yes_no,
+    note_label,
+    small_button,
+)
 from app.views.ranges_view import Timeline
-from app.widgets.base import Button, KvRow, SectionHeader
+from app.widgets.base import KvRow, SectionHeader
 
 # --- copy ------------------------------------------------------------------
 
-KIND_ORDER = ("dark", "bright", "thin", "two_line", "leaking")
+PICK_KINDS = ("dark", "bright", "thin", "two_line")       # the detector's, in gallery order
+LINE_KIND = "line"                                         # a random subtitle line
 KIND_LABELS = {"dark": "dark scene", "bright": "bright bg", "thin": "thin strokes",
-               "two_line": "two lines", "leaking": "background leaking", "pinned": "pinned"}
+               "two_line": "two lines", LINE_KIND: "subtitle line"}
 
-PIN_TILE_TEXT = "＋ pin a frame you are worried about"
-PIN_HINT_TEXT = "click the timeline below to choose a frame"
-ZOOM_LABEL = "zoom"
+SHUFFLE_TEXT = "↻ shuffle"
+SHUFFLE_TIP = "draw other random subtitle lines (the detector's picks stay)"
 LOST_TOGGLE_TEXT = "show lost pixels"
 MASK_TOGGLE_TEXT = "raw ⇄ masked"
+TILE_TIP = "wheel: zoom around the cursor · drag: pan · double-click: fit"
+TILE_LOADING = "loading…"
+TILE_UNREADABLE = "this frame could not be read"
 CURVE_HEADER = "Threshold · keeps pixels where min(B,G,R) ≥ t"
 CURVE_HINT = "drag anywhere — every tile redraws in under a millisecond"
 CURVE_CAPTION = "■ OCR holds up"
 CLUTTER_CAPTION = "┅ background clutter still firing"
 NOT_VERIFIED = "not verified on this file"
 NOT_MEASURABLE = "not measurable"
-PINNED_UNMEASURED = "pinned frame — not measured"
+
+# The gallery's empty states, centred where the tiles would be. Each says
+# what is true now; none promises something nothing is going to deliver.
+EMPTY_NO_CROP = "no crop yet — set one on the Crop tab"
+EMPTY_FINDING = "finding subtitle lines…"
+EMPTY_NO_LINES = "no subtitle lines found in {tried} frames"
+EMPTY_TRY_AGAIN = "↻ shuffle to try again"
+# Lines missing and none on their way (auto-pilot off, say): "finding…"
+# would be a promise nothing keeps, so this says how to get some.
+EMPTY_NOT_DRAWN = "no subtitle lines drawn yet — ↻ shuffle draws some"
+
 STALE_REDETECTING = "measured on an earlier crop — re-detecting"
 STALE_REDETECT = "measured on an earlier crop — re-detect to refresh"
-# Shown under it while the tiles and the curve describe the evidence's crop
-# rather than the file's own (see BrightnessTab._box_for): the warn line
-# above is about the stored VALUE, this one about what is on screen.
-TILES_OTHER_CROP = "the tiles and curve show that crop, not the file's current one"
+# Shown under it while the curve (and the safe range the note names) comes
+# from evidence measured on another crop than the file's own. The tiles are
+# always of the file's crop (see `gallery_plan`); the curve cannot be
+# re-measured by a view, so it says whose it is. The warn line above is
+# about the stored VALUE, this one about what is on screen.
+CURVE_OTHER_CROP = "the curve shows that crop, not the file's current one"
 NO_VALUE = "—"
-# A drag moves a preview, not the file. Until "keep {t}" is pressed the row
-# names both values ("211 → 180") and this line says which of them the file
-# actually has -- otherwise the panel claims 180 while the inspector's
-# Detected section, 150 px below it, still reads 211.
+# Mid-drag the row names both values ("211 → 180"): the file keeps 211 until
+# the mouse is let go. With no value stored at all, the row reads "— → 209"
+# and this line says the file does not have it -- otherwise the panel would
+# claim a value the inspector's Detected section, 150 px below, does not.
 PREVIEW_ROW = "{stored} → {preview}"
 PREVIEW_NOTE = "preview only — {value} is not kept yet"
+# "apply {t} to all files": the value on screen, as MANUAL, for every file not
+# skipped (controller.apply_brightness_to_all), after one question.
+APPLY_ALL_TEXT = "apply {value} to all files"
+APPLY_ALL_BRIGHTNESS_TEXT = ("Set brightness {value} on all {n} files?\n\n"
+                             "Each file's own brightness is replaced. Skipped files are left alone.")
+
+# --- the gallery's counts ----------------------------------------------------
+#
+# Views may not import `core` (tests/ui/test_main_window.py), so these two
+# mirror `core.detect.lines` by hand; tests/ui/test_brightness_view.py pins
+# that they still agree.
+
+GALLERY_SIZE = 6       # core.detect.lines.LINE_COUNT: a full draw fills the gallery alone
+MIN_GAP_SEC = 2.0      # core.detect.lines.MIN_GAP_SEC: a line this close to a pick is the same subtitle
+
+# --- zoom ------------------------------------------------------------------
+#
+# **Not scaled, deliberately.** These are measurements, not sizes: the upper
+# bound is 12 DEVICE pixels per strip pixel -- how far in the user can look at
+# one stroke -- whatever the UI scale or the screen's pixel ratio, and the
+# fit's margin is in strip pixels. The UI scale changes how big a tile is,
+# never what a strip pixel is.
+
+WHEEL_STEP = 1.25      # x per wheel notch
+WHEEL_NOTCH = 120      # QWheelEvent.angleDelta() units per notch (Qt's own eighths of a degree)
+MAX_DEVICE_ZOOM = 12.0
+FIT_MARGIN = 6         # strip pixels around the text boxes' union at fit
 
 # --- geometry (the literal CSS of tabs-hifi.html figure 1) ------------------
 #
-# Every length here is a mockup pixel put through `tokens.px`, so the tiles,
-# the context strip and the curve grow with the rest of the window
-# (app/theme/tokens.py's UI_SCALE); the comments name the mockup's own value,
-# which is the number `tokens.px` is called with. Alphas, column counts and
-# the fractions below are not lengths and are left alone -- and neither the
-# strip arrays, the boxes measured on them nor the zoom presets are ever
-# scaled: the UI scale changes how big a tile is, never what a strip pixel
-# is or how many device pixels a preset spreads it over.
+# Every length here is a mockup pixel put through `tokens.px`, so the tiles
+# and the curve grow with the rest of the window (app/theme/tokens.py's
+# UI_SCALE); the comments name the mockup's own value, which is the number
+# `tokens.px` is called with. Alphas, counts and the fractions below are not
+# lengths and are left alone -- and neither the strip arrays nor the boxes
+# measured on them are ever scaled.
 
-ZOOM_PRESETS = ("fit", "100%", "300%", "600%")
-DEFAULT_PRESET = "300%"
-# **Not scaled, deliberately.** These are a measurement, not a size: "100%"
-# promises one strip pixel per device pixel, which is how the user judges
-# whether a stroke survives the threshold, and "300%" that each one is
-# exactly three across. Multiplying by the UI scale would make the labels
-# lie (125%, 375%) and put the blit off the pixel grid. The tiles grow with
-# the scale instead, and a bigger tile at a true 100% simply shows more of
-# the strip -- which is the right outcome. "fit" is the one preset computed
-# from the tile's own width (`zoom_factor`), and it is fractional by nature.
-PRESET_FACTORS = {"100%": 1.0, "300%": 3.0, "600%": 6.0}
-
-CONTEXT_HEIGHT = tokens.px(26)          # .ctxstrip
-# A pen is not snapped to a whole device pixel, so the stroke widths below
-# scale as floats: rounding 1.5 and 1.2 to ints would collapse two
-# deliberately different weights (the OCR curve and the clutter curve).
-WINDOW_BORDER = 1.5 * tokens.UI_SCALE   # .ctxstrip .win
-WINDOW_MIN_WIDTH = tokens.px(2)         # ... never thinner than this, however far out
-WINDOW_FILL_ALPHA = 0.12                # rgba(255,194,71,.12)
-TAG_BG = QColor(10, 12, 16, 209)        # .tag background rgba(10,12,16,.82)
-CTX_TAG_X = tokens.px(6)                # the "full strip …" chip, off the strip's corner
-CTX_TAG_Y = tokens.px(3)
-CTX_TAG_PAD_X = tokens.px(12)           # ... and around its text
-CTX_TAG_INSET_Y = tokens.px(9)          # its height is the strip's less this
-
-GLYPHS_HEIGHT = tokens.px(96)  # .ztile .glyphs -- the mockup's height, and the minimum here
+# The mockup's tile was 96 px of glyphs over an 18 px caption in a 3-column
+# grid. One column of six shares the page's height instead, so the glyph
+# area only has a floor: six tiles at their minimum plus the curve and the
+# timeline must still fit a 900 px screen.
+GLYPHS_MIN_HEIGHT = tokens.px(24)
 CAPTION_HEIGHT = tokens.px(18)  # .ztile .cap (3px padding, 9.5px text)
-TILE_HEIGHT = GLYPHS_HEIGHT + CAPTION_HEIGHT
+TILE_MIN_HEIGHT = GLYPHS_MIN_HEIGHT + CAPTION_HEIGHT
 TILE_MIN_WIDTH = tokens.px(120)
 TILE_BORDER = 1              # the 1 px border `content_rect` sits inside
 CAPTION_PAD_X = tokens.px(6)  # the caption's text, off the tile's edges
 CAPTION_GAP = tokens.px(8)    # ... and the least room between its two halves
-TILE_COLUMNS = 3             # a count, not a length
-TILE_GAP = tokens.px(9)
+TILE_GAP = tokens.px(6)
 LOST_TINT_ALPHA = 140        # rgba(244,112,125,.55)
+# A pen is not snapped to a whole device pixel, so stroke widths scale as
+# floats: rounding would collapse deliberately different weights.
+HIGHLIGHT_WIDTH = 2 * tokens.UI_SCALE   # the ring round the tile a timeline click chose
 
 PLOT_HEIGHT = tokens.px(64)  # the SVG's viewBox height
 LEGEND_HEIGHT = tokens.px(16)
@@ -176,11 +249,11 @@ MARKER_RADIUS = 3.5 * tokens.UI_SCALE
 PAGE_MARGIN_X = tokens.px(12)     # the page's own padding
 PAGE_MARGIN_TOP = tokens.px(10)
 PAGE_MARGIN_BOTTOM = tokens.px(12)
-PAGE_SPACING = tokens.px(10)      # between the strip, the tiles, the curve and the timeline
-TOOLBAR_GAP = tokens.px(4)        # between the zoom presets ...
-TOOLBAR_SPACING = tokens.px(6)    # ... and before the two toggles
+PAGE_SPACING = tokens.px(10)      # between the gallery, the curve and the timeline
+TOOLBAR_GAP = tokens.px(4)        # between two buttons of a group ...
+TOOLBAR_SPACING = tokens.px(6)    # ... and between the two groups
 PANEL_ROW_SPACING = tokens.px(5)  # between two inspector rows
-PANEL_BUTTON_TOP = tokens.px(3)   # above "use {auto}" / "keep {yours}"
+PANEL_BUTTON_TOP = tokens.px(3)   # above "use {auto}"
 PANEL_BUTTON_GAP = tokens.px(6)
 
 
@@ -208,10 +281,9 @@ def caption_texts(metrics, width: float, left: str, right: str,
     """The tile caption's two halves as they are drawn.
 
     They share one rect, one flush left and one flush right, so a tile too
-    narrow for both prints them through each other -- which at the UI scale
-    is every tile in a 1440 px window ("09:38 · dark scene" over "28% of
-    glyph pixels lost"). The status keeps its words: it is the tile's whole
-    answer, and the tile is red or green because of it.
+    narrow for both would print them through each other. The status keeps
+    its words: it is the tile's whole answer, and the tile is red or green
+    because of it.
 
     The other half gives way in two steps. `short` is the part worth keeping
     whole (the time), so a tile that cannot hold "09:38 · dark scene" reads
@@ -226,31 +298,141 @@ def caption_texts(metrics, width: float, left: str, right: str,
 
 
 # --------------------------------------------------------------------------
+# The gallery plan
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class GalleryTile:
+    """One tile of the gallery: what it is, when, and the boxes its glyphs
+    are measured inside (strip pixels of the file's crop)."""
+
+    kinds: tuple[str, ...]            # PICK_KINDS entries sharing this time, or (LINE_KIND,)
+    time: float
+    boxes: tuple[tuple[int, int, int, int], ...] = ()
+    lines: int = 1
+
+    @property
+    def kind(self) -> str:
+        return self.kinds[0]
+
+    @property
+    def key(self) -> tuple:
+        """What a tile IS across refreshes: the same key keeps its widget,
+        and with it the user's zoom."""
+        return self.kinds, self.time
+
+
+def _as_box(value) -> tuple[int, int, int, int] | None:
+    try:
+        box = tuple(int(part) for part in value)
+    except (TypeError, ValueError):
+        return None
+    return box if len(box) == 4 else None
+
+
+def _as_time(value) -> float | None:
+    try:
+        time = float(value)
+    except (TypeError, ValueError):
+        return None
+    return time if math.isfinite(time) else None
+
+
+def _boxes(value) -> tuple[tuple[int, int, int, int], ...]:
+    try:
+        return normalise_boxes(box for box in value or () if _as_box(box) is not None)
+    except TypeError:
+        return ()
+
+
+def _lines(value) -> int:
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _brightness_sample(evidence: dict, time: float) -> dict:
+    for sample in evidence.get("strips") or ():
+        if isinstance(sample, dict) and _as_time(sample.get("time")) == time:
+            return sample
+    return {}
+
+
+def gallery_plan(evidence: dict, crop_box) -> list[GalleryTile]:
+    """The gallery for a file whose evidence is `evidence` (the whole
+    `entry.evidence`) and whose crop is `crop_box` -- see the module
+    docstring. Empty without a crop: nothing can be grabbed."""
+    own = _as_box(crop_box) if crop_box is not None else None
+    if own is None:
+        return []
+    plan: list[GalleryTile] = []
+
+    brightness = evidence.get("brightness") or {}
+    measured_on = brightness.get("crop_box")
+    if measured_on is None or _as_box(measured_on) == own:
+        chosen = brightness.get("tiles") or {}
+        kinds_at: dict[float, list[str]] = {}
+        for kind in PICK_KINDS:
+            time = _as_time(chosen.get(kind))
+            if time is not None:
+                # One strip, one tile: a frame that is both the darkest and
+                # the thinnest is shown once, named for both.
+                kinds_at.setdefault(time, []).append(kind)
+        for time, kinds in kinds_at.items():
+            sample = _brightness_sample(brightness, time)
+            plan.append(GalleryTile(tuple(kinds), time, _boxes(sample.get("boxes")),
+                                    _lines(sample.get("lines"))))
+
+    lines = evidence.get("lines") or {}
+    if _as_box(lines.get("crop_box")) == own:
+        picks = [tile.time for tile in plan]
+        samples = [(time, sample) for sample in lines.get("samples") or ()
+                   if isinstance(sample, dict) and (time := _as_time(sample.get("time"))) is not None]
+        for time, sample in sorted(samples, key=lambda pair: pair[0]):
+            if len(plan) >= GALLERY_SIZE:
+                break
+            if any(abs(time - pick) < MIN_GAP_SEC for pick in picks):
+                continue
+            plan.append(GalleryTile((LINE_KIND,), time, _boxes(sample.get("boxes")),
+                                    _lines(sample.get("lines"))))
+    return plan[:GALLERY_SIZE]
+
+
+# --------------------------------------------------------------------------
 # Tiles
 # --------------------------------------------------------------------------
 
 class ZoomTile(QWidget):
-    """`.ztile` -- one strip magnified, masked live, with its caption.
+    """`.ztile` -- one strip, masked live, zoomable on its own, with its
+    caption.
 
-    Everything the tile draws is computed in `render()`, synchronously, so a
-    threshold change is a numpy pass and a blit, and a test can read the
-    result without the widget ever being shown.
+    The view is a scale (device-independent pixels per strip pixel) and the
+    strip point at the centre of the glyph area. Neither is stored while the
+    tile is at *fit*: it is recomputed from the tile's size, so a window
+    resize re-fits a tile the user has not touched. The first wheel notch or
+    drag makes them explicit, and from then on they are the user's until a
+    double-click (or another file) puts the tile back to fit.
+
+    Everything drawn is computed in `show_threshold` / `_redraw`,
+    synchronously, so a test can read the result without the widget ever
+    being painted.
     """
 
-    focused = pyqtSignal()
-    resized = pyqtSignal()
-
-    def __init__(self, kind: str, time: float, parent: QWidget | None = None):
+    def __init__(self, spec: GalleryTile, parent: QWidget | None = None):
         super().__init__(parent)
-        self.kind = kind
-        self.time = float(time)
-        self.setMinimumSize(TILE_MIN_WIDTH, TILE_HEIGHT)
+        self.spec = spec
+        self.setMinimumSize(TILE_MIN_WIDTH, TILE_MIN_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setToolTip(TILE_TIP)
         self._pixels: StripPixels | None = None
-        self._is_text = True
-        self._lines = 1
-        self._sampled = True
+        self._unreadable = False             # its strip came back unreadable: say so, not "loading…"
+        self._scale: float | None = None               # None: at fit
+        self._centre: tuple[float, float] | None = None
+        self._t = DEFAULT_BRIGHTNESS
+        self._masked_on = True
+        self._lost_on = True
         self._image: QImage | None = None
         self._overlay: QImage | None = None
         self._target = QRectF()
@@ -259,42 +441,73 @@ class ZoomTile(QWidget):
         self._lost_count = 0
         self._right = ""
         self._tone = "ok"
+        self._drag_from: QPointF | None = None
+        self._highlighted = False
+
+    # --- identity -----------------------------------------------------------
+
+    @property
+    def kind(self) -> str:
+        return self.spec.kind
+
+    @property
+    def kinds(self) -> tuple[str, ...]:
+        return self.spec.kinds
+
+    @property
+    def time(self) -> float:
+        return self.spec.time
+
+    @property
+    def key(self) -> tuple:
+        return self.spec.key
+
+    def set_spec(self, spec: GalleryTile) -> None:
+        """New boxes or line count for the same tile (a re-detection landed)."""
+        self.spec = spec
 
     # --- state ------------------------------------------------------------
 
-    def set_sample(self, pixels: StripPixels | None, *, is_text: bool = True, lines: int = 1,
-                   sampled: bool = True) -> None:
-        """`sampled`: the detector measured this frame, so `is_text`, `lines`
-        and the boxes behind `pixels` describe it. False for a pinned time
-        the detector never looked at -- see `_status`."""
-        self._pixels = pixels
-        self._is_text = is_text
-        self._lines = int(lines)
-        self._sampled = sampled
+    def set_sample(self, pixels: StripPixels | None, *, unreadable: bool = False) -> None:
+        """The tile's pixels, or None while its strip has not arrived --
+        `unreadable` when it never will (the controller could not decode
+        it). A strip of another size (another crop) puts the view back to
+        fit."""
+        if unreadable != self._unreadable:
+            self._unreadable = unreadable
+            self.update()
+        if pixels is self._pixels:
+            return
+        old, self._pixels = self._pixels, pixels
+        if pixels is None or old is None or pixels.strip.shape != old.strip.shape:
+            self._scale = self._centre = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor if pixels is not None
+                       else Qt.CursorShape.ArrowCursor)
 
     def has_pixels(self) -> bool:
         return self._pixels is not None
 
-    def content_rect(self) -> QRect:
-        """The `.glyphs` area, inside the tile's 1 px border.
+    def placeholder_text(self) -> str:
+        """What the glyph area says instead of pixels: "loading…" until the
+        strip arrives, then nothing -- or, for a strip the controller could
+        not decode, that it never will."""
+        if self._pixels is not None:
+            return ""
+        return TILE_UNREADABLE if self._unreadable else TILE_LOADING
 
-        The mockup fixes it at 96 px, which at 300% would show 32 of a 55-row
-        strip and cut the tops and bottoms off the strokes -- the one thing
-        the tile exists to show. So the tiles share whatever height the page
-        has left instead, never less than the mockup's."""
+    def content_rect(self) -> QRect:
+        """The `.glyphs` area, inside the tile's 1 px border and above the
+        caption."""
         return QRect(TILE_BORDER, TILE_BORDER, max(0, self.width() - 2 * TILE_BORDER),
                      max(0, self.height() - CAPTION_HEIGHT - TILE_BORDER))
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self.resized.emit()
-
     def source_rect(self) -> QRect | None:
-        """The region of the strip this tile is showing, in strip pixels."""
+        """The whole strip pixels on screen right now, or None."""
         return self._source
 
     def caption_left(self) -> str:
-        return f"{clock(self.time)} · {KIND_LABELS.get(self.kind, self.kind)}"
+        names = " · ".join(KIND_LABELS.get(kind, kind) for kind in self.kinds)
+        return f"{clock(self.time)} · {names}"
 
     def caption_right(self) -> str:
         return self._right
@@ -314,60 +527,180 @@ class ZoomTile(QWidget):
         toggle off."""
         return self._lost_count
 
+    def set_highlighted(self, on: bool) -> None:
+        if on != self._highlighted:
+            self._highlighted = on
+            self.update()
+
+    def is_highlighted(self) -> bool:
+        return self._highlighted
+
+    # --- the view ---------------------------------------------------------
+
+    def whole_strip_zoom(self) -> float:
+        """The scale at which the whole strip fits the glyph area -- the
+        wheel's lower bound. 0.0 without pixels or room."""
+        content = self.content_rect()
+        if self._pixels is None or content.width() <= 0 or content.height() <= 0:
+            return 0.0
+        return min(content.width() / self._pixels.width, content.height() / self._pixels.height)
+
+    def max_zoom(self) -> float:
+        """MAX_DEVICE_ZOOM device pixels per strip pixel, in this widget's
+        own (device-independent) pixels."""
+        return MAX_DEVICE_ZOOM / max(1e-6, self.devicePixelRatioF())
+
+    def _clamp_zoom(self, scale: float) -> float:
+        top = self.max_zoom()
+        return min(top, max(min(self.whole_strip_zoom(), top), scale))
+
+    def _fit_region(self) -> tuple[float, float, float, float]:
+        """(left, top, right, bottom) in strip pixels: the text boxes' union
+        plus FIT_MARGIN, clipped to the strip; the whole strip without
+        boxes."""
+        pixels = self._pixels
+        boxes = pixels.boxes
+        if not boxes:
+            return 0.0, 0.0, float(pixels.width), float(pixels.height)
+        left = max(0, min(box[0] for box in boxes) - FIT_MARGIN)
+        top = max(0, min(box[1] for box in boxes) - FIT_MARGIN)
+        right = min(pixels.width, max(box[0] + box[2] for box in boxes) + FIT_MARGIN)
+        bottom = min(pixels.height, max(box[1] + box[3] for box in boxes) + FIT_MARGIN)
+        return float(left), float(top), float(right), float(bottom)
+
+    def fit_zoom(self) -> float:
+        """The scale at which the fit region fills the glyph area, limited
+        by width and height, inside the wheel's range."""
+        content = self.content_rect()
+        if self._pixels is None or content.width() <= 0 or content.height() <= 0:
+            return 0.0
+        left, top, right, bottom = self._fit_region()
+        return self._clamp_zoom(min(content.width() / max(1.0, right - left),
+                                    content.height() / max(1.0, bottom - top)))
+
+    def is_fit(self) -> bool:
+        return self._scale is None
+
+    def zoom(self) -> float:
+        """Widget pixels per strip pixel right now."""
+        return self.fit_zoom() if self._scale is None else self._clamp_zoom(self._scale)
+
+    def centre(self) -> tuple[float, float]:
+        """The strip point (x, y) at the centre of the glyph area."""
+        if self._pixels is None:
+            return 0.0, 0.0
+        if self._centre is None:
+            left, top, right, bottom = self._fit_region()
+            wanted = ((left + right) / 2, (top + bottom) / 2)
+        else:
+            wanted = self._centre
+        return self._clamp_centre(self.zoom(), *wanted)
+
+    def _clamp_centre(self, scale: float, x: float, y: float) -> tuple[float, float]:
+        """Keep the view on the strip. Along an axis the whole strip fits,
+        the strip is centred; along one it does not, the view may not run
+        past either edge."""
+        content = self.content_rect()
+        pixels = self._pixels
+        if scale <= 0:
+            return pixels.width / 2, pixels.height / 2
+
+        def clamp(value: float, view: float, size: int) -> float:
+            if view >= size:
+                return size / 2
+            return min(size - view / 2, max(view / 2, value))
+
+        return (clamp(x, content.width() / scale, pixels.width),
+                clamp(y, content.height() / scale, pixels.height))
+
+    def _content_centre(self) -> QPointF:
+        return QRectF(self.content_rect()).center()
+
+    def strip_point_at(self, pos: QPointF) -> tuple[float, float]:
+        """The strip point (x, y) under widget point `pos`."""
+        scale = self.zoom() or 1.0
+        x, y = self.centre()
+        middle = self._content_centre()
+        return x + (pos.x() - middle.x()) / scale, y + (pos.y() - middle.y()) / scale
+
+    def zoom_at(self, notches: float, pos: QPointF) -> None:
+        """WHEEL_STEP ** notches, keeping the strip point under `pos` where
+        it is (as far as the strip's edges allow)."""
+        if self._pixels is None:
+            return
+        scale = self._clamp_zoom(self.zoom() * WHEEL_STEP ** notches)
+        x, y = self.strip_point_at(pos)
+        middle = self._content_centre()
+        self._scale = scale
+        self._centre = self._clamp_centre(scale, x - (pos.x() - middle.x()) / scale,
+                                          y - (pos.y() - middle.y()) / scale)
+        self._redraw()
+
+    def pan_by(self, dx: float, dy: float) -> None:
+        """Move the strip by (dx, dy) widget pixels, as a hand would."""
+        if self._pixels is None:
+            return
+        scale = self.zoom()
+        x, y = self.centre()
+        self._scale = scale
+        self._centre = self._clamp_centre(scale, x - dx / scale, y - dy / scale)
+        self._redraw()
+
+    def fit(self) -> None:
+        self._scale = self._centre = None
+        self._redraw()
+
     # --- rendering --------------------------------------------------------
 
-    def render(self, zoom: float, x_offset: float, t: int, *, masked: bool, lost: bool) -> None:
+    def show_threshold(self, t: int, *, masked: bool, lost: bool) -> None:
+        """Re-mask at `t` (one `mask()` per strip per threshold, cached by
+        StripPixels) and redraw. The status is the whole strip's, never the
+        zoomed region's: zooming onto the background must not turn a
+        losing tile green."""
+        self._t, self._masked_on, self._lost_on = int(t), masked, lost
+        if self._pixels is None:
+            self._right, self._tone = "", "ok"
+        else:
+            self._right, self._tone = self._status(self._pixels, self._t)
+        self._redraw()
+
+    def _redraw(self) -> None:
+        """Slice the region on screen out of the (already masked) strip.
+        No masking happens here, so zoom and pan cost a slice and a blit."""
         self._image = self._overlay = None
         self._drawn = None
         self._source = None
         self._lost_count = 0
         pixels = self._pixels
-        if pixels is None or zoom <= 0:
-            self._right, self._tone = "", "ok"
+        content = QRectF(self.content_rect())
+        scale = self.zoom()
+        if pixels is None or content.width() <= 0 or content.height() <= 0 or scale <= 0:
             self.update()
             return
-
-        content = self.content_rect()
-        source_width = min(pixels.width, max(1, _round_half_up(content.width() / zoom)))
-        source_height = min(pixels.height, max(1, _round_half_up(content.height() / zoom)))
-        x = int(min(max(0.0, x_offset), max(0, pixels.width - source_width)))
-        y = max(0, (pixels.height - source_height) // 2)
-        self._source = QRect(x, y, source_width, source_height)
-
-        shown = pixels.masked(t)                       # always: the gate reads it too
-        if not masked:
-            shown = pixels.strip
-        self._drawn = shown[y:y + source_height, x:x + source_width]
+        x, y = self.centre()
+        half_w, half_h = content.width() / scale / 2, content.height() / scale / 2
+        left, right = max(0, math.floor(x - half_w)), min(pixels.width, math.ceil(x + half_w))
+        top, bottom = max(0, math.floor(y - half_h)), min(pixels.height, math.ceil(y + half_h))
+        if right <= left or bottom <= top:
+            self.update()
+            return
+        self._source = QRect(left, top, right - left, bottom - top)
+        shown = pixels.masked(self._t) if self._masked_on else pixels.strip
+        self._drawn = shown[top:bottom, left:right]
         self._image = _bgr_image(self._drawn)
-        # Centred when the region does not fill the tile -- at "fit" the whole
-        # strip is 11 px tall, and even at 300% a 55-row strip leaves room.
-        drawn_width, drawn_height = source_width * zoom, source_height * zoom
-        self._target = QRectF(content.x() + max(0.0, (content.width() - drawn_width) / 2),
-                              content.y() + max(0.0, (content.height() - drawn_height) / 2),
-                              drawn_width, drawn_height)
-
-        if lost:
-            lost_mask = pixels.lost(t)
+        middle = content.center()
+        self._target = QRectF(middle.x() + (left - x) * scale, middle.y() + (top - y) * scale,
+                              (right - left) * scale, (bottom - top) * scale)
+        if self._lost_on:
+            lost_mask = pixels.lost(self._t)
             if lost_mask is not None:
-                window = lost_mask[y:y + source_height, x:x + source_width]
+                window = lost_mask[top:bottom, left:right]
                 self._lost_count = int(window.sum())
                 if self._lost_count:
                     self._overlay = _tint_image(window, QColor(tokens.BAD), LOST_TINT_ALPHA)
-        self._right, self._tone = self._status(pixels, t)
         self.update()
 
     def _status(self, pixels: StripPixels, t: int) -> tuple[str, str]:
-        if not self._sampled:
-            # A pinned frame the detector never sampled: no boxes, so no
-            # glyph region, and Otsu over the whole strip would find a
-            # "split" in any gradient and then report 100% of that invention
-            # lost -- on the one tile the user added because they are worried
-            # about that frame. The pin is for LOOKING at it under the live
-            # mask, so the tile shows its pixels and claims nothing: no
-            # percentage, no ok tone, never a red border.
-            return PINNED_UNMEASURED, "dim"
-        if not self._is_text:
-            return ("background leaking", "warn") if pixels.gate(t) else ("clean", "ok")
         percent = pixels.lost_percent(t)
         if percent is None:
             # No glyph mask: no boxes, fewer pixels inside them than the
@@ -378,23 +711,63 @@ class ZoomTile(QWidget):
             return NOT_MEASURABLE, "dim"
         if percent >= LOST_ALERT_PERCENT:
             return f"{_round_half_up(percent)}% of glyph pixels lost", "bad"
-        if self._lines >= 2:
+        if self.spec.lines >= 2:
             return "both lines kept", "ok"
         return "strokes solid", "ok"
 
-    # --- painting ---------------------------------------------------------
+    # --- the mouse ----------------------------------------------------------
 
-    def enterEvent(self, event) -> None:
-        self.focused.emit()
-        super().enterEvent(event)
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if self._pixels is None or not delta:
+            event.ignore()
+            return
+        self.zoom_at(delta / WHEEL_NOTCH, event.position())
+        event.accept()
 
     def mousePressEvent(self, event) -> None:
-        self.focused.emit()
+        if event.button() == Qt.MouseButton.LeftButton and self._pixels is not None:
+            self._drag_from = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_from is None:
+            super().mouseMoveEvent(event)
+            return
+        position = event.position()
+        delta = position - self._drag_from
+        self._drag_from = position
+        self.pan_by(delta.x(), delta.y())
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_from is not None:
+            self._drag_from = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.fit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        """The view depends on the glyph area's size (fit is recomputed, an
+        explicit zoom is re-clamped), so a resize re-slices. No masking."""
+        super().resizeEvent(event)
+        if self._pixels is not None:
+            self._redraw()
+
+    # --- painting ---------------------------------------------------------
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)   # nearest-neighbour
         bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         path = QPainterPath()
         path.addRoundedRect(bounds, tokens.RADIUS_SEG, tokens.RADIUS_SEG)
@@ -407,10 +780,10 @@ class ZoomTile(QWidget):
             painter.drawImage(self._target, self._image)
             if self._overlay is not None:
                 painter.drawImage(self._target, self._overlay)
-        else:
+        elif self.placeholder_text():
             painter.setPen(QColor(tokens.DIM2))
             painter.setFont(_font(tokens.FONT_SIZE_BTN_SM))
-            painter.drawText(content, Qt.AlignmentFlag.AlignCenter, "waiting for the frame")
+            painter.drawText(content, Qt.AlignmentFlag.AlignCenter, self.placeholder_text())
         painter.restore()
 
         caption = QRectF(TILE_BORDER, self.height() - CAPTION_HEIGHT,
@@ -433,53 +806,16 @@ class ZoomTile(QWidget):
         painter.setPen(QPen(QColor(border), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
+        if self._highlighted:
+            inset = HIGHLIGHT_WIDTH / 2
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(tokens.ACC), HIGHLIGHT_WIDTH))
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset),
+                                    tokens.RADIUS_SEG, tokens.RADIUS_SEG)
         painter.end()
 
 
 _TONE_COLOURS = {"ok": tokens.OK, "warn": tokens.WARN, "bad": tokens.BAD, "dim": tokens.DIM2}
-
-
-class PinTile(QWidget):
-    """The dashed sixth tile: "＋ pin a frame you are worried about"."""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setMinimumSize(TILE_MIN_WIDTH, TILE_HEIGHT)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._text = PIN_TILE_TEXT
-
-    def text(self) -> str:
-        return self._text
-
-    def set_text(self, text: str) -> None:
-        self._text = text
-        self.update()
-
-    def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        pen = QPen(QColor(tokens.LINE), 1)
-        pen.setStyle(Qt.PenStyle.DashLine)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(bounds, tokens.RADIUS_SEG, tokens.RADIUS_SEG)
-        painter.setPen(QColor(tokens.DIM2))
-        painter.setFont(_font(tokens.FONT_SIZE_BTN_SM))
-        # Wrapped, not cut: at the UI scale the sentence is wider than a tile
-        # in a 1440 px window, and this is the one way into the tab on a file
-        # whose detection found nothing to show.
-        painter.drawText(QRectF(self.rect()).adjusted(CAPTION_PAD_X, 0, -CAPTION_PAD_X, 0),
-                         int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
-                         self._text)
-        painter.end()
 
 
 def _bgr_image(array: np.ndarray) -> QImage:
@@ -497,133 +833,19 @@ def _tint_image(mask: np.ndarray, colour: QColor, alpha: int) -> QImage:
 
 
 # --------------------------------------------------------------------------
-# Context strip
-# --------------------------------------------------------------------------
-
-class ContextStrip(QWidget):
-    """`.ctxstrip` -- the whole strip at 26 px, raw, with the amber zoom
-    window over the region every tile is showing. Dragging the window pans
-    the tiles (`panned` carries the new x offset, in strip pixels)."""
-
-    panned = pyqtSignal(float)
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setFixedHeight(CONTEXT_HEIGHT)
-        self.setCursor(Qt.CursorShape.SizeHorCursor)
-        self._image: QImage | None = None
-        self._strip_size = (0, 0)
-        self._offset = 0.0
-        self._visible = 0
-        self._caption = ""
-        self._drag_grab: float | None = None
-
-    def set_state(self, image: QImage | None, strip_size: tuple[int, int],
-                  offset: float, visible: int, caption: str) -> None:
-        self._image = image
-        self._strip_size = strip_size
-        self._offset = float(offset)
-        self._visible = int(visible)
-        self._caption = caption
-        self.update()
-
-    def caption(self) -> str:
-        return self._caption
-
-    def window_rect(self) -> QRectF:
-        width, _height = self._strip_size
-        if width <= 0 or self._visible <= 0:
-            return QRectF(0, -1, self.width(), self.height() + 2)
-        scale = self.width() / width
-        return QRectF(self._offset * scale, -1,
-                      max(float(WINDOW_MIN_WIDTH), self._visible * scale), self.height() + 2)
-
-    # --- panning ----------------------------------------------------------
-
-    def _to_strip(self, x: float) -> float:
-        width, _height = self._strip_size
-        return x * width / self.width() if self.width() else 0.0
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        x = event.position().x()
-        rect = self.window_rect()
-        if rect.left() <= x <= rect.right():
-            self._drag_grab = self._to_strip(x) - self._offset
-        else:                                        # jump: centre the window here
-            self._drag_grab = self._visible / 2
-            self.panned.emit(self._to_strip(x) - self._drag_grab)
-
-    def mouseMoveEvent(self, event) -> None:
-        if self._drag_grab is None:
-            return
-        self.panned.emit(self._to_strip(event.position().x()) - self._drag_grab)
-
-    def mouseReleaseEvent(self, event) -> None:
-        self._drag_grab = None
-
-    # --- painting ---------------------------------------------------------
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        path = QPainterPath()
-        path.addRoundedRect(bounds, tokens.RADIUS_TAG, tokens.RADIUS_TAG)
-        painter.fillPath(path, QColor("#000000"))
-        painter.save()
-        painter.setClipPath(path)
-        if self._image is not None:
-            painter.drawImage(QRectF(self.rect()), self._image)
-        else:
-            painter.setPen(QColor(tokens.DIM2))
-            painter.setFont(_font(tokens.FONT_SIZE_SCOPE))
-            painter.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, "waiting for the frames")
-        # The caption goes UNDER the amber window, not over it. The window is
-        # the thing on this strip you can take hold of, and at the UI scale
-        # the caption is more than half the width of a strip in a 1440 px
-        # window -- drawn last it hid the window whenever the zoom sat in the
-        # left half, which is where it starts on a centred subtitle.
-        if self._caption:
-            painter.setFont(_font(tokens.FONT_SIZE_SCOPE))
-            metrics = painter.fontMetrics()
-            # Never past the strip's own right edge, either.
-            width = min(metrics.horizontalAdvance(self._caption) + CTX_TAG_PAD_X,
-                        max(0.0, self.width() - 2 * CTX_TAG_X))
-            tag = QRectF(CTX_TAG_X, CTX_TAG_Y, width, CONTEXT_HEIGHT - CTX_TAG_INSET_Y)
-            painter.setPen(QPen(QColor(tokens.LINE2), 1))
-            painter.setBrush(TAG_BG)
-            painter.drawRoundedRect(tag, tokens.RADIUS_TAG, tokens.RADIUS_TAG)
-            painter.setPen(QColor(tokens.DIM))
-            painter.drawText(tag, Qt.AlignmentFlag.AlignCenter,
-                             metrics.elidedText(self._caption, Qt.TextElideMode.ElideRight,
-                                                int(max(0.0, width - CTX_TAG_PAD_X))))
-        window = self.window_rect()
-        painter.fillRect(window, _alpha(tokens.ACC, WINDOW_FILL_ALPHA))
-        painter.setPen(QPen(QColor(tokens.ACC), WINDOW_BORDER))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(window.adjusted(WINDOW_BORDER / 2, 0, -WINDOW_BORDER / 2, 0))
-        painter.restore()
-
-        painter.setPen(QPen(QColor(tokens.LINE), 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(path)
-        painter.end()
-
-
-# --------------------------------------------------------------------------
 # Threshold curve
 # --------------------------------------------------------------------------
 
 class ThresholdCurve(QWidget):
     """The two curves, the plateau band and both markers, over MIN_T..MAX_T.
 
-    Dragging anywhere moves the preview threshold (`previewed`); releasing
-    keeps it as the preview -- nothing is committed here.
+    Dragging anywhere moves the preview threshold (`previewed`); letting go
+    ends the drag (`released`), and the tab commits the threshold the drag
+    last showed -- not one re-read from where the button came up.
     """
 
     previewed = pyqtSignal(int)
+    released = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -716,7 +938,10 @@ class ThresholdCurve(QWidget):
             self.previewed.emit(self.t_for(event.position().x()))
 
     def mouseReleaseEvent(self, event) -> None:
-        self._dragging = False           # the preview stays; committing is the panel's job
+        if not self._dragging or event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._dragging = False
+        self.released.emit()
 
     # --- painting ---------------------------------------------------------
 
@@ -801,13 +1026,14 @@ class WrappingToolbar(QWidget):
 
     Ruling B3 puts a tab's controls in the stage head, and the head lays its
     tab buttons and the toolbar out in a single row -- so the toolbar's
-    minimum width IS part of the window's minimum width. At the UI scale this
-    tab's seven controls want 494 px of the 730 the shell leaves the stage in
-    a 1440 px window, and the head's tab buttons want 287 of it: the window
-    could not then be opened at 1440 at all, on a screen that is exactly that
-    wide. A second row costs the head some height, which it has and can grow
-    into; a width floor the screen cannot meet is not something the user can
-    do anything about.
+    minimum width IS part of the window's minimum width. The shell leaves the
+    stage 730 px of a 1440 px window at the UI scale and the head's tab
+    buttons want 287 of it, so a toolbar that could not break would be a
+    window width floor -- it was one when this tab carried seven controls,
+    and the window could not be opened at 1440 at all, on a screen exactly
+    that wide. A second row costs the head some height, which it has and can
+    grow into; a width floor the screen cannot meet is not something the user
+    can do anything about.
 
     `sizeHint` always asks for the one-row width, so the moment the head can
     give it that much the two groups snap back onto one row. `minimumSizeHint`
@@ -870,10 +1096,11 @@ class WrappingToolbar(QWidget):
 
 class BrightnessInspectorPanel(QWidget):
     """The Brightness tab's slice of the inspector (ruling B4): Auto/Yours,
-    the note, and "use {auto}" / "keep {yours}"."""
+    the note, and "use {auto}". A curve drag writes "yours" itself, on
+    release, so there is no button to keep it."""
 
     use_auto = pyqtSignal()
-    keep_yours = pyqtSignal()
+    apply_all = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -901,22 +1128,30 @@ class BrightnessInspectorPanel(QWidget):
         buttons.setContentsMargins(0, PANEL_BUTTON_TOP, 0, 0)
         buttons.setSpacing(PANEL_BUTTON_GAP)
         self.use_button = small_button("use")
-        self.keep_button = small_button("keep", "ghost")
         self.use_button.clicked.connect(self.use_auto)
-        self.keep_button.clicked.connect(self.keep_yours)
         buttons.addWidget(self.use_button)
-        buttons.addWidget(self.keep_button)
         buttons.addStretch(1)
         column.addLayout(buttons)
+        # Its own row: beside "use" it would outgrow the 322 px inspector.
+        bulk = QHBoxLayout()
+        bulk.setContentsMargins(0, 0, 0, 0)
+        self.all_button = small_button(APPLY_ALL_TEXT.format(value=NO_VALUE), "ghost")
+        self.all_button.clicked.connect(self.apply_all)
+        bulk.addWidget(self.all_button)
+        bulk.addStretch(1)
+        column.addLayout(bulk)
         column.addStretch(1)
 
     def set_state(self, *, auto: int | None, value: int | None, stored: int | None,
                   note: str, flags: str, stale: str, crop_note: str) -> None:
         """`value` is the threshold on screen (the preview) and `stored` the
-        one the file has. They differ while a drag has not been kept, and
-        then the row shows the move rather than the destination alone."""
+        one the file has. They differ mid-drag -- the row then shows the move
+        rather than the destination alone -- and while the file has no value
+        at all, which is the one time the note line says so: a drag in
+        progress is kept by letting go, so saying "not kept" then would only
+        make a line flicker under the row."""
         kept = value is None or value == stored
-        preview = "" if kept else PREVIEW_NOTE.format(value=value)
+        preview = PREVIEW_NOTE.format(value=value) if value is not None and stored is None else ""
         self.auto_row.set_value(NO_VALUE if auto is None else str(auto))
         self.yours_row.set_value(
             NO_VALUE if value is None else
@@ -930,8 +1165,8 @@ class BrightnessInspectorPanel(QWidget):
             label.setVisible(bool(text))
         self.use_button.setText("use" if auto is None else f"use {auto}")
         self.use_button.setEnabled(auto is not None)
-        self.keep_button.setText("keep" if value is None else f"keep {value}")
-        self.keep_button.setEnabled(value is not None)
+        self.all_button.setText(APPLY_ALL_TEXT.format(value=NO_VALUE if value is None else value))
+        self.all_button.setEnabled(value is not None)
 
     def notes(self) -> list[str]:
         """Every note line on show, top to bottom. The series median is NOT
@@ -953,6 +1188,7 @@ class BrightnessInspectorPanel(QWidget):
         return self.crop_note.text()
 
 
+
 # --------------------------------------------------------------------------
 # The tab
 # --------------------------------------------------------------------------
@@ -968,36 +1204,33 @@ class BrightnessTab:
         self._preview_file: str | None = None
         self._preview = DEFAULT_BRIGHTNESS
         self._seen_stored: int | None = None
-        self._pinned: dict[str, list[float]] = {}
         self._pixels: dict[float, StripPixels] = {}
         self._tiles: list[ZoomTile] = []
-        self._focused = 0
-        self._zoom = DEFAULT_PRESET
-        self._offset = 0.0
-        self._offset_ready = False           # the default offset has been measured on real pixels
-        self._resize_pending = False
+        self._highlighted: ZoomTile | None = None
         self._lost_on = True
         self._masked_on = True
-        self._context_image: QImage | None = None
-        self._context_key: int | None = None
         self._facts: dict = {}
         self._facts_key: tuple | None = None
-        self._crop_box: tuple[int, int, int, int] | None = None
-
-        # The compact timeline's current position (seconds, or None when it
-        # has none); the pin tile asks it for a time. `_build_page` points it
-        # at the timeline it mounts (ruling B5).
-        self.timeline_position: Callable[[], float | None] | None = None
+        self._crop_box: tuple[int, int, int, int] | None = None       # the file's own: the strips'
+        self._evidence_box: tuple[int, int, int, int] | None = None   # the one the curve was measured on
+        self._active = False               # the visible stage tab (see set_active)
+        self._asking = False               # inside controller.request_lines
 
         self._build_page()
+        # "apply {t} to all files" asks first; a test replaces this to answer.
+        self.confirm: Callable[[str, str], bool] = lambda title, text: ask_yes_no(self._page, title, text)
         self.panel = BrightnessInspectorPanel()
         self.panel.use_auto.connect(self._commit_auto)
-        self.panel.keep_yours.connect(self._commit_preview)
-        # Only strips_ready: `Stage` (app/views/stage.py) already calls
-        # refresh() on file_changed for every tab it hosts, and a second
-        # connection here would re-mask all six tiles twice per edit. A tab
-        # mounted outside a Stage calls refresh() itself.
+        self.panel.apply_all.connect(self._apply_to_all)
+        # Only strips_ready (and the cheap activity sync below): `Stage`
+        # (app/views/stage.py) already calls refresh() on file_changed for
+        # every tab it hosts, and a second connection here would re-mask all
+        # six tiles twice per edit. A tab mounted outside a Stage calls
+        # refresh() itself.
         controller.strips_ready.connect(self._on_strips_ready)
+        # A lines job queued or finished changes whether "↻ shuffle" may be
+        # pressed and what an empty gallery says; neither needs a re-render.
+        controller.activity_changed.connect(self._sync_lines_state)
 
     # --- construction -----------------------------------------------------
 
@@ -1010,24 +1243,17 @@ class BrightnessTab:
                                   PAGE_MARGIN_X, PAGE_MARGIN_BOTTOM)
         column.setSpacing(PAGE_SPACING)
 
-        zooms = QWidget()
-        zoom_row = QHBoxLayout(zooms)
-        zoom_row.setContentsMargins(0, 0, 0, 0)
-        zoom_row.setSpacing(TOOLBAR_GAP)
+        shuffles = QWidget()
+        shuffle_row = QHBoxLayout(shuffles)
+        shuffle_row.setContentsMargins(0, 0, 0, 0)
+        shuffle_row.setSpacing(TOOLBAR_GAP)
         # Leading, so a row with room to spare right-aligns its controls the
-        # way the head right-aligns the toolbar -- without it the buttons
-        # stretch across the whole of a wrapped row.
-        zoom_row.addStretch(1)
-        zoom_label = QLabel(ZOOM_LABEL)
-        zoom_label.setObjectName("Note")
-        zoom_row.addWidget(zoom_label)
-        self.zoom_buttons: list[Button] = []
-        for preset in ZOOM_PRESETS:
-            button = small_button(preset, "ghost")
-            button.set_toggled(preset == self._zoom)
-            button.clicked.connect(lambda _checked=False, name=preset: self.set_zoom(name))
-            zoom_row.addWidget(button)
-            self.zoom_buttons.append(button)
+        # way the head right-aligns the toolbar.
+        shuffle_row.addStretch(1)
+        self.shuffle_button = small_button(SHUFFLE_TEXT, "ghost")
+        self.shuffle_button.setToolTip(SHUFFLE_TIP)
+        self.shuffle_button.clicked.connect(self.shuffle)
+        shuffle_row.addWidget(self.shuffle_button)
         toggles = QWidget()
         toggle_row = QHBoxLayout(toggles)
         toggle_row.setContentsMargins(0, 0, 0, 0)
@@ -1041,31 +1267,24 @@ class BrightnessTab:
         self.mask_button.clicked.connect(self.toggle_masked)
         toggle_row.addWidget(self.lost_button)
         toggle_row.addWidget(self.mask_button)
-        # The presets and the toggles are two groups, so the head can put them
-        # on two rows when one will not fit -- see WrappingToolbar.
-        self._toolbar = WrappingToolbar(zooms, toggles, TOOLBAR_SPACING)
+        # Two groups, so the head can put them on two rows when one will not
+        # fit -- see WrappingToolbar.
+        self._toolbar = WrappingToolbar(shuffles, toggles, TOOLBAR_SPACING)
         self._toolbar.setObjectName("BrightnessToolbar")
 
-        self.context = ContextStrip()
-        self.context.panned.connect(self._on_panned)
-        column.addWidget(self.context)
-
-        self._grid_host = QWidget()
-        self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(TILE_GAP)
-        self._grid.setVerticalSpacing(TILE_GAP)
-        for index in range(TILE_COLUMNS):
-            self._grid.setColumnStretch(index, 1)
-        self.pin_tile_widget = PinTile()
-        self.pin_tile_widget.clicked.connect(self._on_pin_clicked)
-        # In the grid from the start, not only when `_sync_tiles` rebuilds
-        # it: a file with no brightness evidence has an empty tile plan, the
-        # plan never changes, and the tab would be a black rectangle with no
-        # way in -- exactly the file (FLAG_NO_TEXT) a user most wants to pin
-        # a frame on. `_sync_tiles` repositions it after the real tiles.
-        self._grid.addWidget(self.pin_tile_widget, 0, 0)
-        column.addWidget(self._grid_host, 1)
+        self._gallery = QWidget()
+        self._gallery.setObjectName("BrightnessGallery")
+        self._gallery_layout = QVBoxLayout(self._gallery)
+        self._gallery_layout.setContentsMargins(0, 0, 0, 0)
+        self._gallery_layout.setSpacing(TILE_GAP)
+        # Where the tiles would be, and only while there are none.
+        self._empty = QLabel()
+        self._empty.setObjectName("Note")
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty.setWordWrap(True)
+        self._empty.hide()
+        self._gallery_layout.addWidget(self._empty, 1)
+        column.addWidget(self._gallery, 1)
 
         header_hint = QLabel(CURVE_HINT)
         header_hint.setObjectName("Note")
@@ -1078,11 +1297,11 @@ class BrightnessTab:
         column.addWidget(SectionHeader(CURVE_HEADER, header_hint))
         self.curve = ThresholdCurve()
         self.curve.previewed.connect(self.set_preview)
+        self.curve.released.connect(self._commit_drag)
         column.addWidget(self.curve)
 
         self._timeline = Timeline(self._controller, mode="compact")
-        self._timeline.pin_requested.connect(self.pin_time)
-        self.timeline_position = self._timeline.position
+        self._timeline.seek_requested.connect(self.highlight_nearest)
         column.addWidget(self._timeline)               # under the stage (ruling B5)
         self._page = page
 
@@ -1095,76 +1314,94 @@ class BrightnessTab:
         return self.panel
 
     def toolbar(self) -> QWidget:
-        """The zoom presets and the two toggles, which the Stage mounts in
-        the stage head (ruling B3) beside the tab buttons -- the same place
-        the Crop tab puts envelope / masked / grid."""
+        """"↻ shuffle" and the two toggles, which the Stage mounts in the
+        stage head (ruling B3) beside the tab buttons -- the same place the
+        Crop tab puts envelope / masked / grid."""
         return self._toolbar
 
+    def set_active(self, active: bool) -> None:
+        """Whether this is the stage's visible tab. The Stage calls it on
+        every tab switch (app/views/stage.py); a tab mounted on its own is
+        inactive until told otherwise. Only the visible tab asks the
+        controller for lines: boosting a file the user is not looking at
+        would jump the GPU queue for nobody."""
+        self._active = bool(active)
+        if self._active:
+            self._ask_for_lines()
+            self._sync_lines_state()
+
+    def is_active(self) -> bool:
+        return self._active
+
     def set_file(self, name: str | None) -> None:
+        if name != self._file:
+            # Another file: every tile, and the zoom it carries, starts over.
+            self._clear_tiles()
+            self._pixels = {}
+            self._facts_key = None
         self._file = name
-        self._offset, self._offset_ready = 0.0, False
         self._timeline.set_file(name)
         self.refresh()
 
     def refresh(self) -> None:
         entry = self._entry()
         self._timeline.refresh()
-        evidence = (entry.evidence.get("brightness") or {}) if entry is not None else {}
-        self._crop_box = self._box_for(entry, evidence)
-        auto = evidence.get("value")
+        evidence = (entry.evidence or {}) if entry is not None else {}
+        brightness = evidence.get("brightness") or {}
+        self._crop_box = self._entry_box(entry)
+        self._evidence_box = _as_box(brightness.get("crop_box") or ())
+        auto = brightness.get("value")
         stored = None if entry is None or entry.brightness is None else entry.brightness.value
         self._sync_preview(stored, auto)
-        self._sync_tiles(evidence)
+        self._sync_tiles(gallery_plan(evidence, self._crop_box))
+        self._timeline.set_marks([tile.time for tile in self._tiles])
         self._request_strips()
         self._load_pixels()
-        self._measure(evidence, auto)
-        self.curve.set_state(evidence.get("curve"), evidence.get("clutter_curve"),
-                             evidence.get("plateau"), auto, self._preview)
+        self._measure(brightness, auto)
+        self.curve.set_state(brightness.get("curve"), brightness.get("clutter_curve"),
+                             brightness.get("plateau"), auto, self._preview)
         self._render()
-        self._update_panel(entry, evidence, auto, stored)
+        self._update_panel(entry, brightness, auto, stored)
+        self._ask_for_lines()
+        self._sync_lines_state()
 
     # --- state ------------------------------------------------------------
 
     def tiles(self) -> list[ZoomTile]:
         return list(self._tiles)
 
-    def pin_tile(self) -> PinTile:
-        return self.pin_tile_widget
+    def gallery(self) -> QWidget:
+        return self._gallery
 
-    def grid_widgets(self) -> list[QWidget]:
-        return [*self._tiles, self.pin_tile_widget]
+    def empty_label(self) -> QLabel:
+        return self._empty
+
+    def empty_text(self) -> str:
+        """What the gallery says instead of tiles; "" while it has tiles (or
+        no file)."""
+        return self._empty.text()
 
     def timeline_slot(self) -> Timeline:
-        """The compact, read-only timeline under the stage (ruling B5). A
-        click on it picks the frame the pin tile offers; a double-click pins
-        it straight away."""
+        """The compact, read-only timeline under the stage (ruling B5),
+        ticked at the gallery tiles' times. A click highlights the nearest
+        tile."""
         return self._timeline
+
+    def highlighted_tile(self) -> ZoomTile | None:
+        return self._highlighted
 
     def threshold(self) -> int:
         return self._preview
 
     def crop_box(self) -> tuple[int, int, int, int] | None:
+        """The file's own crop box: the one every strip is grabbed with."""
         return self._crop_box
-
-    def zoom_factor(self) -> float:
-        preset = PRESET_FACTORS.get(self._zoom)
-        if preset is not None:
-            return preset
-        width = self._strip_width()
-        content = self._tiles[0].content_rect().width() if self._tiles else 0
-        return content / width if width and content else 1.0
-
-    def x_offset(self) -> float:
-        return self._offset
 
     def lost_pixels_on(self) -> bool:
         return self._lost_on
 
     def masked_on(self) -> bool:
         return self._masked_on
-
-    def pinned_times(self) -> list[float]:
-        return list(self._pinned.get(self._file or "", ()))
 
     def strip_pixels(self, time: float) -> StripPixels | None:
         """The loaded pixels of the tile at `time`, or None while its strip
@@ -1174,19 +1411,11 @@ class BrightnessTab:
     def losing_threshold(self) -> int | None:
         """The threshold the note's "Above {t} …" sentence names, or None
         when no tile ever loses LOST_RISE_POINTS more than it already had at
-        the detector's value (see `_measure`)."""
+        the reference value (see `_measure`)."""
         losing = self._facts.get("losing")
         return None if losing is None else losing[0]
 
     # --- commands ---------------------------------------------------------
-
-    def set_zoom(self, preset: str) -> None:
-        if preset not in ZOOM_PRESETS:
-            raise ValueError(f"unknown zoom preset {preset!r}")
-        self._zoom = preset
-        for button, name in zip(self.zoom_buttons, ZOOM_PRESETS, strict=True):
-            button.set_toggled(name == preset)
-        self._render()
 
     def toggle_lost_pixels(self) -> None:
         self._lost_on = not self._lost_on
@@ -1199,9 +1428,9 @@ class BrightnessTab:
         self._render()
 
     def set_preview(self, t: int) -> None:
-        """Move the preview threshold. Nothing is written: the tiles, the
-        curve marker and the "keep" button follow, and a commit is one of
-        the panel's two buttons."""
+        """Move the preview threshold. Nothing is written: every tile, the
+        curve marker and the panel follow, and the file takes the value when
+        the drag ends (`_commit_drag`)."""
         value = int(min(MAX_T, max(MIN_T, int(t))))
         if value == self._preview:
             return
@@ -1211,15 +1440,23 @@ class BrightnessTab:
         self._render()
         self._refresh_panel()
 
-    def pin_time(self, time: float) -> None:
-        """Add a sixth tile for `time` (kept for this file for the session)."""
-        if self._file is None:
+    def shuffle(self) -> None:
+        """Draw other random lines for this file (the detector's picks stay):
+        `controller.shuffle_lines`, which excludes the times on show."""
+        entry = self._entry()
+        if entry is None or self._crop_box is None or self._lines_pending(entry):
             return
-        pinned = self._pinned.setdefault(self._file, [])
-        if float(time) not in pinned:
-            pinned.append(float(time))
-        self.pin_tile_widget.set_text(PIN_TILE_TEXT)
-        self.refresh()
+        self._controller.shuffle_lines(entry.name)
+        self._sync_lines_state()
+
+    def highlight_nearest(self, time: float) -> None:
+        """Ring the tile whose time is nearest `time` (a timeline click)."""
+        if not self._tiles:
+            return
+        nearest = min(self._tiles, key=lambda tile: (abs(tile.time - float(time)), tile.time))
+        for tile in self._tiles:
+            tile.set_highlighted(tile is nearest)
+        self._highlighted = nearest
 
     # --- internals --------------------------------------------------------
 
@@ -1232,32 +1469,6 @@ class BrightnessTab:
     def _entry_box(entry) -> tuple[int, int, int, int] | None:
         crop = None if entry is None else entry.crop
         return None if crop is None else (crop.x, crop.y, crop.width, crop.height)
-
-    @classmethod
-    def _box_for(cls, entry, evidence) -> tuple[int, int, int, int] | None:
-        """The crop box the tiles and the curve describe -- the box the
-        strips are grabbed with.
-
-        **`evidence["crop_box"]` wins whenever it differs from the file's
-        crop.** Everything measured about a tile comes from two places that
-        have to agree: the pixels (re-grabbed now, for whatever box is asked
-        for) and `evidence["strips"][].boxes`, which are in the pixel frame
-        of the crop the detection ran on. Asking for the file's new box after
-        a crop edit would pair fresh pixels with boxes that no longer point
-        at the text, and the glyph split, the lost % and the red tint would
-        then be measured over a region that may hold no text at all. Nothing
-        about the stored evidence describes the new box, so the view keeps
-        showing the frame the evidence is in and says so (`_stale_text`),
-        until a re-detection replaces the evidence.
-
-        `core/jobs/apply.py` only ever stores a result whose `crop_box` IS
-        the file's crop, so the two agree in the ordinary case and this
-        chooses nothing. With no evidence box at all, the file's own crop is
-        the only candidate."""
-        box = evidence.get("crop_box")
-        if box is not None:
-            return tuple(int(value) for value in box)
-        return cls._entry_box(entry)
 
     def _auto(self) -> int | None:
         entry = self._entry()
@@ -1282,163 +1493,67 @@ class BrightnessTab:
             if stored is not None:
                 self._preview = stored
 
-    def _tile_plan(self, evidence) -> list[tuple[str, float]]:
-        tiles = evidence.get("tiles") or {}
-        plan = [(kind, float(tiles[kind])) for kind in KIND_ORDER if kind in tiles]
-        plan += [("pinned", time) for time in self.pinned_times()]
-        return plan
-
-    def _sync_tiles(self, evidence) -> None:
-        plan = self._tile_plan(evidence)
-        if [(tile.kind, tile.time) for tile in self._tiles] == plan:
-            return
+    def _clear_tiles(self) -> None:
         for tile in self._tiles:
-            self._grid.removeWidget(tile)
+            self._gallery_layout.removeWidget(tile)
             tile.setParent(None)     # removeWidget alone leaves it parented and painting
             tile.deleteLater()
-        self._grid.removeWidget(self.pin_tile_widget)
         self._tiles = []
-        for index, (kind, time) in enumerate(plan):
-            tile = ZoomTile(kind, time)
-            tile.focused.connect(lambda i=index: self._set_focus(i))
-            tile.resized.connect(self._on_tile_resized)
-            self._grid.addWidget(tile, index // TILE_COLUMNS, index % TILE_COLUMNS)
-            self._tiles.append(tile)
-        position = len(plan)
-        self._grid.addWidget(self.pin_tile_widget, position // TILE_COLUMNS, position % TILE_COLUMNS)
-        self._focused = min(self._focused, max(0, len(self._tiles) - 1))
+        self._highlighted = None
+
+    def _sync_tiles(self, plan: list[GalleryTile]) -> None:
+        """Lay the plan out, keeping the widget -- and so the zoom -- of
+        every tile whose key is still in it."""
+        if [spec.key for spec in plan] != [tile.key for tile in self._tiles]:
+            held = {tile.key: tile for tile in self._tiles}
+            for tile in self._tiles:
+                self._gallery_layout.removeWidget(tile)
+            tiles = []
+            for index, spec in enumerate(plan):
+                tile = held.pop(spec.key, None) or ZoomTile(spec)
+                self._gallery_layout.insertWidget(index, tile, 1)
+                tiles.append(tile)
+            for tile in held.values():
+                tile.setParent(None)
+                tile.deleteLater()
+            self._tiles = tiles
+            if self._highlighted not in tiles:
+                self._highlighted = None
+        for tile, spec in zip(self._tiles, plan, strict=True):
+            tile.set_spec(spec)
 
     def _request_strips(self) -> None:
-        """Ask for every tile's strip. The controller submits each (box,
-        time) at most once a session, so this is safe on every repaint."""
+        """Ask for every tile's strip, for the file's own crop. The
+        controller submits each (box, time) at most once a session, so this
+        is safe on every repaint."""
         if self._file is None or self._crop_box is None or not self._tiles:
             return
-        times = [tile.time for tile in self._tiles]
-        self._controller.request_strips(self._file, self._crop_box, times)
-
-    def _sample_of(self, evidence, time: float) -> dict:
-        for sample in evidence.get("strips") or ():
-            if float(sample.get("time", -1.0)) == float(time):
-                return sample
-        return {}
+        self._controller.request_strips(self._file, self._crop_box,
+                                        [tile.time for tile in self._tiles])
 
     def _load_pixels(self) -> None:
-        entry = self._entry()
-        evidence = (entry.evidence.get("brightness") or {}) if entry is not None else {}
         pixels: dict[float, StripPixels] = {}
         for tile in self._tiles:
-            sample = self._sample_of(evidence, tile.time)
             strip = (None if self._file is None or self._crop_box is None
                      else self._controller.strip(self._file, self._crop_box, tile.time))
-            held = self._pixels.get(tile.time)
             if strip is None:
-                tile.set_sample(None)
+                tile.set_sample(None, unreadable=self._file is not None and self._crop_box is not None
+                                and self._controller.strip_unavailable(self._file, self._crop_box, tile.time))
                 continue
-            boxes = normalise_boxes(sample.get("boxes"))
+            held = self._pixels.get(tile.time)
+            boxes = tile.spec.boxes
             # Re-measured when the pixels OR the boxes change: a re-detection
             # can land new boxes on a strip that is still cached, and the
             # glyph split belongs to the pair, not to the pixels alone.
             if held is None or held.strip is not strip or held.given_boxes != boxes:
                 held = StripPixels(strip, boxes)
             pixels[tile.time] = held
-            tile.set_sample(held, is_text=bool(sample.get("is_text", True)),
-                            lines=int(sample.get("lines") or 1), sampled=bool(sample))
+            tile.set_sample(held)
         self._pixels = pixels
 
-    def _strip_width(self) -> int:
-        for tile in self._tiles:
-            if tile.has_pixels():
-                return self._pixels[tile.time].width
-        return 0
-
-    def _strip_size(self) -> tuple[int, int]:
-        for tile in self._tiles:
-            if tile.has_pixels():
-                held = self._pixels[tile.time]
-                return held.width, held.height
-        return 0, 0
-
-    def _on_tile_resized(self) -> None:
-        """The tiles share the page's leftover height, so a window resize
-        changes how much of each strip they show. Coalesced: one re-render
-        per burst of six resize events."""
-        if self._resize_pending:
-            return
-        self._resize_pending = True
-        QTimer.singleShot(0, self._render_after_resize)
-
-    def _render_after_resize(self) -> None:
-        self._resize_pending = False
-        self._render()
-
-    def _set_focus(self, index: int) -> None:
-        if 0 <= index < len(self._tiles) and index != self._focused:
-            self._focused = index
-            self._render_context()
-
-    def _on_panned(self, offset: float) -> None:
-        self._offset_ready = True
-        self._offset = self._clamp_offset(offset)
-        self._render()
-
-    def _clamp_offset(self, offset: float) -> float:
-        return min(max(0.0, offset), max(0.0, self._strip_width() - self._visible_width()))
-
-    def _default_offset(self) -> float:
-        """Where the zoom window sits before the user pans: centred on the
-        text of the first tile that has any. A 1344 px strip at 300% shows
-        about 90 px, and its left edge -- where an offset of 0 lands -- is
-        empty on every subtitle frame there is."""
-        width = self._strip_width()
-        if not width:
-            return 0.0
-        centre = width / 2
-        held = next((self._pixels[tile.time] for tile in self._tiles
-                     if tile.has_pixels() and self._pixels[tile.time].boxes), None)
-        if held is not None:
-            left = min(box[0] for box in held.boxes)
-            right = max(box[0] + box[2] for box in held.boxes)
-            centre = (left + right) / 2
-        return self._clamp_offset(centre - self._visible_width() / 2)
-
-    def _visible_width(self) -> int:
-        width = self._strip_width()
-        zoom = self.zoom_factor()
-        content = self._tiles[0].content_rect().width() if self._tiles else 0
-        if not width or zoom <= 0 or not content:
-            return width
-        return min(width, max(1, _round_half_up(content / zoom)))
-
     def _render(self) -> None:
-        zoom = self.zoom_factor()
-        # Measured once, from the first tile that has pixels, and then left
-        # alone: recomputing it per render would move every tile whenever the
-        # focus moved to a tile whose text sits somewhere else.
-        if self._offset_ready:
-            self._offset = self._clamp_offset(self._offset)
-        else:
-            self._offset = self._default_offset()
-            self._offset_ready = bool(self._strip_width())
         for tile in self._tiles:
-            tile.render(zoom, self._offset, self._preview,
-                        masked=self._masked_on, lost=self._lost_on)
-        self._render_context()
-
-    def _render_context(self) -> None:
-        width, height = self._strip_size()
-        focused = self._tiles[self._focused] if self._focused < len(self._tiles) else None
-        held = None if focused is None or not focused.has_pixels() else self._pixels[focused.time]
-        # The context strip shows the whole raw strip, which does not change
-        # with the threshold: converting 1344x55 on every drag step would
-        # cost more than masking every tile.
-        key = None if held is None else id(held)
-        if key != self._context_key:
-            self._context_key = key
-            self._context_image = None if held is None else _bgr_image(held.strip)
-        image = self._context_image
-        caption = ("" if not width else
-                   f"full strip {width} × {height} · drag the amber window to move the zoom")
-        self.context.set_state(image, (width, height), self._offset, self._visible_width(), caption)
+            tile.show_threshold(self._preview, masked=self._masked_on, lost=self._lost_on)
 
     def _on_strips_ready(self, name: str) -> None:
         if name != self._file:
@@ -1451,38 +1566,88 @@ class BrightnessTab:
         self._render()
         self._refresh_panel()
 
+    # --- lines --------------------------------------------------------------
+
+    def _lines_pending(self, entry) -> bool:
+        return "lines" in self._controller.pending_detectors().get(entry.name, ())
+
+    def _lines_current(self, entry) -> bool:
+        """The file has lines, drawn on the crop it has now."""
+        lines = entry.evidence.get("lines") or {}
+        return bool(lines) and self._crop_box is not None and \
+            _as_box(lines.get("crop_box") or ()) == self._crop_box
+
+    def _ask_for_lines(self) -> None:
+        """`controller.request_lines` while this tab is on screen and the
+        file's lines are missing or stale. Guarded: the controller may emit
+        file_changed from inside the call, and the Stage answers that with
+        refresh(), which would ask again."""
+        if not self._active or self._asking:
+            return
+        entry = self._entry()
+        if entry is None or self._crop_box is None or self._lines_current(entry):
+            return
+        self._asking = True
+        try:
+            self._controller.request_lines(entry.name)
+        finally:
+            self._asking = False
+
+    def _sync_lines_state(self) -> None:
+        """"↻ shuffle" and the gallery's empty state, which follow the
+        lines job as well as the model."""
+        entry = self._entry()
+        pending = entry is not None and self._lines_pending(entry)
+        self.shuffle_button.setEnabled(entry is not None and self._crop_box is not None
+                                       and not pending)
+        text = self._empty_state(entry, pending)
+        self._empty.setText(text)
+        self._empty.setVisible(bool(text))
+
+    def _empty_state(self, entry, pending: bool) -> str:
+        if self._tiles or entry is None:
+            return ""
+        if self._crop_box is None:
+            return EMPTY_NO_CROP
+        if pending:
+            return EMPTY_FINDING
+        if self._lines_current(entry):
+            tried = (entry.evidence.get("lines") or {}).get("tried") or 0
+            return f"{EMPTY_NO_LINES.format(tried=tried)}\n{EMPTY_TRY_AGAIN}"
+        return EMPTY_NOT_DRAWN
+
     # --- the note's facts -------------------------------------------------
 
     def _measure(self, evidence, auto: int | None = None) -> None:
-        """The two facts the note needs, which do not move with the preview:
-        the lowest threshold at which a text tile starts losing strokes, and
-        whether the leaking tile's gate still fires below the plateau.
+        """The fact the note needs that does not move with the preview: the
+        lowest threshold at which a tile starts losing strokes.
 
         **The losing threshold is self-calibrating.** "Glyph pixels" are
-        everything above the Otsu split inside the detector's boxes, which
+        everything above the Otsu split inside the tile's boxes, which
         necessarily includes the anti-aliased skirt around every stroke --
         and a subtitle threshold always eats part of that skirt, so a healthy
         tile can sit at 20-30% lost with every stroke core intact. An
-        absolute bar would therefore fire on every file. So each text tile is
+        absolute bar would therefore fire on every file. So each tile is
         measured against ITSELF: its lost % at the detector's auto value is
         its baseline, and the note fires at the lowest whole threshold from
         the plateau's `lo` up at which some tile has lost LOST_RISE_POINTS
         more of its glyphs than it had already lost at auto. That is the
         point where the threshold starts taking pixels the detector's own
-        pick was keeping.
+        pick was keeping. Picks and lines alike: a line is a subtitle too.
 
-        Without an auto value (no evidence) the baseline is measured at `lo`
-        instead, so the rule still reads "how much worse than the bottom of
-        the safe range". The per-tile caption is unaffected: it states the
-        plain fact (LOST_ALERT_PERCENT of the glyphs gone) rather than a
+        Without an auto value (no evidence: an IMPORTED or MANUAL
+        brightness) the baseline is measured at `lo`, or MIN_T without a
+        plateau either, so the rule still reads "how much worse than the
+        bottom of the range". The per-tile caption is unaffected: it states
+        the plain fact (LOST_ALERT_PERCENT of the glyphs gone) rather than a
         judgement about this file.
 
-        Recomputed only when the file, the tiles, the pixels or the reference
+        Recomputed only when the file, the tiles' pixels or the reference
         value change -- a threshold drag must not re-measure (and must not
         mask a strip behind the tiles' backs, which is what the
         one-mask-per-tile-per-change budget is)."""
         plateau = evidence.get("plateau")
-        key = (self._file, tuple(sorted(self._pixels)),
+        key = (self._file, tuple(sorted((time, id(held)) for time, held in self._pixels.items())),
                None if plateau is None else tuple(plateau), auto)
         if key == self._facts_key:
             return
@@ -1493,20 +1658,14 @@ class BrightnessTab:
         losing: tuple[int, float] | None = None
         for tile in self._tiles:
             held = self._pixels.get(tile.time)
-            if held is None or tile.kind == "leaking" or not held.has_glyphs():
+            if held is None or not held.has_glyphs():
                 continue
             baseline = held.lost_percent(reference) or 0.0
             found = held.first_losing_threshold(start, baseline + LOST_RISE_POINTS)
             if found is not None and (losing is None or found < losing[0]):
                 losing = (found, tile.time)
-        leaks = False
-        if lo is not None and lo > MIN_T:
-            for tile in self._tiles:
-                held = self._pixels.get(tile.time)
-                if tile.kind == "leaking" and held is not None:
-                    leaks = held.gate(lo - 1)
         self._facts = {"lo": lo, "hi": None if plateau is None else int(plateau[1]),
-                       "losing": losing, "leaks": leaks}
+                       "losing": losing}
 
     def _note_text(self, auto: int | None, stored: int | None) -> str:
         facts = self._facts
@@ -1515,15 +1674,10 @@ class BrightnessTab:
             parts.append(f"Safe range {facts['lo']}–{facts['hi']}.")
         losing = facts.get("losing")
         if losing is not None:
-            # Shown whether or not the preview has passed it. The brief
-            # words this as "crosses 10 within [t, 255]", which matches the
-            # mockup (the cliff sits above the pick); suppressing the line
-            # once the user drags past the cliff would take away the one
+            # Shown whether or not the preview has passed it: suppressing the
+            # line once the user drags past the cliff would take away the one
             # sentence that explains why a tile just turned red.
             parts.append(f"Above {losing[0]} the {clock(losing[1])} sample starts losing strokes.")
-        if facts.get("leaks"):
-            parts.append(f"Below {facts['lo']} the background leaks and the frame gate "
-                         "fires on empty frames.")
         if auto is not None and stored is not None and auto != stored:
             parts.append(f"detected {auto} · yours {stored}")      # ruling C2
         return " ".join(parts)
@@ -1532,15 +1686,23 @@ class BrightnessTab:
     def _flag_text(evidence) -> str:
         return brightness_flag_text(evidence.get("flagged"))
 
+    def _measured_elsewhere(self, entry) -> bool:
+        """The brightness evidence was measured on another crop than the
+        file's own. `own is None` (a file with no crop at all) says nothing:
+        there is no crop to disagree with."""
+        own = self._entry_box(entry)
+        return own is not None and self._evidence_box is not None and self._evidence_box != own
+
     def _stale_text(self, entry) -> str:
-        """The warning that what is on screen was measured on another crop.
+        """The warning that what the panel and the curve describe was
+        measured on another crop.
 
         Two ways that happens, and both must say so. `brightness_is_stale`
         is the model's own rule: the stored VALUE was measured on a crop the
         file no longer has -- but it only judges DETECTED/HINT values, so a
         MANUAL brightness never trips it. The other is this view's: the
-        evidence the tiles and the curve describe (`_box_for`) is not the
-        file's crop, whatever the value's source.
+        evidence (curve, plateau, auto) is of another crop, whatever the
+        value's source.
 
         "…re-detecting" while a brightness measurement for the file is still
         to come -- queued, running, or held by auto-pilot behind the folder's
@@ -1549,24 +1711,17 @@ class BrightnessTab:
         refresh" when nothing is coming."""
         if entry is None:
             return ""
-        own = self._entry_box(entry)
-        # `own is None` (a file with no crop at all) says nothing here: the
-        # evidence box is then the only box there is, so there is nothing to
-        # disagree with. A MANUAL brightness whose crop was cleared would go
-        # unremarked, but no UI path clears a crop.
-        describes_another_crop = own is not None and self._crop_box not in (None, own)
-        if not (describes_another_crop or brightness_is_stale(entry)):
+        if not (self._measured_elsewhere(entry) or brightness_is_stale(entry)):
             return ""
         pending = self._controller.pending_detectors().get(entry.name, frozenset())
         return STALE_REDETECTING if "brightness" in pending else STALE_REDETECT
 
-    def _crop_note_text(self, entry) -> str:
-        """One line saying the tiles are not of the crop the file has now.
-        The warn line above it is about the stored value; a value can be
-        stale while the evidence still describes the current crop, so the
-        two are separate."""
-        own = self._entry_box(entry)            # None: no crop to disagree with, see _stale_text
-        return TILES_OTHER_CROP if own is not None and self._crop_box not in (None, own) else ""
+    def _crop_note_text(self, entry, evidence) -> str:
+        """One line saying the curve is not of the crop the file has now.
+        The tiles always are (see `gallery_plan`); the warn line above is
+        about the stored value, and a value can be stale while the evidence
+        still describes the current crop, so the two are separate."""
+        return CURVE_OTHER_CROP if self._measured_elsewhere(entry) and evidence.get("curve") else ""
 
     def _update_panel(self, entry, evidence, auto: int | None, stored: int | None) -> None:
         self.panel.set_state(auto=auto, value=None if entry is None else self._preview,
@@ -1574,7 +1729,7 @@ class BrightnessTab:
                              note=self._note_text(auto, stored),
                              flags=self._flag_text(evidence),
                              stale=self._stale_text(entry),
-                             crop_note=self._crop_note_text(entry))
+                             crop_note=self._crop_note_text(entry, evidence))
 
     def _refresh_panel(self) -> None:
         entry = self._entry()
@@ -1589,13 +1744,26 @@ class BrightnessTab:
         if self._file is not None and auto is not None:
             self._controller.set_brightness(self._file, int(auto))
 
-    def _commit_preview(self) -> None:
-        if self._file is not None:
-            self._controller.set_brightness(self._file, int(self._preview))
-
-    def _on_pin_clicked(self) -> None:
-        time = self.timeline_position() if self.timeline_position is not None else None
-        if time is None:
-            self.pin_tile_widget.set_text(PIN_HINT_TEXT)     # plan 3C Task 4 mounts the timeline
+    def _commit_drag(self) -> None:
+        """The drag ended: the threshold on screen becomes the file's MANUAL
+        value, one write per gesture as the crop box and the time ranges do.
+        A gesture that ends on the stored value writes nothing -- the same
+        number as MANUAL would freeze a detected value against every later
+        detection."""
+        entry = self._entry()
+        if entry is None:
             return
-        self.pin_time(float(time))
+        stored = None if entry.brightness is None else entry.brightness.value
+        if self._preview != stored:
+            self._controller.set_brightness(self._file, int(self._preview))
+        self._refresh_panel()     # the Stage refreshes the rest on file_changed
+
+    def _apply_to_all(self) -> None:
+        """The value on screen for every file not skipped, after one
+        question naming it and the file count."""
+        if self._file is None:
+            return
+        value = int(self._preview)
+        count = len(self._controller.bulk_targets(self._file))
+        if self.confirm(APPLY_ALL_TITLE, APPLY_ALL_BRIGHTNESS_TEXT.format(value=value, n=count)):
+            self._controller.apply_brightness_to_all(self._file, value)

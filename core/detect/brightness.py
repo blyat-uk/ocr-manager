@@ -192,6 +192,14 @@ FLAG_ESCALATE = "escalate"                  # cheap path: seed outside the folde
 FLAG_CANCELLED = "cancelled"                # cancel_check fired: result incomplete
 INFORMATIONAL_FLAGS = frozenset({FLAG_NO_CLEAN_THRESHOLD})
 
+# Reasons whose result holds no reading of this file at all: `value` is
+# DEFAULT_BRIGHTNESS (nothing was sampled or nothing had text), or -- for
+# "escalate" -- a cheap seed the caller is about to replace with a full run.
+# Every other flag doubts a value that WAS measured (see BrightnessResult.
+# measured), and a doubted measurement is still the file's own reading.
+NOTHING_MEASURED_FLAGS = frozenset({FLAG_NEEDS_CROP, FLAG_RANGES_EMPTY, FLAG_NO_TEXT,
+                                    FLAG_ESCALATE, FLAG_CANCELLED})
+
 # --- Dim-text check
 # Neighbour frames checked around a strip whose line the pick loses, in seconds.
 NEIGHBOUR_OFFSETS_SEC = (-0.8, -0.4, 0.4, 0.8)
@@ -328,8 +336,26 @@ class BrightnessResult:
         trips the gate). Every other flag -- alone or composed -- means the
         value was not measured, not verified, or not safe: needs-crop,
         ranges-empty?, no-text, thin-evidence?, coloured-text?, no-plateau?,
-        narrow-plateau?, dim-text?, escalate, cancelled."""
+        narrow-plateau?, dim-text?, escalate, cancelled.
+
+        Weaker than `measured`: a result may be stored for the user to accept
+        (measured) without being safe to apply unreviewed (auto_applicable).
+        """
         return only_informational(self.flagged, INFORMATIONAL_FLAGS)
+
+    @property
+    def measured(self) -> bool:
+        """True when `value` is a reading of this file rather than a
+        placeholder -- what core.jobs.apply stores, flags and all, so the
+        user has something to accept.
+
+        False for NOTHING_MEASURED_FLAGS: needs-crop, ranges-empty? and
+        no-text carry DEFAULT_BRIGHTNESS (nothing was measured), cancelled is
+        incomplete, and escalate is a cheap seed a full run replaces.
+        thin-evidence?, coloured-text?, no-plateau?, narrow-plateau? and
+        dim-text? all doubt a real reading, so they stay measured."""
+        reasons = {part for part in (self.flagged or "").split("+") if part}
+        return not (reasons & NOTHING_MEASURED_FLAGS)
 
 
 class _Cancelled(Exception):
@@ -993,11 +1019,13 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
 
     With `folder_plateau` this is the cheap path: 6 frames, analytic seed
     only. A seed inside the plateau gives the value seed - PICK_BELOW_TOP,
-    never below the plateau's start ("narrow-plateau?" when that clamp bites):
-    a file's own seed sits at or just under its own plateau top, which the
-    folder plateau's top does not bound. Otherwise the result carries
-    flagged == "escalate" and the caller must run full detection (call again
-    without `folder_plateau`).
+    never below the plateau's start: a file's own seed sits at or just under
+    its own plateau top, which the folder plateau's top does not bound. That
+    clamp is where the pick landed, not a doubt -- "narrow-plateau?" is
+    raised for the same reason as on the full path, a plateau narrower than
+    PICK_BELOW_TOP, which no pick measured against it can have a margin in.
+    Otherwise the result carries flagged == "escalate" and the caller must
+    run full detection (call again without `folder_plateau`).
 
     `cancel_check`: a zero-argument callable polled before each sampling
     round, before OCR verification, and before each OCR batch and neighbour
@@ -1050,7 +1078,13 @@ def detect_brightness(video_path: str, crop_box, time_ranges, det_engine, ocr_en
         if seed is None or not lo <= seed <= hi:
             fallback = DEFAULT_BRIGHTNESS if seed is None else seed
             return with_evidence(BrightnessResult(fallback, None, fallback, None, FLAG_ESCALATE, []))
-        flagged = FLAG_NARROW_PLATEAU if seed - PICK_BELOW_TOP < lo else None
+        # Narrowness is a fact about the plateau, exactly as on the full path
+        # below -- NOT about where this file's seed sat in it. Reading the
+        # seed instead (`seed - PICK_BELOW_TOP < lo`) flagged every seed but
+        # the one at the plateau's very top, so a folder plateau exactly
+        # PICK_BELOW_TOP wide sent almost every file in the folder to review,
+        # all carrying the identical clamped value the flag does not change.
+        flagged = FLAG_NARROW_PLATEAU if hi - lo < PICK_BELOW_TOP else None
         return with_evidence(BrightnessResult(max(lo, seed - PICK_BELOW_TOP), (lo, hi), seed, None, flagged, []))
 
     floor = gate_floor(empty_strips)

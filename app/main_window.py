@@ -93,6 +93,11 @@ GEOMETRY_KEY = "window/geometry"
 # the user set themselves is restored verbatim and never scaled.
 DEFAULT_SIZE = (1440, 900)
 REQUIRED_TOOLS = ("ffmpeg",)
+# Files warmed ahead of the queue's cursor on every selection
+# (ProjectController.set_view_file -> AutoPilot.boost_warm). Eight covers a
+# run of fast Down-arrows: a file's strips take 2-4 s to decode on a 4K
+# source, and reviewing one takes longer than that.
+WARM_LOOKAHEAD = 8
 OPEN_FAILED_TITLE = "Could not open this folder"
 SAVE_FAILED_TITLE = "Not saved"
 CRASH_TITLE = "Something went wrong — details are in Logs (Pipeline)."
@@ -327,11 +332,29 @@ class MainWindow(QMainWindow):
     def _on_selection_changed(self, name) -> None:
         # Before the views ask for their pixels: the frames and strips of the
         # file being left are not worth a worker any more (see
-        # ProjectController.set_view_file).
-        self.controller.set_view_file(name)
+        # ProjectController.set_view_file), and the view cache should warm the
+        # files this selection is heading towards rather than the folder's
+        # first episodes -- the queue's VISIBLE order, so a filter gives the
+        # handful the user is actually walking through.
+        self.controller.set_view_file(name, self._upcoming(name))
         self.stage.set_file(name)
         self.inspector.set_file(name)
         self._sync_actions()
+
+    def _upcoming(self, name) -> list[str]:
+        """`name` and the WARM_LOOKAHEAD files after it in the queue's visible
+        order: what Down-arrow will land on next.
+
+        Falls back to the selection alone when it is not in the filter (the
+        row that was just skipped or marked done, whose filter is about to
+        drop it), so warming still favours what is on screen."""
+        if not name:
+            return []
+        visible = self.queue.visible_names()
+        if name not in visible:
+            return [name]
+        start = visible.index(name)
+        return visible[start:start + 1 + WARM_LOOKAHEAD]
 
     def _sync_actions(self, *_args) -> None:
         """Space and T act on the selected file; neither while the focused

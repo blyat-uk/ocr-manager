@@ -9,6 +9,11 @@ window, through the object the window drives).
 test files, so renaming or deleting a cited test breaks the checklist instead
 of quietly emptying it.
 
+A few rows are newer than §11: behaviour added since the rewrite whose loss
+would be silent -- nothing on screen would go missing, only the work the app
+does for the user. They are marked with a comment saying so, and carry the
+same obligation as the §11 rows: name the tests that keep them.
+
 Two rows are not automatable and are recorded as manual checks in
 `MANUAL_CHECKS` (the Task 6 report spells out what a human should do):
 look-and-feel of the window, and the desktop notification actually appearing
@@ -183,6 +188,31 @@ PARITY = {
     "Time range chips / active-range editing": [
         "test_time_ranges_are_editable_and_reach_the_ocr_call",
         "tests/ui/test_main_window.py::test_selecting_a_file_updates_the_inspector_header_and_detected_rows",
+    ],
+    # Not a §11 row: the brightness auto-confirm stage is newer than the
+    # rewrite (2026-09-20). It is on the checklist because losing it is
+    # invisible -- it adds no screen, no badge and no setting, so the only
+    # symptom of it quietly going away is a folder of ~180 files asking to be
+    # reviewed by hand again. It is also the one behaviour here with no test
+    # of its own in this file: what it produces on screen is the ordinary
+    # "ready" badge of a PROPOSED file, which the rows above already pin, so
+    # a window test could only re-assert what the controller tests do, one
+    # layer further from the rule.
+    "Brightness auto-confirm: a doubted threshold retired by OCR, not by the user": [
+        "tests/test_detect_confirm.py::test_the_ladder_steps_down_by_ten_and_stops_at_the_floor",
+        "tests/test_detect_confirm.py::test_a_reading_passes_exactly_at_the_folders_confidence_threshold",
+        "tests/test_detect_confirm.py::test_the_highest_passing_rung_is_the_files_answer",
+        "tests/test_confirm_jobs.py::test_the_first_gallery_line_is_the_strip_a_confirm_probes",
+        "tests/test_confirm_jobs.py::test_a_confirm_job_calls_confirm_brightness_with_what_it_captured",
+        "tests/test_autopilot_confirm.py::test_a_file_flagged_on_a_measured_but_doubted_brightness_is_confirmed",
+        "tests/test_autopilot_confirm.py::test_confirms_run_one_at_a_time_for_the_whole_folder_in_name_order",
+        "tests/test_autopilot_confirm.py::test_pending_never_reports_confirm_and_the_badge_stays_honest",
+        "tests/test_apply_confirm.py::test_a_confirmed_file_is_proposed_like_any_file_the_detectors_got_right",
+        "tests/test_apply_confirm.py::test_a_ladder_that_passes_nowhere_changes_neither_value_nor_flag",
+        "tests/ui/test_controller.py::test_a_confirmed_file_stops_asking_for_the_user_and_badges_ready",
+        "tests/ui/test_controller.py::test_a_confirm_that_passed_lower_down_leaves_the_lower_brightness",
+        "tests/ui/test_controller.py::test_a_failed_confirm_leaves_the_file_flagged_and_still_checking_brightness",
+        "tests/ui/test_controller.py::test_a_running_confirm_shows_in_the_activity_strip_but_changes_no_badge",
     ],
 }
 
