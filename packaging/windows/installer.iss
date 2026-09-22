@@ -51,6 +51,7 @@ Type: filesandordirs; Name: "{app}\bin"
 
 [Icons]
 Name: "{autoprograms}\OCR Manager"; Filename: "{app}\OCR Manager.exe"
+Name: "{autoprograms}\OCR Manager (OCR engine setup)"; Filename: "{app}\OCR Manager.exe"; Parameters: "--setup-engine"; Comment: "Switch the OCR engine between the GPU and CPU builds, or reinstall it"
 Name: "{autodesktop}\OCR Manager"; Filename: "{app}\OCR Manager.exe"; Tasks: desktopicon
 
 [Run]

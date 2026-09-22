@@ -91,37 +91,45 @@ jobs:
           }
 
       - name: Build
+        timeout-minutes: 60
         run: python packaging/build.py --version ${{ needs.version.outputs.version }}
 
       - name: Smoke test — version
+        timeout-minutes: 5
         run: python packaging/build.py run -- --version
 
       - name: Smoke test — self-test
+        timeout-minutes: 10
         run: python packaging/build.py run -- --self-test
 
       - name: Smoke test — install the CPU engine (first-run path)
+        timeout-minutes: 30
         env:
           OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
         run: python packaging/build.py run -- --install-engine cpu
 
       - name: Smoke test — OCR a test line
+        timeout-minutes: 20
         env:
           OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
           PADDLE_PDX_CACHE_HOME: ${{ runner.temp }}/paddlex
         run: python packaging/build.py run -- --ocr-smoke
 
       - name: Smoke test — open and close the window
+        timeout-minutes: 5
         env:
           OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
         run: python packaging/build.py run -- --quit-after 3
 
       - name: Smoke test — AppImage starts
+        timeout-minutes: 5
         if: matrix.os_name == 'linux'
         run: |
           chmod +x dist/*.AppImage
           dist/*.AppImage --appimage-extract-and-run --version
 
       - name: Smoke test — Windows launcher and installer
+        timeout-minutes: 15
         if: matrix.os_name == 'win'
         shell: pwsh
         run: |
@@ -133,6 +141,7 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "launcher exited with $($p.ExitCode)" }
 
       - name: Smoke test — the .app launches
+        timeout-minutes: 5
         if: matrix.os_name == 'mac'
         run: |
           codesign --verify --deep --strict "build/bundle/OCR Manager.app"
@@ -178,7 +187,7 @@ jobs:
           ## First run
 
           The OCR engine (PaddlePaddle) is not in the download; OCR Manager installs it the first time it starts.
-          On an NVIDIA GPU with a recent driver it picks the matching CUDA build (a 2–4 GB download) and checks
+          On an NVIDIA GPU with a recent driver it picks the matching CUDA build (2–5.5 GB to download, up to 8 GB on disk) and checks
           that it works; otherwise, or if the GPU check fails, it installs the CPU build (about 0.2 GB).
           The engine and the OCR models live in your user data folder, not in the app:
           `%LOCALAPPDATA%\ocr-manager` on Windows, `~/Library/Application Support/ocr-manager` on macOS,

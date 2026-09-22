@@ -6,3 +6,8 @@ Exec=ocr-manager %f
 Icon=ocr-manager
 Terminal=false
 Categories=AudioVideo;Video;Utility;
+Actions=setup-engine;
+
+[Desktop Action setup-engine]
+Name=OCR engine setup (GPU or CPU)
+Exec=ocr-manager --setup-engine
