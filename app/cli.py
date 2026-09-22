@@ -37,6 +37,7 @@ import time
 import traceback
 
 from app.bootstrap import Boot
+from core.proc import TEXT_ENCODING, hidden_child
 from app.version import __version__
 
 PACKAGES = ("app", "core", "videocr")
@@ -52,10 +53,6 @@ _smoke_app = None                       # the QGuiApplication --ocr-smoke render
 
 def _emit(line: str) -> None:
     print(line, flush=True)
-
-
-def _no_window() -> int:
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0
 
 
 # --------------------------------------------------------------------------
@@ -87,7 +84,7 @@ def check_tool(tool: str) -> dict:
         return {"ok": False, "path": None, "error": f"{tool} is not on PATH"}
     try:
         done = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=TOOL_TIMEOUT,
-                              check=False, creationflags=_no_window(), encoding="utf-8", errors="replace")
+                              check=False, **TEXT_ENCODING, **hidden_child())
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "path": path, "error": str(exc)}
     first = (done.stdout or "").splitlines()[0] if done.stdout else ""

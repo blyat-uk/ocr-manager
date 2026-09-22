@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import queue
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
@@ -19,6 +18,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+from core.proc import TEXT_ENCODING, hidden_child
 
 POLL_SECONDS = 0.1
 TAIL_LINES = 40
@@ -48,17 +49,13 @@ class ProcessRunner(Protocol):
         ...
 
 
-def no_window_flags() -> int:
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0
-
-
 class SubprocessRunner:
     def run(self, command, *, env=None, cwd=None, on_line=lambda line: None, cancel=None,
             timeout=None) -> ProcessResult:
         proc = subprocess.Popen(list(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, env=None if env is None else dict(env),
-                                cwd=None if cwd is None else str(cwd), text=True, encoding="utf-8",
-                                errors="replace", bufsize=1, creationflags=no_window_flags())
+                                cwd=None if cwd is None else str(cwd), text=True, bufsize=1,
+                                **TEXT_ENCODING, **hidden_child())
         lines: queue.Queue[str | None] = queue.Queue()
 
         def pump() -> None:

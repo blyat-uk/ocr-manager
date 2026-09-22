@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+
+from core.proc import TEXT_ENCODING, hidden_child
 
 NVIDIA_SMI = "nvidia-smi"
 NVIDIA_SMI_TIMEOUT = 5.0
@@ -177,10 +178,6 @@ def parse_nvidia_smi(text: str) -> tuple[GpuInfo, ...]:
     return tuple(gpus)
 
 
-def _no_window_flags() -> int:
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0
-
-
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
@@ -196,7 +193,7 @@ def probe_gpus(os_name: str, *, run: Run = subprocess.run,
     for fields in (QUERY_FIELDS, "name,driver_version"):    # old drivers cannot report compute_cap
         try:
             done = run([exe, f"--query-gpu={fields}", "--format=csv,noheader"], capture_output=True, text=True,
-                       timeout=NVIDIA_SMI_TIMEOUT, check=False, creationflags=_no_window_flags())
+                       timeout=NVIDIA_SMI_TIMEOUT, check=False, **TEXT_ENCODING, **hidden_child())
         except (OSError, subprocess.SubprocessError) as exc:
             return GpuProbe(error=f"nvidia-smi failed: {exc}")
         if done.returncode == 0:
