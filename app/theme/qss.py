@@ -246,7 +246,8 @@ QPushButton#SegmentItem[on="true"] {{
     color: {tokens.TXT};
     border: 1px solid {tokens.LINE2};
 }}
-""".strip("\n") + "\n" + _views_stylesheet() + "\n" + _folder_settings_stylesheet() + "\n" + _run_stylesheet()
+""".strip("\n") + "\n" + _views_stylesheet() + "\n" + _folder_settings_stylesheet() + "\n" + _run_stylesheet() \
+        + "\n" + _engine_setup_stylesheet()
 
 
 def _views_stylesheet() -> str:
@@ -687,6 +688,74 @@ QWidget#FolderSettings QComboBox QAbstractItemView {{
     selection-background-color: {tokens.ROW_SELECTED};
     selection-color: {tokens.TXT};
     outline: none;
+}}
+""".strip("\n")
+
+
+def _engine_setup_stylesheet() -> str:
+    """The first-run engine setup dialog (`app/views/engine_setup.py`): the
+    folder settings sheet's header and footer surfaces, option buttons that
+    read as selectable cards (the toggled one takes the accent border), a
+    thin blue progress track like `.mini`, and a warn/bad message line."""
+    return f"""
+/* == Engine setup dialog ================================================ */
+QDialog#EngineSetup {{
+    background-color: {tokens.BG};
+}}
+QWidget#EngineSetupHead {{
+    background-color: {tokens.PANEL};
+    border-bottom: 1px solid {tokens.LINE};
+}}
+QWidget#EngineSetupFoot {{
+    background-color: {tokens.PANEL};
+    border-top: 1px solid {tokens.LINE};
+}}
+QLabel#EngineSetupTitle {{
+    font-size: {_font_px(tokens.FONT_SIZE_PROJ)}px;
+    font-weight: {tokens.FONT_WEIGHT_PROJ};
+    color: {tokens.TXT};
+    background: transparent;
+}}
+QLabel#EngineSetupScope,
+QLabel#EngineSetupNote {{
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
+    color: {tokens.DIM2};
+    background: transparent;
+}}
+QLabel#EngineSetupStep {{
+    color: {tokens.TXT};
+}}
+QPushButton#EngineOption {{
+    text-align: left;
+    padding: {tokens.px(8)}px {tokens.px(12)}px;
+    background-color: {tokens.PANEL2};
+    border: 1px solid {tokens.LINE};
+}}
+QPushButton#EngineOption:hover {{
+    border-color: {tokens.LINE2};
+}}
+QPushButton#EngineOption[toggled="true"] {{
+    border-color: {tokens.ACC};
+    color: {tokens.TXT};
+}}
+QPushButton#EngineOption:disabled {{
+    color: {tokens.DIM2};
+}}
+QProgressBar#EngineProgress {{
+    background-color: {tokens.TRACK_BG};
+    border: none;
+    border-radius: {tokens.RADIUS_XS}px;
+}}
+QProgressBar#EngineProgress::chunk {{
+    background-color: {tokens.BLUE};
+    border-radius: {tokens.RADIUS_XS}px;
+}}
+QLabel#EngineSetupMessage {{
+    color: {tokens.WARN};
+    background: transparent;
+}}
+QLabel#EngineSetupMessage[tone="bad"] {{
+    color: {tokens.BAD};
 }}
 """.strip("\n")
 
