@@ -624,7 +624,7 @@ def qa_pass(ass: str) -> str:
     read back. The temporary directory is removed."""
     with tempfile.TemporaryDirectory(prefix="ocr-proof-") as directory:
         path = os.path.join(directory, "proof.ass")
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(ass)
         _qafix.process_file(path)
         with open(path, encoding="utf-8") as handle:

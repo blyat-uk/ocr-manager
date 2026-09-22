@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import subprocess
 import threading
@@ -1285,6 +1286,33 @@ def test_pool_start_failure_falls_back_to_serial_fingerprinting_with_identical_o
     assert list(serial.items()) == list(pooled.items())
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, f"expected exactly one warning, got {[r.message for r in warnings]}"
+
+
+def test_pool_context_is_forkserver_where_there_is_one_else_spawn(monkeypatch):
+    assert pl._pool_context().get_start_method() == "forkserver"            # Linux: unchanged
+    monkeypatch.setattr(multiprocessing, "get_all_start_methods", lambda: ["spawn"])   # Windows
+    assert pl._pool_context().get_start_method() == "spawn"
+
+
+def test_a_spawn_pool_fingerprints_like_the_forkserver_one(synthetic_episodes, monkeypatch, caplog):
+    """Windows has no forkserver: the pool spawns its workers, which import
+    the fingerprint module afresh. It must run (no serial-fallback warning)
+    and give the forkserver pool's result."""
+    pooled = pl.analyse(_entries(synthetic_episodes), _SYNTH_CFG, cache_dir=None, workers=2)
+    monkeypatch.setattr(multiprocessing, "get_all_start_methods", lambda: ["spawn"])
+    methods = []
+    real_executor = pl.ProcessPoolExecutor
+
+    def recording_executor(*args, mp_context, **kwargs):
+        methods.append(mp_context.get_start_method())
+        return real_executor(*args, mp_context=mp_context, **kwargs)
+
+    monkeypatch.setattr(pl, "ProcessPoolExecutor", recording_executor)
+    with caplog.at_level(logging.WARNING):
+        spawned = pl.analyse(_entries(synthetic_episodes), _SYNTH_CFG, cache_dir=None, workers=2)
+    assert methods == ["spawn"]
+    assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert list(spawned.items()) == list(pooled.items())
 
 
 class _CrashAfterFirstExecutor:

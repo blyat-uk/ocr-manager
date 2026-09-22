@@ -56,6 +56,7 @@ from core.detect import vad
 from core.detect.flags import compose_flag as _compose_flag
 from core.detect.flags import is_cancelled as _is_cancelled
 from core.detect.flags import only_informational
+from core.proc import TEXT_ENCODING, hidden_child
 from core.project.model import FolderSettings as _FolderSettings
 from videocr.pyav_adapter import _TRC_ARIB_STD_B67, _TRC_SMPTE2084, PyAVCapture, _pyav_has_zscale
 
@@ -449,7 +450,8 @@ def _probe_source(video_path: str) -> tuple[int, int, str | None]:
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=width,height,color_transfer", "-of", "json", video_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, check=True, text=True, **TEXT_ENCODING,
+                            **hidden_child())
     streams = json.loads(result.stdout).get("streams", [])
     if not streams:
         raise ValueError(f"no video stream found in {video_path}")
@@ -576,7 +578,7 @@ def _grab_one(video_path: str, t: float, crop_w: int, crop_h: int, crop_x: int,
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, check=False, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, check=False, timeout=30, **hidden_child())
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning(
             "grab_frames: failed to grab t=%.3f from %s (%s: %s)",

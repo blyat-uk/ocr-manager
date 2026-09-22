@@ -209,6 +209,12 @@ def save_cached(cache_dir: str, key: str, hashes: np.ndarray, duration: float) -
 
 def _pool_context():
     # forkserver: never fork() the (possibly multi-threaded, Qt) caller.
+    # Windows has no forkserver (and macOS's fork is unsafe for the same
+    # reason): spawn there. A spawned worker imports the fingerprint module
+    # afresh to unpickle fingerprint_file, so it needs no preload -- the
+    # preload below is a forkserver-only setting.
+    if "forkserver" not in multiprocessing.get_all_start_methods():
+        return multiprocessing.get_context("spawn")
     ctx = multiprocessing.get_context("forkserver")
     # "__main__" is preloaded alongside the fingerprint module so the
     # forkserver process (spawned once, reused for every task) pays the

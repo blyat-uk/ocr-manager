@@ -115,11 +115,15 @@ def notifications(monkeypatch):
 
     sent = []
 
-    def fake_run(args, **kwargs):
-        sent.append(list(args))
-        return subprocess.CompletedProcess(args, 0)
+    class Notifier:
+        def wait(self, timeout=None):
+            return 0
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    def fake_popen(args, **kwargs):
+        sent.append(list(args))
+        return Notifier()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     return sent
 
 
