@@ -24,6 +24,10 @@ def fd_is_open(fd: int) -> bool:
 
 
 def fd_is_devnull(fd: int) -> bool:
+    # Windows stats a pipe and NUL alike (all zeros), so this cannot tell
+    # them apart there; pythonw's missing streams are caught as None instead.
+    if sys.platform == "win32":
+        return False
     try:
         return os.path.samestat(os.fstat(fd), os.stat(os.devnull))
     except (OSError, ValueError):

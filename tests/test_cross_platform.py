@@ -230,3 +230,14 @@ def test_windows_starts_no_notifier(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(subprocess, "Popen", refuse)
     notify.send_notification("OCR Complete", "Finished", "normal")
+
+
+def test_a_pipe_is_not_taken_for_devnull_on_windows(monkeypatch):
+    # Windows stats a pipe and NUL identically; the redirect must not fire
+    # for a console or a pipe there (CI's smoke tests read that output).
+    from core.runtime import logfile
+
+    monkeypatch.setattr(logfile.sys, "platform", "win32")
+    monkeypatch.setattr(logfile.os, "fstat", lambda fd: os.stat_result((0,) * 10))
+    monkeypatch.setattr(logfile.os, "stat", lambda path: os.stat_result((0,) * 10))
+    assert logfile.fd_is_devnull(1) is False

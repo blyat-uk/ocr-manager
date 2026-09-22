@@ -148,6 +148,21 @@ jobs:
           codesign --verify --deep --strict "build/bundle/OCR Manager.app"
           "build/bundle/OCR Manager.app/Contents/MacOS/ocr-manager" --version
 
+      - name: App log (on failure)
+        if: failure()
+        shell: bash
+        env:
+          OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          logs = pathlib.Path(os.environ["OCR_MANAGER_DATA_DIR"]) / "logs"
+          for log in sorted(logs.glob("*.log*")) if logs.is_dir() else []:
+              text = log.read_text(encoding="utf-8", errors="replace")[-6000:]
+              body = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title={log.name}::{body}")
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: ocr-manager-${{ matrix.os_name }}
