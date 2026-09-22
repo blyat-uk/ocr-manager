@@ -20,6 +20,7 @@ import numpy as np
 from scipy.ndimage import maximum_filter
 
 from core.detect.ranges.config import DSPConfig, HashConfig, PeakConfig, RangesConfig
+from core.proc import TEXT_ENCODING, hidden_child
 
 _LOSSLESS_CODECS = frozenset({
     "flac", "alac",
@@ -79,7 +80,8 @@ def select_audio_stream(path: str) -> int | None:
         "-of", "json",
         path,
     ]
-    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, check=True, text=True, **TEXT_ENCODING,
+                            **hidden_child())
     streams = json.loads(result.stdout).get("streams", [])
     if len(streams) == 0:
         raise RuntimeError(f"No audio streams found in {path}")
@@ -108,7 +110,7 @@ def decode_audio(path: str, dsp: DSPConfig) -> np.ndarray:
         "-loglevel", "error",
         "pipe:1",
     ]
-    result = subprocess.run(cmd, capture_output=True, check=True)
+    result = subprocess.run(cmd, capture_output=True, check=True, **hidden_child())
     samples = np.frombuffer(result.stdout, dtype=np.int16)
     return samples.astype(np.float32) / 32768.0
 

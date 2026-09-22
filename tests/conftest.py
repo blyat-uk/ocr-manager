@@ -1,4 +1,5 @@
 """Shared pytest fixtures: synthetic media and the reference-media manifest."""
+import builtins
 import json
 import subprocess
 from pathlib import Path
@@ -242,3 +243,20 @@ def detector_truth() -> dict:
     if not truth_path.exists():
         pytest.skip(f"{truth_path} not present")
     return json.loads(truth_path.read_text())
+
+
+@pytest.fixture
+def windows_text_mode(monkeypatch):
+    """open() as it behaves on Windows: a text file opened for writing with
+    no `newline=` turns every "\\n" written into "\\r\\n" (CPython picks that
+    at build time, so os.linesep cannot be patched instead). Code that must
+    write the same bytes on every OS passes newline="\\n" and is unaffected."""
+    real_open = builtins.open
+
+    def open_like_windows(file, mode="r", *args, **kwargs):
+        writes = "b" not in mode and any(flag in mode for flag in "wax+")
+        if writes and len(args) < 4 and kwargs.get("newline") is None:
+            kwargs["newline"] = "\r\n"
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", open_like_windows)

@@ -306,6 +306,9 @@ def test_parallel_must_be_at_least_one(tmp_path, parallel):
      "a.avi, a.mkv and a.mp4 both write chi/a.ass; x.mkv and x.mp4 both write chi/x.ass"),
     (["[1080p] ep.01.mkv", "[1080p] ep.01.mp4"],
      "[1080p] ep.01.mkv and [1080p] ep.01.mp4 both write chi/[1080p] ep.01.ass"),
+    # One file on a case-insensitive filesystem (Windows, macOS).
+    (["a.mkv", "A.mp4"], "A.mp4 and a.mkv both write chi/A.ass"),
+    (["Ep01.mkv", "b.mkv", "EP01.mkv"], "EP01.mkv and Ep01.mkv both write chi/EP01.ass"),
 ])
 def test_run_files_that_write_the_same_output_are_refused(tmp_path, ocr, names, message):
     project = tmp_path / "project"
@@ -318,12 +321,20 @@ def test_run_files_that_write_the_same_output_are_refused(tmp_path, ocr, names, 
 
 
 def test_distinct_output_stems_are_accepted(tmp_path, ocr, qa):
-    names = ["a.mp4", "A.mp4", "a.b.mp4", "a .mp4", "ab.mkv"]     # case-sensitive, like the filesystem
+    names = ["a.mp4", "a.b.mp4", "a .mp4", "ab.mkv"]
     job = RunJob(str(tmp_path), [run_file(tmp_path, n) for n in names], 2)
     ctx, _ = make_ctx()
     summary = job.run(ctx)
     assert summary.succeeded == names
-    assert sorted(os.listdir(tmp_path / "chi")) == sorted(["a.ass", "A.ass", "a.b.ass", "a .ass", "ab.ass"])
+    assert sorted(os.listdir(tmp_path / "chi")) == sorted(["a.ass", "a.b.ass", "a .ass", "ab.ass"])
+
+
+def test_a_multi_range_output_is_written_with_lf_on_every_os(tmp_path, ocr, qa, windows_text_mode):
+    """The several-ranges path writes get_subtitles' text itself: with
+    Windows' text mode it must still be LF, byte for byte what OCR returned."""
+    summary, _ = run_now(tmp_path, [run_file(tmp_path, "ep.mkv", [(0, 10), (20, 30)])])
+    assert summary.succeeded == ["ep.mkv"]
+    assert qa.calls[0].data == ass_text("ep.mkv").encode("utf-8")     # the .partial QA was handed
 
 
 def test_the_file_list_is_a_snapshot_taken_at_construction(tmp_path, ocr, qa):

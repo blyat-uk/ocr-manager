@@ -172,16 +172,26 @@ def _get_enchant_dict():
     global _enchant_dict
     if _enchant_dict is None:
         try:
-            stderr_fd = os.dup(2)
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, 2)
             try:
+                stderr_fd = os.dup(2)
+            except OSError:
+                # No usable fd 2 (a GUI build without a console): nothing to
+                # silence, and the dictionary must still load -- without it
+                # the QA pass keeps words it would drop.
+                stderr_fd = None
+            if stderr_fd is None:
                 import enchant
                 _enchant_dict = enchant.Dict("en_US")
-            finally:
-                os.dup2(stderr_fd, 2)
-                os.close(devnull)
-                os.close(stderr_fd)
+            else:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 2)
+                try:
+                    import enchant
+                    _enchant_dict = enchant.Dict("en_US")
+                finally:
+                    os.dup2(stderr_fd, 2)
+                    os.close(devnull)
+                    os.close(stderr_fd)
         except Exception:
             _enchant_dict = False  # Mark as unavailable
     return _enchant_dict if _enchant_dict else None
@@ -448,7 +458,8 @@ def save_ass(path: str, doc: ASSDocument) -> None:
         else:
             out_lines += ["", EVENTS_SECTION_HDR, fmt_line]
         doc.lines = out_lines
-    with open(path, "w", encoding="utf-8", errors="replace") as f:
+    # newline="\n": LF on every OS (Windows' text mode would write CRLF).
+    with open(path, "w", encoding="utf-8", errors="replace", newline="\n") as f:
         f.write("\n".join(doc.lines) + "\n")
 
 

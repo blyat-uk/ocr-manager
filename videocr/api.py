@@ -207,5 +207,6 @@ def save_subtitles_to_file(
         detect_labels, only_labels, label_min_duration, label_max_duration, label_conf_threshold, label_conf_threshold_min,
         label_mask_crops,
         progress_callback=progress_callback, subtitle_callback=subtitle_callback, cancel_event=cancel_event)
-    with open(file_path, 'w+', encoding='utf-8') as f:
+    # newline='\n': the same bytes on every OS (Windows' text mode writes CRLF).
+    with open(file_path, 'w+', encoding='utf-8', newline='\n') as f:
         f.write(ass)

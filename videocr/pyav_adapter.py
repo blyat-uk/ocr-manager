@@ -8,6 +8,8 @@ import subprocess
 import json
 import shutil
 
+from core.proc import TEXT_ENCODING, hidden_child
+
 logger = logging.getLogger(__name__)
 
 # Try PyAV first (FFmpeg bindings with hardware acceleration support)
@@ -108,7 +110,8 @@ def _has_zscale() -> bool:
         try:
             result = subprocess.run(
                 ['ffmpeg', '-filters'],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, **TEXT_ENCODING,
+                **hidden_child()
             )
             _ZSCALE_AVAILABLE = 'zscale' in result.stdout
         except Exception:
@@ -194,7 +197,7 @@ class FFmpegNVDECCapture:
             '-show_format', '-show_streams',
             self.path
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, **TEXT_ENCODING, **hidden_child())
         if result.returncode != 0:
             raise IOError(f'Cannot probe video {self.path}')
 
@@ -265,7 +268,8 @@ class FFmpegNVDECCapture:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=self._frame_size * 10  # Buffer 10 frames
+            bufsize=self._frame_size * 10,  # Buffer 10 frames
+            **hidden_child()
         )
 
     def __enter__(self):

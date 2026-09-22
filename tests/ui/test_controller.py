@@ -186,11 +186,15 @@ def make_controller(qapp, fake_runner):
 def notifications(monkeypatch):
     sent = []
 
-    def fake_run(args, **kwargs):
-        sent.append(list(args))
-        return subprocess.CompletedProcess(args, 0)
+    class Notifier:
+        def wait(self, timeout=None):
+            return 0
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    def fake_popen(args, **kwargs):
+        sent.append(list(args))
+        return Notifier()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     return sent
 
 
@@ -1554,7 +1558,7 @@ def test_a_missing_notify_send_is_ignored(make_controller, fake_runner, tmp_proj
     def missing(*args, **kwargs):
         raise FileNotFoundError("notify-send")
 
-    monkeypatch.setattr(subprocess, "run", missing)
+    monkeypatch.setattr(subprocess, "Popen", missing)
     names = ["ep01.mkv"]
     folder = tmp_project(names, config=manual_config(names))
     controller = make_controller()
