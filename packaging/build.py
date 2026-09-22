@@ -42,7 +42,9 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
+import traceback
 import zipfile
+from collections import deque
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -85,6 +87,8 @@ APPIMAGETOOL = ("https://github.com/AppImage/appimagetool/releases/download/cont
 MSVC_RUNTIME = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
                 "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll", "vcomp140.dll")
 
+TAIL_LINES = 80
+
 SOURCES = ("main.py", "app", "core", "videocr", "resources")
 
 # The interpreter flags every launcher uses: no user site (-s) and no PYTHON*
@@ -97,9 +101,45 @@ def log(msg: str) -> None:
     print(f"==> {msg}", flush=True)
 
 
+class CommandFailed(Exception):
+    """A build command exited non-zero; carries the end of its output."""
+
+
+def stream(cmd: list, **kw) -> int:
+    """Run `cmd`, echoing its output live and keeping the last lines: CI
+    job logs need a token to read, so a failure is reported through a
+    public annotation (see annotate()) that carries them."""
+    if kw.get("stdout") is not None:
+        return subprocess.run([str(c) for c in cmd], **kw).returncode
+    tail: deque[str] = deque(maxlen=TAIL_LINES)
+    proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", **kw)
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        tail.append(line.rstrip())
+    code = proc.wait()
+    if code:
+        stream.tail = list(tail)
+    return code
+
+
+stream.tail = []
+
+
 def run(cmd: list, **kw) -> None:
     print("   $", " ".join(str(c) for c in cmd), flush=True)
-    subprocess.run([str(c) for c in cmd], check=True, **kw)
+    if code := stream(cmd, **kw):
+        raise CommandFailed(f"exit code {code}: " + " ".join(str(c) for c in cmd)
+                            + "\n" + "\n".join(stream.tail))
+
+
+def annotate(title: str, text: str) -> None:
+    """A GitHub Actions error annotation (readable without a token)."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    body = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error title={title}::{body}", flush=True)
 
 
 def host() -> tuple[str, str]:
@@ -477,7 +517,10 @@ def run_bundle(work: Path, args: list[str]) -> int:
     env["PATH"] = str(root / "bin") + os.pathsep + env.get("PATH", "")
     cmd = [str(python_exe(root, os_name)), *PY_FLAGS, str(root / "src" / "main.py"), *args]
     print("   $", " ".join(cmd), flush=True)
-    return subprocess.run(cmd, env=env).returncode
+    code = stream(cmd, env=env)
+    if code:
+        annotate(f"bundle {' '.join(args)} failed", f"exit code {code}\n" + "\n".join(stream.tail))
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -522,4 +565,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit as exc:
+        if exc.code not in (None, 0) and not isinstance(exc.code, int):
+            annotate("build failed", str(exc.code))
+        raise
+    except BaseException:
+        annotate("build failed", traceback.format_exc()[-6000:])
+        raise
