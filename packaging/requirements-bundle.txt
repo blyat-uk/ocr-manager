@@ -1,0 +1,22 @@
+# What the bundled interpreter gets: every runtime dependency of OCR Manager
+# except Paddle itself, which the app installs on first run (CPU or CUDA
+# build, chosen for the machine). packaging/constraints-bundle.txt pins the
+# whole tree to the versions the dev venv runs and the goldens were made with.
+#
+# paddlepaddle is listed so its pure dependencies resolve together with the
+# rest; the build uninstalls it again (build.py: install_dependencies).
+PyQt6==6.10.2
+numpy==2.4.1
+scipy==1.17.0
+# Pinned exactly: an av bump changes the bundled swscale and the wheel's
+# filter inventory, both of which can move OCR output.
+av==18.1.0
+paddleocr==3.3.2
+paddlex==3.3.10
+paddlepaddle==3.3.0
+rapidfuzz==3.14.3
+thefuzz==0.22.1
+jieba3==1.0.2
+PyYAML==6.0.2
+packaging==25.0
+setuptools==80.9.0

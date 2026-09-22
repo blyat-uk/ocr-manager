@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OCR Manager
+Comment=OCR hardcoded Chinese subtitles out of video episodes into ASS files
+Exec=ocr-manager %f
+Icon=ocr-manager
+Terminal=false
+Categories=AudioVideo;Video;Utility;
