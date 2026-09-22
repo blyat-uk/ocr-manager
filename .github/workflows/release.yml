@@ -125,8 +125,9 @@ jobs:
         timeout-minutes: 5
         if: matrix.os_name == 'linux'
         run: |
-          chmod +x dist/*.AppImage
-          dist/*.AppImage --appimage-extract-and-run --version
+          appimage=$(ls dist/ocr-manager-v*-linux.AppImage)
+          chmod +x "$appimage"
+          "$appimage" --appimage-extract-and-run --version
 
       - name: Smoke test — Windows launcher and installer
         timeout-minutes: 15
