@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import warnings
 import yaml
 from importlib.metadata import version
@@ -164,10 +165,56 @@ def get_model_name_from_dir(model_dir):
         return None
 
 
+_cuda_usable: bool | None = None
+_cuda_lock = threading.Lock()
+
+
+def _paddle_cuda_usable() -> bool:
+    """True when the installed paddle is compiled with CUDA and sees a CUDA
+    device. Checked once per process (paddle is imported for it)."""
+    global _cuda_usable
+    with _cuda_lock:
+        if _cuda_usable is None:
+            try:
+                import paddle
+                _cuda_usable = bool(paddle.device.is_compiled_with_cuda()) and \
+                    paddle.device.cuda.device_count() > 0
+            except Exception as exc:        # a broken or CPU-only paddle: run on the CPU
+                logging.getLogger(__name__).warning("CUDA check failed, using the CPU: %s", exc)
+                _cuda_usable = False
+            if not _cuda_usable:
+                logging.getLogger(__name__).info("paddle has no usable CUDA device; OCR runs on the CPU")
+        return _cuda_usable
+
+
+def resolve_device(use_gpu) -> str:
+    """The paddle device an engine is built on: "gpu" when the folder asks
+    for the GPU AND this paddle can use one, else "cpu". On a machine where
+    the GPU works this is exactly the old `"gpu" if use_gpu else "cpu"`; a
+    CPU-only paddle (a CPU engine install, macOS) no longer fails every
+    engine build just because `use_gpu` defaults to True."""
+    if not use_gpu:
+        return "cpu"
+    return "gpu" if _paddle_cuda_usable() else "cpu"
+
+
+def device_kwargs(device: str) -> dict:
+    """The engine constructor's device arguments. On the CPU, oneDNN
+    (mkldnn) is turned off: paddle 3.3.0's oneDNN path fails every
+    PP-OCRv5 prediction ("ConvertPirAttribute2RuntimeAttribute not support
+    [pir::ArrayAttribute<pir::DoubleAttribute>]"). On the GPU the arguments
+    are exactly what they always were (`enable_mkldnn` only affects the CPU
+    anyway), so GPU output is unchanged."""
+    if device == "cpu":
+        return {"device": "cpu", "enable_mkldnn": False}
+    return {"device": device}
+
+
 def create_ocr_engine(lang, det_model_dir, rec_model_dir, use_gpu):
     """Create a full PaddleOCR engine (detection + recognition)."""
     from paddleocr import PaddleOCR
     with suppress_output():
+        device = resolve_device(use_gpu)
         return PaddleOCR(
             lang=lang,
             text_recognition_model_dir=rec_model_dir,
@@ -177,7 +224,7 @@ def create_ocr_engine(lang, det_model_dir, rec_model_dir, use_gpu):
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            device="gpu" if use_gpu else "cpu",
+            **device_kwargs(device),
         )
 
 
@@ -186,10 +233,11 @@ def create_detection_engine(det_model_dir, use_gpu):
     from paddleocr import TextDetection
     model_name = get_model_name_from_dir(det_model_dir) or "PP-OCRv5_server_det"
     with suppress_output():
+        device = resolve_device(use_gpu)
         return TextDetection(
             model_name=model_name,
             model_dir=det_model_dir,
-            device="gpu" if use_gpu else "cpu",
+            **device_kwargs(device),
         )
 
 

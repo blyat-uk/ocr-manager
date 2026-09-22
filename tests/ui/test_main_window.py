@@ -1062,6 +1062,32 @@ def test_dependency_banner_when_ffmpeg_is_missing(make_window, monkeypatch):
     assert "Required tools not found in PATH:\nffmpeg" in window.dependency_banner.text()
 
 
+def test_dependency_banner_names_a_missing_ffprobe(make_window, monkeypatch):
+    import app.main_window as main_window_module
+    import videocr.pyav_adapter as pyav
+
+    monkeypatch.setattr(main_window_module.shutil, "which", lambda tool: None if tool == "ffprobe" else tool)
+    monkeypatch.setattr(pyav, "PYAV_AVAILABLE", True)
+    window = make_window()
+    assert window.dependency_banner.title() == "Missing Dependencies"
+    assert "Required tools not found in PATH:\nffprobe" in window.dependency_banner.text()
+
+
+def test_dependency_banner_in_a_bundle_without_an_ocr_engine(make_window, monkeypatch, tmp_path):
+    import app.main_window as main_window_module
+    import videocr.pyav_adapter as pyav
+
+    (tmp_path / "bundle").mkdir()
+    (tmp_path / "bundle" / "bundle.json").write_text('{"version": "1.0.0", "os": "linux", "arch": "x86_64"}')
+    monkeypatch.setenv("OCR_MANAGER_BUNDLE", str(tmp_path / "bundle"))
+    monkeypatch.setenv("OCR_MANAGER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(main_window_module.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(pyav, "PYAV_AVAILABLE", True)
+    window = make_window()
+    assert window.dependency_banner.title() == "OCR engine missing"
+    assert "--setup-engine" in window.dependency_banner.text()
+
+
 def test_no_dependency_banner_when_everything_is_there(make_window, monkeypatch):
     import app.main_window as main_window_module
     import videocr.pyav_adapter as pyav

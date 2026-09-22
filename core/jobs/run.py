@@ -8,8 +8,9 @@ Snapshot
     RunJob deep-copies its RunFiles when it is constructed. Edits the user
     makes to the project during the run do not change a file's call.
     Construction raises ValueError when two files would write the same
-    output (chi/<stem>.ass, case-sensitive, like the filesystem), e.g. a.mkv
-    and a.mp4, or the same name twice; nothing is created on disk.
+    output (chi/<stem>.ass, compared case-insensitively: Windows' and
+    macOS's filesystems are), e.g. a.mkv and a.mp4, a.mkv and A.mp4, or the
+    same name twice; nothing is created on disk.
 
 Output, per file (ruling C5)
     OCR writes chi/<stem>.ass.partial. core.ass_qafix.process_file runs on
@@ -379,7 +380,7 @@ class RunJob:
                 cancel_event=cancel_event,
             )
             if text and not cancel_event.is_set():
-                with open(partial, "w", encoding="utf-8") as f:
+                with open(partial, "w", encoding="utf-8", newline="\n") as f:   # LF on every OS
                     f.write(text)
 
 
@@ -399,15 +400,17 @@ def _message(exc: BaseException) -> str:
 
 
 def _refuse_shared_outputs(files: list[RunFile]) -> None:
-    """ValueError naming every group of files that would write the same chi/ output."""
+    """ValueError naming every group of files that would write the same chi/
+    output. Outputs are compared casefolded: a.mkv and A.mp4 write the same
+    file on a case-insensitive filesystem."""
     by_output: dict[str, list[str]] = {}
     for run_file in files:
-        by_output.setdefault(output_name(run_file.name), []).append(run_file.name)
+        by_output.setdefault(output_name(run_file.name).casefold(), []).append(run_file.name)
     collisions = []
-    for output, names in sorted(by_output.items()):
+    for _, names in sorted(by_output.items()):
         if len(names) > 1:
             names = sorted(names)
-            collisions.append(f"{', '.join(names[:-1])} and {names[-1]} both write chi/{output}")
+            collisions.append(f"{', '.join(names[:-1])} and {names[-1]} both write chi/{output_name(names[0])}")
     if collisions:
         raise ValueError("; ".join(collisions))
 

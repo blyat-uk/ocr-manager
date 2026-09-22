@@ -1,0 +1,17 @@
+#!/bin/sh
+# OCR Manager launcher: the bundled interpreter on the bundled sources.
+# Also the AppImage's AppRun (a symlink to this file), so it resolves its
+# own directory through symlinks.
+here=$(dirname "$(readlink -f "$0")")
+
+# Qt's X11 plugin needs libxcb-cursor, which some distributions leave out.
+# Say so on stderr instead of Qt's generic "could not load the platform plugin".
+if [ -z "$WAYLAND_DISPLAY" ] && command -v ldconfig >/dev/null 2>&1 \
+        && ! ldconfig -p 2>/dev/null | grep -q 'libxcb-cursor\.so\.0'; then
+    echo "OCR Manager: libxcb-cursor0 is not installed; if the window does not open," >&2
+    echo "install it (Debian/Ubuntu: libxcb-cursor0, Fedora: xcb-util-cursor, Arch: xcb-util-cursor)." >&2
+fi
+
+export OCR_MANAGER_BUNDLE="$here"
+export PATH="$here/bin:$PATH"
+exec "$here/python/bin/python3" -s -E -B -X utf8 "$here/src/main.py" "$@"

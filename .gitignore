@@ -62,3 +62,4 @@ tests/goldens/*.actual.ass
 .build-venv/
 .claude/
 .ruff_cache/
+.build-cache/

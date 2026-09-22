@@ -1,6 +1,6 @@
 [project]
 name = "ocr-manager"
-version = "2.0.0"
+version = "1.0.0"
 description = "Video OCR crop and brightness configuration tool"
 requires-python = ">=3.11, <3.13"
 dependencies = [

@@ -112,15 +112,15 @@ _CONVERSION_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexErro
 
 
 def list_video_files(project_dir: str) -> list[str]:
-    """Sorted video file names in `project_dir` -- same rule as the v1 app's
-    core/pipeline.py get_video_files (glob on VIDEO_EXTENSIONS,
-    case-sensitive).
+    """Sorted video file names in `project_dir` -- the v1 app's rule
+    (core/pipeline.py get_video_files: names ending in a VIDEO_EXTENSIONS
+    entry), except that the extension's case does not matter on any OS:
+    "EP01.MKV" is a video on Linux too, as it already was on Windows.
     """
-    directory = Path(project_dir)
     names = [
         f.name
-        for ext in VIDEO_EXTENSIONS
-        for f in directory.glob(f"*{ext}")
+        for f in Path(project_dir).iterdir()
+        if f.name.lower().endswith(VIDEO_EXTENSIONS)
     ]
     return sorted(names)
 

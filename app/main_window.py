@@ -64,6 +64,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.controller import ProjectController, UnsupportedProjectVersion
+from app.engine import engine_problem
 from app.logbook import PIPELINE_LOG
 from app.state_text import can_mark_reviewed, can_run_proof
 from app.theme import tokens
@@ -92,7 +93,7 @@ GEOMETRY_KEY = "window/geometry"
 # needs twice the room to show the same rail, stage and inspector. Geometry
 # the user set themselves is restored verbatim and never scaled.
 DEFAULT_SIZE = (1440, 900)
-REQUIRED_TOOLS = ("ffmpeg",)
+REQUIRED_TOOLS = ("ffmpeg", "ffprobe")
 # Files warmed ahead of the queue's cursor on every selection
 # (ProjectController.set_view_file -> AutoPilot.boost_warm). Eight covers a
 # run of fast Down-arrows: a file's strips take 2-4 s to decode on a 4K
@@ -119,8 +120,12 @@ BLOCKED_SAVE_TEXT = ("This folder's .ocr.json could not be written, so nothing y
 
 def dependency_problems() -> list[tuple[str, str]]:
     """(title, text) per missing dependency, in today's words (main.py
-    check_dependencies)."""
+    check_dependencies): the tools on PATH, the bit-exact video backend, and,
+    in a portable bundle, the OCR engine (`app.engine.engine_problem`)."""
     problems = []
+    engine = engine_problem()
+    if engine is not None:
+        problems.append(engine)
     missing = [tool for tool in REQUIRED_TOOLS if not shutil.which(tool)]
     if missing:
         problems.append(("Missing Dependencies",

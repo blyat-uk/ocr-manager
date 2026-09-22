@@ -1,0 +1,7 @@
+#!/bin/sh
+# OCR Manager.app's executable: the bundled interpreter on the bundled
+# sources, all of which live in Contents/Resources.
+root=$(cd "$(dirname "$0")/../Resources" && pwd)
+export OCR_MANAGER_BUNDLE="$root"
+export PATH="$root/bin:$PATH"
+exec "$root/python/bin/python3" -s -E -B -X utf8 "$root/src/main.py" "$@"

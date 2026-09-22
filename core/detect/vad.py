@@ -42,6 +42,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from core.proc import TEXT_ENCODING, hidden_child
+
 SAMPLE_RATE = 16000
 _BAND_LOW_HZ = 300.0
 _BAND_HIGH_HZ = 3400.0
@@ -94,7 +96,8 @@ def has_audio_stream(video_path: str) -> bool:
         "ffprobe", "-v", "error", "-select_streams", "a",
         "-show_entries", "stream=index", "-of", "csv=p=0", video_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, check=True, text=True, **TEXT_ENCODING,
+                            **hidden_child())
     return bool(result.stdout.strip())
 
 
@@ -116,7 +119,7 @@ def extract_audio_window(video_path: str, start_sec: float, duration_sec: float,
     ]
     timeout = AUDIO_EXTRACT_TIMEOUT_SEC
     deadline = time.monotonic() + timeout
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **hidden_child()) as proc:
         while True:
             try:
                 # Retrying communicate() after its timeout loses no output.

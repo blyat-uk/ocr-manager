@@ -1,0 +1,216 @@
+name: Release
+
+# A v* tag builds the three bundles, smoke-tests each on its own OS (the real
+# first-run path: the CPU OCR engine is installed and reads a test line) and
+# publishes a GitHub Release with the artifacts. A manual run builds and
+# tests without releasing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Tag matches app/version.py
+        shell: bash
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' app/version.py)
+          echo "app/version.py: $version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match app/version.py ($version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.os_name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04      # glibc 2.35; PyQt6 6.10 needs 2.34+
+            os_name: linux
+          - runner: windows-latest
+            os_name: win
+          - runner: macos-latest      # Apple Silicon
+            os_name: mac
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download cache
+        uses: actions/cache@v4
+        with:
+          path: .build-cache
+          key: build-cache-${{ matrix.os_name }}-${{ hashFiles('packaging/build.py') }}
+          restore-keys: build-cache-${{ matrix.os_name }}-
+
+      - name: Linux build and test dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 \
+            libglib2.0-0 fonts-noto-cjk file
+
+      - name: MSVC
+        if: matrix.os_name == 'win'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Inno Setup
+        if: matrix.os_name == 'win'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build
+        timeout-minutes: 60
+        run: python packaging/build.py --version ${{ needs.version.outputs.version }}
+
+      - name: Smoke test — version
+        timeout-minutes: 5
+        run: python packaging/build.py run -- --version
+
+      - name: Smoke test — self-test
+        timeout-minutes: 10
+        run: python packaging/build.py run -- --self-test
+
+      - name: Smoke test — install the CPU engine (first-run path)
+        timeout-minutes: 30
+        env:
+          OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
+        run: python packaging/build.py run -- --install-engine cpu
+
+      - name: Smoke test — OCR a test line
+        timeout-minutes: 20
+        env:
+          OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
+          PADDLE_PDX_CACHE_HOME: ${{ runner.temp }}/paddlex
+        run: python packaging/build.py run -- --ocr-smoke
+
+      - name: Smoke test — open and close the window
+        timeout-minutes: 5
+        env:
+          OCR_MANAGER_DATA_DIR: ${{ runner.temp }}/ocr-data
+        run: python packaging/build.py run -- --quit-after 3
+
+      - name: Smoke test — AppImage starts
+        timeout-minutes: 5
+        if: matrix.os_name == 'linux'
+        run: |
+          appimage=$(ls dist/ocr-manager-v*-linux.AppImage)
+          chmod +x "$appimage"
+          "$appimage" --appimage-extract-and-run --version
+
+      - name: Smoke test — Windows launcher and installer
+        timeout-minutes: 15
+        if: matrix.os_name == 'win'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist\*.exe | Select-Object -First 1
+          Start-Process -Wait -FilePath $installer.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          $exe = "$env:LOCALAPPDATA\Programs\OCR Manager\OCR Manager.exe"
+          if (-not (Test-Path $exe)) { throw "installer did not install $exe" }
+          $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '--version'
+          if ($p.ExitCode -ne 0) { throw "launcher exited with $($p.ExitCode)" }
+
+      - name: Smoke test — the .app launches
+        timeout-minutes: 5
+        if: matrix.os_name == 'mac'
+        run: |
+          codesign --verify --deep --strict "build/bundle/OCR Manager.app"
+          "build/bundle/OCR Manager.app/Contents/MacOS/ocr-manager" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ocr-manager-${{ matrix.os_name }}
+          path: dist/ocr-manager-v*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum ocr-manager-v* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          cat > notes.md <<'EOF'
+          ## Downloads
+
+          | OS | File |
+          |---|---|
+          | Windows 10/11 (x64) | `ocr-manager-${{ github.ref_name }}-win.exe` (installer, no admin rights needed) or `-win.zip` (portable) |
+          | macOS 14.5+ (Apple Silicon) | `ocr-manager-${{ github.ref_name }}-mac.dmg` |
+          | Linux x86_64 (glibc 2.34+) | `ocr-manager-${{ github.ref_name }}-linux.AppImage` or `-linux.tar.gz` (portable) |
+
+          ## First run
+
+          The OCR engine (PaddlePaddle) is not in the download; OCR Manager installs it the first time it starts.
+          On an NVIDIA GPU with a recent driver it picks the matching CUDA build (2–5.5 GB to download, up to 8 GB on disk) and checks
+          that it works; otherwise, or if the GPU check fails, it installs the CPU build (about 0.2 GB).
+          The engine and the OCR models live in your user data folder, not in the app:
+          `%LOCALAPPDATA%\ocr-manager` on Windows, `~/Library/Application Support/ocr-manager` on macOS,
+          `~/.local/share/ocr-manager` on Linux. `--setup-engine` switches between GPU and CPU later.
+
+          ## Notes
+
+          - **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
+          - **macOS:** the app is not notarized. Open it once with right-click → Open, or allow it under
+            System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine "/Applications/OCR Manager.app"`.
+          - **Linux:** needs an X11 or Wayland desktop; on X11 install `libxcb-cursor0` if the window does not open.
+
+          Verify downloads against `SHA256SUMS.txt`.
+          EOF
+          sed -i 's/^          //' notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: OCR Manager ${{ github.ref_name }}
+          body_path: notes.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/ocr-manager-v*
+            dist/SHA256SUMS.txt

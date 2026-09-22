@@ -120,7 +120,8 @@ Run
     When the run ends:
     auto-pilot holds are re-derived, done states re-read, the folder is
     reconciled (the watcher ignores changes while a run writes chi/) and,
-    unless the user stopped it, notify-send reports it as today.
+    unless the user stopped it, a desktop notification reports it (app.notify:
+    notify-send as today on Linux, osascript on macOS, none on Windows).
 
 Saving
     save_project, debounced (500 ms); close_folder and shutdown save at once.
@@ -135,7 +136,6 @@ import dataclasses
 import logging
 import os
 import queue
-import subprocess
 import time
 import traceback
 from collections.abc import Callable
@@ -148,6 +148,7 @@ from app.activity import TERMINAL_EVENTS, ActivitySnapshot, ActivityTracker
 from app.folder_watch import OUTPUT_DIR, FolderWatch
 from app.imaging import FrameCache, bgr_to_qimage
 from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
+from app.notify import send_notification
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
 from core.jobs import apply as rules
@@ -207,7 +208,6 @@ VIEW_KINDS = frozenset({"frames", "strips"})
 WARM_KIND = "warm"
 MAX_EVENTS_PER_DRAIN = 2000
 MAX_DRAINS_AT_CLOSE = 50                 # close/shutdown apply what arrived, without chasing a busy runner forever
-NOTIFY_TIMEOUT_SECONDS = 10
 _FOLDER_FIELDS = frozenset(field.name for field in dataclasses.fields(FolderSettings))
 
 
@@ -1238,13 +1238,7 @@ class ProjectController(QObject):
             self._notify(*notification_for(snapshot))
 
     def _notify(self, title: str, body: str, urgency: str) -> None:
-        try:
-            subprocess.run(["notify-send", "-a", "OCR Manager", "-u", urgency, title, body],
-                           check=False, timeout=NOTIFY_TIMEOUT_SECONDS)
-        except FileNotFoundError:
-            pass                                        # notify-send not installed
-        except subprocess.TimeoutExpired:
-            logger.warning("notify-send did not return within %s s", NOTIFY_TIMEOUT_SECONDS)
+        send_notification(title, body, urgency)         # started, never waited for here
 
     # --- model bookkeeping ----------------------------------------------------------------
 

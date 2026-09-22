@@ -44,7 +44,39 @@ Every result carries flags. A result that is not confidently applicable is **nev
 
 Dark-only, single window: a top bar with counts and Start, a review queue of episodes down the left, the evidence for the selected file in the middle, and an inspector showing that file's resolved settings on the right. "Test OCR" runs real OCR on a 30-second window so you can check a setting before committing to a whole run. Folder-wide settings live in one sheet. Window geometry and the last folder opened are remembered.
 
-## Requirements
+## Download
+
+Ready-to-run builds are on the [releases page](https://github.com/blyat-uk/ocr-manager/releases):
+
+| OS | File |
+|---|---|
+| Windows 10/11 (x64) | `ocr-manager-vX.Y.Z-win.exe` — installer, per user, no administrator rights; or `-win.zip`, portable |
+| macOS 14.5+ (Apple Silicon) | `ocr-manager-vX.Y.Z-mac.dmg` |
+| Linux x86_64 (glibc 2.34+: Ubuntu 22.04, Debian 12, Fedora 36 or newer) | `ocr-manager-vX.Y.Z-linux.AppImage`, or `-linux.tar.gz`, portable |
+
+Each carries its own Python, every library and ffmpeg/ffprobe; nothing else needs installing.
+
+**The OCR engine is installed on first run.** PaddlePaddle is too large to ship in every download, so the first start opens a setup window: on an NVIDIA GPU with a recent driver it recommends the matching CUDA build (CUDA 12.9 for RTX 20xx–50xx on driver 575+, older builds for older drivers and cards; 2–5.5 GB to download), otherwise the CPU build (about 0.2 GB). A GPU install is tested before it is used, and falls back to the CPU build by itself if the test fails. The OCR models (about 0.2 GB) download on the first run too. macOS always uses the CPU build.
+
+The engine and logs live in your user data folder, never inside the app:
+
+| OS | Folder |
+|---|---|
+| Windows | `%LOCALAPPDATA%\ocr-manager` |
+| macOS | `~/Library/Application Support/ocr-manager` |
+| Linux | `~/.local/share/ocr-manager` (or `$XDG_DATA_HOME/ocr-manager`) |
+
+To switch between the GPU and CPU builds later, or reinstall the engine, start the app with `--setup-engine` (Windows: the Start menu's "OCR Manager (OCR engine setup)"; Linux: the launcher's "OCR engine setup" action; macOS: `open -a "OCR Manager" --args --setup-engine`). The models are cached in `~/.paddlex`.
+
+Notes:
+
+- **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway). `ocr-manager-cli.cmd` in the install folder runs the app with a console, for `--version`, `--self-test` and troubleshooting.
+- **macOS:** the app is not notarized. Open it once with right-click → Open (or allow it under System Settings → Privacy & Security), or run `xattr -dr com.apple.quarantine "/Applications/OCR Manager.app"`.
+- **Linux:** on X11, Qt needs `libxcb-cursor0` (Debian/Ubuntu), `xcb-util-cursor` (Fedora, Arch).
+
+## Running from source
+
+### Requirements
 
 - **Python** 3.11 or 3.12
 - **NVIDIA GPU** with CUDA 12.9 support (for PaddlePaddle GPU acceleration)
@@ -58,22 +90,22 @@ Optional, each degrading gracefully when absent:
 
 Quality assurance of the OCR output is built in (`core/ass_qafix.py`); no external tool is needed for it.
 
-## Installation
+### Installation
 
-### 1. Clone the repository
+#### 1. Clone the repository
 
 ```bash
 git clone <repo-url>
 cd ocr-manager
 ```
 
-### 2. Create a virtual environment
+#### 2. Create a virtual environment
 
 ```bash
 python3 -m venv .venv
 ```
 
-### 3. Install PaddlePaddle GPU
+#### 3. Install PaddlePaddle GPU
 
 PaddlePaddle must be installed from Paddle's own package index before the other dependencies:
 
@@ -81,19 +113,19 @@ PaddlePaddle must be installed from Paddle's own package index before the other 
 .venv/bin/pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
 ```
 
-### 4. Install remaining dependencies
+#### 4. Install remaining dependencies
 
 ```bash
 .venv/bin/pip install -r requirements.txt
 ```
 
-### 5. Install PyQt6
+#### 5. Install PyQt6
 
 ```bash
 .venv/bin/pip install PyQt6
 ```
 
-### 6. Verify
+#### 6. Verify
 
 ```bash
 .venv/bin/python -c "from videocr.api import get_subtitles; print('OK')"
@@ -269,6 +301,12 @@ Changes to `videocr/` or `core/ass_qafix.py` move those bytes. Treat them as the
 ```bash
 .venv/bin/python tools/bench.py --suite all --label NAME --out FILE
 ```
+
+### Building a release
+
+`packaging/build.py` builds the bundle and the artifacts for the OS it runs on (stdlib only, any Python 3.11+): a python-build-standalone interpreter with every dependency except Paddle, the sources, static ffmpeg/ffprobe and the platform launcher, then the `.tar.gz` + `.AppImage`, the Inno Setup installer + `.zip`, or the signed `.app` in a `.dmg`. Every download is pinned by SHA-256. `python packaging/build.py run -- --self-test` runs the built bundle the way its launcher does.
+
+Pushing a tag `vX.Y.Z` that matches `app/version.py` runs `.github/workflows/release.yml`: it builds on Linux, Windows and macOS, smoke-tests each build (self-test, the CPU engine install, OCR of a test line, the window, the launchers) and publishes a GitHub release with the artifacts and `SHA256SUMS.txt`.
 
 ## License
 

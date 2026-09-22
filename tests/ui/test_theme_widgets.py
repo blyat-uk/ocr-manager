@@ -778,7 +778,7 @@ RULES_THAT_SET_A_FONT_SIZE = [
     "QLabel#OcrTime", "QWidget#ActivityStrip QLabel", "QLabel#OpenTitle", "QLabel#OpenError",
     "QLabel#StartError", "QLabel#RunHeaderCell", "QLabel#RunFile, QLabel#RunPhase, QLabel#RunResult",
     "QWidget#RunFooter QLabel", "QLabel#LiveTitle", "QLabel#FeedTime",
-    "QLabel#FolderSettingsTitle",
+    "QLabel#FolderSettingsTitle", "QLabel#EngineSetupTitle", "QLabel#EngineSetupScope, QLabel#EngineSetupNote",
     "QWidget#FolderSettings QAbstractSpinBox, QWidget#FolderSettings QComboBox",
     # The former literals.
     "QWidget#Chip QLabel", "QLabel#ProjectPath", "QLabel#OcrText", "QLabel#FeedText",
