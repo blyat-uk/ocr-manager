@@ -289,9 +289,15 @@ def compile_bytecode(root: Path, os_name: str) -> None:
     mtimes (zip) cannot invalidate them."""
     log("precompiling bytecode")
     py = python_exe(root, os_name)
-    run([py, "-s", "-E", "-m", "compileall", "-q", "-j", "0",
-         "--invalidation-mode", "unchecked-hash", root / "src", root / "python"],
-        stdout=subprocess.DEVNULL)
+    # Our sources must compile. Third-party trees can ship .py files that are
+    # not Python 3 (templates, py2-only helpers) and never get imported;
+    # compileall exits 1 for those, so they are reported, not fatal.
+    run([py, "-s", "-E", "-m", "compileall", "-q", "--invalidation-mode", "unchecked-hash", root / "src"])
+    cmd = [py, "-s", "-E", "-m", "compileall", "-q", "-j", "0", "--invalidation-mode", "unchecked-hash",
+           root / "python"]
+    print("   $", " ".join(str(c) for c in cmd), flush=True)
+    if stream(cmd):
+        print("    (some third-party files do not compile; they are left as source)", flush=True)
 
 
 def install_ffmpeg(root: Path, os_name: str, cache: Path) -> None:
