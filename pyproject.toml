@@ -2,6 +2,8 @@
 name = "ocr-manager"
 version = "1.0.0"
 description = "Video OCR crop and brightness configuration tool"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11, <3.13"
 dependencies = [
     "PyQt6>=6.5.0",
