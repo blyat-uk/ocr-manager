@@ -272,3 +272,17 @@ def test_engines_are_built_with_the_resolved_device(fresh_cuda_check, monkeypatc
     utils.create_ocr_engine("ch", None, None, True)
     utils.create_detection_engine(None, True)
     assert all(kwargs["device"] == "cpu" and kwargs["enable_mkldnn"] is False for kwargs in built)
+
+
+def test_the_smoke_line_falls_back_to_pillow_when_qt_draws_nothing(monkeypatch):
+    # Qt's offscreen platform on Windows has no font folder and draws a blank
+    # line; the smoke test then draws it with Pillow from a system font file.
+    from app import cli
+
+    font = "/usr/share/fonts/TTF/DejaVuSans.ttf"
+    if not os.path.exists(font):
+        pytest.skip("needs DejaVu Sans")
+    monkeypatch.setattr(cli, "FONT_FILES", (("/no/such/font.ttf", True), (font, False)))
+    image, text, family = cli._render_with_pillow(640, 96)
+    assert image.shape == (96, 640, 3) and image.any()
+    assert text == cli.SMOKE_TEXT_LATIN and family == "DejaVuSans.ttf"

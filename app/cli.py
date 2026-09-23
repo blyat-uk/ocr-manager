@@ -250,6 +250,10 @@ def render_line(text: str | None = None):
     global _smoke_app
     if QGuiApplication.instance() is None:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        if sys.platform == "win32" and os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            # The offscreen platform looks for fonts in Qt's own folder, which
+            # the wheel does not ship; Windows keeps them here.
+            os.environ.setdefault("QT_QPA_FONTDIR", os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"))
         _smoke_app = QGuiApplication([sys.argv[0] if sys.argv else "ocr-manager"])
     family = _cjk_family()
     if text is None:
@@ -268,7 +272,42 @@ def render_line(text: str | None = None):
     buffer.setsize(image.sizeInBytes())
     rgb = np.frombuffer(buffer, np.uint8).reshape(height, image.bytesPerLine())[:, :width * 3]
     rgb = rgb.reshape(height, width, 3)
-    return np.ascontiguousarray(rgb[:, :, ::-1]), text, family or QFont().family()
+    if rgb.any():
+        return np.ascontiguousarray(rgb[:, :, ::-1]), text, family or QFont().family()
+    # Qt found no usable font (a headless platform without a font folder):
+    # draw the line with Pillow from a system font file instead.
+    return _render_with_pillow(width, height)
+
+
+# System font files Pillow can draw the smoke line with: (path, has CJK).
+FONT_FILES = (
+    (r"C:\Windows\Fonts\msyh.ttc", True), (r"C:\Windows\Fonts\simhei.ttf", True),
+    (r"C:\Windows\Fonts\simsun.ttc", True), (r"C:\Windows\Fonts\arial.ttf", False),
+    ("/System/Library/Fonts/PingFang.ttc", True), ("/System/Library/Fonts/Hiragino Sans GB.ttc", True),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", False),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", True),
+    ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", True),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False), ("/usr/share/fonts/TTF/DejaVuSans.ttf", False),
+)
+
+
+def _render_with_pillow(width: int, height: int):
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    for path, cjk in FONT_FILES:
+        if os.path.exists(path):
+            font = ImageFont.truetype(path, 64)
+            text = SMOKE_TEXT_CJK if cjk else SMOKE_TEXT_LATIN
+            break
+    else:
+        raise RuntimeError("no font to draw the smoke-test line with")
+    image = Image.new("RGB", (width, height), "black")
+    draw = ImageDraw.Draw(image)
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    draw.text(((width - (right - left)) / 2 - left, (height - (bottom - top)) / 2 - top), text,
+              font=font, fill="white")
+    return np.ascontiguousarray(np.asarray(image)[:, :, ::-1]), text, os.path.basename(path)
 
 
 def ocr_smoke(boot: Boot) -> int:
