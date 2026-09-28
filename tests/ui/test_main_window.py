@@ -867,9 +867,20 @@ def test_drag_and_drop_of_a_directory_opens_it(make_window, tmp_project, tmp_pat
     assert window.controller.project.path == str(folder)
     assert window.centre.currentWidget() is not window.open_view
 
-    not_a_folder = QMimeData()
-    not_a_folder.setUrls([QUrl.fromLocalFile(str(folder / SLAY_NAMES[0]))])
-    enter = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction, not_a_folder, Qt.MouseButton.LeftButton,
+    # A video is accepted too (it opens as an episode: tests/ui/test_episode_flow.py);
+    # any other file is refused.
+    video = QMimeData()
+    video.setUrls([QUrl.fromLocalFile(str(folder / SLAY_NAMES[0]))])
+    enter = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction, video, Qt.MouseButton.LeftButton,
+                            Qt.KeyboardModifier.NoModifier)
+    window.dragEnterEvent(enter)
+    assert enter.isAccepted()
+
+    other = folder / "notes.txt"
+    other.write_text("not a video", encoding="utf-8")
+    not_openable = QMimeData()
+    not_openable.setUrls([QUrl.fromLocalFile(str(other))])
+    enter = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction, not_openable, Qt.MouseButton.LeftButton,
                             Qt.KeyboardModifier.NoModifier)
     enter.ignore()
     window.dragEnterEvent(enter)
@@ -1307,7 +1318,7 @@ def test_controller_names_the_detection_kinds(controller):
 def test_views_import_no_core_modules():
     import ast
 
-    sources = sorted((REPO_ROOT / "app" / "views").glob("*.py")) + [REPO_ROOT / "app" / "main_window.py"]
+    sources = sorted((REPO_ROOT / "app" / "views").rglob("*.py")) + [REPO_ROOT / "app" / "main_window.py"]
     offenders = []
     for path in sources:
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -1321,7 +1332,7 @@ def test_views_import_no_core_modules():
                 if module == "videocr" or module.startswith("videocr.pyav_adapter"):
                     continue                                # the brief's dependency check
                 if module.split(".")[0] in ("core", "videocr"):
-                    offenders.append(f"{path.name}: {module}")
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}: {module}")
     assert offenders == []
 
 

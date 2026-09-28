@@ -35,6 +35,28 @@ stays. Otherwise the window switches to Run mode: the Run view replaces the
 stage and inspector, the queue stays, and the top bar's Review · Run switch
 goes back and forth. "⤓ Logs" and a queue row's "Open logs" open the
 non-modal logs window.
+
+Episodes (docs spec 2026-09-28): `open_path` is the one opener -- the
+pickers, a drop, the command line and "Open another episode…" all go
+through it, and the controller routes a video file, or a folder with one
+video, to an episode. `open_folder` stays the workbench's own opener (a
+folder, whatever it holds). In episode mode the queue is hidden and the
+Review · Run stack gains three pages around the same review area:
+
+    open                        -> Prepare
+    Prepare: Review             -> the review area, on the flagged tab if any
+    Prepare / top bar: Start    -> Working
+    the run ends (on Working)   -> Done
+    Done: Review                -> the review area
+    Done: Try again             -> Working (a new run)
+    Done: Open another episode… -> the episode picker
+
+The top bar's switch reads Review · Working and moves between the review
+area and Working (or Done once the run has ended). Starting over an
+existing `<stem>.zh.ass` asks first, like the folder's overwrite question;
+nothing is deleted either way. Ctrl+O opens an episode, Ctrl+Shift+O a
+folder; Space and T act on the episode's file. A folder looks and behaves
+exactly as before.
 """
 from __future__ import annotations
 
@@ -70,15 +92,17 @@ from app.state_text import can_mark_reviewed, can_run_proof
 from app.theme import tokens
 from app.views.activity import ActivityStrip
 from app.views.banner import Banner
+from app.views.episode import DoneView, PrepareView, WorkingView
 from app.views.folder_settings import FolderSettingsSheet
 from app.views.inspector import Inspector
 from app.views.logs import LogsWindow
 from app.views.open_folder import (
+    EpisodePicker,
     FolderPicker,
     OpenFolderView,
     app_settings,
-    folder_from_mime,
-    last_path,
+    last_dir,
+    path_from_mime,
     remember_path,
 )
 from app.views.queue import QueueView
@@ -109,6 +133,9 @@ MODE_REVIEW, MODE_RUN = 0, 1
 OVERWRITE_TITLE = "Replace existing subtitles?"
 OVERWRITE_TEXT = ("{n} file(s) already have subtitles in chi/. Re-run and replace them when their new output "
                   "is ready?")
+EPISODE_OVERWRITE_TEXT = "{output} already exists. Replace it when the new one is ready?"
+# PrepareView.flagged_field() -> the Stage tab a flagged episode's review opens on.
+FLAGGED_TABS = {"crop": "Crop", "brightness": "Brightness", "ranges": "Time ranges"}
 NOTHING_TO_RUN = "Nothing to run — the files you picked already have subtitles."
 RUN_STOP_TITLE = "A run is in progress"
 RUN_OPEN_TEXT = "Stop it and open the other folder?"
@@ -168,8 +195,11 @@ class MainWindow(QMainWindow):
         self._closing = False               # the close was confirmed: never ask its questions twice
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
+        self._episode_mode = False
         self._picker = FolderPicker(self)
-        self._picker.chosen.connect(self.open_folder)
+        self._picker.chosen.connect(self.open_path)
+        self._episode_picker = EpisodePicker(self)
+        self._episode_picker.chosen.connect(self.open_path)
 
         central = QWidget()
         column = QVBoxLayout(central)
@@ -201,9 +231,17 @@ class MainWindow(QMainWindow):
         review.setSpacing(0)
         review.addWidget(self.stage, 1)
         review.addWidget(self.inspector)
+        # The episode's own screens (docs spec 2026-09-28). They share the
+        # Review · Run stack with the workbench's two pages rather than
+        # getting a stack of their own, so the review area never has to be
+        # re-parented: a folder only ever shows pages 0 and 1, an episode the
+        # review area and these three.
+        self.prepare_view = PrepareView(self.controller)
+        self.working_view = WorkingView(self.controller)
+        self.done_view = DoneView(self.controller)
         self.modes = QStackedWidget()                    # Review · Run: what sits right of the queue
-        self.modes.addWidget(self.review_area)
-        self.modes.addWidget(self.run_view)
+        for page in (self.review_area, self.run_view, self.prepare_view, self.working_view, self.done_view):
+            self.modes.addWidget(page)
         body.addWidget(self.modes, 1)
         self.workbench = workbench
         self.centre.addWidget(self.open_view)
@@ -216,9 +254,10 @@ class MainWindow(QMainWindow):
 
         self._connect()
         self.quit_action = self._shortcut("Quit", "Ctrl+Q", self.close)
-        self.open_action = self._shortcut("Open folder…", "Ctrl+O", self.choose_folder)
+        self.open_action = self._shortcut("Open episode…", "Ctrl+O", self.choose_episode)
+        self.open_folder_action = self._shortcut("Open folder…", "Ctrl+Shift+O", self.choose_folder)
         self.review_action = self._shortcut("Mark reviewed", "Space", self.inspector.toggle_reviewed)
-        self.proof_action = self._shortcut("Test OCR", "T", lambda: self.inspector.run_proof_for(self.queue.selected()))
+        self.proof_action = self._shortcut("Test OCR", "T", lambda: self.inspector.run_proof_for(self._current_file()))
         app = QApplication.instance()
         if app is not None:
             app.focusChanged.connect(self._sync_actions)
@@ -227,7 +266,9 @@ class MainWindow(QMainWindow):
         if self.controller.project is not None:          # a controller that already has a folder open
             self.inspector.adopt_open_project()
             self.queue.rebuild()
-            self._on_project_opened(self.controller.project.path)
+            name = self.controller.episode_name()
+            project = self.controller.project
+            self._on_project_opened(project.path if name is None else os.path.join(project.path, name))
         self._sync_actions()
 
     def _shortcut(self, text: str, keys: str, slot) -> QAction:
@@ -252,13 +293,20 @@ class MainWindow(QMainWindow):
         self.queue.proof_requested.connect(self.inspector.run_proof_for)
         self.queue.logs_requested.connect(self.open_logs)
         self.inspector.tab_requested.connect(self._on_tab_requested)
-        self.topbar.open_requested.connect(self.choose_folder)
+        self.topbar.open_requested.connect(self._choose_another)
         self.topbar.folder_settings_requested.connect(self.open_folder_settings)
         self.folder_settings.closed.connect(lambda: self.queue.setFocus(Qt.FocusReason.OtherFocusReason))
         self.topbar.logs_requested.connect(lambda: self.open_logs(None))
         self.topbar.start_requested.connect(self.start_run)
         self.topbar.mode_changed.connect(self.set_mode)
         self.open_view.choose_requested.connect(self.choose_folder)
+        self.open_view.choose_episode_requested.connect(self.choose_episode)
+        self.prepare_view.review_requested.connect(self.show_episode_review)
+        self.prepare_view.start_requested.connect(self.start_run)
+        self.done_view.review_requested.connect(self.show_episode_review)
+        self.done_view.retry_requested.connect(self.start_run)
+        self.done_view.open_another_requested.connect(self.choose_episode)
+        controller.run_changed.connect(self._on_run_changed)
 
     # --- folders --------------------------------------------------------------------------
 
@@ -296,10 +344,19 @@ class MainWindow(QMainWindow):
         picker sitting exactly where the run status prints, and Ctrl+O and a
         dropped folder do the same, so a run is never lost to one click:
         stopping it takes one question first."""
+        self._open(self.controller.open_folder, path)
+
+    def open_path(self, path: str) -> None:
+        """Open whatever `path` is: a video file, or a folder with exactly one
+        video, as an episode; any other folder as the workbench. Failures are
+        reported as open_folder reports them."""
+        self._open(self.controller.open_path, path)
+
+    def _open(self, opener: Callable[[str], None], path: str) -> None:
         if not self._may_stop_the_run(RUN_OPEN_TEXT):
             return
         try:
-            self.controller.open_folder(path)
+            opener(path)
         except Exception as exc:                     # reported to the user, never raised into Qt
             if not isinstance(exc, EXPECTED_OPEN_ERRORS):
                 logger.exception("could not open %s", path)
@@ -310,7 +367,17 @@ class MainWindow(QMainWindow):
                 self.error_banner.show_message(OPEN_FAILED_TITLE, message, "bad")
 
     def choose_folder(self) -> None:
-        self._picker.pick(last_path())
+        self._picker.pick(last_dir())
+
+    def choose_episode(self) -> None:
+        self._episode_picker.pick(last_dir())
+
+    def _choose_another(self) -> None:
+        """The top bar's project block: another of what is open."""
+        if self._episode_mode:
+            self.choose_episode()
+        else:
+            self.choose_folder()
 
     def _on_project_opened(self, path: str) -> None:
         remember_path(path)
@@ -319,8 +386,24 @@ class MainWindow(QMainWindow):
         if self.error_banner.title() != SAVE_FAILED_TITLE:
             self.error_banner.hide()      # an open failure is over; a warning about unsaved work is not
         self.centre.setCurrentWidget(self.workbench)
+        name = self.controller.episode_name()
+        self._episode_mode = name is not None
+        self.queue.setVisible(not self._episode_mode)
+        if self._episode_mode:
+            self._enter_episode(name)
+            return
         self.set_mode(MODE_REVIEW)
         self.queue.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _enter_episode(self, name: str) -> None:
+        """Every view on the episode's one file, then Preparing."""
+        self.controller.set_view_file(name, [name])
+        self.stage.set_file(name)
+        self.inspector.set_file(name)
+        for view in (self.prepare_view, self.working_view, self.done_view):
+            view.set_file(name)
+        self._show_page(self.prepare_view)
+        self.prepare_view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_project_saved(self) -> None:
         """The next successful save takes the "Not saved" banner down: a
@@ -332,6 +415,8 @@ class MainWindow(QMainWindow):
     def _on_project_closed(self) -> None:
         self.setWindowTitle(APP_NAME)
         self.centre.setCurrentWidget(self.open_view)
+        self._episode_mode = False
+        self.queue.show()
         self.set_mode(MODE_REVIEW)
 
     def _on_selection_changed(self, name) -> None:
@@ -367,7 +452,7 @@ class MainWindow(QMainWindow):
         it needs is missing, and T not while that file's proof is already
         running or its metadata has not been read (ruling C4: T and the
         inspector's "T run" button are one command)."""
-        name = self.queue.selected()
+        name = self._current_file()
         has_file = name is not None and name in self.controller.names()
         focused = QApplication.focusWidget()
         editing = consumes_keys(focused) or self.folder_settings.contains_focus(focused)
@@ -375,6 +460,10 @@ class MainWindow(QMainWindow):
         self.proof_action.setEnabled(has_file and not editing and not self.controller.proof_pending(name)
                                      and can_run_proof(entry))
         self.review_action.setEnabled(has_file and not editing and can_mark_reviewed(entry))
+
+    def _current_file(self) -> str | None:
+        """The file Space and T act on: the episode's, else the queue's selection."""
+        return self.controller.episode_name() if self._episode_mode else self.queue.selected()
 
     def report_unexpected_error(self, text: str) -> None:
         """An exception nothing handled (see app/__main__.py's excepthook): its
@@ -391,28 +480,108 @@ class MainWindow(QMainWindow):
 
     def open_folder_settings(self) -> None:
         """The Folder settings sheet (plan 3B Task 4), over the review
-        layout: it never covers the Run view."""
-        self.set_mode(MODE_REVIEW)
+        layout: it never covers the Run view (an episode's Working and Done
+        screens included; Preparing may stay under it)."""
+        if not (self._episode_mode and self.modes.currentWidget() is self.prepare_view):
+            self.set_mode(MODE_REVIEW)
         self.folder_settings.open()
 
     # --- run and logs -----------------------------------------------------------------------
 
     def mode(self) -> int:
-        return self.modes.currentIndex()
+        """MODE_RUN while a run's screen shows (the Run view, or an episode's
+        Working or Done), else MODE_REVIEW."""
+        return MODE_RUN if self.modes.currentWidget() in self._run_pages() else MODE_REVIEW
+
+    def _run_pages(self) -> tuple[QWidget, ...]:
+        return (self.run_view, self.working_view, self.done_view)
 
     def set_mode(self, mode: int) -> None:
-        """MODE_REVIEW (stage + inspector) or MODE_RUN (the Run view). The
-        Folder settings sheet belongs to Review, so Run closes it."""
-        if mode == MODE_RUN:
+        """MODE_REVIEW (stage + inspector) or MODE_RUN (the Run view; for an
+        episode, Working while its run is on and Done after it). The Folder
+        settings sheet belongs to Review, so Run closes it."""
+        if not self._episode_mode:
+            if mode == MODE_RUN:
+                self.folder_settings.close_sheet()
+            self.modes.setCurrentIndex(mode)
+            self.topbar.set_mode(mode)
+            return
+        if mode != MODE_RUN:
+            self._show_page(self.review_area)
+        elif self._run_in_progress() or self.controller.run_snapshot() is None:
+            self._show_page(self.working_view)
+        else:
+            self._show_done()
+
+    # --- the episode's screens --------------------------------------------------------------
+
+    def episode_page(self) -> str | None:
+        """"prepare", "review", "working" or "done"; None with a folder (or
+        nothing) open."""
+        if not self._episode_mode:
+            return None
+        pages = {self.prepare_view: "prepare", self.review_area: "review", self.working_view: "working",
+                 self.done_view: "done"}
+        return pages.get(self.modes.currentWidget())
+
+    def _show_page(self, page: QWidget) -> None:
+        if page in self._run_pages():
             self.folder_settings.close_sheet()
-        self.modes.setCurrentIndex(mode)
-        self.topbar.set_mode(mode)
+        self.modes.setCurrentWidget(page)
+        self.topbar.set_mode(MODE_RUN if page in self._run_pages() else MODE_REVIEW)
+
+    def _show_done(self) -> None:
+        self.done_view.set_file(self.controller.episode_name())
+        self.done_view.reload()
+        self._show_page(self.done_view)
+
+    def show_episode_review(self) -> None:
+        """The review area on the episode's file, on the tab its flag is
+        about when it is flagged (the tab otherwise stays where it was)."""
+        title = FLAGGED_TABS.get(self.prepare_view.flagged_field())
+        index = self.stage.index_of(title) if title else None
+        if index is not None:
+            self.stage.set_current(index)
+        self._show_page(self.review_area)
+
+    def _on_run_changed(self) -> None:
+        """An episode run that ended while Working was on screen moves on to
+        Done; anywhere else the switch gets there."""
+        if not self._episode_mode or self.modes.currentWidget() is not self.working_view:
+            return
+        snapshot = self.controller.run_snapshot()
+        if snapshot is not None and snapshot.finished:
+            self._show_done()
+
+    def _start_episode(self) -> None:
+        """Start the episode's file (done included). An existing output is
+        asked about first, and kept on No; either way nothing is deleted --
+        the run replaces it only when the new one is ready."""
+        controller = self.controller
+        name = controller.episode_name()
+        self.topbar.clear_start_error()
+        if name is None or name not in controller.startable_files(include_done=True):
+            return
+        if controller.is_done(name):
+            output = os.path.basename(controller.output_path(name))
+            if not self._ask(OVERWRITE_TITLE, EPISODE_OVERWRITE_TEXT.format(output=output)):
+                return
+        try:
+            controller.start_run([name])
+        except (ValueError, RuntimeError) as exc:
+            self.topbar.show_start_error(str(exc))
+            return
+        self.working_view.reset()
+        self._show_page(self.working_view)
 
     def start_run(self) -> None:
         """Start the startable files. Done files are asked about first; on No
         they stay out of the run (ruling C5: nothing is deleted)."""
         controller = self.controller
         if controller.project is None:
+            return
+        if self._episode_mode:
+            self._start_episode()
             return
         self.topbar.clear_start_error()
         names = controller.startable_files(include_done=True)
@@ -447,7 +616,7 @@ class MainWindow(QMainWindow):
     # --- drag and drop --------------------------------------------------------------------
 
     def dragEnterEvent(self, event) -> None:
-        if folder_from_mime(event.mimeData()) is not None:
+        if path_from_mime(event.mimeData()) is not None:
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -456,12 +625,12 @@ class MainWindow(QMainWindow):
         self.dragEnterEvent(event)
 
     def dropEvent(self, event) -> None:
-        folder = folder_from_mime(event.mimeData())
-        if folder is None:
+        path = path_from_mime(event.mimeData())
+        if path is None:
             event.ignore()
             return
         event.acceptProposedAction()
-        self.open_folder(folder)
+        self.open_path(path)
 
     # --- window state ---------------------------------------------------------------------
 

@@ -18,6 +18,12 @@ chips, and Folder settings / Logs / Start.
   disabled once a stop was asked for. "⤓ Logs" stays: the logs are
   read-only and reachable at any time.
 
+In episode mode (`controller.is_episode`, docs spec 2026-09-28) the bar is
+the one file's: its name and "· folder", "⚙ Settings" and "▶ Start OCR"
+(enabled exactly when the file is startable, done included -- the window
+asks before replacing its output), no chips, and the switch reads
+"Review · Working". Pause, stop and Logs are as above.
+
 Badges change on job "started" events, which emit only `activity_changed`,
 so everything here refreshes on that signal too. Signals only mark the bar
 dirty; it refreshes once per event-loop turn, so a burst of `file_changed`
@@ -39,6 +45,10 @@ from app.widgets.base import Button, Chip, ElidedLabel, SegmentedControl
 APP_NAME = "OCR Manager"
 PAUSE_TEXT, RESUME_TEXT, STOP_TEXT = "⏸ pause", "▶ resume", "■ stop"
 STATUS_REFRESH_MS = 1000
+FOLDER_SETTINGS_TEXT, EPISODE_SETTINGS_TEXT = "⚙ Folder settings", "⚙ Settings"
+EPISODE_START_TEXT = "▶ Start OCR"
+FOLDER_MODES, EPISODE_MODES = ["Review", "Run"], ["Review", "Working"]
+OPEN_TOOLTIP = "Open an episode (Ctrl+O) or a folder (Ctrl+Shift+O)"
 
 
 def start_text(count: int) -> str:
@@ -69,7 +79,7 @@ class _ProjectBlock(QWidget):
         layout.addWidget(self.name_label, 0, Qt.AlignmentFlag.AlignBaseline)
         layout.addWidget(self.path_label, 1, Qt.AlignmentFlag.AlignBaseline)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Open another folder (Ctrl+O)")
+        self.setToolTip(OPEN_TOOLTIP)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
     def mouseReleaseEvent(self, event) -> None:
@@ -112,13 +122,13 @@ class TopBar(QWidget):
             chips.addWidget(chip)
         layout.addWidget(self._chips)
 
-        self.run_switch = SegmentedControl(["Review", "Run"])
+        self.run_switch = SegmentedControl(FOLDER_MODES)
         self.run_switch.current_changed.connect(self.mode_changed)
         self.run_switch.hide()
         layout.addWidget(self.run_switch)
         layout.addStretch(1)
 
-        self.settings_button = Button("⚙ Folder settings", "ghost")
+        self.settings_button = Button(FOLDER_SETTINGS_TEXT, "ghost")
         self.settings_button.clicked.connect(self.folder_settings_requested)
         self.logs_button = Button("⤓ Logs", "ghost")
         self.logs_button.clicked.connect(self.logs_requested)
@@ -181,8 +191,14 @@ class TopBar(QWidget):
         is_open = project is not None
         snapshot = controller.run_snapshot() if is_open else None
         run_active = snapshot is not None and not snapshot.finished
-        for widget in (self._chips, self.settings_button, self.start_button):
+        episode = controller.episode_name() if is_open else None
+        for widget in (self.settings_button, self.start_button):
             widget.setVisible(is_open and not run_active)
+        self._chips.setVisible(is_open and not run_active and episode is None)
+        self.settings_button.setText(FOLDER_SETTINGS_TEXT if episode is None else EPISODE_SETTINGS_TEXT)
+        modes = FOLDER_MODES if episode is None else EPISODE_MODES
+        if self.run_switch.labels() != modes:
+            self.run_switch.set_texts(modes)
         self.logs_button.setVisible(is_open)                 # logs stay reachable during a run
         for widget in (self.pause_button, self.stop_button):
             widget.setVisible(run_active)
@@ -197,7 +213,7 @@ class TopBar(QWidget):
             self.project_label.set_full_text(APP_NAME)
             self.path_label.set_full_text("")
             return
-        self.project_label.set_full_text(os.path.basename(project.path) or project.path)
+        self.project_label.set_full_text(episode or os.path.basename(project.path) or project.path)
         if run_active:
             self.path_label.set_full_text(run_status_text(snapshot, time.monotonic()))
             self.pause_button.setText(RESUME_TEXT if snapshot.paused else PAUSE_TEXT)
@@ -205,6 +221,12 @@ class TopBar(QWidget):
                 button.setEnabled(not snapshot.stopping)
             return
         self.path_label.set_full_text(f"· {project.path}")
+        folder = project.folder
+        extracts = folder.dialogue_enabled or folder.labels_enabled
+        if episode is not None:
+            self.start_button.setText(EPISODE_START_TEXT)
+            self.start_button.setEnabled(extracts and episode in controller.startable_files(include_done=True))
+            return
 
         counts = controller.counts()
         self.reviewed_chip.set_count(counts["reviewed"])
@@ -217,6 +239,5 @@ class TopBar(QWidget):
         # One call: startable_files() is this list without the done files (its include_done rule).
         startable = controller.startable_files(include_done=True)         # done files can be re-run
         ready = sum(1 for name in startable if not controller.is_done(name))
-        folder = project.folder
         self.start_button.setText(start_text(ready) if ready or not startable else rerun_text(len(startable)))
-        self.start_button.setEnabled(bool(startable) and (folder.dialogue_enabled or folder.labels_enabled))
+        self.start_button.setEnabled(bool(startable) and extracts)

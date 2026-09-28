@@ -214,6 +214,56 @@ PARITY = {
         "tests/ui/test_controller.py::test_a_failed_confirm_leaves_the_file_flagged_and_still_checking_brightness",
         "tests/ui/test_controller.py::test_a_running_confirm_shows_in_the_activity_strip_but_changes_no_badge",
     ],
+    # Not §11 rows: the episode view (docs spec 2026-09-28) is newer than the
+    # rewrite. A folder must keep opening exactly as it did, and an episode
+    # must keep its promises -- routing, nothing written next to the video
+    # but the output, the guided screens, the overwrite question, the seed
+    # and the remembered speed -- none of which a folder test would notice
+    # going missing.
+    "Episode view: a video, or a folder with one video, opens one episode": [
+        "test_main_py_opens_a_video_argument_as_an_episode",
+        "tests/ui/test_episode_flow.py::test_open_path_opens_a_video_file_as_an_episode",
+        "tests/ui/test_episode_flow.py::test_open_path_routes_folders_by_their_video_count",
+        "tests/ui/test_episode_flow.py::test_a_video_opens_the_episode_view_on_prepare",
+        "tests/ui/test_episode_flow.py::test_a_folder_with_two_videos_opens_the_workbench",
+        "tests/ui/test_episode_flow.py::test_dropping_a_video_opens_it_as_an_episode",
+        "tests/ui/test_episode_flow.py::test_open_episode_starts_the_picker_at_the_last_dir",
+        "tests/test_layout.py::test_a_folder_with_exactly_one_video_opens_that_video",
+        "tests/test_layout.py::test_a_folder_of_zero_or_several_videos_opens_as_a_folder",
+    ],
+    "Episode: nothing but <stem>.zh.ass is written next to the video": [
+        "tests/ui/test_episode_flow.py::test_an_episode_writes_nothing_next_to_the_video_but_its_output",
+        "tests/ui/test_episode_flow.py::test_the_whole_episode_flow",
+        "tests/ui/test_episode_flow.py::test_view_jobs_and_the_run_use_the_episode_layout",
+        "tests/test_layout.py::test_the_folder_layout_is_todays_paths_literally",
+        "tests/test_layout.py::test_an_episode_round_trips_without_writing_into_the_video_directory",
+        "tests/test_run_job.py::test_an_episode_run_writes_stem_zh_ass_next_to_the_video_and_creates_no_directory",
+        "tests/test_run_job.py::test_a_stopped_episode_keeps_its_old_output_and_removes_the_partial",
+    ],
+    "Episode screens: Preparing -> Review -> Working -> Done": [
+        "tests/ui/test_episode_flow.py::test_the_whole_episode_flow",
+        "tests/ui/test_episode_flow.py::test_a_flagged_episode_reviews_on_its_flagged_tab",
+        "tests/ui/test_episode_flow.py::test_space_and_t_act_on_the_episode_file",
+        "tests/ui/test_episode_views.py::test_prepare_all_green",
+        "tests/ui/test_episode_views.py::test_prepare_needs_a_look",
+        "tests/ui/test_episode_views.py::test_a_batch_drips_each_line_only_after_its_frame",
+        "tests/ui/test_episode_views.py::test_done_loads_the_written_output",
+        "tests/ui/test_episode_views.py::test_a_failed_or_stopped_run_offers_try_again",
+    ],
+    "Episode: replacing an existing output is asked first": [
+        "tests/ui/test_episode_flow.py::test_declining_the_overwrite_starts_nothing",
+        "tests/ui/test_episode_flow.py::test_the_whole_episode_flow",
+    ],
+    "Episode: the same-folder crop seed and the remembered run speed": [
+        "tests/ui/test_episode_flow.py::test_a_saved_episode_is_recorded_and_seeds_its_sibling",
+        "tests/ui/test_episode_flow.py::test_an_episode_with_a_crop_of_its_own_takes_no_seed",
+        "tests/ui/test_episode_flow.py::test_a_finished_episode_run_remembers_its_speed",
+        "tests/ui/test_episode_flow.py::test_a_stopped_episode_run_remembers_no_speed",
+        "tests/ui/test_episode_flow.py::test_kept_duration_estimate_and_speed",
+        "tests/ui/test_episode_flow.py::test_opening_an_episode_prunes_the_cache_but_never_itself",
+        "tests/test_episode_cache.py::test_the_seed_is_the_newest_siblings_crop_as_fractions",
+        "tests/test_episode_cache.py::test_the_last_speed_is_video_seconds_per_wall_second",
+    ],
 }
 
 MANUAL_CHECKS = {
@@ -423,7 +473,8 @@ def test_main_py_launches_the_new_window(tmp_path):
     and hook never touch this session)."""
     folder = tmp_path / "episodes"
     folder.mkdir()
-    (folder / "ep01.mkv").write_bytes(b"placeholder video")
+    (folder / "ep01.mkv").write_bytes(b"placeholder video 1")
+    (folder / "ep02.mkv").write_bytes(b"placeholder video 2")     # two: a folder, not an episode
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=str(tmp_path / "config"))
     result = subprocess.run([sys.executable, str(REPO_ROOT / "main.py"), str(folder), "--quit-after", "1"],
                             cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=120,
@@ -431,6 +482,25 @@ def test_main_py_launches_the_new_window(tmp_path):
     assert result.returncode == 0, result.stderr[-2000:]
     assert (folder / ".ocr.json").exists()              # the folder really opened
     assert (tmp_path / "config" / "OCRManager" / "OCRTool.conf").exists()
+
+
+def test_main_py_opens_a_video_argument_as_an_episode(tmp_path):
+    """A video on the command line opens the episode view: its settings land
+    in the cache root ($OCR_MANAGER_CACHE_DIR, per test), nothing next to it."""
+    folder = tmp_path / "episodes"
+    folder.mkdir()
+    video = folder / "EP06.mkv"
+    video.write_bytes(b"placeholder video")
+    cache = tmp_path / "cache"
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=str(tmp_path / "config"),
+               OCR_MANAGER_CACHE_DIR=str(cache))
+    result = subprocess.run([sys.executable, str(REPO_ROOT / "main.py"), str(video), "--quit-after", "1"],
+                            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=120,
+                            check=False)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "Traceback" not in result.stderr
+    assert sorted(path.name for path in folder.iterdir()) == ["EP06.mkv"]
+    assert list(cache.glob("videos/*/settings.json"))
 
 
 def test_main_py_and_python_m_app_both_describe_themselves(tmp_path):
