@@ -565,3 +565,73 @@ def test_pause_holds_confirm_jobs(tmp_path):
     owner.autopilot.pause()
     assert [lane for lane, _only in owner.runner.pauses] == [Lane.GPU, Lane.CPU]
     assert all(only(sub.job) for _lane, only in owner.runner.pauses)
+
+
+# --------------------------------------------------------------------------
+# confirm_expected: is a doubt about to be retired? (the episode view's wait)
+# --------------------------------------------------------------------------
+
+def test_a_confirm_is_expected_while_it_is_queued_and_running_and_not_after(tmp_path):
+    """The Preparing screen must not show "take a quick look" for a doubt a
+    confirm is about to retire: it waits for this answer to turn False."""
+    project = _confirm_folder(tmp_path, ["a.mkv"])
+    owner = Owner(project)
+    _opened(owner)
+    (sub,) = owner.take()
+    assert owner.autopilot.confirm_expected("a.mkv") is True          # queued
+    owner.start(sub)
+    assert owner.autopilot.confirm_expected("a.mkv") is True          # running
+    owner.deliver(sub, confirm_done(sub, BRIGHTNESS))
+    assert owner.autopilot.confirm_expected("a.mkv") is False         # answered: PROPOSED now
+    assert owner.state("a.mkv") == ReviewState.PROPOSED
+
+
+def test_a_confirm_is_expected_while_the_files_evidence_still_moves(tmp_path):
+    """Before the gallery lines land there is no confirm job yet, but the
+    doubt is one a confirm will be asked about once they do."""
+    project = _confirm_folder(tmp_path, ["a.mkv"])
+    project.files["a.mkv"].evidence["lines"] = {"crop_box": list(OTHER_BOX)}
+    owner = Owner(project)
+    opened = _opened(owner)
+    (draw,) = of_kind(opened, "lines")
+    assert confirms(owner.take()) == []
+    assert owner.autopilot.confirm_expected("a.mkv") is True
+    owner.deliver(draw, lines_done(draw, times=(407.5,)))
+    (sub,) = confirms(owner.take())
+    assert owner.autopilot.confirm_expected("a.mkv") is True
+    owner.deliver(sub, confirm_done(sub, None))                        # the ladder passed nowhere
+    assert owner.autopilot.confirm_expected("a.mkv") is False
+    assert owner.state("a.mkv") == ReviewState.FLAGGED                 # now the look really is the user's
+
+
+def test_a_doubt_with_no_strip_to_read_expects_no_confirm_once_settled(tmp_path):
+    project = _confirm_folder(tmp_path, ["a.mkv"])
+    _doubted(project.files["a.mkv"], probe=None)
+    owner = Owner(project)
+    _opened(owner)
+    assert owner.autopilot.confirm_expected("a.mkv") is False
+
+
+@pytest.mark.parametrize("change", ["skipped", "crop_flagged", "manual", "unflagged", "nothing_measured"])
+def test_a_doubt_this_stage_never_retires_expects_no_confirm(tmp_path, change):
+    project = _confirm_folder(tmp_path, ["a.mkv"])
+    entry = project.files["a.mkv"]
+    if change == "skipped":
+        entry.skipped = True
+    elif change == "crop_flagged":
+        entry.flags["crop"] = crop_mod.FLAG_LOW_AGREEMENT
+    elif change == "manual":
+        entry.brightness = Brightness(BRIGHTNESS, Source.MANUAL)
+    elif change == "unflagged":
+        entry.flags["brightness"] = ""
+    else:
+        entry.flags["brightness"] = sorted(NOTHING_MEASURED_FLAGS)[0]
+    owner = Owner(project)
+    _opened(owner)
+    owner.take()
+    assert owner.autopilot.confirm_expected("a.mkv") is False
+
+
+def test_an_unknown_file_expects_no_confirm(tmp_path):
+    owner = Owner(_confirm_folder(tmp_path, ["a.mkv"]))
+    assert owner.autopilot.confirm_expected("gone.mkv") is False

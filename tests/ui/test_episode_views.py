@@ -28,6 +28,7 @@ from app.views.episode import prepare as prepare_module
 from app.views.episode.done import OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_STOPPED
 from app.views.episode.prepare import (
     ACTIVE,
+    CONFIRMING_LABEL,
     HEADLINE_FLAGGED,
     HEADLINE_READY,
     HEADLINE_WORKING,
@@ -43,6 +44,7 @@ from app.views.episode.prepare import (
 from app.views.episode.slideshow import pushed_rect
 from app.views.episode.working import TITLE_DIALOGUE, TITLE_LABELS
 from core.detect import crop as crop_detect
+from core.detect.brightness import FLAG_NARROW_PLATEAU
 from core.project import (
     Brightness,
     Crop,
@@ -102,6 +104,7 @@ class StubController(QObject):
         self.subtitles: list[tuple[float, float, str]] = []
         self.done: set[str] = set()
         self.seed: str | None = None
+        self.confirming: set[str] = set()
         self.estimate: float | None = None
         self.kept = 1200.0
         self.speed: float | None = None
@@ -141,6 +144,9 @@ class StubController(QObject):
 
     def episode_seed_source(self) -> str | None:
         return self.seed
+
+    def brightness_confirm_expected(self, name: str) -> bool:
+        return name in self.confirming
 
     def episode_estimate_seconds(self) -> float | None:
         return self.estimate
@@ -292,6 +298,42 @@ def test_prepare_needs_a_look(qapp):
     QTest.keyClick(view, Qt.Key.Key_Return)                  # Enter presses the primary button: Review
     view.review_button.click()
     assert reviews == [True, True]
+
+
+def doubted_brightness_entry() -> FileEntry:
+    entry = ready_entry(ReviewState.FLAGGED)
+    entry.flags["brightness"] = FLAG_NARROW_PLATEAU
+    return entry
+
+
+def test_prepare_waits_for_a_confirm_that_may_retire_the_doubt(qapp):
+    """A doubted brightness is FLAGGED the moment it is measured, but the
+    confirm stage still has the OCR engine read a strip at it and usually
+    clears the doubt: saying "take a quick look" before that answer is in
+    tells the user detection failed when it had not finished."""
+    controller = StubController(doubted_brightness_entry())
+    controller.confirming = {NAME}
+    view = PrepareView(controller)
+    view.set_file(NAME)
+    assert view.mode() == MODE_WORKING
+    assert view.headline.text() == HEADLINE_WORKING
+    assert view.checklist()[-1] == (CONFIRMING_LABEL, ACTIVE)
+    assert not view.reason.isVisible()
+
+    controller.entry(NAME).review = ReviewState.PROPOSED        # the confirm read the strip
+    controller.entry(NAME).flags["brightness"] = ""
+    controller.confirming = set()
+    controller.file_changed.emit(NAME)
+    settle()
+    assert view.mode() == MODE_READY
+
+
+def test_prepare_says_take_a_look_once_the_confirm_could_not_help(qapp):
+    controller = StubController(doubted_brightness_entry())
+    view = PrepareView(controller)
+    view.set_file(NAME)
+    assert view.mode() == MODE_FLAGGED
+    assert view.checklist()[-1] == ("Measuring subtitle brightness", CHECK_DONE)
 
 
 def test_prepare_start_follows_startable_whatever_the_screen_says(qapp):

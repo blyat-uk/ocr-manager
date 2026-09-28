@@ -10,6 +10,15 @@ and ticks off as the ordinary detection jobs finish:
     Finding the subtitle area       a crop that is not pending    (crop)
     Measuring subtitle brightness   a brightness value, or labels-only  (brightness)
 
+A doubted brightness is FLAGGED the moment it is measured, but AutoPilot's
+confirm stage then has the OCR engine read a strip at it, and usually that
+retires the doubt. The folder's row keeps its honest "check brightness"
+badge meanwhile (`pending_detectors` leaves the confirm out on purpose);
+this screen gives one verdict, so it asks
+`brightness_confirm_expected` and, while a confirm is still to come, keeps
+working with the brightness item reading "Double-checking the brightness".
+"Take a quick look" is only said once nothing is left that could answer it.
+
 An item whose job is running shows a spinner; one still to come, a hollow
 circle; one that ended without a value (a video with no audio track), a
 dash, so the list never hangs on a job that is not coming.
@@ -76,6 +85,7 @@ MARKS = {DONE: "✓", ACTIVE: "◌", WAITING: "○", MISSING: "–"}
 MARK_COLOURS = {DONE: tokens.OK, ACTIVE: tokens.ACC, WAITING: tokens.DIM2, MISSING: tokens.DIM2}
 SPIN_FRAMES = ("◜", "◝", "◞", "◟")
 SPIN_MS = 150
+CONFIRMING_LABEL = "Double-checking the brightness"
 PREVIEW_RESERVED_HEIGHT = 260      # mockup px under the preview: headline, sublines, buttons, margins
 
 MODE_WORKING, MODE_READY, MODE_FLAGGED = "working", "ready", "flagged"
@@ -85,8 +95,11 @@ MODE_WORKING, MODE_READY, MODE_FLAGGED = "working", "ready", "flagged"
 # Pure rules (the entry is read, never changed)
 # --------------------------------------------------------------------------
 
-def checklist_states(entry, pending: set[str], running: set[str], *, labels_only: bool) -> list[tuple[str, str]]:
-    """[(label, state)] in CHECKLIST order; state is DONE | ACTIVE | WAITING | MISSING."""
+def checklist_states(entry, pending: set[str], running: set[str], *, labels_only: bool,
+                     confirming: bool = False) -> list[tuple[str, str]]:
+    """[(label, state)] in CHECKLIST order; state is DONE | ACTIVE | WAITING | MISSING.
+    `confirming`: a confirm is still to come for the file's doubted
+    brightness, so that item is at work, as CONFIRMING_LABEL."""
     has = {
         "media": entry.media.duration > 0,
         "audio": bool(entry.evidence.get("audio")),
@@ -104,6 +117,8 @@ def checklist_states(entry, pending: set[str], running: set[str], *, labels_only
             state = WAITING
         else:
             state = MISSING
+        if key == "brightness" and confirming and not labels_only:
+            label, state = CONFIRMING_LABEL, ACTIVE
         states.append((label, state))
     return states
 
@@ -176,6 +191,10 @@ class CheckItem(QWidget):
         row.addWidget(self.mark)
         row.addWidget(self.text, 1)
         self.state = WAITING
+
+    def set_label(self, label: str) -> None:
+        if self.text.text() != label:
+            self.text.setText(label)
 
     def set_state(self, state: str, spin_frame: int = 0) -> None:
         mark = SPIN_FRAMES[spin_frame % len(SPIN_FRAMES)] if state == ACTIVE else MARKS[state]
@@ -310,8 +329,10 @@ class PrepareView(QWidget):
         name = self._name
         pending = self._controller.pending_detectors().get(name, set())
         running = self._controller.running_detectors(name)
-        states = checklist_states(entry, pending, running, labels_only=self._labels_only())
-        for item, (_label, state) in zip(self.items, states, strict=True):
+        confirming = self._controller.brightness_confirm_expected(name)
+        states = checklist_states(entry, pending, running, labels_only=self._labels_only(), confirming=confirming)
+        for item, (label, state) in zip(self.items, states, strict=True):
+            item.set_label(label)
             item.set_state(state, self._spin)
         self._mode = screen_mode(entry, states)
         working = self._mode == MODE_WORKING

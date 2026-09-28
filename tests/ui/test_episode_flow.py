@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from app.controller import ProjectController
 from app.main_window import MODE_REVIEW, MODE_RUN, MainWindow
 from app.views import open_folder as open_folder_module
-from core.detect.brightness import BrightnessResult
+from core.detect.brightness import FLAG_NARROW_PLATEAU, BrightnessResult, StripSample
 from core.detect.crop import CONSENSUS_MIN_ENTRIES, FLAG_LOW_AGREEMENT, CropResult
 from core.jobs.autopilot import AutoPilot
 from core.jobs.detect_jobs import BrightnessJobResult, CropJobResult, MetadataResult
@@ -172,11 +172,14 @@ def deliver(controller) -> None:
     settle()
 
 
-def run_detections(fake_runner, controller, name: str, *, crop_flag=None) -> None:
+def run_detections(fake_runner, controller, name: str, *, crop_flag=None, brightness_flag=None,
+                   hold=()) -> None:
     """Finish every queued detection of `name` the way the detectors would
-    on a clean episode, until nothing is left to run."""
+    on a clean episode, until nothing is left to run -- leaving the kinds in
+    `hold` queued, for the test to finish."""
     for _ in range(40):
-        pending = [s for s in fake_runner.queued() if s.job.file == name and s.job.kind not in ("frames", "strips")]
+        pending = [s for s in fake_runner.queued() if s.job.file == name
+                   and s.job.kind not in ("frames", "strips", *hold)]
         if not pending:
             return
         submission = pending[0]
@@ -188,8 +191,10 @@ def run_detections(fake_runner, controller, name: str, *, crop_flag=None) -> Non
                                                     probes_used=3, flagged=crop_flag, hit_pts=[300.0],
                                                     frame_size=(1920, 1080)), job.hint)
         elif job.kind == "brightness":
+            strips = [StripSample(512.0, True, 200, 20.0, 3.0, 1, ((10, 10, 80, 30),), None)]
             result = BrightnessJobResult(name, BrightnessResult(value=205, plateau=(180, 230), seed=225,
-                                                                gate_floor=None, flagged=None, curve=[]),
+                                                                gate_floor=None, flagged=brightness_flag, curve=[],
+                                                                strips=strips),
                                          {}, job.hint_value, job.crop_box)
         else:
             result = None
@@ -604,3 +609,31 @@ def test_the_settings_sheet_says_an_episodes_settings_are_its_own(make_window, c
     window.open_folder_settings()
     settle()
     assert window.folder_settings.scope_label.full_text() == "applies to EP06.mkv only"
+
+
+def test_a_doubted_brightness_keeps_preparing_until_its_confirm_answers(make_window, controller, fake_runner, videos):
+    """The detector's doubt makes the file FLAGGED at once, but the confirm
+    stage is already on its way to answer it: the Preparing screen goes on
+    working ("Double-checking the brightness") rather than telling the user
+    to take a look detection had not finished with -- and turns green when
+    the confirm reads the strip."""
+    from core.detect.confirm import ConfirmResult, Rung
+    from core.jobs.detect_jobs import ConfirmJobResult
+
+    folder = videos(["EP06.mkv"])
+    window = make_window()
+    window.open_path(str(folder / "EP06.mkv"))
+    run_detections(fake_runner, controller, "EP06.mkv", brightness_flag=FLAG_NARROW_PLATEAU, hold=("confirm",))
+    assert controller.entry("EP06.mkv").review == ReviewState.FLAGGED
+    (confirm,) = [s for s in fake_runner.queued() if s.job.kind == "confirm"]
+    settle()
+    assert window.prepare_view.mode() == "working"
+    assert window.prepare_view.checklist()[-1] == ("Double-checking the brightness", "active")
+
+    job = confirm.job
+    rung = Rung(threshold=job.start_value, gated=True, text="字幕", confidence=0.99, passed=True)
+    result = ConfirmResult(value=job.start_value, probe_time=job.probe_time, rungs=(rung,), cancelled=False)
+    fake_runner.finish(confirm, ConfirmJobResult(job.file, result, job.crop_box, job.start_value, job.conf_threshold))
+    deliver(controller)
+    assert controller.entry("EP06.mkv").review == ReviewState.PROPOSED
+    assert window.prepare_view.mode() == "ready"

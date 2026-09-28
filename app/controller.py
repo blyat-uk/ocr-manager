@@ -562,6 +562,13 @@ class ProjectController(QObject):
         recomputed from; a fresh dict, empty with no folder open."""
         return {} if self._project is None else self._autopilot.pending()
 
+    def brightness_confirm_expected(self, name: str) -> bool:
+        """A confirm is still to come for the file's doubted brightness
+        (`AutoPilot.confirm_expected`): the one question pending_detectors
+        leaves out, for a view that must not call a doubt final while the
+        confirm may yet retire it. False with no folder open."""
+        return self._autopilot is not None and self._autopilot.confirm_expected(name)
+
     def thumbnail(self, name: str) -> QImage | None:
         return self._thumbnails.get(name)
 

@@ -1299,6 +1299,50 @@ class AutoPilot:
 
     # --- confirming a doubted brightness ----------------------------------------
 
+    @staticmethod
+    def _confirmable(folder: FolderSettings, entry: FileEntry) -> bool:
+        """The file's doubt is one this stage retires: every clause of
+        _confirm_wanted that is about the file's values and flags rather than
+        about timing (what is still pending, which strip there is to read,
+        what was asked already)."""
+        if not folder.autopilot_enabled or not folder.dialogue_enabled:
+            return False
+        if entry.skipped or entry.crop is None or entry.brightness is None:
+            return False
+        if entry.brightness.source not in DETECTION_SOURCES or brightness_is_stale(entry):
+            return False
+        if not apply.counts_flagged(entry, "brightness"):
+            return False
+        reasons = set((entry.flags.get("brightness") or "").split("+"))
+        if reasons & NOTHING_MEASURED_FLAGS:
+            return False
+        if reasons & apply.SOURCE_INDEPENDENT_FLAGS["brightness"]:
+            return False
+        return not apply.counts_flagged(entry, "crop")
+
+    def confirm_expected(self, name: str) -> bool:
+        """A confirm is still to come for the file's doubted brightness: one
+        is queued or running, or the doubt is one this stage retires and the
+        file's own evidence is still moving (the gallery lines the probe
+        strip comes from), or it would be submitted now.
+
+        pending() deliberately leaves the confirm out -- a folder's row keeps
+        its honest "check brightness" badge -- so this is the question for a
+        view that must not give its verdict early: the episode view's
+        Preparing screen waits for it to turn False before it says "take a
+        quick look", since the confirm may well answer the doubt itself.
+        False for a file the project does not hold."""
+        if self._is_outstanding("confirm", name):
+            return True
+        project = self._project()
+        entry = project.files.get(name)
+        if entry is None or not self._confirmable(project.folder, entry):
+            return False
+        pending = self.pending()
+        if name in pending:
+            return True
+        return self._confirm_wanted(project.folder, name, entry, pending) is not None
+
     def _confirm_wanted(self, folder: FolderSettings, name: str, entry: FileEntry,
                         pending: dict[str, set[str]]) -> _ConfirmProbe | None:
         """The probe a ConfirmJob for the file would ask, or None when it is
@@ -1312,22 +1356,7 @@ class AutoPilot:
         must not have been asked already, on disk (confirm.matches) or in
         this session (self._confirmed).
         """
-        if not folder.autopilot_enabled or not folder.dialogue_enabled:
-            return None
-        if entry.skipped or entry.crop is None or entry.brightness is None:
-            return None
-        if entry.brightness.source not in DETECTION_SOURCES or brightness_is_stale(entry):
-            return None
-        if not apply.counts_flagged(entry, "brightness"):
-            return None
-        reasons = set((entry.flags.get("brightness") or "").split("+"))
-        if reasons & NOTHING_MEASURED_FLAGS:
-            return None
-        if reasons & apply.SOURCE_INDEPENDENT_FLAGS["brightness"]:
-            return None
-        if apply.counts_flagged(entry, "crop"):
-            return None
-        if name in pending:
+        if not self._confirmable(folder, entry) or name in pending:
             return None
         probe_time = probe_time_for(entry)
         if probe_time is None:
