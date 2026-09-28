@@ -164,7 +164,7 @@ from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
 from app.notify import send_notification
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
-from app.views.ranges_view import read_ranges
+from app.time_spans import read_ranges
 from core.ass_qafix import load_ass
 from core.detect.crop import CONSENSUS_MIN_ENTRIES
 from core.jobs import apply as rules

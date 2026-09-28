@@ -54,11 +54,11 @@ from app.imaging import bgr_to_qimage
 from app.run_snapshot import CANCELLED, DONE, FAILED, QUEUED
 from app.state_text import format_duration
 from app.theme import tokens
+from app.time_spans import read_ranges
 from app.views.deferred import Deferred
 from app.views.episode.common import SMALL_SIZE, TITLE_SIZE, font
 from app.views.episode.script import ScriptPanel
 from app.views.episode.slideshow import SlideShow
-from app.views.ranges_view import read_ranges
 
 POLL_MS = 100
 SHIMMER_MS = 2200
