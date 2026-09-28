@@ -51,6 +51,17 @@ Evidence (spec SS8.3: caches live in `.ocr-cache/`)
       An entry's inline evidence wins over an evidence file: it belongs to
       the values in the same file.
 
+Layout (core/project/layout.py)
+    Every path above is the project's ProjectLayout's: a folder's are the
+    ones named here (`.ocr.json`, `.ocr-cache/evidence/`, `.ocr.json.v1.bak`),
+    byte for byte. An episode keeps the same v2 document in
+    `<root>/videos/<key>/settings.json` and its evidence in
+    `<root>/videos/<key>/evidence/`, reconciled against its one video; it has
+    no v1 past, so a v1 document there is treated as corrupt rather than
+    migrated, and nothing is ever backed up. A corrupt config is moved aside
+    next to itself either way. save_project creates an episode's directory;
+    a folder's is never re-created (a vanished folder fails the save).
+
 Writing
     Every file is written atomically: to `<name>.tmp` in the same directory,
     flushed and fsynced, then os.replace()d onto `<name>`. Everything written
@@ -68,6 +79,15 @@ import shutil
 import time
 from pathlib import Path
 
+from core.project.layout import (
+    CACHE_DIRNAME,
+    CONFIG_FILENAME,
+    VIDEO_EXTENSIONS,
+    ProjectLayout,
+    folder_layout,
+    layout_of,
+    list_video_files,
+)
 from core.project.migrate import migrate_v1
 from core.project.model import (
     Brightness,
@@ -84,10 +104,9 @@ from core.project.model import (
 
 logger = logging.getLogger(__name__)
 
-VIDEO_EXTENSIONS = (".mkv", ".mp4")
-CONFIG_FILENAME = ".ocr.json"
+# CACHE_DIRNAME, CONFIG_FILENAME, VIDEO_EXTENSIONS and list_video_files live in
+# core.project.layout, below the store, and are still importable from here.
 SUPPORTED_VERSIONS = (1, 2)       # 1 (or no version): migrated; 2: current
-CACHE_DIRNAME = ".ocr-cache"      # the project's cache directory (same as core.detect.ranges.pipeline's)
 EVIDENCE_DIRNAME = "evidence"
 EVIDENCE_FORMAT_VERSION = 1
 _EVIDENCE_FILE_RE = re.compile(r"^[0-9a-f]{64}\.json$")
@@ -111,24 +130,14 @@ class _CorruptProject(Exception):
 _CONVERSION_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexError)
 
 
-def list_video_files(project_dir: str) -> list[str]:
-    """Sorted video file names in `project_dir` -- the v1 app's rule
-    (core/pipeline.py get_video_files: names ending in a VIDEO_EXTENSIONS
-    entry), except that the extension's case does not matter on any OS:
-    "EP01.MKV" is a video on Linux too, as it already was on Windows.
-    """
-    names = [
-        f.name
-        for f in Path(project_dir).iterdir()
-        if f.name.lower().endswith(VIDEO_EXTENSIONS)
-    ]
-    return sorted(names)
-
-
-def load_project(project_dir: str) -> Project:
+def load_project(project_dir: str, layout: ProjectLayout | None = None) -> Project:
+    """The project in `project_dir`, kept as `layout` says (the folder
+    layout of `project_dir` by default; see the module docstring). The
+    layout is set on the returned project."""
     directory = Path(project_dir)
-    config_path = directory / CONFIG_FILENAME
-    video_names = list_video_files(project_dir)
+    layout = folder_layout(project_dir) if layout is None else layout
+    config_path = Path(layout.config_path)
+    video_names = layout.video_names()
 
     project: Project
     brightness_records: dict[str, list[int] | None] = {}
@@ -138,6 +147,8 @@ def load_project(project_dir: str) -> Project:
             if not isinstance(data, dict):
                 raise _CorruptProject(f"top level is {type(data).__name__}, not an object")
             version = _config_version(data, config_path)
+            if version != 2 and layout.is_episode:
+                raise _CorruptProject(f"version {version} in an episode's settings: only folders were v1")
             try:
                 if version == 2:
                     project, brightness_records = _from_json(data, str(directory))
@@ -148,9 +159,9 @@ def load_project(project_dir: str) -> Project:
         except (OSError, ValueError, _CorruptProject) as exc:      # JSONDecodeError/UnicodeDecodeError are ValueErrors
             logger.warning(
                 "Corrupt %s in %s (%s) -- renaming and starting a fresh project",
-                CONFIG_FILENAME, project_dir, exc,
+                config_path.name, config_path.parent, exc,
             )
-            corrupt_path = directory / f"{CONFIG_FILENAME}.corrupt-{int(time.time())}"
+            corrupt_path = config_path.with_name(f"{config_path.name}.corrupt-{int(time.time())}")
             try:
                 config_path.rename(corrupt_path)
             except OSError:
@@ -159,16 +170,18 @@ def load_project(project_dir: str) -> Project:
     else:
         project = Project(path=str(directory), folder=FolderSettings(), files={})
 
+    project.layout = layout
     reconcile_files(project, video_names)
     _load_evidence(project)
     _apply_brightness_records(project, brightness_records)
     return project
 
 
-def evidence_path(project_dir: str, name: str) -> Path:
-    """The evidence cache file of the video file `name` in `project_dir`."""
+def evidence_path(cache_dir: str, name: str) -> Path:
+    """The evidence cache file of the video file `name` in the project cache
+    `cache_dir` (ProjectLayout.cache_dir: a folder's `<dir>/.ocr-cache`)."""
     digest = hashlib.sha256(os.fsencode(name)).hexdigest()
-    return Path(project_dir) / CACHE_DIRNAME / EVIDENCE_DIRNAME / f"{digest}.json"
+    return Path(cache_dir) / EVIDENCE_DIRNAME / f"{digest}.json"
 
 
 def _evidence_text(name: str, evidence: dict) -> str:
@@ -223,10 +236,11 @@ def _load_evidence(project: Project) -> None:
     """Read every entry's evidence file (see the module docstring), and seed
     project.evidence_digests with what was read."""
     missing = []
+    cache_dir = layout_of(project).cache_dir
     for name, entry in project.files.items():
         if entry.evidence:                           # inline, from a v2 file written before the cache
             continue
-        path = evidence_path(project.path, name)
+        path = evidence_path(cache_dir, name)
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -254,7 +268,8 @@ def _save_evidence(project: Project) -> None:
     """Write changed evidence files and delete stale ones (see the module
     docstring). Never raises OSError: failures are logged and retried by the
     next save."""
-    directory = Path(project.path) / CACHE_DIRNAME / EVIDENCE_DIRNAME
+    cache_dir = layout_of(project).cache_dir
+    directory = Path(cache_dir) / EVIDENCE_DIRNAME
     try:
         existing = {item.name for item in os.scandir(directory) if _EVIDENCE_FILE_RE.match(item.name)}
     except FileNotFoundError:
@@ -269,7 +284,7 @@ def _save_evidence(project: Project) -> None:
     for name, entry in project.files.items():
         if not entry.evidence:
             continue
-        path = evidence_path(project.path, name)
+        path = evidence_path(cache_dir, name)
         kept.add(path.name)
         text = _evidence_text(name, entry.evidence)
         digest = _digest(_encode(text))
@@ -343,16 +358,22 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def save_project(project: Project) -> None:
-    directory = Path(project.path)
-    config_path = directory / CONFIG_FILENAME
-    backup_path = directory / f"{CONFIG_FILENAME}.v1.bak"
+    layout = layout_of(project)
+    config_path = Path(layout.config_path)
 
     _refuse_unsupported_existing(config_path)
 
     if project.migrated_from_v1:
-        if not backup_path.exists() and config_path.exists():
-            shutil.copy2(config_path, backup_path)
+        if layout.v1_backup_path is not None:
+            backup_path = Path(layout.v1_backup_path)
+            if not backup_path.exists() and config_path.exists():
+                shutil.copy2(config_path, backup_path)
         project.migrated_from_v1 = False
+
+    if layout.is_episode:
+        # An episode's directory is the app's own, under the cache root; a
+        # folder's is the user's, and one that has gone must fail the save.
+        config_path.parent.mkdir(parents=True, exist_ok=True)
 
     _atomic_write_text(config_path,
                        json.dumps(to_json(project, include_evidence=False), ensure_ascii=False, indent=2))

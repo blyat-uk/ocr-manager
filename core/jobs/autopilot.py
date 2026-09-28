@@ -207,6 +207,20 @@ Crop consensus (crop_consensus)
     redetect() is not part of the chain: it is submitted at once, with the
     pool as it stands. Hint re-detects use the hint consensus (CropJob).
 
+    Seed consensus (episodes). An episode is a project of one file, so its
+    pool is always empty. `seed_consensus` -- the crop of a sibling episode
+    from the same directory, core.project.episode_cache.sibling_seed -- is
+    used as the consensus whenever the pool is empty. It is a consensus, not
+    a hint: the result applies as DETECTED and is never flagged
+    "differs-from-hint?", so an episode that disagrees with its sibling is
+    not sent to review for that alone.
+
+Caches
+    Every job that keeps a cache (thumbnails, ranges, confirms, warming) is
+    given the project's ProjectLayout.cache_dir (core.project.layout.layout_of),
+    so a folder's caches stay in `<dir>/.ocr-cache/` and an episode's go to
+    its own cache directory.
+
 Hint re-detects (ruling C3)
     redetect_others_with_crop_hint / _brightness_hint submit jobs for exactly
     hint_targets(source, what): the other files, not skipped, whose target
@@ -313,6 +327,7 @@ from core.jobs.detect_jobs import (
 from core.jobs.runner import Job, JobEvent, JobRunner, Lane
 from core.jobs.view_cache import Wanted, wanted
 from core.jobs.view_jobs import WARM_PRIORITY, WarmJob
+from core.project.layout import layout_of
 from core.project.model import FileEntry, FolderSettings, Project, Source
 
 AUTOPILOT_KINDS = frozenset({"metadata", "thumbnail", "crop", "brightness", "ranges", "audio_profile", "lines",
@@ -550,9 +565,13 @@ class AutoPilot:
     """
 
     def __init__(self, runner: JobRunner, project_getter: Callable[[], Project], *,
-                 seed_source: Callable[[], int] | None = None):
+                 seed_source: Callable[[], int] | None = None,
+                 seed_consensus: list[tuple[float, float]] | None = None):
         self._runner = runner
         self._project_getter = project_getter
+        # The crop consensus when the project's own pool is empty (see "Seed consensus").
+        self._seed_consensus: tuple[tuple[float, float], ...] = tuple(
+            (float(y_frac), float(h_frac)) for y_frac, h_frac in (seed_consensus or ()))
         self._seed_source = default_seed if seed_source is None else seed_source   # one seed per lines draw
         self._outstanding: dict[str, int] = {}                    # key -> submissions without a terminal event
         self._identity: dict[str, tuple[str, str | None]] = {}    # key -> (kind, file), while outstanding
@@ -1073,7 +1092,8 @@ class AutoPilot:
             return
         if not force and (self._ranges_done or self.ranges_pending()):
             return
-        self._submit(RangesJob(project.path, names, project.folder), PRIORITY["ranges"])
+        self._submit(RangesJob(project.path, names, project.folder, cache_dir=layout_of(project).cache_dir),
+                     PRIORITY["ranges"])
         self._ranges_files = tuple(names)
 
     def _submit_crop(self, project: Project, name: str, *, hint: tuple[float, float] | None = None,
@@ -1088,6 +1108,8 @@ class AutoPilot:
                 self._submit(MetadataJob(project.path, name), PRIORITY["metadata"] + bonus)
             return
         consensus = [] if hint is not None else crop_consensus(project, exclude=name)
+        if hint is None and not consensus:
+            consensus = list(self._seed_consensus)
         self._submit(CropJob(project.path, name, entry.media.duration, consensus, project.folder, hint=hint),
                      PRIORITY["crop"] + bonus)
 
@@ -1131,7 +1153,8 @@ class AutoPilot:
             return
         if self._thumbnail_times.get(name) == time:
             return
-        self._submit(ThumbnailJob(project.path, name, time), PRIORITY["thumbnail"])
+        self._submit(ThumbnailJob(project.path, name, time, cache_dir=layout_of(project).cache_dir),
+                     PRIORITY["thumbnail"])
         self._thumbnail_times[name] = time
 
     def _submit_brightness(self, project: Project, name: str, box: Box, *, plateau: Plateau | None,
@@ -1344,7 +1367,8 @@ class AutoPilot:
             probe = self._confirm_wanted(folder, name, entry, pending)
             if probe is None:
                 continue
-            self._submit(ConfirmJob(project.path, name, probe.box, probe.probe_time, probe.start_value, folder),
+            self._submit(ConfirmJob(project.path, name, probe.box, probe.probe_time, probe.start_value, folder,
+                                    cache_dir=layout_of(project).cache_dir),
                          PRIORITY["confirm"])
             self._confirmed[name] = probe
             self._confirm_active = name
@@ -1413,7 +1437,7 @@ class AutoPilot:
             keep = self._warm_wanted(name, project.files[name], pending)
             if keep is None:
                 continue
-            self._submit(WarmJob(project.path, name, keep), WARM_PRIORITY)
+            self._submit(WarmJob(project.path, name, keep, cache_dir=layout_of(project).cache_dir), WARM_PRIORITY)
             self._warmed[name] = keep
             self._warm_active = name
             return

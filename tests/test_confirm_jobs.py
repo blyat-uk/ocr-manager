@@ -18,6 +18,7 @@ real one, over an ordinary file standing in for the episode (it only stat()s
 its source).
 """
 import inspect
+import os
 from pathlib import Path
 
 import numpy as np
@@ -315,7 +316,7 @@ def test_a_confirm_job_calls_confirm_brightness_with_what_it_captured(tmp_path, 
 def test_a_confirm_job_reads_its_strip_out_of_the_view_cache_rather_than_decoding(tmp_path, ocr_engine,
                                                                                   monkeypatch):
     project_dir = _project(tmp_path)
-    cache = view_cache.FileViewCache(project_dir, NAME, str(tmp_path / NAME))
+    cache = view_cache.FileViewCache(os.path.join(project_dir, ".ocr-cache"), NAME, str(tmp_path / NAME))
     assert cache.write_strip(BOX, PROBE_TIME, _strip()) is True
     _no_decoding(monkeypatch)
     job = _job(project_dir)
@@ -339,7 +340,7 @@ def test_a_confirm_job_decodes_its_strip_when_the_cache_does_not_hold_it(tmp_pat
 
 def test_a_strip_cached_for_another_crop_box_is_a_miss_not_the_old_pixels(tmp_path, ocr_engine, monkeypatch):
     project_dir = _project(tmp_path)
-    cache = view_cache.FileViewCache(project_dir, NAME, str(tmp_path / NAME))
+    cache = view_cache.FileViewCache(os.path.join(project_dir, ".ocr-cache"), NAME, str(tmp_path / NAME))
     cache.write_strip((0, 0, 640, 48), PROBE_TIME, _strip())
     calls = _decodes(monkeypatch)
 
@@ -405,3 +406,17 @@ def test_a_confirm_job_leases_only_an_ocr_engine(tmp_path, ocr_engine, monkeypat
 
     idle = [e for pool in engine_registry._idle_ocr_engines.values() for e in pool]
     assert idle == [ocr_engine], "the lease was not returned"
+
+
+def test_a_confirm_job_given_a_cache_dir_reads_its_strip_from_there(tmp_path, ocr_engine, monkeypatch):
+    """An episode's view cache is under the cache root, not beside its video."""
+    project_dir = _project(tmp_path)
+    cache_dir = str(tmp_path / "root" / "videos" / ("a" * 32))
+    view_cache.FileViewCache(cache_dir, NAME, str(tmp_path / NAME)).write_strip(BOX, PROBE_TIME, _strip())
+    _no_decoding(monkeypatch)
+    job = ConfirmJob(project_dir, NAME, BOX, PROBE_TIME, 230, FolderSettings(use_gpu=False), cache_dir=cache_dir)
+
+    out = job.run(_ctx(job))
+
+    assert out.result.value == 230
+    assert not (tmp_path / ".ocr-cache").exists()

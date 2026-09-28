@@ -632,14 +632,14 @@ def test_evidence_files_are_compact_utf8_json_named_by_the_hash_of_the_file_name
     save_project(project)
 
     for name, entry in project.files.items():
-        path = evidence_path(str(tmp_path), name)
+        path = evidence_path(str(tmp_path / ".ocr-cache"), name)
         assert path == _evidence_dir(tmp_path) / (hashlib.sha256(name.encode("utf-8")).hexdigest() + ".json")
         text = path.read_text(encoding="utf-8")
         assert text == json.dumps({"version": 1, "name": name, "evidence": entry.evidence},
                                   separators=(",", ":"), ensure_ascii=False)
-    assert "第一集" in evidence_path(str(tmp_path), NAMES_CJK[0]).read_text(encoding="utf-8")
+    assert "第一集" in evidence_path(str(tmp_path / ".ocr-cache"), NAMES_CJK[0]).read_text(encoding="utf-8")
     assert sorted(p.name for p in _evidence_dir(tmp_path).iterdir()) == sorted(
-        evidence_path(str(tmp_path), name).name for name in NAMES_CJK)
+        evidence_path(str(tmp_path / ".ocr-cache"), name).name for name in NAMES_CJK)
 
 
 def test_unchanged_evidence_is_not_rewritten(tmp_path, monkeypatch):
@@ -647,7 +647,7 @@ def test_unchanged_evidence_is_not_rewritten(tmp_path, monkeypatch):
 
     spy = _WriteSpy(monkeypatch)
     names = ["a.mkv", "b.mkv", "c.mkv"]
-    file_of = {name: evidence_path(str(tmp_path), name).name for name in names}
+    file_of = {name: evidence_path(str(tmp_path / ".ocr-cache"), name).name for name in names}
     project = _evidence_project(tmp_path, names)
 
     save_project(project)
@@ -664,7 +664,7 @@ def test_unchanged_evidence_is_not_rewritten(tmp_path, monkeypatch):
     save_project(reloaded)
     assert spy.take() == sorted([".ocr.json", file_of["b.mkv"]])
 
-    evidence_path(str(tmp_path), "c.mkv").unlink()                # the cache was cleaned behind our back
+    evidence_path(str(tmp_path / ".ocr-cache"), "c.mkv").unlink()                # the cache was cleaned behind our back
     save_project(reloaded)
     assert spy.take() == sorted([".ocr.json", file_of["c.mkv"]])
 
@@ -675,12 +675,12 @@ def test_a_file_without_evidence_has_no_evidence_file(tmp_path):
     project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
     project.files["b.mkv"].evidence = {}
     save_project(project)
-    assert evidence_path(str(tmp_path), "a.mkv").exists()
-    assert not evidence_path(str(tmp_path), "b.mkv").exists()
+    assert evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path / ".ocr-cache"), "b.mkv").exists()
 
     project.files["a.mkv"].evidence.clear()
     save_project(project)
-    assert not evidence_path(str(tmp_path), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").exists()
     assert load_project(str(tmp_path)).files["a.mkv"].evidence == {}
 
 
@@ -705,8 +705,8 @@ def test_a_removed_files_evidence_is_deleted_and_other_cache_files_are_kept(tmp_
     assert list(reloaded.files) == ["a.mkv"]
     save_project(reloaded)
 
-    assert evidence_path(str(tmp_path), "a.mkv").exists()
-    assert not evidence_path(str(tmp_path), "b.mkv").exists()
+    assert evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path / ".ocr-cache"), "b.mkv").exists()
     assert other.exists() and (fingerprints / "x.npz").exists()
 
 
@@ -723,7 +723,7 @@ def test_a_corrupt_evidence_file_gives_empty_evidence_and_a_warning(tmp_path, ca
 
     project = _evidence_project(tmp_path, ["a.mkv", "b.mkv"])
     save_project(project)
-    evidence_path(str(tmp_path), "a.mkv").write_bytes(content)
+    evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").write_bytes(content)
 
     with caplog.at_level(logging.WARNING):
         reloaded = load_project(str(tmp_path))
@@ -736,11 +736,11 @@ def test_a_corrupt_evidence_file_gives_empty_evidence_and_a_warning(tmp_path, ca
     assert any(r.levelno == logging.WARNING and "a.mkv" in r.getMessage() for r in caplog.records)
 
     save_project(reloaded)                                         # the corrupt cache file is replaced
-    assert json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
+    assert json.loads(evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
         {"brightness": {"value_crop_box": record}}
     reloaded.files["a.mkv"].evidence = {}
     save_project(reloaded)                                         # and goes away with the evidence
-    assert not evidence_path(str(tmp_path), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").exists()
 
 
 def test_a_missing_evidence_file_warns_only_when_evidence_was_stored(tmp_path, caplog):
@@ -750,8 +750,8 @@ def test_a_missing_evidence_file_warns_only_when_evidence_was_stored(tmp_path, c
     project.files["b.mkv"].flags = {}
     project.files["b.mkv"].evidence = {"audio": _audio_evidence()}
     save_project(project)
-    evidence_path(str(tmp_path), "a.mkv").unlink()
-    evidence_path(str(tmp_path), "b.mkv").unlink()
+    evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").unlink()
+    evidence_path(str(tmp_path / ".ocr-cache"), "b.mkv").unlink()
     _touch(tmp_path / "fresh.mkv")
 
     with caplog.at_level(logging.WARNING):
@@ -778,7 +778,7 @@ def test_a_v2_file_with_inline_evidence_loads_and_the_next_save_moves_it_out(tmp
 
     spy = _WriteSpy(monkeypatch)
     save_project(loaded)
-    assert spy.take() == sorted([".ocr.json"] + [evidence_path(str(tmp_path), n).name for n in NAMES_CJK])
+    assert spy.take() == sorted([".ocr.json"] + [evidence_path(str(tmp_path / ".ocr-cache"), n).name for n in NAMES_CJK])
     config = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
     assert all("evidence" not in entry for entry in config["files"].values())
     again = load_project(str(tmp_path))
@@ -797,7 +797,7 @@ def test_inline_evidence_wins_over_an_evidence_file_left_by_an_interrupted_save(
     loaded = load_project(str(tmp_path))
     assert loaded.files["a.mkv"].evidence == project.files["a.mkv"].evidence
     save_project(loaded)
-    stored = json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))
+    stored = json.loads(evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").read_text(encoding="utf-8"))
     assert stored["evidence"] == project.files["a.mkv"].evidence
 
 
@@ -809,7 +809,7 @@ def test_evidence_digests_belong_to_each_project_not_the_module(tmp_path):
     second.mkdir()
     save_project(_evidence_project(first, ["a.mkv"]))
     save_project(_evidence_project(second, ["a.mkv"]))              # same name, same evidence
-    assert evidence_path(str(second), "a.mkv").exists()
+    assert evidence_path(str(second / ".ocr-cache"), "a.mkv").exists()
     assert Project(path="x", folder=FolderSettings(), files={}).evidence_digests == {}
 
 
@@ -828,10 +828,10 @@ def test_a_failed_evidence_write_is_retried_on_the_next_save(tmp_path, monkeypat
     monkeypatch.setattr(store, "_atomic_write_text", failing)
     save_project(project)                                           # a cache failure never aborts the save
     assert json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))["files"]["a.mkv"]["review"] == "proposed"
-    assert not evidence_path(str(tmp_path), "a.mkv").exists()
+    assert not evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").exists()
     monkeypatch.setattr(store, "_atomic_write_text", real)
     save_project(project)
-    assert json.loads(evidence_path(str(tmp_path), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
+    assert json.loads(evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").read_text(encoding="utf-8"))["evidence"] == \
         project.files["a.mkv"].evidence
 
 
@@ -1039,8 +1039,8 @@ def test_a_file_name_that_is_not_utf8_loads_and_saves(tmp_path, monkeypatch):
     save_project(project)
 
     (tmp_path / ".ocr.json").read_bytes().decode("utf-8")                     # still valid UTF-8
-    assert evidence_path(str(tmp_path), name).name == hashlib.sha256(os.fsencode(name)).hexdigest() + ".json"
-    evidence_path(str(tmp_path), name).read_bytes().decode("utf-8")
+    assert evidence_path(str(tmp_path / ".ocr-cache"), name).name == hashlib.sha256(os.fsencode(name)).hexdigest() + ".json"
+    evidence_path(str(tmp_path / ".ocr-cache"), name).read_bytes().decode("utf-8")
     reloaded = load_project(str(tmp_path))
     assert reloaded == project
     assert reloaded.files[name].evidence == project.files[name].evidence
@@ -1071,7 +1071,7 @@ def test_evidence_that_cannot_be_written_does_not_stop_the_values_being_saved(tm
 
     (tmp_path / ".ocr-cache" / "evidence").unlink()
     save_project(project)                                                    # retried
-    assert evidence_path(str(tmp_path), "a.mkv").exists()
+    assert evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").exists()
 
 
 def test_an_unwritable_evidence_directory_does_not_stop_the_values_being_saved(tmp_path, caplog, monkeypatch):
@@ -1098,8 +1098,8 @@ def test_an_unwritable_evidence_directory_does_not_stop_the_values_being_saved(t
         directory.chmod(0o755)
     spy = _WriteSpy(monkeypatch)
     save_project(project)
-    assert spy.take() == sorted([".ocr.json", evidence_path(str(tmp_path), "a.mkv").name])
-    assert not evidence_path(str(tmp_path), "b.mkv").exists()
+    assert spy.take() == sorted([".ocr.json", evidence_path(str(tmp_path / ".ocr-cache"), "a.mkv").name])
+    assert not evidence_path(str(tmp_path / ".ocr-cache"), "b.mkv").exists()
 
 
 def test_ocr_json_is_written_before_the_evidence(tmp_path, monkeypatch):

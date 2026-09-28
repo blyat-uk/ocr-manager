@@ -85,6 +85,7 @@ from core.project import (
     TimeRanges,
     migrate_v1,
 )
+from core.project.layout import episode_layout
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ocr_json_v1"
 SLAY_NAMES = [
@@ -2744,3 +2745,96 @@ def test_autopilot_module_imports_no_qt():
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False,
                           cwd=Path(__file__).resolve().parent.parent)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------
+# Episodes: the sibling seed and the episode's own cache directory
+# --------------------------------------------------------------------------
+
+SEED = (972 / 1080, 54 / 1080)
+
+
+def _episode_owner(project: Project, seed_consensus) -> Owner:
+    owner = Owner(project)
+    owner.autopilot = AutoPilot(owner.runner, lambda: owner.project, seed_source=lambda: next(owner.seeds),
+                                seed_consensus=seed_consensus)
+    return owner
+
+
+def _one_episode(tmp_path) -> Project:
+    project = _project(tmp_path, ["EP06.mkv"])
+    entry = _media(project.files["EP06.mkv"])
+    entry.evidence["audio"] = {}
+    entry.sample_time = 300.0
+    return project
+
+
+def test_an_empty_pool_takes_the_seed_as_its_consensus(tmp_path):
+    owner = _episode_owner(_one_episode(tmp_path), [SEED])
+    owner.autopilot.on_open()
+    (crop,) = of_kind(owner.take(), "crop")
+    assert list(crop.job.consensus) == [SEED]
+    assert crop.job.hint is None
+
+
+def test_a_seeded_crop_that_disagrees_is_detected_not_flagged_for_differing(tmp_path):
+    project = _one_episode(tmp_path)
+    owner = _episode_owner(project, [SEED])
+    owner.autopilot.on_open()
+    (crop,) = of_kind(owner.take(), "crop")
+    owner.deliver(crop, crop_done(crop, box=(0, 700, 1920, 90)))
+    entry = project.files["EP06.mkv"]
+    assert entry.crop == Crop(0, 700, 1920, 90, Source.DETECTED)
+    assert "differs-from-hint?" not in entry.flags.get("crop", "")
+
+
+def test_the_projects_own_pool_wins_over_the_seed(tmp_path):
+    project = _project(tmp_path, ["a.mkv", "b.mkv"])
+    for entry in project.files.values():
+        _media(entry).evidence["audio"] = {}
+        entry.sample_time = 300.0
+    project.files["a.mkv"].crop = Crop(0, 900, 1920, 60, Source.MANUAL)
+    owner = _episode_owner(project, [SEED])
+    owner.autopilot.on_open()
+    (crop,) = of_kind(owner.take(), "crop")
+    assert crop.job.file == "b.mkv" and list(crop.job.consensus) == [(900 / HEIGHT, 60 / HEIGHT)]
+
+
+def test_without_a_seed_an_empty_pool_is_an_empty_consensus(tmp_path):
+    owner = _episode_owner(_one_episode(tmp_path), None)
+    owner.autopilot.on_open()
+    (crop,) = of_kind(owner.take(), "crop")
+    assert list(crop.job.consensus) == []
+
+
+def test_a_hint_redetect_never_takes_the_seed(tmp_path):
+    project = _hint_folder(tmp_path)
+    seed = (0.5, 0.1)
+    owner = _episode_owner(project, [seed])
+    owner.autopilot.redetect_others_with_crop_hint("a.mkv")
+    crops = of_kind(owner.take(), "crop")
+    assert crops
+    for sub in crops:
+        assert sub.job.hint is not None and seed not in sub.job.consensus
+
+
+def test_a_folders_jobs_keep_their_caches_in_the_folder(tmp_path):
+    owner = Owner(_one_episode(tmp_path))
+    owner.autopilot.on_open()
+    (thumbnail,) = of_kind(owner.take(), "thumbnail")
+    assert thumbnail.job.cache_dir == str(tmp_path / ".ocr-cache")
+
+
+def test_an_episodes_jobs_keep_their_caches_in_its_cache_directory(tmp_path):
+    project = _warm_folder(tmp_path, ["EP06.mkv"])
+    (tmp_path / "EP06.mkv").write_bytes(b"video")
+    project.layout = episode_layout(str(tmp_path / "EP06.mkv"), str(tmp_path / "root"), key="a" * 32)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    opened = owner.take()
+    (thumbnail,) = of_kind(opened, "thumbnail")
+    assert thumbnail.job.cache_dir == project.layout.cache_dir
+    finish_side_jobs(owner, opened)
+    (warm,) = owner.take()
+    assert warm.job.kind == "warm" and warm.job.cache_dir == project.layout.cache_dir
+    assert warm.job.project_dir == project.path

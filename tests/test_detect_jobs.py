@@ -2307,7 +2307,7 @@ def test_a_decoded_thumbnail_is_written_to_the_view_cache(tmp_path, monkeypatch)
     out = job.run(_ctx(job))
 
     assert out.image is image
-    cached = view_cache.FileViewCache(project, name, os.path.join(project, name)).read_thumbnail(407.4)
+    cached = view_cache.FileViewCache(os.path.join(project, ".ocr-cache"), name, os.path.join(project, name)).read_thumbnail(407.4)
     # Lossless: the queue shows hundreds of these at the size artefacts show most.
     assert cached is not None and np.array_equal(cached, image)
 
@@ -2317,7 +2317,7 @@ def test_a_cached_thumbnail_never_reaches_the_decoder(tmp_path, monkeypatch):
     not decode a single frame."""
     project, name = _thumb_project(tmp_path)
     image = np.full((THUMB_HEIGHT, 128, 3), 77, dtype=np.uint8)
-    view_cache.FileViewCache(project, name, os.path.join(project, name)).write_thumbnail(407.4, image)
+    view_cache.FileViewCache(os.path.join(project, ".ocr-cache"), name, os.path.join(project, name)).write_thumbnail(407.4, image)
     fake = Recording(crop_mod.grab_frames, returns=[])
     monkeypatch.setattr(crop_mod, "grab_frames", fake)
     job = ThumbnailJob(project, name, 407.4)
@@ -2331,7 +2331,7 @@ def test_a_cached_thumbnail_never_reaches_the_decoder(tmp_path, monkeypatch):
 def test_a_thumbnail_at_another_time_is_a_miss(tmp_path, monkeypatch):
     """A crop result moves sample_time, and the row must show the new frame."""
     project, name = _thumb_project(tmp_path)
-    view_cache.FileViewCache(project, name, os.path.join(project, name)).write_thumbnail(
+    view_cache.FileViewCache(os.path.join(project, ".ocr-cache"), name, os.path.join(project, name)).write_thumbnail(
         407.4, np.full((THUMB_HEIGHT, 128, 3), 77, dtype=np.uint8))
     fresh = np.full((THUMB_HEIGHT, 128, 3), 99, dtype=np.uint8)
     monkeypatch.setattr(crop_mod, "grab_frames", Recording(crop_mod.grab_frames, returns=[fresh]))
@@ -2346,7 +2346,7 @@ def test_a_thumbnail_that_could_not_be_grabbed_caches_nothing(tmp_path, monkeypa
     job = ThumbnailJob(project, name, 99999.0)
 
     assert job.run(_ctx(job)).image is None
-    cache = view_cache.FileViewCache(project, name, os.path.join(project, name))
+    cache = view_cache.FileViewCache(os.path.join(project, ".ocr-cache"), name, os.path.join(project, name))
     assert cache.read_thumbnail(99999.0) is None
 
 
@@ -2850,3 +2850,29 @@ def test_mark_reviewed_accepts_a_clamped_crop_and_a_pasted_brightness():
     assert FLAG_CROP_CLAMPED not in (entry.flags.get("crop") or "")
     assert FLAG_BRIGHTNESS_OTHER_CROP not in (entry.flags.get("brightness") or "")
     assert _state(project, "a.mp4") == ReviewState.REVIEWED
+
+
+def test_a_thumbnail_job_given_a_cache_dir_keeps_its_thumbnail_there(tmp_path, monkeypatch):
+    """An episode's thumbnail goes to its own cache directory, and nothing is
+    written beside the video."""
+    project, name = _thumb_project(tmp_path)
+    cache_dir = str(tmp_path / "root" / "videos" / ("a" * 32))
+    image = np.full((THUMB_HEIGHT, 128, 3), 77, dtype=np.uint8)
+    monkeypatch.setattr(crop_mod, "grab_frames", Recording(crop_mod.grab_frames, returns=[image]))
+    job = ThumbnailJob(project, name, 407.4, cache_dir=cache_dir)
+
+    job.run(_ctx(job))
+
+    assert sorted(os.listdir(project)) == [name, "root"]
+    cached = view_cache.FileViewCache(cache_dir, name, os.path.join(project, name)).read_thumbnail(407.4)
+    assert cached is not None and np.array_equal(cached, image)
+
+
+def test_a_ranges_job_given_a_cache_dir_fingerprints_into_it(monkeypatch):
+    fake = Recording(ranges_pipeline.analyse_detailed, returns=None)
+    monkeypatch.setattr(ranges_pipeline, "analyse_detailed", fake)
+    job = RangesJob(PROJECT_DIR, ["a.mp4"], FolderSettings(), cache_dir="/root/videos/k")
+
+    job.run(_ctx(job))
+
+    assert fake.calls[0]["cache_dir"] == "/root/videos/k"

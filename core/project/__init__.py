@@ -2,7 +2,20 @@
 
 No PyQt6 import belongs anywhere under this package -- it is the shared
 model used by the pipeline, the store, migration and the Stage 3 window.
+Where a project's files live (a folder's, or one episode's under the cache
+root) is core.project.layout's; the cache root's own bookkeeping is
+core.project.episode_cache's.
 """
+from core.project.layout import (
+    EPISODE_SUFFIX,
+    ProjectLayout,
+    cache_root,
+    episode_layout,
+    episode_target,
+    folder_layout,
+    layout_of,
+    video_key,
+)
 from core.project.migrate import migrate_v1
 from core.project.model import (
     MIN_CROP_SIDE,
@@ -49,6 +62,14 @@ __all__ = [
     "CONFIG_FILENAME",
     "VIDEO_EXTENSIONS",
     "UnsupportedProjectVersion",
+    "EPISODE_SUFFIX",
+    "ProjectLayout",
+    "cache_root",
+    "episode_layout",
+    "episode_target",
+    "folder_layout",
+    "layout_of",
+    "video_key",
     "DEFAULT_BRIGHTNESS",
     "OcrCall",
     "ocr_call_for",

@@ -39,6 +39,7 @@ from core import ass_qafix
 from core.jobs import JobContext, JobEvent, JobRunner, Lane
 from core.jobs import run as run_module
 from core.jobs.run import RunFile, RunJob, RunSummary
+from core.project.layout import episode_layout, folder_layout
 from core.project.model import (
     Brightness,
     Crop,
@@ -1191,6 +1192,75 @@ def test_through_the_runner_cancelling_the_run_stops_it_with_its_summary(tmp_pat
     terminal = events.events[-1]
     assert terminal.type == "cancelled"
     assert terminal.result.cancelled == ["a.mp4", "b.mp4"]
+
+
+# --------------------------------------------------------------------------
+# An episode's layout: <stem>.zh.ass next to the video, no directories
+# --------------------------------------------------------------------------
+
+def episode(tmp_path: Path, name: str = "EP06.mkv"):
+    """A show directory holding `name`, and its episode layout (a fixed key:
+    the fake OCR never reads the video)."""
+    show = tmp_path / "Show"
+    show.mkdir(exist_ok=True)
+    (show / name).write_bytes(b"video")
+    return show, episode_layout(str(show / name), str(tmp_path / "root"), key="a" * 32)
+
+
+def test_an_episode_run_writes_stem_zh_ass_next_to_the_video_and_creates_no_directory(tmp_path, ocr, qa):
+    show, layout = episode(tmp_path)
+    old = show / "EP06.zh.ass"
+    old.write_bytes(OLD_FINAL)
+    during_ocr = []
+    ocr.hooks["EP06.mkv"] = lambda kwargs: during_ocr.append(old.read_bytes())
+    ctx, _ = make_ctx()
+
+    summary = RunJob(str(show), [run_file(show, "EP06.mkv")], 1, layout=layout).run(ctx)
+
+    assert summary.succeeded == ["EP06.mkv"]
+    assert during_ocr == [OLD_FINAL]                      # replaced only when the new one was ready
+    assert [(c.args, c.kwargs) for c in qa.calls] == [((str(show / "EP06.zh.ass.partial"),), {})]
+    assert qa.calls[0].final == OLD_FINAL
+    assert old.read_bytes() == (ass_text("EP06.mkv") + QA_LINE).encode("utf-8")
+    assert sorted(os.listdir(show)) == ["EP06.mkv", "EP06.zh.ass"]
+    assert not (tmp_path / "root").exists()
+
+
+def test_an_episode_run_uses_the_stem_rule_of_the_folder_run(tmp_path, ocr, qa):
+    show, layout = episode(tmp_path, "ep.01 [1080p].mp4")
+    RunJob(str(show), [run_file(show, "ep.01 [1080p].mp4")], 1, layout=layout).run(make_ctx()[0])
+    assert sorted(os.listdir(show)) == ["ep.01 [1080p].mp4", "ep.01 [1080p].zh.ass"]
+
+
+def test_a_stopped_episode_keeps_its_old_output_and_removes_the_partial(tmp_path, ocr, qa):
+    show, layout = episode(tmp_path)
+    (show / "EP06.zh.ass").write_bytes(OLD_FINAL)
+    entered = threading.Event()
+    ocr.hooks["EP06.mkv"] = blocking_until_cancelled(entered, produce=ass_text("partial"))
+    ctx, _ = make_ctx()
+    running = Running(RunJob(str(show), [run_file(show, "EP06.mkv")], 1, layout=layout), ctx)
+    assert entered.wait(WAIT)
+    ctx.cancel_event.set()
+    summary = running.join()
+
+    assert summary.cancelled == ["EP06.mkv"]
+    assert (show / "EP06.zh.ass").read_bytes() == OLD_FINAL
+    assert sorted(os.listdir(show)) == ["EP06.mkv", "EP06.zh.ass"]
+
+
+def test_episode_files_that_write_the_same_output_are_refused_by_their_output(tmp_path, ocr):
+    show, layout = episode(tmp_path)
+    with pytest.raises(ValueError) as raised:
+        RunJob(str(show), [run_file(show, "EP06.mkv"), run_file(show, "EP06.mkv")], 1, layout=layout)
+    assert str(raised.value) == "EP06.mkv and EP06.mkv both write EP06.zh.ass"
+
+
+def test_without_a_layout_a_run_is_the_folder_layouts(tmp_path, ocr, qa):
+    job = RunJob(str(tmp_path), [run_file(tmp_path, "a.mp4")], 1)
+    assert job.layout == folder_layout(str(tmp_path))
+    job.run(make_ctx()[0])
+    assert sorted(os.listdir(tmp_path)) == ["chi", "eng", "translate"]
+    assert os.listdir(tmp_path / "chi") == ["a.ass"]
 
 
 def test_run_module_imports_no_qt():

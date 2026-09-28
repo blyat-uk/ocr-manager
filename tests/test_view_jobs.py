@@ -160,15 +160,15 @@ class FakeViewCache:
         self.strips = dict(strips or {})                     # (box, time) -> strip
         self.writable = writable
         self.trimmed = trimmed
-        self.built: list[tuple[str, str, str]] = []          # (project_dir, file, video_path) per construction
+        self.built: list[tuple[str, str, str]] = []          # (cache_dir, file, video_path) per construction
         self.reads: list[float] = []                         # frame times read, in order
         self.strip_reads: list[tuple[tuple, float]] = []
         self.writes: list[float] = []                        # frame times written, in order
         self.strip_writes: list[tuple[tuple, float]] = []
         self.trims: list[Wanted] = []                        # what each trim was told to keep
 
-    def __call__(self, project_dir: str, file: str, video_path: str) -> "FakeViewCache":
-        self.built.append((project_dir, file, video_path))
+    def __call__(self, cache_dir: str, file: str, video_path: str) -> "FakeViewCache":
+        self.built.append((cache_dir, file, video_path))
         return self
 
     def read_frame(self, time):
@@ -375,7 +375,7 @@ def test_a_frame_job_opens_the_cache_of_its_own_file(cache, monkeypatch):
 
     job.run(_ctx(job))
 
-    assert cache.built == [(PROJECT_DIR, "a.mp4", os.path.join(PROJECT_DIR, "a.mp4"))]
+    assert cache.built == [(os.path.join(PROJECT_DIR, ".ocr-cache"), "a.mp4", os.path.join(PROJECT_DIR, "a.mp4"))]
 
 
 def test_frames_the_cache_holds_are_never_decoded(cache, monkeypatch):
@@ -662,7 +662,7 @@ def test_a_warm_job_puts_a_file_s_frames_and_strips_on_disk(cache, monkeypatch):
 
     out = job.run(_ctx(job))
 
-    assert cache.built == [(PROJECT_DIR, "a.mp4", os.path.join(PROJECT_DIR, "a.mp4"))]
+    assert cache.built == [(os.path.join(PROJECT_DIR, ".ocr-cache"), "a.mp4", os.path.join(PROJECT_DIR, "a.mp4"))]
     assert cache.writes == [1.0, 2.0]
     assert cache.strip_writes == [(BOX, 3.0)]
     assert [call["target_height"] for call in frames.calls] == [FRAME_HEIGHT]
@@ -908,3 +908,20 @@ def test_view_jobs_on_a_reference_episode_match_a_direct_grab(reference_media, t
     assert frames.frames[times[0]].shape[:2] == (FRAME_HEIGHT, width - width % 2)
     # And not the strips: the two sources are never interchangeable.
     assert frames.frames[times[0]].shape != strips.strips[times[0]].shape
+
+
+@pytest.mark.parametrize("build", [
+    lambda cache_dir: FrameJob(PROJECT_DIR, "a.mp4", [1.0], cache_dir=cache_dir),
+    lambda cache_dir: StripJob(PROJECT_DIR, "a.mp4", BOX, [1.0], cache_dir=cache_dir),
+    lambda cache_dir: WarmJob(PROJECT_DIR, "a.mp4", Wanted((1.0,), BOX, (1.0,)), cache_dir=cache_dir),
+])
+def test_a_job_given_a_cache_dir_opens_the_cache_there(cache, monkeypatch, build):
+    """An episode's pixels live under its own cache directory; the video is
+    still read from the project directory."""
+    monkeypatch.setattr(crop_mod, "grab_frames", FakeGrabFrames({1.0: _image(10)}))
+    monkeypatch.setattr(ocr_view, "grab_ocr_strips_at", FakeGrabStrips({1.0: _image(30)}))
+    job = build("/root/videos/k")
+
+    job.run(_ctx(job))
+
+    assert cache.built == [("/root/videos/k", "a.mp4", os.path.join(PROJECT_DIR, "a.mp4"))]

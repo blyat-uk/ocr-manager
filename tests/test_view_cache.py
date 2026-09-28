@@ -56,8 +56,13 @@ def _video(directory: Path, name: str = NAME, size: int = 2048) -> Path:
     return path
 
 
+def _cache_dir(directory: Path) -> str:
+    """The folder cache of the project `directory` (ProjectLayout.cache_dir)."""
+    return str(directory / ".ocr-cache")
+
+
 def _cache(directory: Path, name: str = NAME) -> FileViewCache:
-    return FileViewCache(str(directory), name, str(directory / name))
+    return FileViewCache(_cache_dir(directory), name, str(directory / name))
 
 
 def _noise(height: int = 53, width: int = 1344) -> np.ndarray:
@@ -92,7 +97,7 @@ def _images(directory: Path) -> list[str]:
 def test_the_view_directory_is_the_name_digest_under_the_project_cache(tmp_path):
     digest = hashlib.sha256(os.fsencode(NAME)).hexdigest()
 
-    assert view_dir(str(tmp_path), NAME) == tmp_path / ".ocr-cache" / "view" / digest
+    assert view_dir(_cache_dir(tmp_path), NAME) == tmp_path / ".ocr-cache" / "view" / digest
 
 
 def test_the_view_directory_uses_the_same_digest_as_the_evidence_cache(tmp_path):
@@ -100,7 +105,7 @@ def test_the_view_directory_uses_the_same_digest_as_the_evidence_cache(tmp_path)
     Chinese, a byte that is not UTF-8), it hashes to the same short directory
     name the evidence file is called."""
     for name in (NAME, "第01集.mkv", "a/b is not a name.mp4"):
-        assert view_dir(str(tmp_path), name).name == evidence_path(str(tmp_path), name).stem
+        assert view_dir(_cache_dir(tmp_path), name).name == evidence_path(_cache_dir(tmp_path), name).stem
 
 
 def test_the_view_directory_is_not_created_until_something_is_written(tmp_path):
@@ -109,7 +114,7 @@ def test_the_view_directory_is_not_created_until_something_is_written(tmp_path):
     cache = _cache(tmp_path)
 
     assert cache.readable is True
-    assert not view_dir(str(tmp_path), NAME).exists()
+    assert not view_dir(_cache_dir(tmp_path), NAME).exists()
 
 
 # --------------------------------------------------------------------------
@@ -193,7 +198,7 @@ def test_writing_the_same_time_again_replaces_what_was_there(tmp_path):
     assert cache.write_strip(BOX, 9.0, second) is True
 
     assert np.array_equal(cache.read_strip(BOX, 9.0), second)
-    assert len(_images(view_dir(str(tmp_path), NAME))) == 1
+    assert len(_images(view_dir(_cache_dir(tmp_path), NAME))) == 1
 
 
 def test_an_empty_cache_misses(tmp_path):
@@ -223,7 +228,7 @@ def test_the_file_names_spell_out_the_time_and_the_crop_box(tmp_path):
     cache.write_frame(120.0, _noise(64, 64))
     cache.write_strip(BOX, 120.0, _subtitle_strip())
 
-    assert _images(view_dir(str(tmp_path), NAME)) == ["f-000120.000.webp",
+    assert _images(view_dir(_cache_dir(tmp_path), NAME)) == ["f-000120.000.webp",
                                                       "s-288_786_1344_53-000120.000.webp"]
 
 
@@ -236,7 +241,7 @@ def test_the_names_sort_by_time(tmp_path):
     for time in times:
         cache.write_frame(time, _noise(32, 32))
 
-    names = _images(view_dir(str(tmp_path), NAME))
+    names = _images(view_dir(_cache_dir(tmp_path), NAME))
     assert names == sorted(names)
     assert [float(name[2:-5]) for name in names] == times
 
@@ -251,7 +256,7 @@ def test_two_times_a_millisecond_apart_are_two_files(tmp_path):
     cache.write_strip(BOX, 120.001, first)
     cache.write_strip(BOX, 120.002, second)
 
-    assert len(_images(view_dir(str(tmp_path), NAME))) == 2
+    assert len(_images(view_dir(_cache_dir(tmp_path), NAME))) == 2
     assert np.array_equal(cache.read_strip(BOX, 120.001), first)
     assert np.array_equal(cache.read_strip(BOX, 120.002), second)
 
@@ -267,7 +272,7 @@ def test_a_time_the_name_cannot_hold_exactly_is_not_cached(tmp_path):
     assert cache.write_strip(BOX, 1 / 3, _subtitle_strip()) is False
     assert cache.read_frame(1 / 3) is None
     assert cache.read_strip(BOX, 1 / 3) is None
-    assert not view_dir(str(tmp_path), NAME).exists() or _images(view_dir(str(tmp_path), NAME)) == []
+    assert not view_dir(_cache_dir(tmp_path), NAME).exists() or _images(view_dir(_cache_dir(tmp_path), NAME)) == []
 
 
 def test_a_time_that_is_not_a_number_is_not_cached(tmp_path):
@@ -284,7 +289,7 @@ def test_a_time_that_is_not_a_number_is_not_cached(tmp_path):
 # --------------------------------------------------------------------------
 
 def _meta(tmp_path: Path) -> dict:
-    return json.loads((view_dir(str(tmp_path), NAME) / "meta.json").read_text())
+    return json.loads((view_dir(_cache_dir(tmp_path), NAME) / "meta.json").read_text())
 
 
 def test_the_cache_records_the_format_version_and_the_source(tmp_path):
@@ -310,7 +315,7 @@ def test_a_video_of_another_size_wipes_the_pixels(tmp_path):
 
     assert fresh.read_frame(1.0) is None
     assert fresh.read_strip(BOX, 1.0) is None
-    assert _images(view_dir(str(tmp_path), NAME)) == []
+    assert _images(view_dir(_cache_dir(tmp_path), NAME)) == []
     assert _meta(tmp_path)["size"] == 4096
 
 
@@ -324,7 +329,7 @@ def test_a_video_of_the_same_size_but_another_mtime_wipes_the_pixels(tmp_path):
     fresh = _cache(tmp_path)
 
     assert fresh.read_frame(1.0) is None
-    assert _images(view_dir(str(tmp_path), NAME)) == []
+    assert _images(view_dir(_cache_dir(tmp_path), NAME)) == []
 
 
 def test_an_unchanged_video_keeps_its_pixels(tmp_path):
@@ -345,10 +350,10 @@ def test_a_missing_or_unreadable_meta_wipes_the_pixels(tmp_path):
                    lambda path: path.write_text(json.dumps(["not", "an", "object"]))):
         _video(tmp_path)
         _cache(tmp_path).write_frame(1.0, _noise(32, 32))
-        damage(view_dir(str(tmp_path), NAME) / "meta.json")
+        damage(view_dir(_cache_dir(tmp_path), NAME) / "meta.json")
 
         assert _cache(tmp_path).read_frame(1.0) is None
-        assert _images(view_dir(str(tmp_path), NAME)) == []
+        assert _images(view_dir(_cache_dir(tmp_path), NAME)) == []
 
 
 def test_a_video_that_cannot_be_stat_d_is_not_readable(tmp_path):
@@ -362,7 +367,7 @@ def test_a_video_that_cannot_be_stat_d_is_not_readable(tmp_path):
     assert cache.write_frame(1.0, _noise(32, 32)) is False
     assert cache.write_strip(BOX, 1.0, _subtitle_strip()) is False
     assert cache.trim(Wanted((1.0,), BOX, (1.0,))) == 0
-    assert not view_dir(str(tmp_path), NAME).exists()
+    assert not view_dir(_cache_dir(tmp_path), NAME).exists()
 
 
 # --------------------------------------------------------------------------
@@ -395,7 +400,7 @@ def test_a_cache_directory_that_cannot_be_written_to_degrades_to_a_miss(tmp_path
     _video(tmp_path)
     cache = _cache(tmp_path)
     cache.write_frame(1.0, _noise(32, 32))
-    directory = view_dir(str(tmp_path), NAME)
+    directory = view_dir(_cache_dir(tmp_path), NAME)
     directory.chmod(0o500)
     try:
         assert cache.write_frame(2.0, _noise(32, 32)) is False
@@ -411,7 +416,7 @@ def test_a_corrupt_image_reads_as_a_miss(tmp_path):
     cache = _cache(tmp_path)
     cache.write_strip(BOX, 1.0, _subtitle_strip())
     cache.write_frame(1.0, _noise(32, 32))
-    directory = view_dir(str(tmp_path), NAME)
+    directory = view_dir(_cache_dir(tmp_path), NAME)
     strip_file = directory / "s-288_786_1344_53-000001.000.webp"
     strip_file.write_bytes(strip_file.read_bytes()[: len(strip_file.read_bytes()) // 2])
     (directory / "f-000001.000.webp").write_bytes(b"not a webp at all")
@@ -424,7 +429,7 @@ def test_an_empty_image_file_reads_as_a_miss(tmp_path):
     _video(tmp_path)
     cache = _cache(tmp_path)
     cache.write_frame(1.0, _noise(32, 32))
-    (view_dir(str(tmp_path), NAME) / "f-000001.000.webp").write_bytes(b"")
+    (view_dir(_cache_dir(tmp_path), NAME) / "f-000001.000.webp").write_bytes(b"")
 
     assert cache.read_frame(1.0) is None
 
@@ -444,7 +449,7 @@ def test_a_write_that_fails_at_the_last_step_leaves_nothing_behind(tmp_path, mon
 
     assert cache.write_frame(2.0, _noise(32, 32)) is False
     assert cache.write_strip(BOX, 2.0, _subtitle_strip()) is False
-    assert _names(view_dir(str(tmp_path), NAME)) == ["f-000001.000.webp", "meta.json"]
+    assert _names(view_dir(_cache_dir(tmp_path), NAME)) == ["f-000001.000.webp", "meta.json"]
 
 
 def test_an_image_the_encoder_refuses_is_not_a_crash(tmp_path):
@@ -486,7 +491,7 @@ def test_trim_never_deletes_the_meta(tmp_path):
 
     cache.trim(Wanted((), None, ()))
 
-    assert _names(view_dir(str(tmp_path), NAME)) == ["meta.json"]
+    assert _names(view_dir(_cache_dir(tmp_path), NAME)) == ["meta.json"]
 
 
 def test_trim_deletes_the_strips_of_an_old_crop_box(tmp_path):
@@ -501,7 +506,7 @@ def test_trim_deletes_the_strips_of_an_old_crop_box(tmp_path):
     deleted = cache.trim(Wanted(frame_times=(1.0,), crop_box=OTHER_BOX, strip_times=(1.0, 2.0)))
 
     assert deleted == 2
-    assert _images(view_dir(str(tmp_path), NAME)) == ["f-000001.000.webp"]
+    assert _images(view_dir(_cache_dir(tmp_path), NAME)) == ["f-000001.000.webp"]
 
 
 def test_trim_with_no_crop_box_deletes_every_strip(tmp_path):
@@ -511,7 +516,7 @@ def test_trim_with_no_crop_box_deletes_every_strip(tmp_path):
     cache.write_frame(1.0, _noise(32, 32))
 
     assert cache.trim(Wanted(frame_times=(1.0,), crop_box=None, strip_times=(1.0,))) == 1
-    assert _images(view_dir(str(tmp_path), NAME)) == ["f-000001.000.webp"]
+    assert _images(view_dir(_cache_dir(tmp_path), NAME)) == ["f-000001.000.webp"]
 
 
 def test_trim_keeps_everything_it_is_asked_to(tmp_path):
@@ -521,7 +526,7 @@ def test_trim_keeps_everything_it_is_asked_to(tmp_path):
     cache.write_strip(BOX, 1.0, _subtitle_strip())
 
     assert cache.trim(Wanted((1.0,), BOX, (1.0,))) == 0
-    assert len(_images(view_dir(str(tmp_path), NAME))) == 2
+    assert len(_images(view_dir(_cache_dir(tmp_path), NAME))) == 2
 
 
 def test_trim_on_a_cache_with_nothing_in_it_deletes_nothing(tmp_path):
@@ -536,7 +541,7 @@ def test_trim_leaves_files_that_are_not_its_own_alone(tmp_path):
     _video(tmp_path)
     cache = _cache(tmp_path)
     cache.write_frame(1.0, _noise(32, 32))
-    directory = view_dir(str(tmp_path), NAME)
+    directory = view_dir(_cache_dir(tmp_path), NAME)
     (directory / "notes.txt").write_text("hello")
     (directory / "f-nonsense.webp").write_bytes(b"junk")
 
@@ -553,9 +558,9 @@ def test_trim_leaves_files_that_are_not_its_own_alone(tmp_path):
 def _warm(directory: Path, name: str) -> Path:
     """A file's view directory, with something in it."""
     _video(directory, name)
-    cache = FileViewCache(str(directory), name, str(directory / name))
+    cache = FileViewCache(_cache_dir(directory), name, str(directory / name))
     cache.write_frame(1.0, _noise(32, 32))
-    return view_dir(str(directory), name)
+    return view_dir(_cache_dir(directory), name)
 
 
 def test_prune_deletes_the_directory_of_a_video_that_has_left_the_folder(tmp_path):
@@ -588,7 +593,7 @@ def test_prune_leaves_anything_that_is_not_one_of_its_directories(tmp_path):
     """A digest-shaped directory is the cache's; a loose file or a directory
     under any other name belongs to somebody else."""
     _warm(tmp_path, NAME)
-    view = view_dir(str(tmp_path), NAME).parent
+    view = view_dir(_cache_dir(tmp_path), NAME).parent
     (view / "notes.txt").write_text("hello")
     (view / "not-a-digest").mkdir()
     (view / ("a" * 64)).write_text("a file, not a directory")
@@ -687,8 +692,20 @@ def test_frames_are_stored_lossily_and_strips_are_not(tmp_path):
     cache.write_frame(1.0, picture)
     cache.write_strip(BOX, 1.0, picture)
 
-    directory = view_dir(str(tmp_path), NAME)
+    directory = view_dir(_cache_dir(tmp_path), NAME)
     lossy = (directory / "f-000001.000.webp").stat().st_size
     lossless = (directory / "s-288_786_1344_53-000001.000.webp").stat().st_size
     assert lossy * 2 < lossless
     assert np.array_equal(cache.read_strip(BOX, 1.0), picture)
+
+
+def test_prune_given_a_cache_dir_prunes_that_cache(tmp_path):
+    """An episode's cache directory is not `<project>/.ocr-cache`."""
+    cache_dir = tmp_path / "root" / "videos" / ("a" * 32)
+    video = tmp_path / "Show" / NAME
+    video.parent.mkdir()
+    video.write_bytes(b"\0" * 2048)
+    FileViewCache(str(cache_dir), NAME, str(video)).write_frame(1.0, _noise(72, 128))
+    FileViewCache(str(cache_dir), "gone.mkv", str(video)).write_frame(1.0, _noise(72, 128))
+    assert prune(None, [NAME], cache_dir=str(cache_dir)) == 1
+    assert [p.name for p in (cache_dir / "view").iterdir()] == [view_dir(str(cache_dir), NAME).name]

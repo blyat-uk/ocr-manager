@@ -32,6 +32,11 @@ The disk sits in front of both of them
     that cannot be written to, a directory wiped because the video changed
     all degrade to decoding everything, which is what these jobs always did.
 
+    The cache is the one under `cache_dir`, the project's
+    ProjectLayout.cache_dir; a job built without it uses the folder cache of
+    its project directory (`<project>/.ocr-cache`), so a folder's pixels stay
+    where they always were and an episode's go to its own cache directory.
+
 Lossy frames, lossless strips
     Frames are stored lossily (a canvas to look at, ~84 KB against 571 KB),
     so where a frame came from matters: FramesResult.lossy names the times
@@ -100,7 +105,7 @@ from typing import TYPE_CHECKING
 from core.detect import crop as _crop
 from core.detect import ocr_view as _ocr_view
 from core.jobs.runner import JobContext, Lane
-from core.jobs.view_cache import FileViewCache, Wanted
+from core.jobs.view_cache import FileViewCache, Wanted, default_cache_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -296,17 +301,18 @@ class WarmJob:
     lane = Lane.CPU
     priority = WARM_PRIORITY
 
-    def __init__(self, project_dir: str, file: str, keep: Wanted):
+    def __init__(self, project_dir: str, file: str, keep: Wanted, *, cache_dir: str | None = None):
         self.file = file
         self.keep = keep
         self.key = f"{self.kind}:{file}"
         self.project_dir = project_dir
+        self.cache_dir = default_cache_dir(project_dir) if cache_dir is None else cache_dir
         self.video_path = os.path.join(project_dir, file)
 
     def run(self, ctx: JobContext) -> WarmResult | None:
         if ctx.cancelled():
             return None
-        cache = FileViewCache(self.project_dir, self.file, self.video_path)
+        cache = FileViewCache(self.cache_dir, self.file, self.video_path)
         frames_written = _decode_into(
             _missing(self.keep.frame_times, cache.read_frame),
             lambda times: _grab_frames(self.video_path, times, FRAME_HEIGHT),
@@ -351,13 +357,14 @@ class FrameJob:
     priority = VIEW_PRIORITY
 
     def __init__(self, project_dir: str, file: str, times: list[float], target_height: int = FRAME_HEIGHT,
-                 exact: bool = False):
+                 exact: bool = False, *, cache_dir: str | None = None):
         self.file = file
         self.times = tuple(float(time) for time in times)
         # `exact` is part of the key: an exact request must not be answered by
         # a queued lossy one (JobRunner replaces an identical key).
         self.key = f"{self.kind}:{file}:{hash(self.times)}:{'exact' if exact else 'cached'}"
         self.project_dir = project_dir
+        self.cache_dir = default_cache_dir(project_dir) if cache_dir is None else cache_dir
         self.video_path = os.path.join(project_dir, file)
         self.target_height = int(target_height)
         self.exact = bool(exact)
@@ -367,7 +374,7 @@ class FrameJob:
             return None
         if not self.times:
             return FramesResult(self.file, {})
-        cache = FileViewCache(self.project_dir, self.file, self.video_path)
+        cache = FileViewCache(self.cache_dir, self.file, self.video_path)
         frames, hits = _fetch(self.times,
                               None if self.exact else cache.read_frame,
                               lambda times: _grab_frames(self.video_path, times, self.target_height),
@@ -391,12 +398,14 @@ class StripJob:
     lane = Lane.CPU
     priority = VIEW_PRIORITY
 
-    def __init__(self, project_dir: str, file: str, crop_box: tuple[int, int, int, int], times: list[float]):
+    def __init__(self, project_dir: str, file: str, crop_box: tuple[int, int, int, int], times: list[float],
+                 *, cache_dir: str | None = None):
         self.file = file
         self.crop_box = tuple(int(value) for value in crop_box)
         self.times = tuple(float(time) for time in times)
         self.key = f"{self.kind}:{file}:{self.crop_box}:{hash(self.times)}"
         self.project_dir = project_dir
+        self.cache_dir = default_cache_dir(project_dir) if cache_dir is None else cache_dir
         self.video_path = os.path.join(project_dir, file)
 
     def run(self, ctx: JobContext) -> StripsResult | None:
@@ -404,7 +413,7 @@ class StripJob:
             return None
         if not self.times:
             return StripsResult(self.file, self.crop_box, {})
-        cache = FileViewCache(self.project_dir, self.file, self.video_path)
+        cache = FileViewCache(self.cache_dir, self.file, self.video_path)
         strips, _ = _fetch(self.times,
                            lambda time: cache.read_strip(self.crop_box, time),
                            lambda times: _grab_strips(self.video_path, self.crop_box, times),
