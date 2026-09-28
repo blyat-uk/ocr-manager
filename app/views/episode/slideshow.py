@@ -3,9 +3,16 @@
 `SlideShow` is the Working screen's picture (episode-view-v2.html, screen
 4): each released line cross-fades to its frame over FADE_MS while the
 frame pushes in slowly, 1.00 -> PUSH_IN over the time until the next line,
-and the line's text rises into place over it. A line whose frame never came
-keeps the picture on screen and only changes the words. The previous frame
-is kept, frozen at the scale it had reached, for the fade to come from.
+and the text OCR read rises into place in a caption band under the frame.
+A line whose frame never came keeps the picture on screen and only changes
+the words. The previous frame is kept, frozen at the scale it had reached,
+for the fade to come from.
+
+The burned-in subtitle is what the user watches being read, so nothing may
+hide it: the whole frame is shown (fitted, never cropped to fill), the
+push-in grows from the frame's bottom edge (the subtitles' side stays put
+while the rest drifts), and the recognised text sits under the picture --
+burned-in line above, what we read below, never one over the other.
 
 `FramePreview` is a still frame with the crop box drawn on it: the
 Preparing screen's "here is what we found" (green and solid when the box
@@ -24,6 +31,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QEasingCurve, QPointF, QRectF, QSize, Qt, QVariantAnimation
 from PyQt6.QtGui import (
     QColor,
+    QFontMetricsF,
     QImage,
     QPainter,
     QPainterPath,
@@ -42,7 +50,8 @@ RISE_PX = 12                   # how far it rises from (mockup px)
 PUSH_IN = 1.06                 # the slow zoom's end scale
 MIN_PUSH_MS = 1000             # a push-in never runs faster than this
 STAGE_BG = "#07090c"           # .work background (episode-view-v2.html)
-CAPTION_BOTTOM = 0.24          # the caption's baseline, as a fraction of the height from the bottom
+CAPTION_LINES = 2              # the caption band holds two lines of recognised text
+CAPTION_PAD = 10               # mockup px above and below the caption band's text
 TAG_ALPHA = 179                # .ts background rgba(10,12,16,.7)
 
 
@@ -57,14 +66,14 @@ def paint_placeholder(painter: QPainter, rect: QRectF) -> None:
     painter.fillRect(rect, gradient)
 
 
-def cover_rect(image_size: QSize, target: QRectF, scale: float = 1.0) -> QRectF:
-    """Where to draw an image so it covers `target` (cropping the overflow),
-    `scale` times larger, centred."""
-    if image_size.width() <= 0 or image_size.height() <= 0:
-        return QRectF(target)
-    factor = max(target.width() / image_size.width(), target.height() / image_size.height()) * scale
-    width, height = image_size.width() * factor, image_size.height() * factor
-    return QRectF(target.center().x() - width / 2, target.center().y() - height / 2, width, height)
+def pushed_rect(image_size: QSize, target: QRectF, scale: float = 1.0) -> QRectF:
+    """The frame fitted whole into `target`, `scale` times larger, grown from
+    the middle of its bottom edge: the bottom (where subtitles are burned in)
+    never moves, and whatever grows past `target` is clipped at the top and
+    the sides."""
+    fitted = contain_rect(image_size, target)
+    width, height = fitted.width() * scale, fitted.height() * scale
+    return QRectF(fitted.center().x() - width / 2, fitted.bottom() - height, width, height)
 
 
 def contain_rect(image_size: QSize, target: QRectF) -> QRectF:
@@ -193,30 +202,58 @@ class SlideShow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         rect = QRectF(self.rect())
         painter.fillRect(rect, QColor(STAGE_BG))
+        picture, band = self.picture_rect(), self.caption_rect()
+        painter.save()
+        painter.setClipRect(picture)
         if self._current is None:
-            paint_placeholder(painter, rect)
+            paint_placeholder(painter, picture)
         else:
             if self._fade < 1.0:                        # what the new frame fades in over
                 if self._previous is not None:
-                    painter.drawPixmap(cover_rect(self._previous.size(), rect, self._previous_scale),
+                    painter.drawPixmap(pushed_rect(self._previous.size(), picture, self._previous_scale),
                                        self._previous, QRectF(self._previous.rect()))
                 else:
-                    paint_placeholder(painter, rect)
+                    paint_placeholder(painter, contain_rect(self._current.size(), picture))
             painter.setOpacity(self._fade)
-            painter.drawPixmap(cover_rect(self._current.size(), rect, self._scale), self._current,
+            painter.drawPixmap(pushed_rect(self._current.size(), picture, self._scale), self._current,
                                QRectF(self._current.rect()))
             painter.setOpacity(1.0)
-        self._paint_stamp(painter)
-        self._paint_caption(painter, rect)
+        painter.restore()
+        self._paint_stamp(painter, picture)
+        self._paint_caption(painter, band)
         painter.end()
 
-    def _paint_stamp(self, painter: QPainter) -> None:
+    def _caption_height(self) -> float:
+        metrics = QFontMetricsF(font(CAPTION_SIZE, 600))
+        return metrics.lineSpacing() * CAPTION_LINES + 2 * tokens.px(CAPTION_PAD)
+
+    def _layout(self) -> tuple[QRectF, QRectF]:
+        """(frame, caption band): the frame fitted whole into the widget above
+        room for the band, the band right under it, and the two centred as one
+        block -- the text read sits under the line it was read from, not
+        across an empty letterbox from it."""
+        band = min(self._caption_height(), self.height() / 3)
+        size = self._current.size() if self._current is not None else QSize(16, 9)
+        frame = contain_rect(size, QRectF(0, 0, self.width(), max(1.0, self.height() - band)))
+        top = max(0.0, (self.height() - frame.height() - band) / 2)
+        frame.moveTop(top)
+        return frame, QRectF(0, frame.bottom(), self.width(), band)
+
+    def caption_rect(self) -> QRectF:
+        """The band under the frame the recognised text is drawn in."""
+        return self._layout()[1]
+
+    def picture_rect(self) -> QRectF:
+        """Where the frame is drawn (the push-in is clipped to it)."""
+        return self._layout()[0]
+
+    def _paint_stamp(self, painter: QPainter, picture: QRectF) -> None:
         if not self._stamp:
             return
         painter.setFont(font(SMALL_SIZE))
         metrics = painter.fontMetrics()
         pad_x, pad_y = tokens.px(6), tokens.px(2)
-        box = QRectF(tokens.px(10), tokens.px(9), metrics.horizontalAdvance(self._stamp) + 2 * pad_x,
+        box = QRectF(picture.left() + tokens.px(10), picture.top() + tokens.px(9), metrics.horizontalAdvance(self._stamp) + 2 * pad_x,
                      metrics.height() + 2 * pad_y)
         path = QPainterPath()
         path.addRoundedRect(box, tokens.RADIUS_TAG, tokens.RADIUS_TAG)
@@ -225,22 +262,19 @@ class SlideShow(QWidget):
         painter.setPen(QColor(tokens.TXT))
         painter.drawText(box, Qt.AlignmentFlag.AlignCenter, self._stamp)
 
-    def _paint_caption(self, painter: QPainter, rect: QRectF) -> None:
+    def _paint_caption(self, painter: QPainter, band: QRectF) -> None:
         if not self._caption:
             return
+        painter.save()
+        painter.setClipRect(band)
         painter.setFont(font(CAPTION_SIZE, 600))
         margin = tokens.px(24)
-        bottom = rect.bottom() - rect.height() * CAPTION_BOTTOM + tokens.px(RISE_PX) * (1.0 - self._rise)
-        area = QRectF(rect.left() + margin, rect.top(), rect.width() - 2 * margin, bottom - rect.top())
-        flags = int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom) | int(Qt.TextFlag.TextWordWrap)
+        area = band.adjusted(margin, 0, -margin, 0).translated(0, tokens.px(RISE_PX) * (1.0 - self._rise))
+        flags = int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap)
         painter.setOpacity(self._rise)
-        shadow = QColor(0, 0, 0, 200)
-        painter.setPen(shadow)
-        for dx, dy in ((0, 2), (1, 2), (-1, 2), (0, 3)):
-            painter.drawText(area.translated(dx, dy), flags, self._caption)
         painter.setPen(QColor("#ffffff"))
         painter.drawText(area, flags, self._caption)
-        painter.setOpacity(1.0)
+        painter.restore()
 
 
 class FramePreview(QWidget):

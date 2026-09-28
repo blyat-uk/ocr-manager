@@ -1,8 +1,8 @@
 """The Working screen (episode-view-v2.html, screen 4): the run of one
 episode, shown as it happens.
 
-Left, the screenshot (`SlideShow`) with the HUD over its foot: what the run
-is doing, the ETA, a progress bar with a green tick where each found line
+Left, the screenshot (`SlideShow`) and, under it, the HUD: which phase the
+run is in, the ETA, a progress bar with a green tick where each found line
 sits, "position of duration" and the speed ("4.1× real time"). Right, the
 Script panel.
 
@@ -27,7 +27,13 @@ skipped ranges; with keep ranges the ticks are placed along the kept time,
 in order). The ETA is `EtaEstimator` over the file's `run_file_progress`,
 blended with the speed remembered from the last run. videocr counts
 dialogue, then labels, each from 0 to 100 %; the second phase restarts the
-bar and the estimate, and the HUD says which phase it is reading.
+bar and the estimate, so the HUD names the phase ("Dialogue" / "Labels",
+"step 1 of 2" when both run) -- a bar going back to zero must read as the
+next step, not as lost work.
+
+The HUD sits under the picture, never over it: the burned-in line is the
+thing the user is watching the OCR read, and covering it would hide exactly
+what the screen is there to show.
 
 The clock is injectable, and `tick()` is public, so tests drive the drip
 without real time passing.
@@ -39,7 +45,7 @@ from collections.abc import Callable
 
 from PyQt6.QtCore import QRectF, Qt, QTimer, QVariantAnimation
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath
-from PyQt6.QtWidgets import QHBoxLayout, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
 
 from app.episode_feed import (
     EtaEstimator,
@@ -58,21 +64,30 @@ from app.time_spans import read_ranges
 from app.views.deferred import Deferred
 from app.views.episode.common import SMALL_SIZE, TITLE_SIZE, font
 from app.views.episode.script import ScriptPanel
-from app.views.episode.slideshow import SlideShow
+from app.views.episode.slideshow import STAGE_BG, SlideShow
 
 POLL_MS = 100
 SHIMMER_MS = 2200
-HUD_HEIGHT = 120                # mockup px (scaled): tall enough to shade the burned-in line under it
+HUD_HEIGHT = 84                 # mockup px (scaled): title, bar and position rows, under the picture
 SCRIPT_MIN_WIDTH = 300
 STAGE_STRETCH, SCRIPT_STRETCH = 17, 10     # .work flex 1.7 / .script flex 1
 
 TITLE_STARTING = "Starting…"
-TITLE_DIALOGUE = "Reading subtitles…"
-TITLE_LABELS = "Reading labels…"
+TITLE_DIALOGUE = "Dialogue"
+TITLE_LABELS = "Labels"
+STEP = "step {index} of {count}"
 TITLE_PAUSED = "Paused"
 TITLE_STOPPING = "Stopping…"
 TITLE_FINISHED = "Finished"
 POSITION = "{position} of {duration}"
+
+
+def hud_step(title: str, dialogue: bool, labels: bool) -> str:
+    """"step 1 of 2" / "step 2 of 2" while a two-phase run reads its
+    dialogue or its labels; "" otherwise (one phase has no steps to count)."""
+    if not (dialogue and labels) or title not in (TITLE_DIALOGUE, TITLE_LABELS):
+        return ""
+    return STEP.format(index=1 if title == TITLE_DIALOGUE else 2, count=2)
 
 
 def hud_title(snapshot, row) -> str:
@@ -92,13 +107,14 @@ def hud_title(snapshot, row) -> str:
 
 
 class Hud(QWidget):
-    """The painted overlay at the foot of the screenshot."""
+    """The run's status strip under the screenshot."""
 
     def __init__(self, parent: QWidget | None = None, *, animated: bool = True):
         super().__init__(parent)
         self.setObjectName("EpisodeHud")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.title = TITLE_STARTING
+        self.step = ""
         self.eta = ""
         self.position = ""
         self.speed = ""
@@ -114,8 +130,8 @@ class Hud(QWidget):
         self._shimmer_animation.valueChanged.connect(self._set_shimmer)
 
     def set_state(self, *, title: str, eta: str, position: str, speed: str, progress: float,
-                  ticks: list[float], shimmer: bool) -> None:
-        self.title, self.eta, self.position, self.speed = title, eta, position, speed
+                  ticks: list[float], shimmer: bool, step: str = "") -> None:
+        self.title, self.step, self.eta, self.position, self.speed = title, step, eta, position, speed
         self.progress = max(0.0, min(1.0, progress))
         self.ticks = ticks
         running = shimmer and self._animated and self.isVisible()
@@ -138,11 +154,7 @@ class Hud(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect())
-        shade = QLinearGradient(0, rect.top(), 0, rect.bottom())    # linear-gradient(0deg, rgba(7,9,12,.95) 45%, transparent)
-        shade.setColorAt(0.0, QColor(7, 9, 12, 0))
-        shade.setColorAt(0.45, QColor(7, 9, 12, 242))
-        shade.setColorAt(1.0, QColor(7, 9, 12, 242))
-        painter.fillRect(rect, shade)
+        painter.fillRect(rect, QColor(STAGE_BG))
 
         pad_x, pad_bottom = tokens.px(14), tokens.px(10)
         inner = rect.adjusted(pad_x, 0, -pad_x, -pad_bottom)
@@ -164,6 +176,12 @@ class Hud(QWidget):
         top_row = QRectF(inner.left(), track.top() - tokens.px(6) - title_height, inner.width(), title_height)
         painter.setPen(QColor(tokens.TXT))
         painter.drawText(top_row, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), self.title)
+        if self.step:
+            title_width = painter.fontMetrics().horizontalAdvance(self.title)
+            painter.setFont(small)
+            painter.setPen(QColor(tokens.DIM2))
+            painter.drawText(top_row.adjusted(title_width + tokens.px(8), 0, 0, 0),
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), self.step)
         if self.eta:
             painter.setFont(small)
             left_word = " left"
@@ -207,21 +225,18 @@ class Hud(QWidget):
 
 
 class _Stage(QWidget):
-    """The slideshow with the HUD laid over its foot."""
+    """The slideshow with the HUD under it (see the module docstring: never over it)."""
 
     def __init__(self, slideshow: SlideShow, hud: Hud, parent: QWidget | None = None):
         super().__init__(parent)
         self.slideshow, self.hud = slideshow, hud
-        slideshow.setParent(self)
-        hud.setParent(self)
-        hud.raise_()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self.slideshow.setGeometry(self.rect())
-        height = tokens.px(HUD_HEIGHT)
-        self.hud.setGeometry(0, max(0, self.height() - height), self.width(), height)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(slideshow, 1)
+        hud.setFixedHeight(tokens.px(HUD_HEIGHT))
+        column.addWidget(hud)
 
 
 class WorkingView(QWidget):
@@ -276,7 +291,7 @@ class WorkingView(QWidget):
         return list(self._received)
 
     def hud_texts(self) -> dict[str, str]:
-        return {"title": self.hud.title, "eta": self.hud.eta, "position": self.hud.position, "speed": self.hud.speed}
+        return {"title": self.hud.title, "step": self.hud.step, "eta": self.hud.eta, "position": self.hud.position, "speed": self.hud.speed}
 
     # --- the file and the run -----------------------------------------------------------
 
@@ -452,8 +467,12 @@ class WorkingView(QWidget):
         total = kept_total(spans)
         ticks = [kept_position(line.start, spans) / total for line in self._received] if total > 0 else []
         speed = self._eta.speed(kept) if active else None
+        title = hud_title(snapshot, row)
+        folder = getattr(getattr(self._controller, "project", None), "folder", None)
+        step = "" if folder is None else hud_step(title, folder.dialogue_enabled, folder.labels_enabled)
         self.hud.set_state(
-            title=hud_title(snapshot, row),
+            title=title,
+            step=step,
             eta=eta,
             position=POSITION.format(position=format_duration(progress * kept), duration=format_duration(kept))
             if kept > 0 else "",

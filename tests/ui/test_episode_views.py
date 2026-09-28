@@ -40,6 +40,7 @@ from app.views.episode.prepare import (
 from app.views.episode.prepare import (
     DONE as CHECK_DONE,
 )
+from app.views.episode.slideshow import pushed_rect
 from app.views.episode.working import TITLE_DIALOGUE, TITLE_LABELS
 from core.detect import crop as crop_detect
 from core.project import (
@@ -489,6 +490,53 @@ def test_hud_shows_phase_position_eta_and_speed(qapp):
     controller.run_changed.emit()
     settle()
     assert view.hud_texts()["title"] == TITLE_LABELS
+
+
+@pytest.mark.parametrize("dialogue, labels, phase, title, step", [
+    (True, True, "Extracting dialogue", "Dialogue", "step 1 of 2"),
+    (True, True, "Extracting labels", "Labels", "step 2 of 2"),
+    (True, False, "Extracting dialogue", "Dialogue", ""),
+    (False, True, "Extracting labels", "Labels", ""),
+])
+def test_hud_names_the_phase_so_a_restarting_bar_reads_as_the_next_step(qapp, dialogue, labels, phase, title,
+                                                                       step):
+    """videocr counts each phase from 0 to 100 %: the bar going back to
+    zero must say it is the labels now, not that the dialogue was lost."""
+    controller = StubController(ready_entry(), FolderSettings(dialogue_enabled=dialogue, labels_enabled=labels))
+    controller.snapshot = run_snapshot(progress=0.3, phase=phase)
+    view = working(controller, FakeClock())
+    controller.run_changed.emit()
+    settle()
+    assert (view.hud_texts()["title"], view.hud_texts()["step"]) == (title, step)
+
+
+def test_the_hud_sits_under_the_picture_never_over_it(qapp):
+    """The burned-in line is what the user watches being read: the HUD and
+    the recognised caption are laid out under the frame, not painted on it."""
+    controller = StubController(ready_entry())
+    controller.snapshot = run_snapshot(progress=0.3)
+    view = working(controller, FakeClock())
+    view.resize(1400, 800)
+    view.show()
+    settle()
+    slideshow, hud = view.slideshow, view.hud
+    assert hud.geometry().top() >= slideshow.geometry().bottom()
+    picture, band = slideshow.picture_rect(), slideshow.caption_rect()
+    assert band.top() >= picture.bottom() and band.height() > 0
+    view.hide()
+
+
+def test_the_push_in_grows_from_the_frames_bottom_edge(qapp):
+    """Zooming in from the bottom keeps the burned-in subtitles where they
+    are; only the top and the sides drift out of view."""
+    from PyQt6.QtCore import QRectF, QSize
+    target = QRectF(0, 0, 1600, 900)
+    still, pushed = pushed_rect(QSize(1920, 1080), target, 1.0), pushed_rect(QSize(1920, 1080), target, 1.06)
+    assert pushed.bottom() == pytest.approx(still.bottom()) == pytest.approx(target.bottom())
+    assert pushed.center().x() == pytest.approx(still.center().x())
+    assert pushed.height() == pytest.approx(still.height() * 1.06)
+    tall = QRectF(0, 0, 1600, 1200)                      # letterboxed: the whole frame is shown, never cropped
+    assert pushed_rect(QSize(1920, 1080), tall, 1.0).width() == pytest.approx(1600)
 
 
 def test_hud_ticks_every_reported_line_at_once(qapp):
