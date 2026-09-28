@@ -207,6 +207,14 @@ Crop consensus (crop_consensus)
     redetect() is not part of the chain: it is submitted at once, with the
     pool as it stands. Hint re-detects use the hint consensus (CropJob).
 
+    Seed consensus (episodes). An episode is a project of one file, so its
+    pool is always empty. `seed_consensus` -- the crop of a sibling episode
+    from the same directory, core.project.episode_cache.sibling_seed -- is
+    used as the consensus whenever the pool is empty. It is a consensus, not
+    a hint: the result applies as DETECTED and is never flagged
+    "differs-from-hint?", so an episode that disagrees with its sibling is
+    not sent to review for that alone.
+
 Caches
     Every job that keeps a cache (thumbnails, ranges, confirms, warming) is
     given the project's ProjectLayout.cache_dir (core.project.layout.layout_of),
@@ -557,9 +565,13 @@ class AutoPilot:
     """
 
     def __init__(self, runner: JobRunner, project_getter: Callable[[], Project], *,
-                 seed_source: Callable[[], int] | None = None):
+                 seed_source: Callable[[], int] | None = None,
+                 seed_consensus: list[tuple[float, float]] | None = None):
         self._runner = runner
         self._project_getter = project_getter
+        # The crop consensus when the project's own pool is empty (see "Seed consensus").
+        self._seed_consensus: tuple[tuple[float, float], ...] = tuple(
+            (float(y_frac), float(h_frac)) for y_frac, h_frac in (seed_consensus or ()))
         self._seed_source = default_seed if seed_source is None else seed_source   # one seed per lines draw
         self._outstanding: dict[str, int] = {}                    # key -> submissions without a terminal event
         self._identity: dict[str, tuple[str, str | None]] = {}    # key -> (kind, file), while outstanding
@@ -1096,6 +1108,8 @@ class AutoPilot:
                 self._submit(MetadataJob(project.path, name), PRIORITY["metadata"] + bonus)
             return
         consensus = [] if hint is not None else crop_consensus(project, exclude=name)
+        if hint is None and not consensus:
+            consensus = list(self._seed_consensus)
         self._submit(CropJob(project.path, name, entry.media.duration, consensus, project.folder, hint=hint),
                      PRIORITY["crop"] + bonus)
 
