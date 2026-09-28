@@ -12,11 +12,29 @@ Get the latest build from the [releases page](https://github.com/blyat-uk/ocr-ma
 
 | OS | File |
 |---|---|
-| Windows 10/11 | `-win.exe` installer, or `-win.zip` portable |
+| Windows 10/11 (x64) | `-win.exe` installer (per-user, no admin rights needed), or `-win.zip` portable |
 | macOS 14.5+ (Apple Silicon) | `-mac.dmg` |
 | Linux x86_64 | `-linux.AppImage`, or `-linux.tar.gz` portable |
 
-On first launch the app downloads its OCR engine (PaddleOCR): the GPU build on a supported NVIDIA card, the CPU build otherwise. Run it with `--setup-engine` to switch later.
+Each release lists every file and what it is for, plus `SHA256SUMS.txt` to verify them against.
+
+## First run
+
+The OCR engine (PaddlePaddle) is not in the download; OCR Manager installs it the first time it starts. On an NVIDIA GPU with a recent driver it picks the matching CUDA build (2–5.5 GB to download, up to 8 GB on disk) and checks that it works; otherwise, or if the GPU check fails, it installs the CPU build (about 0.2 GB). Run it with `--setup-engine` to switch between GPU and CPU later.
+
+The engine and the OCR models live in your user data folder, not in the app:
+
+| OS | Data folder |
+|---|---|
+| Windows | `%LOCALAPPDATA%\ocr-manager` |
+| macOS | `~/Library/Application Support/ocr-manager` |
+| Linux | `~/.local/share/ocr-manager` |
+
+## Platform notes
+
+- **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
+- **macOS:** the app is not notarized. Open it once with right-click → Open, or allow it under System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine "/Applications/OCR Manager.app"`.
+- **Linux:** needs an X11 or Wayland desktop and glibc 2.34+; on X11 install `libxcb-cursor0` if the window does not open.
 
 ## Run from source
 

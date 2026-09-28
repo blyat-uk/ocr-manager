@@ -178,6 +178,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history and tags: the changelog is every commit since the
+      # previous tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -189,42 +195,38 @@ jobs:
           sha256sum ocr-manager-v* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # The release page is the Downloads table and the changelog, nothing
+      # else. First run and platform notes live in README.md.
       - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          cat > notes.md <<'EOF'
+          cat > notes.md <<EOF
           ## Downloads
 
-          | OS | File |
+          | File | For |
           |---|---|
-          | Windows 10/11 (x64) | `ocr-manager-${{ github.ref_name }}-win.exe` (installer, no admin rights needed) or `-win.zip` (portable) |
-          | macOS 14.5+ (Apple Silicon) | `ocr-manager-${{ github.ref_name }}-mac.dmg` |
-          | Linux x86_64 (glibc 2.34+) | `ocr-manager-${{ github.ref_name }}-linux.AppImage` or `-linux.tar.gz` (portable) |
+          | \`ocr-manager-$TAG-win.exe\` | Windows 10/11 (x64). Installs for you only, no admin rights needed |
+          | \`ocr-manager-$TAG-win.zip\` | Windows 10/11 (x64), portable |
+          | \`ocr-manager-$TAG-mac.dmg\` | macOS 14.5+ (Apple Silicon) |
+          | \`ocr-manager-$TAG-linux.AppImage\` | Linux x86_64 (glibc 2.34+) |
+          | \`ocr-manager-$TAG-linux.tar.gz\` | Linux x86_64 (glibc 2.34+), portable |
+          | \`SHA256SUMS.txt\` | SHA-256 checksums of every file above |
 
-          ## First run
+          ## Changelog
 
-          The OCR engine (PaddlePaddle) is not in the download; OCR Manager installs it the first time it starts.
-          On an NVIDIA GPU with a recent driver it picks the matching CUDA build (2–5.5 GB to download, up to 8 GB on disk) and checks
-          that it works; otherwise, or if the GPU check fails, it installs the CPU build (about 0.2 GB).
-          The engine and the OCR models live in your user data folder, not in the app:
-          `%LOCALAPPDATA%\ocr-manager` on Windows, `~/Library/Application Support/ocr-manager` on macOS,
-          `~/.local/share/ocr-manager` on Linux. `--setup-engine` switches between GPU and CPU later.
-
-          ## Notes
-
-          - **Windows:** the installer is not code-signed; SmartScreen may ask you to confirm (More info → Run anyway).
-          - **macOS:** the app is not notarized. Open it once with right-click → Open, or allow it under
-            System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine "/Applications/OCR Manager.app"`.
-          - **Linux:** needs an X11 or Wayland desktop; on X11 install `libxcb-cursor0` if the window does not open.
-
-          Verify downloads against `SHA256SUMS.txt`.
           EOF
-          sed -i 's/^          //' notes.md
+          # Since the previous v* tag, or all history for the first release.
+          # "chore: version X.Y.Z" is the bump the tag sits on, not a change.
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$TAG" \
+            | grep -Ev '^- chore: version [0-9]' >> notes.md || echo "- No changes." >> notes.md
+          cat notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
           name: OCR Manager ${{ github.ref_name }}
           body_path: notes.md
-          generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
             dist/ocr-manager-v*
