@@ -63,7 +63,7 @@ def _frame_key(time: float) -> float:
 
 def format_ts(seconds: float) -> str:
     """"H:MM:SS.mmm", the script's time stamp."""
-    total_ms = max(0, int(round(float(seconds) * 1000)))
+    total_ms = max(0, round(float(seconds) * 1000))
     total_s, ms = divmod(total_ms, 1000)
     hours, rest = divmod(total_s, 3600)
     minutes, secs = divmod(rest, 60)
