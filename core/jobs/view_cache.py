@@ -9,11 +9,13 @@ lossless, for a picture nobody measures anything on) and an OCR strip about
 a few hundred KB a file for two orders of magnitude on the wait, and
 `core.jobs.view_jobs` asks it before it asks a decoder.
 
-Layout, one directory per video under the project's cache, named by the same
-name digest `core.project.store.evidence_path` uses (a name of any shape
-hashes to one short, filesystem-safe directory name):
+Layout, one directory per video under the project's cache directory
+(`ProjectLayout.cache_dir`: a folder's `.ocr-cache/`, an episode's
+`<root>/videos/<key>/`), named by the same name digest
+`core.project.store.evidence_path` uses (a name of any shape hashes to one
+short, filesystem-safe directory name):
 
-    .ocr-cache/view/<sha256 of the file name>/
+    <cache dir>/view/<sha256 of the file name>/
         meta.json                          {"version", "size", "mtime_ns"} of the video
         f-000120.000.webp                  whole frame, lossy (FRAME_QUALITY)
         t-000120.000.webp                  queue thumbnail, lossless, 72 rows
@@ -93,7 +95,7 @@ from typing import TYPE_CHECKING
 import cv2
 import numpy as np
 
-from core.project.store import CACHE_DIRNAME
+from core.project.layout import CACHE_DIRNAME
 
 if TYPE_CHECKING:
     from core.project.model import FileEntry
@@ -203,13 +205,21 @@ def _name_digest(file: str) -> str:
     return hashlib.sha256(os.fsencode(file)).hexdigest()
 
 
-def view_dir(project_dir: str, file: str) -> Path:
-    """`<project_dir>/.ocr-cache/view/<sha256 hex of the file name>`, the same
-    name-digest convention as `core.project.store.evidence_path`."""
-    return Path(project_dir) / CACHE_DIRNAME / VIEW_DIRNAME / _name_digest(file)
+def view_dir(cache_dir: str, file: str) -> Path:
+    """`<cache_dir>/view/<sha256 hex of the file name>`, the same name-digest
+    convention as `core.project.store.evidence_path`. `cache_dir` is the
+    project's (ProjectLayout.cache_dir; a folder's `<dir>/.ocr-cache`)."""
+    return Path(cache_dir) / VIEW_DIRNAME / _name_digest(file)
 
 
-def prune(project_dir: str, names: Iterable[str]) -> int:
+def default_cache_dir(project_dir: str) -> str:
+    """A folder's cache directory, `<project_dir>/.ocr-cache`: what a job
+    built with a project directory and no `cache_dir` uses, as every job did
+    before episodes kept their caches elsewhere."""
+    return os.path.join(project_dir, CACHE_DIRNAME)
+
+
+def prune(project_dir: str | None, names: Iterable[str], *, cache_dir: str | None = None) -> int:
     """Delete the view-cache directory of every video no longer in the folder;
     how many went.
 
@@ -225,8 +235,11 @@ def prune(project_dir: str, names: Iterable[str]) -> int:
     put there is left alone, the way `core.project.store` guards its evidence
     sweep. Nothing raises: an absent or unreadable cache prunes nothing, and a
     directory that will not go is logged and counted out.
+
+    The cache is `cache_dir` when given (ProjectLayout.cache_dir), else the
+    folder cache of `project_dir`.
     """
-    directory = Path(project_dir) / CACHE_DIRNAME / VIEW_DIRNAME
+    directory = Path(default_cache_dir(project_dir) if cache_dir is None else cache_dir) / VIEW_DIRNAME
     keep = {_name_digest(name) for name in names}
     try:
         entries = list(os.scandir(directory))
@@ -346,10 +359,10 @@ class FileViewCache:
     today's decode-every-time behaviour, never fail a job.
     """
 
-    def __init__(self, project_dir: str, file: str, video_path: str):
+    def __init__(self, cache_dir: str, file: str, video_path: str):
         self.file = file
         self.video_path = video_path
-        self.directory = view_dir(project_dir, file)
+        self.directory = view_dir(cache_dir, file)
         self._meta: dict | None = None                           # the meta the pixels here belong to
         self._meta_on_disk = False                               # ... and whether it has been written
         self._readable = self._open()

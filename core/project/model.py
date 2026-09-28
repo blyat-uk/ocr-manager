@@ -10,6 +10,10 @@ docstring.
 """
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.project.layout import ProjectLayout
 
 MIN_CROP_SIDE = 8        # video pixels; app/views/crop_view.py's CropCanvas.MIN_BOX
 
@@ -146,10 +150,14 @@ class FolderSettings:
 
 @dataclass
 class Project:
-    path: str                                  # folder path
+    path: str                                  # the directory holding the video(s): the folder, or an episode's
     folder: FolderSettings
     files: dict[str, FileEntry]                # insertion order = sorted filename order
     migrated_from_v1: bool = False             # True until the first save writes .ocr.json.v1.bak
     # Store bookkeeping, not project data: file name -> digest of the evidence
     # last loaded from or saved to its evidence cache file (core/project/store.py).
     evidence_digests: dict[str, str] = field(default_factory=dict, compare=False, repr=False)
+    # Where the project's files live (core/project/layout.py): set by
+    # store.load_project; None means the folder layout of `path`, which is
+    # what core.project.layout.layout_of answers for it.
+    layout: "ProjectLayout | None" = field(default=None, compare=False, repr=False)

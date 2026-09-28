@@ -85,6 +85,7 @@ from core.project import (
     TimeRanges,
     migrate_v1,
 )
+from core.project.layout import episode_layout
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ocr_json_v1"
 SLAY_NAMES = [
@@ -2744,3 +2745,37 @@ def test_autopilot_module_imports_no_qt():
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False,
                           cwd=Path(__file__).resolve().parent.parent)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------
+# Episodes: the episode's own cache directory
+# --------------------------------------------------------------------------
+
+def _one_episode(tmp_path) -> Project:
+    project = _project(tmp_path, ["EP06.mkv"])
+    entry = _media(project.files["EP06.mkv"])
+    entry.evidence["audio"] = {}
+    entry.sample_time = 300.0
+    return project
+
+
+def test_a_folders_jobs_keep_their_caches_in_the_folder(tmp_path):
+    owner = Owner(_one_episode(tmp_path))
+    owner.autopilot.on_open()
+    (thumbnail,) = of_kind(owner.take(), "thumbnail")
+    assert thumbnail.job.cache_dir == str(tmp_path / ".ocr-cache")
+
+
+def test_an_episodes_jobs_keep_their_caches_in_its_cache_directory(tmp_path):
+    project = _warm_folder(tmp_path, ["EP06.mkv"])
+    (tmp_path / "EP06.mkv").write_bytes(b"video")
+    project.layout = episode_layout(str(tmp_path / "EP06.mkv"), str(tmp_path / "root"), key="a" * 32)
+    owner = Owner(project)
+    owner.autopilot.on_open()
+    opened = owner.take()
+    (thumbnail,) = of_kind(opened, "thumbnail")
+    assert thumbnail.job.cache_dir == project.layout.cache_dir
+    finish_side_jobs(owner, opened)
+    (warm,) = owner.take()
+    assert warm.job.kind == "warm" and warm.job.cache_dir == project.layout.cache_dir
+    assert warm.job.project_dir == project.path

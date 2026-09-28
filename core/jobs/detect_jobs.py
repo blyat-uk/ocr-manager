@@ -34,6 +34,14 @@ Fidelity
     (core.ass_qafix.process_file on a temporary copy), i.e. what a run would
     write, labels included.
 
+Caches
+    ThumbnailJob and ConfirmJob read and write the view cache, RangesJob its
+    fingerprint cache, under `cache_dir`: the project's
+    ProjectLayout.cache_dir. Without it they use the folder cache of their
+    project directory (`<project>/.ocr-cache`), as they always did; an
+    episode passes its own cache directory, so nothing but the output is
+    written next to its video.
+
 Cancellation convention: a cancelled job returns None
     A job whose work was cut short by a cancel request returns None. It never
     returns a partial result and never raises. The runner then delivers
@@ -244,17 +252,18 @@ class ThumbnailJob:
     lane = Lane.CPU
     priority = 0
 
-    def __init__(self, project_dir: str, file: str, time: float):
+    def __init__(self, project_dir: str, file: str, time: float, *, cache_dir: str | None = None):
         self.file = file
         self.key = f"{self.kind}:{file}"
         self.project_dir = project_dir
+        self.cache_dir = _view_cache.default_cache_dir(project_dir) if cache_dir is None else cache_dir
         self.video_path = os.path.join(project_dir, file)
         self.time = float(time)
 
     def run(self, ctx: JobContext) -> ThumbnailResult | None:
         if ctx.cancelled():
             return None
-        cache = _view_cache.FileViewCache(self.project_dir, self.file, self.video_path)
+        cache = _view_cache.FileViewCache(self.cache_dir, self.file, self.video_path)
         cached = cache.read_thumbnail(self.time)
         if cached is not None:
             return ThumbnailResult(self.file, self.time, cached)
@@ -275,10 +284,12 @@ class RangesJob:
     lane = Lane.CPU
     priority = 0
 
-    def __init__(self, project_dir: str, files: list[str], folder: FolderSettings):
+    def __init__(self, project_dir: str, files: list[str], folder: FolderSettings, *,
+                 cache_dir: str | None = None):
         self.file = None
         self.key = "ranges:*"
         self.project_dir = project_dir
+        self.cache_dir = _ranges.default_cache_dir(project_dir) if cache_dir is None else cache_dir
         self.files = tuple(files)
         self.config = RangesConfig(
             match=MatchConfig(min_length_sec=folder.min_segment_length),
@@ -302,7 +313,7 @@ class RangesJob:
         try:
             analysis = _ranges.analyse_detailed(
                 entries, self.config, on_progress,
-                cache_dir=_ranges.default_cache_dir(self.project_dir),
+                cache_dir=self.cache_dir,
                 cancel=ctx.cancel_check(),
             )
         except (_ranges.AnalysisCancelled, _vad.AudioExtractionCancelled):
@@ -557,12 +568,13 @@ class ConfirmJob:
     priority = 0
 
     def __init__(self, project_dir: str, file: str, crop_box: tuple[int, int, int, int],
-                 probe_time: float, start_value: int, folder: FolderSettings):
+                 probe_time: float, start_value: int, folder: FolderSettings, *, cache_dir: str | None = None):
         if crop_box is None:
             raise ValueError("the confirm strip is cut from the file's crop: pass its crop box")
         self.file = file
         self.key = f"{self.kind}:{file}"
         self.project_dir = project_dir
+        self.cache_dir = _view_cache.default_cache_dir(project_dir) if cache_dir is None else cache_dir
         self.video_path = os.path.join(project_dir, file)
         self.crop_box = tuple(int(value) for value in crop_box)
         self.probe_time = float(probe_time)
@@ -572,7 +584,7 @@ class ConfirmJob:
         self.use_gpu = folder.use_gpu
 
     def run(self, ctx: JobContext) -> ConfirmJobResult | None:
-        cache = _view_cache.FileViewCache(self.project_dir, self.file, self.video_path)
+        cache = _view_cache.FileViewCache(self.cache_dir, self.file, self.video_path)
         strip = cache.read_strip(self.crop_box, self.probe_time) if cache.readable else None
         with engine_registry.lease_ocr_engine(self.ocr_lang, None, None, self.use_gpu) as ocr_engine:
             result = _confirm.confirm_brightness(self.video_path, self.crop_box, self.probe_time,

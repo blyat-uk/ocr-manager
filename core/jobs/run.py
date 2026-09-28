@@ -12,6 +12,15 @@ Snapshot
     macOS's filesystems are), e.g. a.mkv and a.mp4, a.mkv and A.mp4, or the
     same name twice; nothing is created on disk.
 
+Layout (core/project/layout.py)
+    Where the output goes is the ProjectLayout's: `layout.output_dirs()` are
+    created before the first file, and `layout.output_path(name)` is the
+    final file (its `.partial` beside it). Without a layout, the folder
+    layout of project_dir -- chi/, eng/, translate/ and chi/<stem>.ass,
+    which is what every path below says. An episode creates no directory and
+    writes `<stem>.zh.ass` next to its video, by the same partial, QA and
+    replace steps.
+
 Output, per file (ruling C5)
     OCR writes chi/<stem>.ass.partial. core.ass_qafix.process_file runs on
     the .partial with its default arguments, then os.replace() moves it onto
@@ -102,14 +111,15 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 from core import ass_qafix as _qafix
 from core.jobs.runner import JobContext, Lane, _first_line, _format_traceback
+from core.project.layout import OUTPUT_DIRS, ProjectLayout, folder_layout, output_name
 from core.project.ocr_kwargs import OcrCall
 from videocr import api as _api
 
-OUTPUT_DIRS = ("chi", "eng", "translate")
+# OUTPUT_DIRS and output_name moved to core.project.layout; still importable from here.
+
 PARTIAL_SUFFIX = ".partial"
 STOP_POLL_SECONDS = 0.1
 
@@ -141,12 +151,14 @@ class RunJob:
     file = None
     key = "run"
 
-    def __init__(self, project_dir: str, files: list[RunFile], parallel: int):
+    def __init__(self, project_dir: str, files: list[RunFile], parallel: int, *,
+                 layout: ProjectLayout | None = None):
         parallel = int(parallel)
         if parallel < 1:
             raise ValueError(f"parallel must be at least 1, got {parallel}")
         files = list(files)
-        _refuse_shared_outputs(files)
+        self.layout = folder_layout(project_dir) if layout is None else layout
+        _refuse_shared_outputs(files, self.layout)
         self.project_dir = project_dir
         self.files: tuple[RunFile, ...] = tuple(copy.deepcopy(files))
         self.parallel = parallel
@@ -202,8 +214,8 @@ class RunJob:
 
     def run(self, ctx: JobContext) -> RunSummary:
         started = time.perf_counter()
-        for sub in OUTPUT_DIRS:
-            os.makedirs(os.path.join(self.project_dir, sub), exist_ok=True)
+        for directory in self.layout.output_dirs():
+            os.makedirs(directory, exist_ok=True)
 
         with self._cond:
             workers = [threading.Thread(target=self._work, args=(ctx,), name=f"run-file-{index}", daemon=True)
@@ -308,7 +320,7 @@ class RunJob:
     def _run_file(self, ctx: JobContext, run_file: RunFile,
                   cancel_event: threading.Event) -> tuple[str, str]:
         name = run_file.name
-        final = os.path.join(self.project_dir, "chi", output_name(name))
+        final = self.layout.output_path(name)
         partial = final + PARTIAL_SUFFIX
         ctx.emit("run_file_started", file=name)
 
@@ -384,12 +396,6 @@ class RunJob:
                     f.write(text)
 
 
-def output_name(video_name: str) -> str:
-    """The file a video's run writes into chi/: "<stem>.ass", the stem as
-    today's OCRWorker took it (pathlib's, so "a.b.mkv" gives "a.b.ass")."""
-    return Path(video_name).stem + ".ass"
-
-
 def _message(exc: BaseException) -> str:
     """str(exc), as today's worker put it in "OCR failed: ..."; the type name
     when that fails."""
@@ -399,18 +405,18 @@ def _message(exc: BaseException) -> str:
         return type(exc).__name__
 
 
-def _refuse_shared_outputs(files: list[RunFile]) -> None:
-    """ValueError naming every group of files that would write the same chi/
-    output. Outputs are compared casefolded: a.mkv and A.mp4 write the same
-    file on a case-insensitive filesystem."""
+def _refuse_shared_outputs(files: list[RunFile], layout: ProjectLayout) -> None:
+    """ValueError naming every group of files that would write the same
+    output (layout.output_path). Outputs are compared casefolded: a.mkv and
+    A.mp4 write the same file on a case-insensitive filesystem."""
     by_output: dict[str, list[str]] = {}
     for run_file in files:
-        by_output.setdefault(output_name(run_file.name).casefold(), []).append(run_file.name)
+        by_output.setdefault(layout.output_path(run_file.name).casefold(), []).append(run_file.name)
     collisions = []
     for _, names in sorted(by_output.items()):
         if len(names) > 1:
             names = sorted(names)
-            collisions.append(f"{', '.join(names[:-1])} and {names[-1]} both write chi/{output_name(names[0])}")
+            collisions.append(f"{', '.join(names[:-1])} and {names[-1]} both write {layout.output_label(names[0])}")
     if collisions:
         raise ValueError("; ".join(collisions))
 
