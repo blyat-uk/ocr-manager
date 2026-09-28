@@ -551,5 +551,9 @@ class FolderSettingsSheet(QWidget):
         if project is None:
             self.scope_label.set_full_text("")
             return
+        episode = getattr(self._controller, "episode_name", lambda: None)()
+        if episode is not None:                 # an episode's settings are its own, not its folder's
+            self.scope_label.set_full_text(f"applies to {episode} only")
+            return
         folder = os.path.basename(project.path) or project.path
         self.scope_label.set_full_text(scope_text(len(self._controller.names()), folder))

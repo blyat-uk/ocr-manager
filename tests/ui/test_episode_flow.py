@@ -592,3 +592,15 @@ def test_done_offers_another_episode(make_window, videos, monkeypatch):
     window.open_path(str(folder / "EP06.mkv"))
     window.done_view.open_another_requested.emit()
     assert picked == [str(folder)]
+
+
+def test_the_settings_sheet_says_an_episodes_settings_are_its_own(make_window, controller, videos):
+    """In a folder the sheet's settings apply to every file in it; an
+    episode's live in its own cache entry, so naming the folder would be
+    wrong -- the sheet names the episode."""
+    folder = videos(["EP06.mkv", "notes.txt"])
+    window = make_window()
+    window.open_path(str(folder / "EP06.mkv"))
+    window.open_folder_settings()
+    settle()
+    assert window.folder_settings.scope_label.full_text() == "applies to EP06.mkv only"
