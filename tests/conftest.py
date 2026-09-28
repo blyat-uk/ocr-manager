@@ -27,6 +27,17 @@ def _reset_engine_registry():
     engine_registry.reset_registry()
 
 
+@pytest.fixture(autouse=True)
+def _episode_cache_root(tmp_path_factory, monkeypatch):
+    """Every test gets its own episode cache root ($OCR_MANAGER_CACHE_DIR,
+    core.project.layout.cache_root), so no test ever reads or writes the
+    user's real ~/.cache/ocr-manager -- opening an episode prunes that root
+    and records into its index. It is a directory of its own, outside
+    tmp_path, so a test comparing tmp_path's listing sees nothing extra.
+    Tests that need to see the root read the variable."""
+    monkeypatch.setenv("OCR_MANAGER_CACHE_DIR", str(tmp_path_factory.mktemp("episode-cache")))
+
+
 def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True, capture_output=True)
 

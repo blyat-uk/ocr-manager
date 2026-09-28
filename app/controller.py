@@ -127,6 +127,19 @@ Saving
     save_project, debounced (500 ms); close_folder and shutdown save at once.
     A project that failed to load is never installed, so never saved.
 
+Episodes (docs spec 2026-09-28)
+    open_path routes: a video file, or a folder holding exactly one video,
+    opens as an episode (open_episode); anything else is open_folder's. An
+    episode is a Project like any other, with one file and an episode
+    ProjectLayout, so everything above applies unchanged; only paths differ,
+    and every path here comes from layout_of(project) -- settings and caches
+    under the per-user cache root, the output as `<stem>.zh.ass` next to the
+    video, nothing else written there. On top of that: opening prunes the
+    cache root, a save files the episode in its index (the same-folder crop
+    seed reads it), and a run that finished its file remembers its speed for
+    the next estimate. The episode_* readers are what the episode screens
+    (app/views/episode/) show.
+
 Views import no core module: UnsupportedProjectVersion (raised by
 open_folder) and DETECTION_KINDS are re-exported here.
 """
@@ -145,12 +158,15 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from app.activity import TERMINAL_EVENTS, ActivitySnapshot, ActivityTracker
-from app.folder_watch import OUTPUT_DIR, FolderWatch
+from app.folder_watch import FolderWatch
 from app.imaging import FrameCache, bgr_to_qimage
 from app.logbook import DETECTIONS_LOG, PIPELINE_LOG, LogBook
 from app.notify import send_notification
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
+from app.views.ranges_view import read_ranges
+from core.ass_qafix import load_ass
+from core.detect.crop import CONSENSUS_MIN_ENTRIES
 from core.jobs import apply as rules
 from core.jobs import view_cache
 from core.jobs.autopilot import AUTOPILOT_KINDS, DETECTION_KINDS, AutoPilot
@@ -165,11 +181,13 @@ from core.jobs.detect_jobs import (
     ProofResult,
     RangesJobResult,
     ThumbnailResult,
+    proof_lines,
 )
-from core.jobs.run import RunFile, RunJob, RunSummary, output_name
+from core.jobs.run import RunFile, RunJob, RunSummary
 from core.jobs.runner import JobEvent, JobRunner
 from core.jobs.view_jobs import FrameJob, FramesResult, StripJob, StripsResult
-from core.project import store
+from core.project import episode_cache, store
+from core.project.layout import ProjectLayout, cache_root, episode_layout, episode_target, layout_of
 from core.project.model import FileEntry, FolderSettings, Project, ReviewState
 from core.project.ocr_kwargs import ocr_call_for
 from core.project.store import UnsupportedProjectVersion
@@ -312,6 +330,8 @@ class ProjectController(QObject):
         self._run_active = False
         self._run_stop_requested = False
         self._save_blocked = False
+        self._episode_root: str | None = None    # the cache root an open episode lives under
+        self._seed_source: str | None = None     # the sibling its crop detection was seeded from
         self._activity.clear()
 
     def _reset_emits(self) -> None:
@@ -338,22 +358,83 @@ class ProjectController(QObject):
         path = os.path.abspath(os.fspath(path))
         if not os.path.isdir(path):
             raise NotADirectoryError(path)
-        project = store.load_project(path)
-        reopening = self._project is not None and _same_folder(self._project.path, path)
+        project = self._load(path, None)
+        self._install(project, path)
+
+    def open_path(self, path: str) -> None:
+        """The one opener the window uses (docs spec 2026-09-28, "Routing"):
+        a video file, or a folder holding exactly one video, opens as an
+        episode (open_episode); anything else goes to open_folder, which
+        opens a folder of 0 or several videos as the workbench and fails on
+        whatever is not a folder, exactly as it always did."""
+        target = episode_target(os.fspath(path))
+        if target is not None:
+            self.open_episode(target)
+        else:
+            self.open_folder(path)
+
+    def open_episode(self, video_path: str) -> None:
+        """Open the one video `video_path` as an episode. Its settings and
+        caches live under the cache root, keyed by its content
+        (core.project.layout.episode_layout); nothing but its output is ever
+        written next to it.
+
+        Stale episodes are pruned from the cache root first (never this one).
+        An episode with no crop of its own yet starts crop detection from the
+        newest sibling's crop (episode_cache.sibling_seed), given to AutoPilot
+        as a consensus of CONSENSUS_MIN_ENTRIES copies: detect_crop only uses
+        a consensus that long, and only to stop early when its own reading
+        already agrees -- a seed never forces a box and never flags one.
+
+        Same failure rules as open_folder; project_opened carries the video's
+        path, which is what the window remembers and titles itself with."""
+        self._check_alive()
+        video_path = os.path.abspath(os.fspath(video_path))
+        if not os.path.isfile(video_path):
+            raise FileNotFoundError(video_path)
+        root = cache_root()
+        layout = episode_layout(video_path, root)
+        project = self._load(layout.video_dir, layout)
+        episode_cache.prune(root, layout.key)
+        seed_source, seed = None, None
+        entry = project.files.get(layout.only_file)
+        if entry is not None and entry.crop is None:
+            found = episode_cache.sibling_seed(root, video_path, layout.key)
+            if found is not None:
+                seed_source, fractions = found
+                seed = [fractions] * CONSENSUS_MIN_ENTRIES
+        self._install(project, video_path, seed_consensus=seed, episode_root=root, seed_source=seed_source)
+
+    def _load(self, directory: str, layout: ProjectLayout | None) -> Project:
+        """Load the project, then close the open one (saving it). Reopening
+        the open project reads it again after that save, so no edit is
+        lost; a load that raises leaves the open project untouched."""
+        project = store.load_project(directory, layout)
+        wanted = layout_of(project)
+        open_layout = None if self._project is None else layout_of(self._project)
+        reopening = open_layout is not None and open_layout.kind == wanted.kind and (
+            open_layout.config_path == wanted.config_path if wanted.is_episode
+            else _same_folder(open_layout.video_dir, directory))
         self.close_folder()
         if reopening:
-            project = store.load_project(path)
+            project = store.load_project(directory, layout)
+        return project
+
+    def _install(self, project: Project, opened: str, *, seed_consensus=None, episode_root: str | None = None,
+                 seed_source: str | None = None) -> None:
         self._project = project
-        self._autopilot = AutoPilot(self._runner, self._current_project)
+        self._episode_root = episode_root
+        self._seed_source = seed_source
+        self._autopilot = AutoPilot(self._runner, self._current_project, seed_consensus=seed_consensus)
         self._refresh_done(notify=False)
         self._prune_view_cache()            # videos that left while the folder was closed
-        self._folder_watch.watch(path)
+        self._folder_watch.watch(project.path, layout_of(project).output_dirs()[:1])
         self._emit_files = self._emit_folder = self._emit_activity = True
         self._autopilot.on_open()
         self._recompute()
         if project.migrated_from_v1:
             self._schedule_save()
-        self.project_opened.emit(path)
+        self.project_opened.emit(opened)
         self._flush()
 
     def close_folder(self) -> None:
@@ -404,8 +485,67 @@ class ProjectController(QObject):
         return [] if self._project is None else list(self._project.files)
 
     def is_done(self, name: str) -> bool:
-        """chi/<output_name(name)> exists and is not empty (the run's stem rule)."""
+        """The file's output (output_path: a folder's chi/<stem>.ass, an
+        episode's <stem>.zh.ass) exists and is not empty."""
         return name in self._done
+
+    # --- the episode view's reading (docs spec 2026-09-28) -------------------------------
+
+    @property
+    def is_episode(self) -> bool:
+        """The open project is one episode rather than a folder."""
+        return self._project is not None and layout_of(self._project).is_episode
+
+    def episode_name(self) -> str | None:
+        """The episode's video file name; None with a folder (or nothing) open."""
+        return layout_of(self._project).only_file if self.is_episode else None
+
+    def episode_seed_source(self) -> str | None:
+        """The sibling episode whose crop seeded this one's crop detection
+        (the Preparing screen's "Starting from EP05's settings"); None when
+        nothing was seeded."""
+        return self._seed_source if self.is_episode else None
+
+    def episode_kept_duration(self, name: str) -> float:
+        """Seconds of `name` a run OCRs: its media duration, or the sum of
+        its keep ranges when it has placeable ones -- read with the ranges
+        view's own rule (read_ranges), so the Working screen's position and
+        this agree. 0.0 while the duration is unknown; KeyError for a file
+        that is not open."""
+        entry = self._require()[0].files[name]
+        duration = float(entry.media.duration or 0.0)
+        keeps, _unreadable = read_ranges(entry, duration)
+        return sum(end - start for start, end in keeps) if keeps else max(0.0, duration)
+
+    def episode_speed_hint(self) -> float | None:
+        """The remembered run speed, video seconds per wall second
+        (episode_cache.last_speed); None when no run has been measured."""
+        return episode_cache.last_speed(self._episode_root or cache_root())
+
+    def episode_estimate_seconds(self) -> float | None:
+        """How long a run of the episode should take on this computer: its
+        kept duration at the remembered speed. None when either is unknown."""
+        name = self.episode_name()
+        speed = self.episode_speed_hint()
+        if name is None or not speed or name not in self._project.files:
+            return None
+        kept = self.episode_kept_duration(name)
+        return kept / speed if kept > 0 else None
+
+    def output_path(self, name: str) -> str:
+        """Where a run writes `name`'s finished subtitles (the layout's rule)."""
+        return layout_of(self._require()[0]).output_path(name)
+
+    def output_lines(self, name: str) -> list[tuple[float, float, str]]:
+        """(start, end, text) of every Dialogue line of `name`'s output file,
+        read with core.ass_qafix.load_ass as the run's QA pass wrote it, so
+        the Done screen shows exactly what is on disk. [] when there is no
+        output or it cannot be read."""
+        try:
+            document = load_ass(self.output_path(name))
+        except (OSError, ValueError):
+            return []
+        return proof_lines("\n".join(document.lines))
 
     @staticmethod
     def is_detection_kind(kind: str) -> bool:
@@ -544,7 +684,8 @@ class ProjectController(QObject):
         wanted, entries = self._missing_times(times, lambda time_value: _frame_key(name, time_value),
                                               exact=exact)
         if wanted:
-            self._submit_view_job(FrameJob(project.path, name, wanted, exact=exact), entries)
+            self._submit_view_job(FrameJob(project.path, name, wanted, exact=exact,
+                                           cache_dir=layout_of(project).cache_dir), entries)
 
     def frame(self, name: str, time: float, exact: bool = False) -> np.ndarray | None:
         """The cached whole frame at `time` (a BGR numpy array), or None --
@@ -572,7 +713,8 @@ class ProjectController(QObject):
         box = tuple(int(value) for value in crop_box)
         wanted, entries = self._missing_times(times, lambda time_value: _strip_key(name, box, time_value))
         if wanted:
-            self._submit_view_job(StripJob(project.path, name, box, wanted), entries)
+            self._submit_view_job(StripJob(project.path, name, box, wanted, cache_dir=layout_of(project).cache_dir),
+                                  entries)
 
     def strip(self, name: str, crop_box: tuple[int, int, int, int], time: float) -> np.ndarray | None:
         """The cached OCR-exact strip at `time` for `crop_box`, or None (same
@@ -899,7 +1041,7 @@ class ProjectController(QObject):
         if not names:
             raise ValueError("no files to run")
         files = [RunFile(name, ocr_call_for(project.files[name], folder, project.path)) for name in names]
-        job = RunJob(project.path, files, folder.ocr_parallel)
+        job = RunJob(project.path, files, folder.ocr_parallel, layout=layout_of(project))
         self._run_active = True
         self._sync_autopilot_hold()
         try:
@@ -1027,7 +1169,7 @@ class ProjectController(QObject):
         project = self._project
         if project is None:
             return
-        gone = view_cache.prune(project.path, project.files)
+        gone = view_cache.prune(project.path, project.files, cache_dir=layout_of(project).cache_dir)
         if gone:
             logger.debug("Dropped the view cache of %d file(s) no longer in %s", gone, project.path)
 
@@ -1235,7 +1377,21 @@ class ProjectController(QObject):
         self._refresh_done()
         self._reconcile_folder()
         if not stopped:
+            self._remember_episode_speed(snapshot)
             self._notify(*notification_for(snapshot))
+
+    def _remember_episode_speed(self, snapshot: RunSnapshot) -> None:
+        """An episode run that finished its file (not stopped, not failed)
+        teaches the next Preparing screen and Working ETA how fast this
+        computer is: kept video seconds per wall second of the run job
+        (RunSummary.seconds). episode_cache.record_speed ignores a run too
+        short to say anything."""
+        name = self.episode_name()
+        summary = snapshot.summary
+        if name is None or summary is None or name not in summary.succeeded or name not in self._project.files:
+            return
+        episode_cache.record_speed(self._episode_root or cache_root(), self.episode_kept_duration(name),
+                                   summary.seconds)
 
     def _notify(self, title: str, body: str, urgency: str) -> None:
         send_notification(title, body, urgency)         # started, never waited for here
@@ -1276,9 +1432,9 @@ class ProjectController(QObject):
 
     def _refresh_done(self, names: list[str] | None = None, *, notify: bool = True) -> None:
         project = self._project
-        chi = os.path.join(project.path, OUTPUT_DIR)
+        layout = layout_of(project)
         for name in (list(project.files) if names is None else names):
-            done = name in project.files and _non_empty_file(os.path.join(chi, output_name(name)))
+            done = name in project.files and _non_empty_file(layout.output_path(name))
             if done != (name in self._done):
                 (self._done.add if done else self._done.discard)(name)
                 if notify:
@@ -1342,21 +1498,30 @@ class ProjectController(QObject):
     def _warn_if_save_blocked(self) -> None:
         if self._project is not None and self._save_blocked:
             self._save_failure(f"Closing {self._project.path} without saving: "
-                               f"its {store.CONFIG_FILENAME} was written by a newer version.")
+                               f"its {os.path.basename(layout_of(self._project).config_path)} was written by "
+                               f"a newer version.")
 
     def _save_now(self) -> None:
         self._save_timer.stop()
         project = self._project
         if project is None or self._save_blocked:
             return
+        layout = layout_of(project)
         try:
             store.save_project(project)
-            self.project_saved.emit()
         except UnsupportedProjectVersion as exc:
             self._save_blocked = True           # someone put a newer project file there: never overwrite it
             self._save_failure(f"Not saving: {exc}")
+            return
         except (OSError, TypeError, ValueError) as exc:        # TypeError/ValueError: a value JSON cannot hold
-            self._save_failure(f"Could not save {os.path.join(project.path, store.CONFIG_FILENAME)}: {exc}")
+            self._save_failure(f"Could not save {layout.config_path}: {exc}")
+            return
+        if layout.is_episode:
+            # The index is what finds this episode's crop for next week's
+            # sibling (episode_cache.sibling_seed). It never raises.
+            episode_cache.record_episode(self._episode_root or cache_root(),
+                                         os.path.join(layout.video_dir, layout.only_file), layout.key)
+        self.project_saved.emit()
 
     def _save_failure(self, message: str) -> None:
         logger.warning("%s", message)
@@ -1377,7 +1542,7 @@ class ProjectController(QObject):
             logger.warning("%s is not reachable: its file list is left as it was", project.path)
             return
         self._folder_watch.rewatch()
-        names = store.list_video_files(project.path)
+        names = layout_of(project).video_names()
         gone = frozenset(project.files) - set(names)
         if gone:
             self._runner.cancel_where(lambda job: job.file in gone)
