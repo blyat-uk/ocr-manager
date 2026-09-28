@@ -848,8 +848,8 @@ def test_empty_state_before_a_folder_is_open(make_window):
     window = make_window()
     assert window.windowTitle() == "OCR Manager"
     assert window.centre.currentWidget() is window.open_view
-    assert window.open_view.title_label.text() == "Open a folder of episodes"
-    assert window.open_view.choose_button.text() == "Choose folder…"
+    assert window.open_view.title_label.text() == "Open an episode or a folder of episodes"
+    assert window.open_view.choose_button.text() == "Open folder…"
 
 
 def test_drag_and_drop_of_a_directory_opens_it(make_window, tmp_project, tmp_path):

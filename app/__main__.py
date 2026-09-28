@@ -1,4 +1,5 @@
-"""`python -m app [folder]`: the workbench window (ruling C10).
+"""`python -m app [path]`: the window (ruling C10), opening `path` -- an
+episode, or a folder of episodes -- when one is given.
 
 Startup order (`main`): `app.bootstrap.boot()` first -- stdout/stderr to
 the log file when there is no console, then the bundle's OCR engine
@@ -58,7 +59,7 @@ def _program_name() -> str:
 
 def _parse(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(prog=_program_name(), description="OCR Manager")
-    parser.add_argument("folder", nargs="?", help="a folder of episodes to open")
+    parser.add_argument("path", nargs="?", help="an episode, or a folder of episodes")
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     parser.add_argument("--setup-engine", action="store_true",
                         help="open the OCR engine setup (install, reinstall or switch GPU/CPU)")
@@ -93,6 +94,17 @@ def run_engine_setup(started: Boot) -> bool:
     if accepted:
         reactivate(started)
     return started.state is not None
+
+
+def open_path(window: MainWindow, path: str) -> None:
+    """Open the command line's path: `window.open_path` routes an episode or
+    a folder; a window without it (before the episode view) takes folders
+    through `open_folder`, as it always did."""
+    opener = getattr(window, "open_path", None)
+    if callable(opener):
+        opener(path)
+    else:
+        window.open_folder(path)
 
 
 def install_excepthook(window: MainWindow) -> Callable:
@@ -148,8 +160,8 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow(tabs_factory=evidence_tabs)
     window.show()
-    if args.folder:
-        window.open_folder(args.folder)
+    if args.path:
+        open_path(window, args.path)
     if args.quit_after is not None:
         def quit_now() -> None:
             window.close()
