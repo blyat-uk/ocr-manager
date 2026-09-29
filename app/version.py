@@ -3,4 +3,4 @@
 A release tag ``vX.Y.Z`` must match it; CI refuses to build otherwise.
 """
 
-__version__ = "2.0.1"
+__version__ = "3.0.0"
