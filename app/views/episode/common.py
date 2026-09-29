@@ -25,9 +25,6 @@ BODY_SIZE = tokens.FONT_SIZE_BODY_BASE
 SMALL_SIZE = tokens.FONT_SIZE_BTN_SM_BASE
 CAPTION_SIZE = 22                   # the slideshow's line text
 
-OUTPUT_SUFFIX = ".zh.ass"
-
-
 def font(size: float, weight: int | None = None) -> QFont:
     """The theme's family stack at mockup `size` px (scaled), for painting."""
     result = QFont()
@@ -58,11 +55,6 @@ def set_label_style(label: QLabel, *, color: str, size: float = BODY_SIZE, weigh
         rules.append(f"font-weight: {weight}")
     label.setStyleSheet("; ".join(rules) + ";")
     label.setProperty("tone_color", color)
-
-
-def output_file_name(path: str) -> str:
-    """The output's file name from `controller.output_path(name)`."""
-    return os.path.basename(path) if path else ""
 
 
 def episode_label(name: str) -> str:

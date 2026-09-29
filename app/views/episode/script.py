@@ -1,6 +1,6 @@
 """The Script panel (episode-view-v2.html, screen 4): the episode's lines,
 first line first, each as "H:MM:SS.mmm → H:MM:SS.mmm" over its text, with
-the raw float times the run reported (or the written .zh.ass holds).
+the raw float times the run reported (or the written .ass holds).
 
 It follows the newest line: a line appended while following scrolls into
 view and flashes the drip's amber briefly. Scrolling up -- or clicking a

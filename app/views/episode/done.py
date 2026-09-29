@@ -1,8 +1,9 @@
 """The Done screen (episode-view.html, screen 5): the episode's subtitles
 are written, and here is what they say.
 
-"Subtitles unburned": N lines in T, saved as `<stem>.zh.ass` next to the
-video, then Show in folder · Open the .ass · Open another episode…, and
+"Subtitles unburned": N lines in T, saved as the output's label next to the
+video (`controller.output_label`: "zh/EP06.zh.ass", or "EP06.zh.ass" with
+the subfolder off), then Show in folder · Open the .ass · Open another episode…, and
 "Review the settings used ▸" back to the tabs. The Script panel is loaded
 from the written file (`controller.output_lines`), not from what the run
 reported along the way, so the user proofreads the exact output: QA-fixed,
@@ -34,7 +35,6 @@ from app.views.episode.common import (
     BODY_SIZE,
     HEADLINE_SIZE,
     SMALL_SIZE,
-    output_file_name,
     text_label,
 )
 from app.views.episode.script import ScriptPanel
@@ -178,7 +178,7 @@ class DoneView(QWidget):
         else:
             self._outcome = OUTCOME_DONE
 
-        output = output_file_name(self._controller.output_path(name))
+        output = self._controller.output_label(name)
         key = (name, snapshot.finished_at if snapshot is not None else None, self._controller.is_done(name))
         if key != self._loaded_from:
             self._loaded_from = key
@@ -229,7 +229,10 @@ class DoneView(QWidget):
     def show_in_folder(self) -> None:
         path = self._controller.output_path(self._name) if self._name else ""
         if path:
-            self._open_url(QUrl.fromLocalFile(os.path.dirname(path)))
+            directory = os.path.dirname(path)
+            if not os.path.isdir(directory):        # an output subfolder no run has made yet: the video's folder
+                directory = os.path.dirname(directory)
+            self._open_url(QUrl.fromLocalFile(directory))
 
     def open_output(self) -> None:
         path = self._controller.output_path(self._name) if self._name else ""

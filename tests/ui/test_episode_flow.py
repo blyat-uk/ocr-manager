@@ -205,6 +205,7 @@ def run_detections(fake_runner, controller, name: str, *, crop_flag=None, bright
 
 def write_output(path: str, lines) -> None:
     body = "".join(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n" for start, end, text in lines)
+    Path(path).parent.mkdir(exist_ok=True)                   # the output subfolder a run would have made
     Path(path).write_text(ASS_HEADER + body, encoding="utf-8")
 
 
@@ -219,7 +220,7 @@ def test_open_path_opens_a_video_file_as_an_episode(controller, videos):
     assert controller.episode_name() == "EP06.mkv"
     assert controller.names() == ["EP06.mkv"]            # the sibling is not part of it
     assert controller.project.path == str(folder)
-    assert controller.output_path("EP06.mkv") == str(folder / "EP06.zh.ass")
+    assert controller.output_path("EP06.mkv") == str(folder / "zh" / "EP06.zh.ass")
 
 
 def test_open_path_routes_folders_by_their_video_count(controller, videos):
@@ -232,7 +233,7 @@ def test_open_path_routes_folders_by_their_video_count(controller, videos):
     assert not controller.is_episode
     assert controller.episode_name() is None
     assert controller.names() == ["EP06.mkv", "EP07.mkv"]
-    assert controller.output_path("EP06.mkv") == str(two / "chi" / "EP06.ass")
+    assert controller.output_path("EP06.mkv") == str(two / "zh" / "EP06.zh.ass")
 
 
 def test_open_folder_stays_a_folder_even_with_one_video(controller, videos):
@@ -402,11 +403,23 @@ def test_output_lines_parse_the_written_output(controller, videos):
     assert controller.output_lines("EP06.mkv") == [(1.0, 2.5, "你好"), (60.0, 61.0, "再见")]
 
 
-def test_a_folder_run_still_writes_into_chi(controller, fake_runner, videos):
+def test_a_folder_and_an_episode_name_their_output_by_the_same_rule(controller, fake_runner, videos):
+    """`<tag>/<stem>.<tag>.ass`, or `<stem>.<tag>.ass` next to the video with
+    "Create subfolder" off -- in the workbench and the episode view alike."""
     folder = videos(["EP06.mkv", "EP07.mkv"])
     controller.open_path(str(folder))
-    assert controller.output_path("EP07.mkv") == str(folder / "chi" / "EP07.ass")
+    assert controller.output_path("EP07.mkv") == str(folder / "zh" / "EP07.zh.ass")
     assert controller.episode_seed_source() is None
+    controller.update_folder(output_subfolder=False, ocr_lang="japan")
+    assert controller.output_path("EP07.mkv") == str(folder / "EP07.ja.ass")
+
+    controller.open_path(str(folder / "EP06.mkv"))
+    assert controller.is_episode
+    assert controller.output_path("EP06.mkv") == str(folder / "zh" / "EP06.zh.ass")
+    assert controller.output_label("EP06.mkv") == "zh/EP06.zh.ass"
+    controller.update_folder(output_subfolder=False)
+    assert controller.output_path("EP06.mkv") == str(folder / "EP06.zh.ass")
+    assert controller.output_label("EP06.mkv") == "EP06.zh.ass"
 
 
 # --------------------------------------------------------------------------
@@ -494,7 +507,7 @@ def test_the_whole_episode_flow(make_window, fake_runner, videos, monkeypatch):
     assert wait_for(lambda: window.episode_page() == "done")
     assert window.done_view.outcome() == "done"
     assert controller.output_lines("EP06.mkv") == [(1.0, 2.5, "你好"), (60.0, 61.0, "再见")]
-    assert listing(folder) == sorted(before + ["EP06.zh.ass"])
+    assert listing(folder) == sorted(before + ["zh", "zh/EP06.zh.ass"])
 
     window.done_view.review_requested.emit()
     settle()
@@ -507,7 +520,7 @@ def test_the_whole_episode_flow(make_window, fake_runner, videos, monkeypatch):
     window.done_view.retry_requested.emit()                   # again: the output exists, so it asks
     settle()
     assert asked == [("Replace existing subtitles?",
-                      "EP06.zh.ass already exists. Replace it when the new one is ready?")]
+                      "zh/EP06.zh.ass already exists. Replace it when the new one is ready?")]
     assert window.episode_page() == "working"
     assert len(fake_runner.of_kind("run")) == 2
 
@@ -516,7 +529,7 @@ def test_declining_the_overwrite_starts_nothing(make_window, fake_runner, videos
     window = make_window()
     folder = videos(["EP06.mkv"])
     save_episode(folder / "EP06.mkv", ready_entry("EP06.mkv"))
-    write_output(str(folder / "EP06.zh.ass"), [("0:00:01.00", "0:00:02.00", "旧")])
+    write_output(str(folder / "zh" / "EP06.zh.ass"), [("0:00:01.00", "0:00:02.00", "旧")])
     window.open_path(str(folder / "EP06.mkv"))
     settle()
     assert window.controller.is_done("EP06.mkv")

@@ -9,8 +9,8 @@ change means is the owner's business (ProjectController reconciles the file
 list, and ignores changes while a run writes its outputs).
 
 Which output directories to watch is the project layout's answer, given by
-the owner: a folder's chi/, and none for an episode, whose `<stem>.zh.ass`
-sits in the watched folder itself.
+the owner: the output subfolder (`zh/`), or none when the outputs sit in the
+watched folder itself. A settings change moves it (set_outputs).
 """
 from __future__ import annotations
 
@@ -43,14 +43,33 @@ class FolderWatch(QObject):
 
     def rewatch(self) -> None:
         """Watch the folder and its output directories again where they
-        exist and are not watched: chi/ once a run created it, the folder
-        after it vanished and came back (the watcher drops a deleted path)."""
+        exist and are not watched: the output subfolder once a run created
+        it, the folder after it vanished and came back (the watcher drops a
+        deleted path)."""
         if self._path is None:
             return
         watched = set(self._watcher.directories())
         for directory in (self._path, *self._outputs):
             if directory not in watched and os.path.isdir(directory):
                 self._watcher.addPath(directory)
+
+    def set_outputs(self, output_dirs: Iterable[str]) -> None:
+        """Watch `output_dirs` instead of the current ones, the folder itself
+        still watched; nothing while no folder is watched."""
+        if self._path is None:
+            return
+        outputs = tuple(output_dirs)
+        watched = set(self._watcher.directories())
+        dropped = [directory for directory in self._outputs
+                   if directory not in outputs and directory != self._path and directory in watched]
+        if dropped:
+            self._watcher.removePaths(dropped)
+        self._outputs = outputs
+        self.rewatch()
+
+    def directories(self) -> tuple[str, ...]:
+        """What is being watched now: the folder and each existing output directory."""
+        return tuple(self._watcher.directories())
 
     def stop(self) -> None:
         self._path = None

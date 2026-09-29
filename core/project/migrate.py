@@ -143,6 +143,7 @@ def _migrate_folder(data: dict) -> FolderSettings:
             automation.get("bottom_half_cutoff"), defaults.bottom_half_cutoff
         ),
         # detection_batch_size is intentionally dropped (ruling A5).
+        output_subfolder=defaults.output_subfolder,   # v1 had no such setting; its chi/ output is not carried over
     )
 
 

@@ -2,10 +2,14 @@
 
 Pinned here (rulings C5/C6, task-9-brief.md):
 
-- Atomic output. Each file writes chi/<stem>.ass.partial, runs
-  core.ass_qafix.process_file on it, then os.replace()s it onto chi/<stem>.ass.
-  A stopped or failed file deletes only its .partial: an existing
-  chi/<stem>.ass is never deleted or modified except by that replace.
+- Atomic output. Each file writes zh/<stem>.zh.ass.partial (the default
+  layout's output, core/project/layout.py), runs core.ass_qafix.process_file
+  on it, then os.replace()s it onto zh/<stem>.zh.ass. A stopped or failed
+  file deletes only its .partial: an existing zh/<stem>.zh.ass is never
+  deleted or modified except by that replace.
+- Directories. A run creates only its output subfolder (<tag>/), or nothing
+  when the output goes next to the video; no chi/, eng/ or translate/, and
+  an old chi/<stem>.ass is never touched.
 - The old OCRWorker call shape. No range or one range goes through
   save_subtitles_to_file(time_start=, time_end=); several go through
   get_subtitles(time_ranges=) and the text is written only if there is some
@@ -39,12 +43,13 @@ from core import ass_qafix
 from core.jobs import JobContext, JobEvent, JobRunner, Lane
 from core.jobs import run as run_module
 from core.jobs.run import RunFile, RunJob, RunSummary
-from core.project.layout import episode_layout, folder_layout
+from core.project.layout import episode_layout, folder_layout, layout_of
 from core.project.model import (
     Brightness,
     Crop,
     FileEntry,
     FolderSettings,
+    Project,
     Source,
     TimeRange,
     TimeRanges,
@@ -88,12 +93,20 @@ def stem(name: str) -> str:
     return Path(name).stem
 
 
+OUT = "zh"                  # the default layout's output subfolder and tag
+
+
+def out(name: str) -> str:
+    """The output file name of video `name` in the default layout."""
+    return f"{stem(name)}.{OUT}.ass"
+
+
 def partial_of(project: Path, name: str) -> Path:
-    return project / "chi" / f"{stem(name)}.ass.partial"
+    return project / OUT / f"{out(name)}.partial"
 
 
 def final_of(project: Path, name: str) -> Path:
-    return project / "chi" / f"{stem(name)}.ass"
+    return project / OUT / out(name)
 
 
 def write_old_final(project: Path, name: str) -> Path:
@@ -301,15 +314,15 @@ def test_parallel_must_be_at_least_one(tmp_path, parallel):
 
 
 @pytest.mark.parametrize("names, message", [
-    (["a.mp4", "a.mkv"], "a.mkv and a.mp4 both write chi/a.ass"),
-    (["a.mp4", "b.mp4", "a.mp4"], "a.mp4 and a.mp4 both write chi/a.ass"),
+    (["a.mp4", "a.mkv"], "a.mkv and a.mp4 both write zh/a.zh.ass"),
+    (["a.mp4", "b.mp4", "a.mp4"], "a.mp4 and a.mp4 both write zh/a.zh.ass"),
     (["x.mp4", "a.mp4", "a.mkv", "x.mkv", "a.avi"],
-     "a.avi, a.mkv and a.mp4 both write chi/a.ass; x.mkv and x.mp4 both write chi/x.ass"),
+     "a.avi, a.mkv and a.mp4 both write zh/a.zh.ass; x.mkv and x.mp4 both write zh/x.zh.ass"),
     (["[1080p] ep.01.mkv", "[1080p] ep.01.mp4"],
-     "[1080p] ep.01.mkv and [1080p] ep.01.mp4 both write chi/[1080p] ep.01.ass"),
+     "[1080p] ep.01.mkv and [1080p] ep.01.mp4 both write zh/[1080p] ep.01.zh.ass"),
     # One file on a case-insensitive filesystem (Windows, macOS).
-    (["a.mkv", "A.mp4"], "A.mp4 and a.mkv both write chi/A.ass"),
-    (["Ep01.mkv", "b.mkv", "EP01.mkv"], "EP01.mkv and Ep01.mkv both write chi/EP01.ass"),
+    (["a.mkv", "A.mp4"], "A.mp4 and a.mkv both write zh/A.zh.ass"),
+    (["Ep01.mkv", "b.mkv", "EP01.mkv"], "EP01.mkv and Ep01.mkv both write zh/EP01.zh.ass"),
 ])
 def test_run_files_that_write_the_same_output_are_refused(tmp_path, ocr, names, message):
     project = tmp_path / "project"
@@ -327,7 +340,7 @@ def test_distinct_output_stems_are_accepted(tmp_path, ocr, qa):
     ctx, _ = make_ctx()
     summary = job.run(ctx)
     assert summary.succeeded == names
-    assert sorted(os.listdir(tmp_path / "chi")) == sorted(["a.ass", "a.b.ass", "a .ass", "ab.ass"])
+    assert sorted(os.listdir(tmp_path / OUT)) == sorted(["a.zh.ass", "a.b.zh.ass", "a .zh.ass", "ab.zh.ass"])
 
 
 def test_a_multi_range_output_is_written_with_lf_on_every_os(tmp_path, ocr, qa, windows_text_mode):
@@ -370,25 +383,58 @@ def test_run_file_and_run_summary_are_frozen(tmp_path):
 # Directories and output
 # --------------------------------------------------------------------------
 
-def test_output_dirs_are_created_before_any_file(tmp_path, ocr, qa):
+def test_only_the_output_subfolder_is_created_before_any_file(tmp_path, ocr, qa):
     (tmp_path / "eng").mkdir()
     (tmp_path / "eng" / "keep.ass").write_text("keep")
     summary, events = run_now(tmp_path, [])
-    for sub in ("chi", "eng", "translate"):
-        assert (tmp_path / sub).is_dir()
+    assert sorted(os.listdir(tmp_path)) == ["eng", OUT]
+    assert (tmp_path / OUT).is_dir() and os.listdir(tmp_path / OUT) == []
     assert (tmp_path / "eng" / "keep.ass").read_text() == "keep"
     assert (summary.succeeded, summary.failed, summary.cancelled) == ([], {}, [])
     assert events.events == []
 
     seen = []
-    ocr.hooks["a.mp4"] = lambda kwargs: seen.append(
-        all((tmp_path / sub).is_dir() for sub in ("chi", "eng", "translate")))
-    shutil.rmtree(tmp_path / "chi")
+    ocr.hooks["a.mp4"] = lambda kwargs: seen.append((tmp_path / OUT).is_dir())
+    shutil.rmtree(tmp_path / OUT)
     run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
     assert seen == [True]
+    assert not (tmp_path / "chi").exists() and not (tmp_path / "translate").exists()
 
 
-def test_output_lands_in_chi_only_after_qa_replacing_the_old_file(tmp_path, ocr, qa):
+def test_an_old_chi_output_is_left_alone(tmp_path, ocr, qa):
+    old = tmp_path / "chi" / "a.ass"
+    old.parent.mkdir()
+    old.write_bytes(OLD_FINAL)
+    summary, _ = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
+    assert summary.succeeded == ["a.mp4"]
+    assert qa.calls[0].final is None                              # not this layout's output: no old final
+    assert old.read_bytes() == OLD_FINAL and os.listdir(tmp_path / "chi") == ["a.ass"]
+    assert final_of(tmp_path, "a.mp4").read_bytes() == (ass_text("a.mp4") + QA_LINE).encode("utf-8")
+
+
+@pytest.mark.parametrize("ocr_lang, tag", [("ch", "zh"), ("japan", "ja"), ("rs_latin", "sr-Latn")])
+@pytest.mark.parametrize("subfolder", [True, False])
+def test_a_run_writes_where_the_projects_settings_say(tmp_path, ocr, qa, ocr_lang, tag, subfolder):
+    folder = FolderSettings(ocr_lang=ocr_lang, output_subfolder=subfolder)
+    layout = layout_of(Project(path=str(tmp_path), folder=folder, files={}))
+    (tmp_path / "a.mp4").write_bytes(b"video")
+    summary = RunJob(str(tmp_path), [run_file(tmp_path, "a.mp4")], 1, layout=layout).run(make_ctx()[0])
+    assert summary.succeeded == ["a.mp4"]
+    final = tmp_path / tag / f"a.{tag}.ass" if subfolder else tmp_path / f"a.{tag}.ass"
+    assert [c.args for c in qa.calls] == [(f"{final}.partial",)]
+    assert final.read_bytes() == (ass_text("a.mp4") + QA_LINE).encode("utf-8")
+    assert sorted(os.listdir(tmp_path)) == (sorted(["a.mp4", tag]) if subfolder else sorted(["a.mp4", final.name]))
+
+
+def test_the_run_keeps_the_layout_it_was_built_with(tmp_path, ocr, qa):
+    project = Project(path=str(tmp_path), folder=FolderSettings(), files={})
+    job = RunJob(str(tmp_path), [run_file(tmp_path, "a.mp4")], 1, layout=layout_of(project))
+    project.folder.ocr_lang, project.folder.output_subfolder = "japan", False   # changed after submit
+    assert job.run(make_ctx()[0]).succeeded == ["a.mp4"]
+    assert sorted(os.listdir(tmp_path)) == [OUT] and os.listdir(tmp_path / OUT) == [out("a.mp4")]
+
+
+def test_output_lands_in_its_subfolder_only_after_qa_replacing_the_old_file(tmp_path, ocr, qa):
     write_old_final(tmp_path, "a.mp4")
     during_ocr = []
     ocr.hooks["a.mp4"] = lambda kwargs: during_ocr.append(final_of(tmp_path, "a.mp4").read_bytes())
@@ -408,7 +454,7 @@ def test_output_lands_in_chi_only_after_qa_replacing_the_old_file(tmp_path, ocr,
     assert qa.calls[1].final is None
     for name in ("a.mp4", "b.mkv"):
         assert final_of(tmp_path, name).read_bytes() == (ass_text(name) + QA_LINE).encode("utf-8")
-    assert sorted(os.listdir(tmp_path / "chi")) == ["a.ass", "b.ass"]
+    assert sorted(os.listdir(tmp_path / OUT)) == ["a.zh.ass", "b.zh.ass"]
 
 
 def test_final_is_exactly_what_the_real_qa_makes_of_the_ocr_text(tmp_path, ocr):
@@ -499,7 +545,7 @@ def test_several_ranges_with_no_text_produce_no_file_and_keep_the_old_final(tmp_
     assert summary.failed == {"a.mp4": "no subtitles produced"}
     assert qa.calls == []
     assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
-    assert sorted(os.listdir(tmp_path / "chi")) == ["a.ass"]
+    assert sorted(os.listdir(tmp_path / OUT)) == [out("a.mp4")]
     assert events.of("a.mp4")[-1].result == {"ok": False, "lines": 0, "error": "no subtitles produced"}
 
 
@@ -533,7 +579,7 @@ def test_stopping_mid_file_keeps_the_old_final_and_removes_the_partial(tmp_path,
     summary = running.join()
 
     assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
-    assert sorted(os.listdir(tmp_path / "chi")) == ["a.ass"]
+    assert sorted(os.listdir(tmp_path / OUT)) == [out("a.mp4")]
     assert qa.calls == []
     assert [fn for fn, _ in ocr.calls] == ["save_subtitles_to_file" if ranges is None else "get_subtitles"]
     assert (summary.succeeded, summary.failed, summary.cancelled) == ([], {}, ["a.mp4", "b.mp4"])
@@ -561,8 +607,8 @@ def test_stop_reaches_every_in_flight_file_through_its_own_event(tmp_path, ocr, 
     assert all(event.is_set() and event is not ctx.cancel_event for event in seen)
     assert summary.cancelled == ["a.mp4", "b.mp4", "c.mp4"]
     assert events.of("c.mp4") == []
-    assert not (tmp_path / "chi" / "a.ass.partial").exists()
-    assert os.listdir(tmp_path / "chi") == []
+    assert not partial_of(tmp_path, "a.mp4").exists()
+    assert os.listdir(tmp_path / OUT) == []
 
 
 def test_a_run_stopped_before_it_starts_starts_nothing(tmp_path, ocr, qa):
@@ -572,7 +618,7 @@ def test_a_run_stopped_before_it_starts_starts_nothing(tmp_path, ocr, qa):
     assert ocr.calls == []
     assert events.events == []
     assert (summary.succeeded, summary.failed, summary.cancelled) == ([], {}, ["a.mp4", "b.mp4"])
-    assert (tmp_path / "chi").is_dir()
+    assert (tmp_path / OUT).is_dir()
 
 
 # --------------------------------------------------------------------------
@@ -594,7 +640,7 @@ def test_an_exception_in_one_file_does_not_stop_the_others(tmp_path, ocr, qa):
     assert summary.failed == {"b.mp4": "decoder exploded"}
     assert summary.cancelled == []
     assert final_of(tmp_path, "b.mp4").read_bytes() == OLD_FINAL
-    assert sorted(os.listdir(tmp_path / "chi")) == ["a.ass", "b.ass", "c.ass"]
+    assert sorted(os.listdir(tmp_path / OUT)) == [out(n) for n in ("a.mp4", "b.mp4", "c.mp4")]
     assert [c.args[0] for c in qa.calls] == [str(partial_of(tmp_path, n)) for n in ("a.mp4", "c.mp4")]
     assert events.of("b.mp4")[-1].result == {"ok": False, "lines": 0, "error": "decoder exploded"}
     logs = [e.message for e in events.events if e.type == "log"]
@@ -613,13 +659,13 @@ def test_an_exception_without_a_message_reports_its_type(tmp_path, ocr, qa):
 
 def test_a_qa_failure_keeps_the_old_final_and_removes_the_partial(tmp_path, ocr, qa):
     write_old_final(tmp_path, "a.mp4")
-    qa.raise_for["a.ass.partial"] = ValueError("qa broke")
+    qa.raise_for["a.zh.ass.partial"] = ValueError("qa broke")
     summary, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4"), run_file(tmp_path, "b.mp4")])
 
     assert summary.failed == {"a.mp4": "qa broke"}
     assert summary.succeeded == ["b.mp4"]
     assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
-    assert sorted(os.listdir(tmp_path / "chi")) == ["a.ass", "b.ass"]
+    assert sorted(os.listdir(tmp_path / OUT)) == ["a.zh.ass", "b.zh.ass"]
     assert events.of("a.mp4")[-1].result == {"ok": False, "lines": 0, "error": "qa broke"}
 
 
@@ -628,7 +674,7 @@ def test_a_failed_replace_keeps_the_old_final(tmp_path, ocr, qa, monkeypatch):
     real_replace = os.replace
 
     def failing_replace(src, dst, *args, **kwargs):
-        if str(src).endswith("a.ass.partial"):
+        if str(src).endswith("a.zh.ass.partial"):
             raise OSError("disk full")
         return real_replace(src, dst, *args, **kwargs)
 
@@ -636,7 +682,7 @@ def test_a_failed_replace_keeps_the_old_final(tmp_path, ocr, qa, monkeypatch):
     summary, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
     assert summary.failed == {"a.mp4": "disk full"}
     assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
-    assert os.listdir(tmp_path / "chi") == ["a.ass"]
+    assert os.listdir(tmp_path / OUT) == [out("a.mp4")]
     assert events.of("a.mp4")[-1].result == {"ok": False, "lines": 0, "error": "disk full"}
 
 
@@ -670,7 +716,7 @@ def test_failed_always_means_the_final_was_not_replaced(tmp_path, ocr, qa, monke
 
     assert summary.failed == {"a.mp4": "read back failed"}
     assert final_of(tmp_path, "a.mp4").read_bytes() == OLD_FINAL
-    assert os.listdir(tmp_path / "chi") == ["a.ass"]
+    assert os.listdir(tmp_path / OUT) == [out("a.mp4")]
     assert events.of("a.mp4")[-1].result == {"ok": False, "lines": 0, "error": "read back failed"}
 
 
@@ -807,7 +853,7 @@ def test_pause_before_the_run_holds_the_first_file(tmp_path, ocr, qa):
     running = Running(job, ctx)
     time.sleep(QUIET)
     assert events.events == [] and ocr.calls == []
-    assert (tmp_path / "chi").is_dir()
+    assert (tmp_path / OUT).is_dir()
     job.resume()
     assert running.join().succeeded == ["a.mp4"]
 
@@ -1126,7 +1172,7 @@ def test_a_failed_file_logs_the_error_and_its_traceback(tmp_path, ocr, qa):
 
 
 def test_a_qa_failure_logs_no_qa_line(tmp_path, ocr, qa):
-    qa.raise_for["a.ass.partial"] = ValueError("bad ass")
+    qa.raise_for["a.zh.ass.partial"] = ValueError("bad ass")
     _, events = run_now(tmp_path, [run_file(tmp_path, "a.mp4")])
     log = file_log(events, "a.mp4")
     assert [line.split("\n")[0] for line in log] == ["Starting OCR: a.mp4", "OCR failed: bad ass"]
@@ -1138,15 +1184,15 @@ def test_a_file_that_produced_nothing_logs_the_failure(tmp_path, ocr, qa):
     assert file_log(events, "a.mp4")[-1] == "OCR failed: no subtitles produced\n"
 
 
-def test_output_name_is_the_file_a_run_writes_into_chi(tmp_path, ocr, qa):
+def test_output_name_is_the_file_a_run_writes_into_its_subfolder(tmp_path, ocr, qa):
     from core.jobs.run import output_name
 
-    assert output_name("ZS2_-_11_[1080p]TXHBR.mp4") == "ZS2_-_11_[1080p]TXHBR.ass"
-    assert output_name("a.b.mkv") == "a.b.ass"
-    assert output_name("第一集.mp4") == "第一集.ass"
+    assert output_name("ZS2_-_11_[1080p]TXHBR.mp4") == "ZS2_-_11_[1080p]TXHBR.zh.ass"
+    assert output_name("a.b.mkv") == "a.b.zh.ass"
+    assert output_name("第一集.mp4") == "第一集.zh.ass"
     names = ["a.b.mkv", "第一集.mp4"]
     run_now(tmp_path, [run_file(tmp_path, name) for name in names])
-    assert sorted(os.listdir(tmp_path / "chi")) == sorted(output_name(name) for name in names)
+    assert sorted(os.listdir(tmp_path / OUT)) == sorted(output_name(name) for name in names)
 
 
 def test_progress_is_a_fraction_clamped_to_0_1(tmp_path, ocr, qa):
@@ -1195,7 +1241,8 @@ def test_through_the_runner_cancelling_the_run_stops_it_with_its_summary(tmp_pat
 
 
 # --------------------------------------------------------------------------
-# An episode's layout: <stem>.zh.ass next to the video, no directories
+# An episode's layout: the same output rule as a folder's (zh/<stem>.zh.ass
+# by default), its state under the cache root
 # --------------------------------------------------------------------------
 
 def episode(tmp_path: Path, name: str = "EP06.mkv"):
@@ -1207,9 +1254,10 @@ def episode(tmp_path: Path, name: str = "EP06.mkv"):
     return show, episode_layout(str(show / name), str(tmp_path / "root"), key="a" * 32)
 
 
-def test_an_episode_run_writes_stem_zh_ass_next_to_the_video_and_creates_no_directory(tmp_path, ocr, qa):
+def test_an_episode_run_writes_into_the_language_subfolder(tmp_path, ocr, qa):
     show, layout = episode(tmp_path)
-    old = show / "EP06.zh.ass"
+    old = show / "zh" / "EP06.zh.ass"
+    old.parent.mkdir()
     old.write_bytes(OLD_FINAL)
     during_ocr = []
     ocr.hooks["EP06.mkv"] = lambda kwargs: during_ocr.append(old.read_bytes())
@@ -1219,22 +1267,39 @@ def test_an_episode_run_writes_stem_zh_ass_next_to_the_video_and_creates_no_dire
 
     assert summary.succeeded == ["EP06.mkv"]
     assert during_ocr == [OLD_FINAL]                      # replaced only when the new one was ready
-    assert [(c.args, c.kwargs) for c in qa.calls] == [((str(show / "EP06.zh.ass.partial"),), {})]
+    assert [(c.args, c.kwargs) for c in qa.calls] == [((str(show / "zh" / "EP06.zh.ass.partial"),), {})]
     assert qa.calls[0].final == OLD_FINAL
     assert old.read_bytes() == (ass_text("EP06.mkv") + QA_LINE).encode("utf-8")
-    assert sorted(os.listdir(show)) == ["EP06.mkv", "EP06.zh.ass"]
+    assert sorted(os.listdir(show)) == ["EP06.mkv", "zh"]
+    assert os.listdir(show / "zh") == ["EP06.zh.ass"]
+    assert not (tmp_path / "root").exists()
+
+
+def test_an_episode_without_the_subfolder_writes_next_to_the_video_and_creates_no_directory(tmp_path, ocr, qa):
+    show, base = episode(tmp_path)
+    folder = FolderSettings(ocr_lang="japan", output_subfolder=False)
+    layout = layout_of(Project(path=str(show), folder=folder, files={}, layout=base))
+    old = show / "EP06.zh.ass"                                  # another language's output: not touched
+    old.write_bytes(OLD_FINAL)
+    summary = RunJob(str(show), [run_file(show, "EP06.mkv")], 1, layout=layout).run(make_ctx()[0])
+    assert summary.succeeded == ["EP06.mkv"]
+    assert [c.args for c in qa.calls] == [(str(show / "EP06.ja.ass.partial"),)]
+    assert old.read_bytes() == OLD_FINAL
+    assert sorted(os.listdir(show)) == ["EP06.ja.ass", "EP06.mkv", "EP06.zh.ass"]
     assert not (tmp_path / "root").exists()
 
 
 def test_an_episode_run_uses_the_stem_rule_of_the_folder_run(tmp_path, ocr, qa):
     show, layout = episode(tmp_path, "ep.01 [1080p].mp4")
     RunJob(str(show), [run_file(show, "ep.01 [1080p].mp4")], 1, layout=layout).run(make_ctx()[0])
-    assert sorted(os.listdir(show)) == ["ep.01 [1080p].mp4", "ep.01 [1080p].zh.ass"]
+    assert sorted(os.listdir(show)) == ["ep.01 [1080p].mp4", "zh"]
+    assert os.listdir(show / "zh") == ["ep.01 [1080p].zh.ass"]
 
 
 def test_a_stopped_episode_keeps_its_old_output_and_removes_the_partial(tmp_path, ocr, qa):
     show, layout = episode(tmp_path)
-    (show / "EP06.zh.ass").write_bytes(OLD_FINAL)
+    (show / "zh").mkdir()
+    (show / "zh" / "EP06.zh.ass").write_bytes(OLD_FINAL)
     entered = threading.Event()
     ocr.hooks["EP06.mkv"] = blocking_until_cancelled(entered, produce=ass_text("partial"))
     ctx, _ = make_ctx()
@@ -1244,23 +1309,23 @@ def test_a_stopped_episode_keeps_its_old_output_and_removes_the_partial(tmp_path
     summary = running.join()
 
     assert summary.cancelled == ["EP06.mkv"]
-    assert (show / "EP06.zh.ass").read_bytes() == OLD_FINAL
-    assert sorted(os.listdir(show)) == ["EP06.mkv", "EP06.zh.ass"]
+    assert (show / "zh" / "EP06.zh.ass").read_bytes() == OLD_FINAL
+    assert os.listdir(show / "zh") == ["EP06.zh.ass"]
 
 
 def test_episode_files_that_write_the_same_output_are_refused_by_their_output(tmp_path, ocr):
     show, layout = episode(tmp_path)
     with pytest.raises(ValueError) as raised:
         RunJob(str(show), [run_file(show, "EP06.mkv"), run_file(show, "EP06.mkv")], 1, layout=layout)
-    assert str(raised.value) == "EP06.mkv and EP06.mkv both write EP06.zh.ass"
+    assert str(raised.value) == "EP06.mkv and EP06.mkv both write zh/EP06.zh.ass"
 
 
 def test_without_a_layout_a_run_is_the_folder_layouts(tmp_path, ocr, qa):
     job = RunJob(str(tmp_path), [run_file(tmp_path, "a.mp4")], 1)
     assert job.layout == folder_layout(str(tmp_path))
     job.run(make_ctx()[0])
-    assert sorted(os.listdir(tmp_path)) == ["chi", "eng", "translate"]
-    assert os.listdir(tmp_path / "chi") == ["a.ass"]
+    assert sorted(os.listdir(tmp_path)) == [OUT]
+    assert os.listdir(tmp_path / OUT) == [out("a.mp4")]
 
 
 def test_run_module_imports_no_qt():
@@ -1414,7 +1479,7 @@ def test_run_output_is_byte_identical_to_todays_worker_flow_and_matches_the_gold
     print(f"run: {time.perf_counter() - started:.1f}s {summary}")
 
     assert summary.succeeded == [names[case.name] for case in cases], summary
-    assert sorted(os.listdir(run_dir / "chi")) == sorted(f"{stem(n)}.ass" for n in names.values())
+    assert sorted(os.listdir(run_dir / OUT)) == sorted(out(n) for n in names.values())
 
     # Which branch of the old call shape each file took.
     def calls_for(name):
@@ -1442,7 +1507,7 @@ def test_run_output_is_byte_identical_to_todays_worker_flow_and_matches_the_gold
         assert produced == expected[case.name], f"{case.name}: run output differs from the old OCRWorker flow"
         golden = digest((GOLDEN_DIR / f"{case.name}.ass").read_text(encoding="utf-8"))
         assert golden.startswith(FIDELITY_CASES[case.name]), case.name
-        got = digest(pre_qa[f"{stem(name)}.ass.partial"])
+        got = digest(pre_qa[f"{out(name)}.partial"])
         assert got == golden, f"{case.name}: golden {golden[:12]} != produced {got[:12]}"
         lines = produced.decode("utf-8").count("\nDialogue:")
         finished = [e.result for e in events.of(name) if e.type == "run_file_finished"]

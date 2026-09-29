@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -1269,9 +1270,9 @@ def test_a_running_confirm_shows_in_the_activity_strip_but_changes_no_badge(make
 def mixed_project(tmp_project):
     names = ["a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv", "f.mkv", "g.mkv"]
     folder = tmp_project(names, config=manual_config(names, autopilot_enabled=False))
-    (folder / "chi").mkdir()
-    (folder / "chi" / "f.ass").write_text("[Script Info]\n", encoding="utf-8")
-    (folder / "chi" / "g.ass").write_bytes(b"")                 # empty: not done
+    (folder / "zh").mkdir()
+    (folder / "zh" / "f.zh.ass").write_text("[Script Info]\n", encoding="utf-8")
+    (folder / "zh" / "g.zh.ass").write_bytes(b"")               # empty: not done
     return folder
 
 
@@ -1321,10 +1322,10 @@ def counts_project(tmp_project):
     entries = [make_entry(name, crop=BOX, brightness=209, crop_source=Source.DETECTED,
                           flags={"crop": FLAG_LOW_AGREEMENT}) for name in names]
     folder = tmp_project(names, config=v2_config(entries, autopilot_enabled=False))
-    (folder / "chi").mkdir()
+    (folder / "zh").mkdir()
     for name, (_state, _skipped, done, *_rest) in zip(names, COUNT_CASES, strict=True):
         if done:
-            (folder / "chi" / name.replace(".mkv", ".ass")).write_text("Dialogue: x\n", encoding="utf-8")
+            (folder / "zh" / name.replace(".mkv", ".zh.ass")).write_text("Dialogue: x\n", encoding="utf-8")
     return folder, names
 
 
@@ -1440,7 +1441,7 @@ def test_start_run_refuses_files_that_write_the_same_output(make_controller, fak
     folder = tmp_project(names, config=manual_config(names))
     controller = make_controller()
     controller.open_folder(str(folder))
-    with pytest.raises(ValueError, match=r"a\.mkv and a\.mp4 both write chi/a\.ass"):
+    with pytest.raises(ValueError, match=r"a\.mkv and a\.mp4 both write zh/a\.zh\.ass"):
         controller.start_run(names)
     assert fake_runner.of_kind("run") == [] and fake_runner.pauses == []
     assert controller.run_snapshot() is None
@@ -1597,8 +1598,8 @@ def test_run_end_re_derives_done_states(make_controller, fake_runner, tmp_projec
     controller.start_run(names)
     run = fake_runner.last("run")
     changed = Spy(controller.file_changed)
-    (folder / "chi").mkdir()
-    (folder / "chi" / "ep01.ass").write_text("Dialogue: x\n", encoding="utf-8")
+    (folder / "zh").mkdir()
+    (folder / "zh" / "ep01.zh.ass").write_text("Dialogue: x\n", encoding="utf-8")
     run_to_end(fake_runner, run, RunSummary(["ep01.mkv"], {}, ["ep02.mkv"], 3.0))
     controller.drain_events()
     assert controller.is_done("ep01.mkv") and not controller.is_done("ep02.mkv")
@@ -1606,6 +1607,73 @@ def test_run_end_re_derives_done_states(make_controller, fake_runner, tmp_projec
     snapshot = controller.run_snapshot()
     assert snapshot.row("ep02.mkv").state == "cancelled"
     assert controller.startable_files() == ["ep02.mkv"]
+
+
+def test_done_follows_the_output_naming_and_never_counts_the_old_chi_output(
+        make_controller, fake_runner, tmp_project):
+    """Done is a non-empty file at the output path of the current settings
+    only: `zh/EP01.zh.ass` by default, `EP01.zh.ass` next to the video with
+    the subfolder off, `ja/...` for Japanese. Changing either re-reads every
+    badge at once, and submits nothing. The old `chi/<stem>.ass` never
+    counts and is never touched."""
+    names = ["EP01.mkv", "EP02.mkv"]
+    folder = tmp_project(names, config=manual_config(names))
+    (folder / "chi").mkdir()
+    old = folder / "chi" / "EP02.ass"
+    old.write_text("Dialogue: old\n", encoding="utf-8")
+    (folder / "zh").mkdir()
+    (folder / "zh" / "EP01.zh.ass").write_text("Dialogue: x\n", encoding="utf-8")
+    controller = make_controller(watch_debounce_ms=20)
+    controller.open_folder(str(folder))
+    controller.drain_events()
+    submitted = len(fake_runner.submissions)
+    changed = Spy(controller.file_changed)
+    assert controller.is_done("EP01.mkv") and badge(controller, "EP01.mkv")[0] == "done"
+    assert not controller.is_done("EP02.mkv")
+    assert controller.output_path("EP01.mkv") == str(folder / "zh" / "EP01.zh.ass")
+    assert controller.output_label("EP01.mkv") == "zh/EP01.zh.ass"
+
+    controller.update_folder(output_subfolder=False)
+    assert controller.output_path("EP01.mkv") == str(folder / "EP01.zh.ass")
+    assert not controller.is_done("EP01.mkv") and badge(controller, "EP01.mkv")[0] != "done"
+    assert changed.firsts == ["EP01.mkv"]
+    (folder / "EP01.zh.ass").write_text("Dialogue: y\n", encoding="utf-8")    # the watched folder itself
+    assert wait_for(lambda: controller.is_done("EP01.mkv"), WAIT_MS)
+
+    controller.update_folder(ocr_lang="japan")
+    assert controller.output_label("EP01.mkv") == "EP01.ja.ass" and not controller.is_done("EP01.mkv")
+    controller.update_folder(ocr_lang="ch", output_subfolder=True)
+    assert controller.is_done("EP01.mkv") and not controller.is_done("EP02.mkv")
+    controller.drain_events()
+    assert len(fake_runner.submissions) == submitted                    # output naming detects nothing
+    assert controller.startable_files() == ["EP02.mkv"]
+    assert old.read_text(encoding="utf-8") == "Dialogue: old\n"
+
+
+def test_the_watcher_follows_the_output_directory(make_controller, fake_runner, tmp_project):
+    """The output subfolder is watched (a deleted or new output changes a
+    badge); with the output next to the video only the folder is, and a new
+    language moves the watch to its own subfolder."""
+    names = ["EP01.mkv", "EP02.mkv"]
+    folder = tmp_project(names, config=manual_config(names, autopilot_enabled=False))
+    (folder / "zh").mkdir()
+    (folder / "ja").mkdir()
+    controller = make_controller(watch_debounce_ms=20)
+    controller.open_folder(str(folder))
+
+    def watched() -> set[Path]:
+        return {Path(directory) for directory in controller._folder_watch.directories()}
+
+    assert watched() == {folder, folder / "zh"}
+    controller.update_folder(output_subfolder=False)
+    assert watched() == {folder}
+    controller.update_folder(output_subfolder=True, ocr_lang="japan")
+    assert watched() == {folder, folder / "ja"}
+    (folder / "ja" / "EP02.ja.ass").write_text("Dialogue: x\n", encoding="utf-8")
+    assert wait_for(lambda: controller.is_done("EP02.mkv"), WAIT_MS)
+    (folder / "zh" / "EP01.zh.ass").write_text("Dialogue: x\n", encoding="utf-8")    # no longer the output
+    QTest.qWait(200)
+    assert not controller.is_done("EP01.mkv")
 
 
 def test_parallel_files_changed_during_a_run_reach_the_run_job(

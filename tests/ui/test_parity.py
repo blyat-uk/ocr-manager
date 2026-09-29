@@ -42,7 +42,6 @@ from app.logbook import PIPELINE_LOG
 from app.main_window import MODE_RUN, MainWindow
 from app.views import open_folder as open_folder_module
 from app.views.run_view import MAX_PARALLEL
-from core.jobs.run import OUTPUT_DIRS
 from core.jobs.runner import JobContext
 from core.project import (
     Brightness,
@@ -107,17 +106,19 @@ PARITY = {
         "test_done_files_are_badged_done_and_left_out_of_a_start",
         "tests/ui/test_controller.py::test_startable_files_and_overwrite",
         "tests/ui/test_controller.py::test_run_end_re_derives_done_states",
+        "tests/ui/test_controller.py::test_done_follows_the_output_naming_and_never_counts_the_old_chi_output",
     ],
     "Overwrite confirmation before re-running finished files": [
         "test_replacing_done_files_is_asked_once_and_deletes_nothing",
         "tests/ui/test_run_view.py::test_start_asks_before_replacing_done_files",
         "tests/test_run_job.py::test_stopping_mid_file_keeps_the_old_final_and_removes_the_partial",
-        "tests/test_run_job.py::test_output_lands_in_chi_only_after_qa_replacing_the_old_file",
+        "tests/test_run_job.py::test_output_lands_in_its_subfolder_only_after_qa_replacing_the_old_file",
     ],
     "Folder watcher": [
         "test_the_folder_watcher_adds_new_episodes_and_drops_vanished_ones",
         "tests/ui/test_controller.py::test_watcher_adds_new_videos_and_drops_vanished_ones",
         "tests/ui/test_controller.py::test_watcher_changes_wait_for_the_run_to_end",
+        "tests/ui/test_controller.py::test_the_watcher_follows_the_output_directory",
     ],
     "Desktop notification on completion": [
         "test_a_finished_run_sends_a_desktop_notification",
@@ -173,9 +174,13 @@ PARITY = {
         "tests/test_run_job.py::test_several_ranges_call_get_subtitles_and_write_the_text_as_utf8",
         "tests/test_multirange.py::test_time_ranges_matches_old_per_range_calls_and_golden",
     ],
-    "Creating chi/, eng/, translate/ output directories": [
-        "test_a_run_creates_the_three_output_directories",
-        "tests/test_run_job.py::test_output_dirs_are_created_before_any_file",
+    # The chi/, eng/ and translate/ of the old window became one directory
+    # named after the OCR language (2026-09-29): `zh/` by default, none with
+    # "Create subfolder" off. Losing it would put outputs somewhere "done"
+    # does not look.
+    "Creating the output directory": [
+        "test_a_run_creates_only_the_language_output_directory",
+        "tests/test_run_job.py::test_only_the_output_subfolder_is_created_before_any_file",
     ],
     "HDR->SDR tone mapping (PQ and HLG)": [
         "test_detector_frames_and_ocr_frames_share_one_decode_and_tone_map_path",
@@ -231,13 +236,14 @@ PARITY = {
         "tests/test_layout.py::test_a_folder_with_exactly_one_video_opens_that_video",
         "tests/test_layout.py::test_a_folder_of_zero_or_several_videos_opens_as_a_folder",
     ],
-    "Episode: nothing but <stem>.zh.ass is written next to the video": [
+    "Episode: nothing but its output is written next to the video": [
         "tests/ui/test_episode_flow.py::test_an_episode_writes_nothing_next_to_the_video_but_its_output",
         "tests/ui/test_episode_flow.py::test_the_whole_episode_flow",
         "tests/ui/test_episode_flow.py::test_view_jobs_and_the_run_use_the_episode_layout",
         "tests/test_layout.py::test_the_folder_layout_is_todays_paths_literally",
         "tests/test_layout.py::test_an_episode_round_trips_without_writing_into_the_video_directory",
-        "tests/test_run_job.py::test_an_episode_run_writes_stem_zh_ass_next_to_the_video_and_creates_no_directory",
+        "tests/test_run_job.py::test_an_episode_run_writes_into_the_language_subfolder",
+        "tests/test_run_job.py::test_an_episode_without_the_subfolder_writes_next_to_the_video_and_creates_no_directory",
         "tests/test_run_job.py::test_a_stopped_episode_keeps_its_old_output_and_removes_the_partial",
     ],
     "Episode screens: Preparing -> Review -> Working -> Done": [
@@ -341,8 +347,8 @@ def make_window(controller, notifications, tmp_project):
         files = entries if entries is not None else {name: ready_entry(name) for name in names}
         save_project(Project(path=str(folder_path), folder=FolderSettings(**folder), files=files))
         for name in done:
-            (folder_path / "chi").mkdir(exist_ok=True)
-            (folder_path / "chi" / f"{Path(name).stem}.ass").write_text("Dialogue: old\n", encoding="utf-8")
+            (folder_path / "zh").mkdir(exist_ok=True)
+            (folder_path / "zh" / f"{Path(name).stem}.zh.ass").write_text("Dialogue: old\n", encoding="utf-8")
         window = MainWindow(controller)
         window.resize(1440, 900)
         windows.append(window)
@@ -570,12 +576,13 @@ def test_nothing_in_the_new_app_force_terminates_a_thread_or_opens_a_progress_di
 # --------------------------------------------------------------------------
 
 def test_done_files_are_badged_done_and_left_out_of_a_start(make_window, monkeypatch, fake_runner):
-    """A non-empty `chi/<stem>.ass` is the old resume rule: the file shows
-    `done` and a start leaves it out unless the user says to replace it."""
+    """A non-empty output (`zh/<stem>.zh.ass`, once `chi/<stem>.ass`) is the
+    old resume rule: the file shows `done` and a start leaves it out unless
+    the user says to replace it."""
     window = make_window(done=("ep02.mkv", "ep04.mkv"))
     controller = window.controller
     folder = Path(controller.project.path)
-    (folder / "chi" / "ep03.ass").write_text("", encoding="utf-8")       # empty: not done
+    (folder / "zh" / "ep03.zh.ass").write_text("", encoding="utf-8")     # empty: not done
     controller._refresh_done()
     settle()
 
@@ -597,7 +604,7 @@ def test_replacing_done_files_is_asked_once_and_deletes_nothing(make_window, mon
     stay untouched until each file's new output is ready (ruling C5)."""
     window = make_window(done=("ep02.mkv",))
     folder = Path(window.controller.project.path)
-    existing = folder / "chi" / "ep02.ass"
+    existing = folder / "zh" / "ep02.zh.ass"
     before = existing.read_bytes()
 
     asked = answer(monkeypatch, Yes)
@@ -846,19 +853,19 @@ def test_a_files_ranges_reach_the_run_as_one_get_subtitles_call(make_window, fak
     assert ocr.calls[0][1]["time_ranges"] == [("9:30", "10:00"), ("14:00", "14:30")]
 
 
-def test_a_run_creates_the_three_output_directories(make_window, fake_runner, monkeypatch):
+def test_a_run_creates_only_the_language_output_directory(make_window, fake_runner, monkeypatch):
     window = make_window()
     folder = Path(window.controller.project.path)
-    assert not (folder / "eng").exists()
+    before = {path.name for path in folder.iterdir() if path.is_dir()}
 
     window.controller.start_run(["ep01.mkv"])
     settle()
     FakeOcr(monkeypatch)
     fake_runner.last("run").job.run(JobContext("run", "run"))
 
-    assert OUTPUT_DIRS == ("chi", "eng", "translate")
-    assert all((folder / name).is_dir() for name in OUTPUT_DIRS)
-    assert (folder / "chi" / "ep01.ass").exists()
+    assert {path.name for path in folder.iterdir() if path.is_dir()} - before == {"zh"}
+    assert not any((folder / name).exists() for name in ("chi", "eng", "translate"))
+    assert (folder / "zh" / "ep01.zh.ass").exists()
 
 
 def test_detector_frames_and_ocr_frames_share_one_decode_and_tone_map_path():

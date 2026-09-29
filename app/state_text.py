@@ -143,8 +143,8 @@ def badge_for(entry: FileEntry, *, running_detectors: set[str], done: bool,
 
     Outside a run, in order: skipped (an explicit user choice) always shows
     first and stays "default" (B10: "default, row dimmed" -- the dimming is
-    the caller's row style, not this badge's tone); then the non-empty
-    `chi/<stem>.ass` `done` state; then the file's ReviewState ladder.
+    the caller's row style, not this badge's tone); then the `done` state
+    (a non-empty output at the controller's output_path); then the file's ReviewState ladder.
     PENDING's text names whichever required detector `running_detectors`
     has running (see _PENDING_ORDER), else "waiting".
     """

@@ -8,26 +8,29 @@ Snapshot
     RunJob deep-copies its RunFiles when it is constructed. Edits the user
     makes to the project during the run do not change a file's call.
     Construction raises ValueError when two files would write the same
-    output (chi/<stem>.ass, compared case-insensitively: Windows' and
+    output (layout.output_path, compared case-insensitively: Windows' and
     macOS's filesystems are), e.g. a.mkv and a.mp4, a.mkv and A.mp4, or the
     same name twice; nothing is created on disk.
 
 Layout (core/project/layout.py)
-    Where the output goes is the ProjectLayout's: `layout.output_dirs()` are
-    created before the first file, and `layout.output_path(name)` is the
-    final file (its `.partial` beside it). Without a layout, the folder
-    layout of project_dir -- chi/, eng/, translate/ and chi/<stem>.ass,
-    which is what every path below says. An episode creates no directory and
-    writes `<stem>.zh.ass` next to its video, by the same partial, QA and
-    replace steps.
+    Where the output goes is the ProjectLayout's, taken when the job is
+    built: the app passes layout_of(project), a frozen snapshot, so a
+    settings change during the run (language, subfolder) does not move its
+    outputs. `layout.output_dirs()` are created before the first file -- the
+    `<tag>/` subfolder, or nothing when the output goes next to the video;
+    no chi/, eng/ or translate/ -- and `layout.output_path(name)` is the
+    final file, `<tag>/<stem>.<tag>.ass` or `<stem>.<tag>.ass` (its
+    `.partial` beside it). Without a layout, the folder layout of
+    project_dir: "zh", in the subfolder. Folder and episode alike.
 
 Output, per file (ruling C5)
-    OCR writes chi/<stem>.ass.partial. core.ass_qafix.process_file runs on
-    the .partial with its default arguments, then os.replace() moves it onto
-    chi/<stem>.ass. A stopped or failed file deletes only its .partial. An
-    existing chi/<stem>.ass is never deleted or modified except by that
-    replace. A .partial left over from an interrupted run is deleted before
-    the file starts, so it can never be promoted.
+    OCR writes <output>.partial. core.ass_qafix.process_file runs on the
+    .partial with its default arguments, then os.replace() moves it onto
+    <output>. A stopped or failed file deletes only its .partial. An
+    existing <output> is never deleted or modified except by that replace;
+    a file anywhere else (an old chi/<stem>.ass) is never touched. A
+    .partial left over from an interrupted run is deleted before the file
+    starts, so it can never be promoted.
 
 Call shape (fidelity: today's OCRWorker._run_ocr, one-to-one)
     No range or one range: videocr.api.save_subtitles_to_file(**kwargs,
@@ -114,11 +117,11 @@ from dataclasses import dataclass
 
 from core import ass_qafix as _qafix
 from core.jobs.runner import JobContext, Lane, _first_line, _format_traceback
-from core.project.layout import OUTPUT_DIRS, ProjectLayout, folder_layout, output_name
+from core.project.layout import ProjectLayout, folder_layout, output_name
 from core.project.ocr_kwargs import OcrCall
 from videocr import api as _api
 
-# OUTPUT_DIRS and output_name moved to core.project.layout; still importable from here.
+# output_name moved to core.project.layout; still importable from here.
 
 PARTIAL_SUFFIX = ".partial"
 STOP_POLL_SECONDS = 0.1

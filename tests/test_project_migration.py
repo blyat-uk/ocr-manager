@@ -115,6 +115,7 @@ def test_migrate_slay_folder_settings():
     assert folder.bottom_half_cutoff == 0.55        # "0.50" -> new default (ruling A5)
     assert folder.min_segment_length == 30.0
     assert folder.merge_repeating_silences is False
+    assert folder.output_subfolder is True           # v1 had no such setting: the default
     assert project.migrated_from_v1 is True
 
 

@@ -7,7 +7,6 @@ root) is core.project.layout's; the cache root's own bookkeeping is
 core.project.episode_cache's.
 """
 from core.project.layout import (
-    EPISODE_SUFFIX,
     ProjectLayout,
     cache_root,
     episode_layout,
@@ -62,7 +61,6 @@ __all__ = [
     "CONFIG_FILENAME",
     "VIDEO_EXTENSIONS",
     "UnsupportedProjectVersion",
-    "EPISODE_SUFFIX",
     "ProjectLayout",
     "cache_root",
     "episode_layout",

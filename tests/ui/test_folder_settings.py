@@ -23,6 +23,7 @@ from app.controller import ProjectController
 from app.main_window import MainWindow
 from app.theme import tokens
 from app.views.folder_settings import CONTENT_MARGIN, MAX_WIDTH, NAV_WIDTH, FolderSettingsSheet
+from app.views.folder_settings_fields import LANGUAGES, language_label
 from app.widgets.base import Toggle
 from core.project import Brightness, Crop, FileEntry, FolderSettings, Media, Project, ReviewState, Source, save_project
 
@@ -32,7 +33,8 @@ BOTH_OFF = "At least one of dialogue or labels must be on."
 SECTIONS = ["What to extract", "OCR engine", "Labels", "Performance", "Auto-pilot"]
 ROW_KEYS = {
     "What to extract": ["Dialogue subtitles", "Positioned labels / nameplates"],
-    "OCR engine": ["Language", "Confidence threshold", "Merge similar lines above", "Similar-frame threshold"],
+    "OCR engine": ["Language", "Create subfolder", "Confidence threshold", "Merge similar lines above",
+                   "Similar-frame threshold"],
     # No "Confidence threshold": `label_conf_threshold` has no editor, see
     # NOT_IN_THE_SHEET and app/views/folder_settings_fields.py.
     "Labels": ["Minimum duration", "Maximum duration", "Minimum confidence", "Mask regions"],
@@ -169,10 +171,15 @@ def enter(sheet: FolderSettingsSheet, field: str, value) -> None:
     if isinstance(editor, QAbstractButton):
         if editor.isChecked() != value:
             editor.click()
-    elif isinstance(editor, QComboBox):
-        editor.setEditText(value)
-        editor.lineEdit().textEdited.emit(value)
-        editor.lineEdit().editingFinished.emit()
+    elif isinstance(editor, QComboBox):                           # a pick from the list; other text is only typed
+        index = editor.findText(value)
+        if index >= 0:
+            editor.activated.emit(index)
+        else:
+            editor.setEditText(value)
+            editor.lineEdit().textEdited.emit(value)
+            editor.lineEdit().editingFinished.emit()
+            settle()                                               # it reverts after the event loop turns
     else:
         editor.setValue(value)
         editor.editingFinished.emit()
@@ -316,7 +323,8 @@ def test_every_folder_setting_b9_names_has_an_editor(window):
 
 def test_editor_kinds_and_ranges(window):
     sheet = open_sheet(window)
-    for field in ("dialogue_enabled", "labels_enabled", "autopilot_enabled", "merge_repeating_silences"):
+    for field in ("dialogue_enabled", "labels_enabled", "output_subfolder", "autopilot_enabled",
+                  "merge_repeating_silences"):
         assert isinstance(sheet.editor(field), Toggle), field
     for field in ("conf_threshold", "sim_threshold", "label_conf_threshold_min"):
         editor = sheet.editor(field)
@@ -343,7 +351,7 @@ def test_editor_kinds_and_ranges(window):
 
 def test_default_values_are_shown(window):
     sheet = open_sheet(window)
-    assert shown(sheet, "ocr_lang") == "Chinese (ch)"
+    assert shown(sheet, "ocr_lang") == "Chinese"
     assert shown(sheet, "conf_threshold") == 95
     assert shown(sheet, "sim_threshold") == 82
     assert sheet.editor("similar_image").text() == "0.30 %"
@@ -360,7 +368,8 @@ def test_default_values_are_shown(window):
 ROUND_TRIPS = [
     ("dialogue_enabled", False, False, True, True),
     ("labels_enabled", False, False, True, True),
-    ("ocr_lang", "japan", "japan", "en", "en"),
+    ("ocr_lang", "Japanese", "japan", "en", "English"),
+    ("output_subfolder", False, False, True, True),
     ("conf_threshold", 90, 90, 97, 97),
     ("sim_threshold", 75, 75, 88, 88),
     ("similar_image", 0.45, 0.45, 1.25, 1.25),
@@ -406,19 +415,78 @@ def test_each_editor_round_trips_its_folder_setting(window, field, entered, stor
     assert len(updates.calls) == 2                                # syncing the editor commits nothing
 
 
-def test_language_combo_offers_chinese_plus_the_current_value(window):
+def test_language_combo_offers_every_paddle_language_by_name(window):
     controller = window.controller
     sheet = open_sheet(window)
     combo = sheet.editor("ocr_lang")
-    assert [combo.itemText(i) for i in range(combo.count())] == ["Chinese (ch)"]
-    controller.update_folder(ocr_lang="en")
+    labels = [combo.itemText(i) for i in range(combo.count())]
+    assert [combo.itemData(i) for i in range(combo.count())] == list(LANGUAGES)
+    assert labels == sorted(labels, key=str.casefold)
+    assert {"Chinese", "English", "Japanese", "Korean"} <= set(labels)
+    assert combo.currentText() == "Chinese"
+    combo.activated.emit(labels.index("English"))
+    assert controller.project.folder.ocr_lang == "en"
+    controller.update_folder(ocr_lang="xx")                        # a code Paddle lacks: shown at the end, as is
     settle()
-    assert [combo.itemText(i) for i in range(combo.count())] == ["Chinese (ch)", "en"]
-    assert combo.currentText() == "en"
-    combo.activated.emit(0)
+    assert combo.itemData(combo.count() - 1) == "xx" and combo.currentText() == "xx"
+    combo.activated.emit(labels.index("Chinese"))
     assert controller.project.folder.ocr_lang == "ch"
+    assert combo.count() == len(LANGUAGES)
     enter(sheet, "ocr_lang", "   ")                                # blank: nothing stored, the value comes back
-    assert controller.project.folder.ocr_lang == "ch" and combo.currentText() == "Chinese (ch)"
+    assert controller.project.folder.ocr_lang == "ch" and combo.currentText() == "Chinese"
+
+
+@pytest.mark.parametrize("typed, stored", [
+    ("English", "en"),               # a list item's whole name: Enter picks it
+    ("English (en)", "ch"),          # the reported bug: this was stored as typed and Paddle refused it
+    ("english", "en"),               # (Qt matches a whole name in any case)
+    ("en", "ch"),                    # anything else only filtered the list: nothing is stored
+    ("xx", "ch"),
+])
+def test_only_a_language_from_the_list_is_stored(window, typed, stored):
+    activate(window)
+    controller = window.controller
+    updates = Recorder(controller, "update_folder")
+    sheet = open_sheet(window)
+    combo = sheet.editor("ocr_lang")
+    focus(combo)
+    combo.lineEdit().selectAll()
+    QTest.keyClicks(combo.lineEdit(), typed)
+    QTest.keyClick(combo.lineEdit(), Qt.Key.Key_Return)
+    settle()
+    assert controller.project.folder.ocr_lang == stored
+    assert combo.currentText() == language_label(stored)
+    assert len(updates.calls) == (stored != "ch")
+
+
+def test_a_language_filter_not_picked_goes_back_on_focus_out(window):
+    activate(window)
+    controller = window.controller
+    sheet = open_sheet(window)
+    combo = sheet.editor("ocr_lang")
+    focus(combo)
+    combo.lineEdit().selectAll()
+    QTest.keyClicks(combo.lineEdit(), "Japan")
+    QTest.keyClick(combo.completer().popup(), Qt.Key.Key_Escape)   # the filter's popup first, as a click away does
+    focus(sheet.close_button)
+    settle()
+    assert controller.project.folder.ocr_lang == "ch" and combo.currentText() == "Chinese"
+
+
+def test_a_typed_part_of_a_name_suggests_languages_to_pick(window):
+    activate(window)
+    controller = window.controller
+    sheet = open_sheet(window)
+    combo = sheet.editor("ocr_lang")
+    focus(combo)
+    combo.lineEdit().selectAll()
+    QTest.keyClicks(combo.lineEdit(), "glish")                    # anywhere in the name, not just its start
+    popup = combo.completer().popup()
+    assert wait_for(popup.isVisible)
+    QTest.keyClick(popup, Qt.Key.Key_Down)
+    QTest.keyClick(popup, Qt.Key.Key_Return)
+    settle()
+    assert controller.project.folder.ocr_lang == "en" and combo.currentText() == "English"
 
 
 # --------------------------------------------------------------------------
@@ -514,6 +582,58 @@ def test_detector_settings_only_commit(window, fake_runner):
     folder = controller.project.folder
     assert (folder.crop_width_fraction, folder.crop_vertical_padding, folder.bottom_half_cutoff,
             folder.crop_min_height_fraction, folder.min_segment_length) == (0.6, 0.01, 0.5, 0.07, 20.0)
+
+
+def test_output_naming_only_commits(window, fake_runner):
+    """Language and "Create subfolder" decide where the next output goes and
+    where done is looked for; neither re-detects anything."""
+    controller = window.controller
+    sheet = open_sheet(window)
+    redetects = Recorder(controller, "redetect")
+    hinted = Recorder(controller, "redetect_others_with_hint")
+    controller.drain_events()
+    submitted = len(fake_runner.submissions)
+    enter(sheet, "output_subfolder", False)
+    enter(sheet, "ocr_lang", "Japanese")
+    enter(sheet, "output_subfolder", True)
+    controller.drain_events()
+    assert redetects.calls == [] and hinted.calls == []
+    assert len(fake_runner.submissions) == submitted
+    folder = controller.project.folder
+    assert (folder.output_subfolder, folder.ocr_lang) == (True, "japan")
+
+
+def test_start_drops_a_language_filter_not_picked_before_the_run_takes_its_settings(window, fake_runner):
+    """Start takes no focus, so the combo's typed filter is still there when
+    it is clicked: it is not a pick, so the run keeps the stored language
+    (its OCR language and output path) and the combo shows it again."""
+    activate(window)
+    controller = window.controller
+    sheet = open_sheet(window)
+    combo = sheet.editor("ocr_lang")
+    focus(combo)
+    combo.lineEdit().selectAll()
+    QTest.keyClicks(combo.lineEdit(), "japan")
+    QTest.mouseClick(window.topbar.start_button, Qt.MouseButton.LeftButton)
+    settle()
+    assert controller.project.folder.ocr_lang == "ch" and combo.currentText() == "Chinese"
+    run = fake_runner.last("run").job
+    assert {file.call.kwargs["lang"] for file in run.files} == {"ch"}
+    assert run.layout.output_tag == "zh"
+
+
+def test_the_subfolder_toggle_moves_the_queues_done_badges(make_window, folder):
+    (folder / "zh").mkdir()
+    (folder / "zh" / "ep01.zh.ass").write_text("Dialogue: x\n", encoding="utf-8")
+    window = make_window(folder)
+    window.show()
+    row = window.queue.row("ep01.mkv")
+    assert row.badge.text() == "done"
+    sheet = open_sheet(window)
+    enter(sheet, "output_subfolder", False)                          # now looked for next to the video
+    assert wait_for(lambda: window.queue.row("ep01.mkv").badge.text() != "done")
+    enter(sheet, "output_subfolder", True)
+    assert wait_for(lambda: window.queue.row("ep01.mkv").badge.text() == "done")
 
 
 def test_scrolling_over_an_unfocused_editor_does_not_change_it(window):

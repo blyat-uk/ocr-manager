@@ -428,6 +428,7 @@ def to_json(project: Project, *, include_evidence: bool = True) -> dict:
         "crop_vertical_padding": folder.crop_vertical_padding,
         "crop_min_height_fraction": folder.crop_min_height_fraction,
         "bottom_half_cutoff": folder.bottom_half_cutoff,
+        "output_subfolder": folder.output_subfolder,
     }
 
     files_dict = {}
@@ -528,6 +529,7 @@ def _from_json(data: dict, project_dir: str) -> tuple[Project, dict[str, list[in
             "crop_min_height_fraction", defaults.crop_min_height_fraction
         ),
         bottom_half_cutoff=folder_data.get("bottom_half_cutoff", defaults.bottom_half_cutoff),
+        output_subfolder=bool(folder_data.get("output_subfolder", defaults.output_subfolder)),
     )
 
     files: dict[str, FileEntry] = {}

@@ -24,9 +24,10 @@ Editors and commits
     and lets auto-pilot decide whether detections need to run; the sheet
     never re-runs detections itself. A toggle commits on click. A spin box
     commits on editingFinished, or after 400 ms without typing, so a
-    half-typed number is never stored; the language commits on Enter, focus
-    out or a pick from the list. Closing the sheet commits what is still
-    pending. Only edits the user made are committed: syncing an editor from
+    half-typed number is never stored. The language changes only by a pick
+    from its list: typing filters the list, and text not picked (Enter, focus
+    out, closing the sheet, Start) goes back to the stored language. Closing
+    the sheet commits what is still pending. Only edits the user made are committed: syncing an editor from
     the model (`folder_changed`) never writes back, and an editor with an
     uncommitted edit is left alone while it syncs.
 
@@ -48,6 +49,7 @@ from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QComboBox,
+    QCompleter,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -59,6 +61,7 @@ from app.theme import tokens
 from app.views.folder_settings_fields import (
     EXTRACTION_FIELDS,
     LABELS_SECTION,
+    LANGUAGES,
     MASK_KEY,
     MASK_NOTE,
     SECTIONS,
@@ -67,7 +70,6 @@ from app.views.folder_settings_fields import (
     LanguageCombo,
     Section,
     SpinBox,
-    language_code,
     language_label,
 )
 from app.widgets.base import Button, ElidedLabel, SegmentedControl, Toggle
@@ -79,7 +81,7 @@ MAX_WIDTH = 760
 NAV_WIDTH = 150
 CONTENT_MARGIN = 12
 EDITOR_WIDTH = 84
-LANGUAGE_WIDTH = 128
+LANGUAGE_WIDTH = 170           # the longest name, "Chinese (Traditional)", whole
 COMMIT_IDLE_MS = 400          # milliseconds, not pixels: never scaled
 SLIDE_MS = 160
 MASKS_TEXT = "{count} drawn · draw on the Crop tab"
@@ -234,11 +236,16 @@ class FolderSettingsSheet(QWidget):
             combo = LanguageCombo()
             combo.setEditable(True)
             combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            # Typing only filters: a popup of the matching languages, never filled in.
+            combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
             combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             combo.setFixedWidth(tokens.px(LANGUAGE_WIDTH))
             combo.lineEdit().textEdited.connect(lambda _text, name=field.name: self._mark_pending(name))
-            combo.lineEdit().editingFinished.connect(self._commit_language_text)
+            # After the pick, if any: a suggestion's editingFinished comes before its activated.
+            combo.lineEdit().editingFinished.connect(lambda: QTimer.singleShot(0, self._drop_language_text))
             combo.activated.connect(self._on_language_activated)
+            combo.completer().activated[str].connect(self._on_language_suggestion)
             return combo
         spin = DoubleSpinBox() if field.decimals else SpinBox()
         if field.decimals:
@@ -291,6 +298,12 @@ class FolderSettingsSheet(QWidget):
         self._slide.stop()
         self.hide()
         self.closed.emit()
+
+    def commit_pending(self) -> None:
+        """Commit the edits still pending, sheet left open: a run snapshots
+        the settings at Start, so a half-typed number must land first (and
+        a language filter not picked from goes back)."""
+        self._flush_pending()
 
     def target_geometry(self) -> QRect:
         """Right edge of the host, the anchor's top and height,
@@ -458,18 +471,23 @@ class FolderSettingsSheet(QWidget):
         if field.name in EXTRACTION_FIELDS:
             self.warning_label.hide()
 
-    def _commit_language_text(self) -> None:
-        if "ocr_lang" not in self._pending:
+    def _drop_language_text(self) -> None:
+        """Typed text is a filter, not a value: what was not picked goes back
+        to the stored language."""
+        if self._pending.pop("ocr_lang", None) is None:
             return
-        project = self._pending.pop("ocr_lang")
-        if project is not self._controller.project:
-            return
-        self._store_language(language_code(self._editors["ocr_lang"].currentText()))
+        project = self._controller.project
+        if project is not None:
+            self._sync_language(project.folder.ocr_lang)
 
     def _on_language_activated(self, index: int) -> None:
         self._pending.pop("ocr_lang", None)
-        combo = self._editors["ocr_lang"]
-        self._store_language(combo.itemData(index) or language_code(combo.itemText(index)))
+        self._store_language(self._editors["ocr_lang"].itemData(index))
+
+    def _on_language_suggestion(self, text: str) -> None:
+        index = self._editors["ocr_lang"].findText(text)
+        if index >= 0:
+            self._on_language_activated(index)
 
     def _store_language(self, code: str) -> None:
         project = self._controller.project
@@ -483,7 +501,7 @@ class FolderSettingsSheet(QWidget):
     def _flush_pending(self) -> None:
         for name in list(self._pending):
             if name == "ocr_lang":
-                self._commit_language_text()
+                self._drop_language_text()
             else:
                 self._commit(name)
 
@@ -535,15 +553,14 @@ class FolderSettingsSheet(QWidget):
 
     def _sync_language(self, code: str) -> None:
         combo = self._editors["ocr_lang"]
-        codes = ["ch"] if code == "ch" else ["ch", code]
+        codes = list(LANGUAGES) if code in LANGUAGES else [*LANGUAGES, code]    # a code Paddle lacks stays visible
         if [combo.itemData(i) for i in range(combo.count())] == codes and combo.currentText() == language_label(code):
             return                                           # unchanged: keep the cursor where the user left it
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem(language_label("ch"), "ch")
-        if code != "ch":
-            combo.addItem(language_label(code), code)
-        combo.setCurrentIndex(0 if code == "ch" else 1)
+        for item in codes:
+            combo.addItem(language_label(item), item)
+        combo.setCurrentIndex(codes.index(code))
         combo.blockSignals(False)
 
     def _sync_scope(self, *_args) -> None:

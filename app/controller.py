@@ -119,7 +119,7 @@ Run
     files not yet started follow the new limit, in-flight files carry on.
     When the run ends:
     auto-pilot holds are re-derived, done states re-read, the folder is
-    reconciled (the watcher ignores changes while a run writes chi/) and,
+    reconciled (the watcher ignores changes while a run writes its outputs) and,
     unless the user stopped it, a desktop notification reports it (app.notify:
     notify-send as today on Linux, osascript on macOS, none on Windows).
 
@@ -133,12 +133,22 @@ Episodes (docs spec 2026-09-28)
     episode is a Project like any other, with one file and an episode
     ProjectLayout, so everything above applies unchanged; only paths differ,
     and every path here comes from layout_of(project) -- settings and caches
-    under the per-user cache root, the output as `<stem>.zh.ass` next to the
-    video, nothing else written there. On top of that: opening prunes the
+    under the per-user cache root, the output by the same rule as a folder's
+    (see Output below), nothing else written next to the video. On top of that: opening prunes the
     cache root, a save files the episode in its index (the same-folder crop
     seed reads it), and a run that finished its file remembers its speed for
     the next estimate. The episode_* readers are what the episode screens
     (app/views/episode/) show.
+
+Output
+    Where a file's subtitles go is the layout's rule (ProjectLayout.output_path):
+    `<tag>/<stem>.<tag>.ass` beside the video, or `<stem>.<tag>.ass` next to it
+    with FolderSettings.output_subfolder off; the tag comes from ocr_lang
+    (languages.output_tag, "zh" for "ch"). A file is done when that file is
+    non-empty -- an output anywhere else, the old `chi/<stem>.ass` included,
+    does not count. Changing ocr_lang or output_subfolder only moves where
+    the next output goes: done states are re-read there and the watcher
+    follows the new output directory; nothing is re-detected.
 
 Views import no core module: UnsupportedProjectVersion (raised by
 open_folder) and DETECTION_KINDS are re-exported here.
@@ -428,7 +438,7 @@ class ProjectController(QObject):
         self._autopilot = AutoPilot(self._runner, self._current_project, seed_consensus=seed_consensus)
         self._refresh_done(notify=False)
         self._prune_view_cache()            # videos that left while the folder was closed
-        self._folder_watch.watch(project.path, layout_of(project).output_dirs()[:1])
+        self._folder_watch.watch(project.path, layout_of(project).output_dirs())
         self._emit_files = self._emit_folder = self._emit_activity = True
         self._autopilot.on_open()
         self._recompute()
@@ -485,8 +495,8 @@ class ProjectController(QObject):
         return [] if self._project is None else list(self._project.files)
 
     def is_done(self, name: str) -> bool:
-        """The file's output (output_path: a folder's chi/<stem>.ass, an
-        episode's <stem>.zh.ass) exists and is not empty."""
+        """The file's output (output_path: `<tag>/<stem>.<tag>.ass`, or
+        `<stem>.<tag>.ass` without the subfolder) exists and is not empty."""
         return name in self._done
 
     # --- the episode view's reading (docs spec 2026-09-28) -------------------------------
@@ -535,6 +545,11 @@ class ProjectController(QObject):
     def output_path(self, name: str) -> str:
         """Where a run writes `name`'s finished subtitles (the layout's rule)."""
         return layout_of(self._require()[0]).output_path(name)
+
+    def output_label(self, name: str) -> str:
+        """output_path relative to the video's directory, for messages:
+        "zh/EP01.zh.ass", or "EP01.zh.ass" without the subfolder."""
+        return layout_of(self._require()[0]).output_label(name)
 
     def output_lines(self, name: str) -> list[tuple[float, float, str]]:
         """(start, end, text) of every Dialogue line of `name`'s output file,
@@ -894,7 +909,10 @@ class ProjectController(QObject):
         """Replace FolderSettings fields. TypeError for an unknown field;
         ValueError when dialogue and labels would both be off, or when
         ocr_parallel is below 1. A new ocr_parallel during a run also goes to
-        the run job."""
+        the run job. A new output naming (ocr_lang, output_subfolder) re-reads
+        every done state at the new output path and moves the watcher to the
+        new output directory; like any folder change, auto-pilot decides what
+        (if anything) to detect, and output naming asks for nothing."""
         project, autopilot = self._require()
         unknown = sorted(set(changes) - _FOLDER_FIELDS)
         if unknown:
@@ -908,11 +926,16 @@ class ProjectController(QObject):
         if all(getattr(old, key) == value for key, value in changes.items()):
             return
         before = self._states()
+        old_output = layout_of(project)
         for key, value in changes.items():
             setattr(project.folder, key, value)
         new = project.folder
         if new.ocr_parallel != old.ocr_parallel:
             self._set_run_parallel(new.ocr_parallel)
+        new_output = layout_of(project)
+        if new_output != old_output:            # only the output naming follows the settings
+            self._folder_watch.set_outputs(new_output.output_dirs())
+            self._refresh_done()
         rules.apply_folder_change(project, old, new)
         autopilot.on_folder_changed(old, new)
         self._emit_folder = True
@@ -1034,7 +1057,7 @@ class ProjectController(QObject):
 
     def start_run(self, names: list[str]) -> None:
         """Snapshot each file's OCR call, hold auto-pilot and submit a RunJob.
-        ValueError when two files write the same chi/ output (RunJob's
+        ValueError when two files write the same output (RunJob's
         message), when no file is given or when both extraction toggles are
         off; RuntimeError while a run is in progress."""
         self._check_alive()

@@ -27,7 +27,7 @@ closes it. During a run the top bar hides its button anyway (B12), while
 "⤓ Logs" stays.
 
 Run (plan 3B Task 5, rulings B12, C5): "▶ Start" collects the startable
-files, done ones included; when some already have `chi/` output, one Yes/No
+files, done ones included; when some already have their output, one Yes/No
 question (default No, the window's only modal) decides whether they are
 re-run -- nothing is deleted either way. A start the controller refuses
 (e.g. two files writing the same output) is shown beside Start and the mode
@@ -53,10 +53,10 @@ Review · Run stack gains three pages around the same review area:
 
 The top bar's switch reads Review · Working and moves between the review
 area and Working (or Done once the run has ended). Starting over an
-existing `<stem>.zh.ass` asks first, like the folder's overwrite question;
-nothing is deleted either way. Ctrl+O opens an episode, Ctrl+Shift+O a
-folder; Space and T act on the episode's file. A folder looks and behaves
-exactly as before.
+existing output (`zh/<stem>.zh.ass` by default) asks first, like the
+folder's overwrite question; nothing is deleted either way. Ctrl+O opens
+an episode, Ctrl+Shift+O a folder; Space and T act on the episode's file. A
+folder looks and behaves exactly as before.
 """
 from __future__ import annotations
 
@@ -131,8 +131,7 @@ NEWER_VERSION_TEXT = ("This folder was saved by a newer version of OCR Manager (
 EXPECTED_OPEN_ERRORS = (UnsupportedProjectVersion, OSError, ValueError)
 MODE_REVIEW, MODE_RUN = 0, 1
 OVERWRITE_TITLE = "Replace existing subtitles?"
-OVERWRITE_TEXT = ("{n} file(s) already have subtitles in chi/. Re-run and replace them when their new output "
-                  "is ready?")
+OVERWRITE_TEXT = "{n} file(s) already have subtitles. Re-run and replace them when their new output is ready?"
 EPISODE_OVERWRITE_TEXT = "{output} already exists. Replace it when the new one is ready?"
 # PrepareView.flagged_field() -> the Stage tab a flagged episode's review opens on.
 FLAGGED_TABS = {"crop": "Crop", "brightness": "Brightness", "ranges": "Time ranges"}
@@ -563,7 +562,7 @@ class MainWindow(QMainWindow):
         if name is None or name not in controller.startable_files(include_done=True):
             return
         if controller.is_done(name):
-            output = os.path.basename(controller.output_path(name))
+            output = controller.output_label(name)
             if not self._ask(OVERWRITE_TITLE, EPISODE_OVERWRITE_TEXT.format(output=output)):
                 return
         try:
@@ -580,6 +579,10 @@ class MainWindow(QMainWindow):
         controller = self.controller
         if controller.project is None:
             return
+        # Start does not take focus, so an edit still pending in the sheet
+        # would otherwise commit only when Run closes it -- after the run
+        # snapshotted the old value (its OCR language and output path).
+        self.folder_settings.commit_pending()
         if self._episode_mode:
             self._start_episode()
             return
@@ -598,7 +601,7 @@ class MainWindow(QMainWindow):
             return
         try:
             controller.start_run(names)
-        except (ValueError, RuntimeError) as exc:        # e.g. two files write the same chi/ output
+        except (ValueError, RuntimeError) as exc:        # e.g. two files write the same output
             self.topbar.show_start_error(str(exc))
             return
         self.set_mode(MODE_RUN)

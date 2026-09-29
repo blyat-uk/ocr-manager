@@ -21,7 +21,41 @@ from PyQt6.QtWidgets import QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QSpi
 from app.theme import tokens
 from app.widgets.base import ElidedLabel, SectionHeader
 
-LANGUAGE_NAMES = {"ch": "Chinese"}
+# Every `lang` PaddleOCR 3.3.2 has a recognition model for (its
+# `_get_ocr_model_names`), minus the aliases "french" and "german" (fr, de).
+# Static on purpose: a frozen build installs Paddle on first run, so the sheet
+# cannot ask it. `tests/test_language_names.py` pins this against the
+# installed paddleocr.
+LANGUAGE_NAMES = {
+    "ch": "Chinese", "chinese_cht": "Chinese (Traditional)", "en": "English", "japan": "Japanese",
+    "korean": "Korean", "th": "Thai", "el": "Greek", "te": "Telugu", "ta": "Tamil", "ka": "Georgian",
+    # Latin script
+    "af": "Afrikaans", "az": "Azerbaijani", "bs": "Bosnian", "ca": "Catalan", "cs": "Czech", "cy": "Welsh",
+    "da": "Danish", "de": "German", "es": "Spanish", "et": "Estonian", "eu": "Basque", "fi": "Finnish",
+    "fr": "French", "ga": "Irish", "gl": "Galician", "hr": "Croatian", "hu": "Hungarian", "id": "Indonesian",
+    "is": "Icelandic", "it": "Italian", "ku": "Kurdish", "la": "Latin", "lb": "Luxembourgish",
+    "lt": "Lithuanian", "lv": "Latvian", "mi": "Maori", "ms": "Malay", "mt": "Maltese", "nl": "Dutch",
+    "no": "Norwegian", "oc": "Occitan", "pi": "Pali", "pl": "Polish", "pt": "Portuguese", "qu": "Quechua",
+    "rm": "Romansh", "ro": "Romanian", "rs_latin": "Serbian (Latin)", "sk": "Slovak", "sl": "Slovenian",
+    "sq": "Albanian", "sv": "Swedish", "sw": "Swahili", "tl": "Tagalog", "tr": "Turkish", "uz": "Uzbek",
+    "vi": "Vietnamese",
+    # Arabic script
+    "ar": "Arabic", "bal": "Balochi", "fa": "Persian", "ps": "Pashto", "sd": "Sindhi", "ug": "Uyghur",
+    "ur": "Urdu",
+    # Cyrillic script
+    "abq": "Abaza", "ady": "Adyghe", "ava": "Avar", "ba": "Bashkir", "be": "Belarusian", "bg": "Bulgarian",
+    "bua": "Buryat", "che": "Chechen", "cv": "Chuvash", "dar": "Dargwa", "inh": "Ingush", "kaa": "Karakalpak",
+    "kbd": "Kabardian", "kk": "Kazakh", "kv": "Komi", "ky": "Kyrgyz", "lbe": "Lak", "lez": "Lezgian",
+    "mhr": "Meadow Mari", "mk": "Macedonian", "mn": "Mongolian", "mo": "Moldovan", "os": "Ossetian",
+    "rs_cyrillic": "Serbian (Cyrillic)", "ru": "Russian", "sah": "Yakut", "tab": "Tabasaran", "tg": "Tajik",
+    "tt": "Tatar", "tyv": "Tuvan", "udm": "Udmurt", "uk": "Ukrainian", "xal": "Kalmyk",
+    # Devanagari script
+    "ang": "Angika", "bgc": "Haryanvi", "bh": "Bihari", "bho": "Bhojpuri", "gom": "Konkani", "hi": "Hindi",
+    "mah": "Magahi", "mai": "Maithili", "mr": "Marathi", "ne": "Nepali", "new": "Newari", "sa": "Sanskrit",
+    "sck": "Sadri",
+}
+# The language list's order: by name, A to Z.
+LANGUAGES = tuple(sorted(LANGUAGE_NAMES, key=lambda code: (LANGUAGE_NAMES[code].casefold(), code)))
 LABELS_NOTE = "With labels off, the label mask regions and their thresholds are hidden entirely."
 AUTOPILOT_NOTE = "These tune detections that start after a change; ↻ re-detect redoes a file."
 EXTRACTION_FIELDS = ("dialogue_enabled", "labels_enabled")
@@ -31,16 +65,8 @@ MASK_NOTE = "blacked out before labels are searched, e.g. a channel logo"
 
 
 def language_label(code: str) -> str:
-    name = LANGUAGE_NAMES.get(code)
-    return f"{name} ({code})" if name else code
-
-
-def language_code(text: str) -> str:
-    text = text.strip()
-    for code in LANGUAGE_NAMES:
-        if text == language_label(code):
-            return code
-    return text
+    """The list shows a language by name; a code Paddle lacks shows as itself."""
+    return LANGUAGE_NAMES.get(code, code)
 
 
 @dataclass(frozen=True)
@@ -95,7 +121,10 @@ SECTIONS: tuple[tuple[str, tuple[Field, ...], str], ...] = (
               "short captions and name cards placed elsewhere in the frame", kind="toggle"),
     ), LABELS_NOTE),
     ("OCR engine", (
-        Field("ocr_lang", "Language", "the OCR model's language code, e.g. ch, en, japan", kind="language"),
+        Field("ocr_lang", "Language", "the subtitles' language; type to filter the list", kind="language"),
+        Field("output_subfolder", "Create subfolder",
+              "subtitles go in a folder named after the language, e.g. zh/EP01.zh.ass; off: next to the video",
+              kind="toggle"),
         _percent("conf_threshold", "Confidence threshold", "retry until this confident"),
         _percent("sim_threshold", "Merge similar lines above",
                  "neighbouring readings at least this alike become one line"),

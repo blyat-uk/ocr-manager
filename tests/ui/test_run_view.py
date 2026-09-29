@@ -137,8 +137,8 @@ def make_window(controller, notifications):
         save_project(Project(path=str(folder_path), folder=FolderSettings(**folder),
                              files={name: ready_entry(name) for name in names}))
         for name in done:
-            (folder_path / "chi").mkdir(exist_ok=True)
-            (folder_path / "chi" / f"{Path(name).stem}.ass").write_text("Dialogue: old\n", encoding="utf-8")
+            (folder_path / "zh").mkdir(exist_ok=True)
+            (folder_path / "zh" / f"{Path(name).stem}.zh.ass").write_text("Dialogue: old\n", encoding="utf-8")
         window = MainWindow(controller)
         window.resize(1440, 900)
         windows.append(window)
@@ -218,12 +218,12 @@ def test_start_asks_before_replacing_done_files(make_window, tmp_project, fake_r
     assert len(asked) == 1
     parent, _title, text, buttons, default = asked[0]
     assert parent is window
-    assert text == "2 file(s) already have subtitles in chi/. Re-run and replace them when their new output is ready?"
+    assert text == "2 file(s) already have subtitles. Re-run and replace them when their new output is ready?"
     assert text == OVERWRITE_TEXT.format(n=2)
     assert buttons == Yes | No and default == No
     assert started.calls == [((expected,), {})]
     assert fake_runner.last("run").job.files[0].name == "ep01.mkv"
-    assert (folder / "chi" / "ep02.ass").read_text(encoding="utf-8") == "Dialogue: old\n"    # nothing deleted
+    assert (folder / "zh" / "ep02.zh.ass").read_text(encoding="utf-8") == "Dialogue: old\n"    # nothing deleted
     assert window.mode() == MODE_RUN
 
 
@@ -312,7 +312,7 @@ def test_a_refused_start_is_shown_beside_start_without_switching_modes(make_wind
     settle()
     assert fake_runner.of_kind("run") == []
     assert not top.start_error_label.isHidden()
-    assert top.start_error_label.full_text() == "a.mkv and a.mp4 both write chi/a.ass"
+    assert top.start_error_label.full_text() == "a.mkv and a.mp4 both write zh/a.zh.ass"
     assert window.mode() == MODE_REVIEW and top.run_switch.isHidden()
 
     window.controller.set_skipped("a.mp4", True)

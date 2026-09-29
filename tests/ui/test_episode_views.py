@@ -158,7 +158,10 @@ class StubController(QObject):
         return self.speed
 
     def output_path(self, name: str) -> str:
-        return f"{VIDEO_DIR}/{Path(name).stem}.zh.ass"
+        return f"{VIDEO_DIR}/{self.output_label(name)}"
+
+    def output_label(self, name: str) -> str:
+        return f"zh/{Path(name).stem}.zh.ass"
 
     def output_lines(self, name: str) -> list[tuple[float, float, str]]:
         return list(self.output)
@@ -643,11 +646,22 @@ def test_done_loads_the_written_output(qapp):
     assert view.outcome() == OUTCOME_DONE
     assert view.title.text() == "Subtitles unburned"
     assert "3 lines in 6 min 12 s · saved as" in view.summary.text()
-    assert "EP06.zh.ass" in view.summary.text()
+    assert "zh/EP06.zh.ass" in view.summary.text()
     assert view.script.lines() == [Line(*line) for line in batch(3)]
     assert view.retry_button.isHidden()
+
+
+def test_done_show_in_folder_opens_the_outputs_folder_or_the_videos_until_it_exists(qapp, tmp_path):
+    controller = StubController(ready_entry())
+    controller.done = {NAME}
+    controller.snapshot = run_snapshot(DONE, 1.0, lines=3, finished=True, started_at=10.0, finished_at=382.0)
+    controller.output_path = lambda name: str(tmp_path / "zh" / f"{Path(name).stem}.zh.ass")
+    opened = []
+    view = done_view(controller, opened)
+    view.folder_button.click()                                    # no run made zh/ yet
+    (tmp_path / "zh").mkdir()
     view.folder_button.click()
-    assert opened == [VIDEO_DIR]
+    assert opened == [str(tmp_path), str(tmp_path / "zh")]
 
 
 def test_done_clicking_a_line_shows_its_frame(qapp):
@@ -694,7 +708,7 @@ def test_a_failed_or_stopped_run_offers_try_again(qapp, state, outcome, title):
     view = done_view(controller, [])
     assert view.outcome() == outcome and view.title.text() == title
     assert view.summary.text() == ("boom" if state == FAILED else "The run was stopped before it finished.")
-    assert view.detail.text() == "The earlier EP06.zh.ass is unchanged."
+    assert view.detail.text() == "The earlier zh/EP06.zh.ass is unchanged."
     assert not view.retry_button.isHidden()
     retries = []
     view.retry_requested.connect(lambda: retries.append(True))

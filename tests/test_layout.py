@@ -3,12 +3,15 @@
 Pinned here:
 
 - The folder layout is today's paths, as literals: `.ocr.json`,
-  `.ocr-cache/`, `chi/<stem>.ass`, `chi/`, `eng/`, `translate/`, the v1
-  backup -- and the evidence and view caches under its cache_dir land where
-  they always did.
+  `.ocr-cache/`, the v1 backup -- and the evidence and view caches under its
+  cache_dir land where they always did.
 - The episode layout keeps everything but the output out of the video's
-  directory: settings and caches under `<root>/videos/<key>/`, the output as
-  `<stem>.zh.ass` next to the video.
+  directory: settings and caches under `<root>/videos/<key>/`.
+- The output, folder and episode alike: `<tag>/<stem>.<tag>.ass` with
+  output_subfolder on (the default), `<stem>.<tag>.ass` next to the video
+  with it off; the tag is the OCR language's (core.project.languages). A
+  run creates only `<tag>/`, or nothing. layout_of follows the project's
+  current settings.
 - video_key is content-based (a rename keeps it, a changed head or tail
   byte does not), also for files shorter than two chunks.
 - episode_target routes a path the way the spec's table does.
@@ -29,7 +32,6 @@ from core.jobs.run import output_name
 from core.jobs.view_cache import view_dir
 from core.project import layout as layout_module
 from core.project.layout import (
-    EPISODE_SUFFIX,
     KEY_CHUNK,
     ProjectLayout,
     _default_cache_root,
@@ -69,11 +71,12 @@ def test_the_folder_layout_is_todays_paths_literally():
     )
     assert not layout.is_episode
     assert layout.only_file is None and layout.key is None
-    assert layout.output_path("EP01.mkv") == d + os.sep + "chi" + os.sep + "EP01.ass"
-    assert layout.output_path("a.b.mkv") == d + os.sep + "chi" + os.sep + "a.b.ass"
-    assert layout.output_path("第一集.mp4") == d + os.sep + "chi" + os.sep + "第一集.ass"
-    assert layout.output_label("EP01.mkv") == "chi/EP01.ass"
-    assert layout.output_dirs() == (d + os.sep + "chi", d + os.sep + "eng", d + os.sep + "translate")
+    assert layout.output_tag == "zh" and layout.output_subfolder
+    assert layout.output_path("EP01.mkv") == d + os.sep + "zh" + os.sep + "EP01.zh.ass"
+    assert layout.output_path("a.b.mkv") == d + os.sep + "zh" + os.sep + "a.b.zh.ass"
+    assert layout.output_path("第一集.mp4") == d + os.sep + "zh" + os.sep + "第一集.zh.ass"
+    assert layout.output_label("EP01.mkv") == "zh/EP01.zh.ass"
+    assert layout.output_dirs() == (d + os.sep + "zh",)
     assert layout.v1_backup_path == d + os.sep + ".ocr.json.v1.bak"
 
 
@@ -83,7 +86,7 @@ def test_the_folder_layout_joins_onto_the_directory_exactly_as_given(tmp_path):
         assert layout.video_dir == d
         assert layout.config_path == os.path.join(d, ".ocr.json")
         assert layout.cache_dir == os.path.join(d, ".ocr-cache")
-        assert layout.output_path("x.mkv") == os.path.join(d, "chi", output_name("x.mkv"))
+        assert layout.output_path("x.mkv") == os.path.join(d, "zh", output_name("x.mkv"))
 
 
 def test_the_folder_layouts_caches_are_where_they_always_were(tmp_path):
@@ -105,7 +108,7 @@ def test_layout_of_a_project_built_without_one_is_its_folder_layout(tmp_path):
     assert layout_of(project) == folder_layout(str(tmp_path))
     episode = episode_layout(str(_write(tmp_path / "EP01.mkv")), str(tmp_path / "root"))
     project.layout = episode
-    assert layout_of(project) is episode
+    assert layout_of(project) == episode                       # default settings: the default output naming
 
 
 def test_the_layout_is_not_part_of_a_projects_equality(tmp_path):
@@ -129,11 +132,10 @@ def test_the_episode_layout_keeps_state_under_the_root_and_output_next_to_the_vi
     assert layout.video_dir == str(tmp_path / "Show")
     assert layout.cache_dir == str(root / "videos" / key)
     assert layout.config_path == str(root / "videos" / key / "settings.json")
-    assert layout.output_path("EP06.mkv") == str(tmp_path / "Show" / "EP06.zh.ass")
-    assert layout.output_path("a.b.mp4") == str(tmp_path / "Show" / "a.b.zh.ass")
-    assert layout.output_label("EP06.mkv") == "EP06.zh.ass"
-    assert EPISODE_SUFFIX == ".zh.ass"
-    assert layout.output_dirs() == ()
+    assert layout.output_path("EP06.mkv") == str(tmp_path / "Show" / "zh" / "EP06.zh.ass")
+    assert layout.output_path("a.b.mp4") == str(tmp_path / "Show" / "zh" / "a.b.zh.ass")
+    assert layout.output_label("EP06.mkv") == "zh/EP06.zh.ass"
+    assert layout.output_dirs() == (str(tmp_path / "Show" / "zh"),)
     assert layout.v1_backup_path is None
 
 
@@ -164,6 +166,63 @@ def test_an_episode_layout_uses_the_cache_root_by_default(tmp_path, monkeypatch)
     monkeypatch.setenv("OCR_MANAGER_CACHE_DIR", str(tmp_path / "env-root"))
     video = _write(tmp_path / "EP01.mkv")
     assert episode_layout(str(video)).cache_dir.startswith(str(tmp_path / "env-root" / "videos"))
+
+
+# --------------------------------------------------------------------------
+# The output: language tag x subfolder, folder and episode alike
+# --------------------------------------------------------------------------
+
+def _layouts(tmp_path) -> dict[str, ProjectLayout]:
+    show = tmp_path / "Show"
+    return {"folder": folder_layout(str(show)),
+            "episode": episode_layout(str(_write(show / "EP01.mkv")), str(tmp_path / "root"))}
+
+
+@pytest.mark.parametrize("kind", ["folder", "episode"])
+@pytest.mark.parametrize("ocr_lang, tag", [("ch", "zh"), ("japan", "ja"), ("rs_latin", "sr-Latn")])
+def test_the_output_is_in_the_language_subfolder_by_default(tmp_path, kind, ocr_lang, tag):
+    base = _layouts(tmp_path)[kind]
+    project = Project(path=str(tmp_path / "Show"), folder=FolderSettings(ocr_lang=ocr_lang), files={}, layout=base)
+    layout = layout_of(project)
+    show = tmp_path / "Show"
+    assert (layout.output_tag, layout.output_subfolder) == (tag, True)
+    assert layout.output_path("EP01.mkv") == str(show / tag / f"EP01.{tag}.ass")
+    assert layout.output_path("a.b.mp4") == str(show / tag / f"a.b.{tag}.ass")
+    assert layout.output_label("EP01.mkv") == f"{tag}/EP01.{tag}.ass"
+    assert layout.output_dirs() == (str(show / tag),)
+    # Only the output naming differs from the layout the project was loaded with.
+    assert (layout.kind, layout.config_path, layout.cache_dir) == (base.kind, base.config_path, base.cache_dir)
+
+
+@pytest.mark.parametrize("kind", ["folder", "episode"])
+@pytest.mark.parametrize("ocr_lang, tag", [("ch", "zh"), ("japan", "ja"), ("rs_latin", "sr-Latn")])
+def test_without_the_subfolder_the_output_is_next_to_the_video(tmp_path, kind, ocr_lang, tag):
+    folder = FolderSettings(ocr_lang=ocr_lang, output_subfolder=False)
+    project = Project(path=str(tmp_path / "Show"), folder=folder, files={}, layout=_layouts(tmp_path)[kind])
+    layout = layout_of(project)
+    show = tmp_path / "Show"
+    assert layout.output_path("EP01.mkv") == str(show / f"EP01.{tag}.ass")
+    assert layout.output_path("a.b.mp4") == str(show / f"a.b.{tag}.ass")
+    assert layout.output_label("EP01.mkv") == f"EP01.{tag}.ass"
+    assert layout.output_dirs() == ()
+
+
+def test_output_name_is_the_stem_and_the_tag():
+    assert output_name("EP01.mkv") == "EP01.zh.ass"
+    assert output_name("a.b.MP4", "sr-Latn") == "a.b.sr-Latn.ass"
+
+
+def test_layout_of_follows_a_settings_change_on_the_same_project(tmp_path):
+    project = Project(path=str(tmp_path), folder=FolderSettings(), files={})
+    assert layout_of(project).output_path("EP01.mkv") == str(tmp_path / "zh" / "EP01.zh.ass")
+    project.folder.ocr_lang = "japan"
+    assert layout_of(project).output_path("EP01.mkv") == str(tmp_path / "ja" / "EP01.ja.ass")
+    project.folder.output_subfolder = False
+    snapshot = layout_of(project)
+    assert snapshot.output_path("EP01.mkv") == str(tmp_path / "EP01.ja.ass")
+    project.folder.ocr_lang = "korean"                           # a layout already taken does not move
+    assert snapshot.output_path("EP01.mkv") == str(tmp_path / "EP01.ja.ass")
+    assert layout_of(project).output_path("EP01.mkv") == str(tmp_path / "EP01.ko.ass")
 
 
 # --------------------------------------------------------------------------

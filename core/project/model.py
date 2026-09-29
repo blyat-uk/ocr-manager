@@ -142,6 +142,7 @@ class FolderSettings:
     crop_vertical_padding: float = 0.003
     crop_min_height_fraction: float = 0.05
     bottom_half_cutoff: float = 0.55
+    output_subfolder: bool = True  # output in <tag>/ beside the videos, else next to them (core/project/layout.py)
 
     @property
     def labels_only(self) -> bool:

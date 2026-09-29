@@ -291,6 +291,7 @@ def _fully_populated_project(tmp_path) -> Project:
         crop_vertical_padding=0.01,
         crop_min_height_fraction=0.1,
         bottom_half_cutoff=0.6,
+        output_subfolder=False,
     )
     files = {
         "a.mkv": FileEntry(
@@ -337,6 +338,24 @@ def test_to_json_output_is_json_serializable_with_string_enum_values(tmp_path):
     assert isinstance(reloaded["folder"]["similar_image"], float)
     assert reloaded["files"]["b.mkv"]["crop"] is None
     assert reloaded["files"]["b.mkv"]["review"] == "pending"
+
+
+@pytest.mark.parametrize("output_subfolder", [True, False])
+def test_output_subfolder_round_trips_through_ocr_json(tmp_path, output_subfolder):
+    _touch(tmp_path / "vid.mkv")
+    save_project(Project(path=str(tmp_path), folder=FolderSettings(output_subfolder=output_subfolder), files={}))
+    data = json.loads((tmp_path / ".ocr.json").read_text(encoding="utf-8"))
+    assert data["version"] == 2 and data["folder"]["output_subfolder"] is output_subfolder
+    assert load_project(str(tmp_path)).folder.output_subfolder is output_subfolder
+
+
+def test_a_v2_document_without_output_subfolder_loads_it_on(tmp_path):
+    data = to_json(Project(path=str(tmp_path), folder=FolderSettings(output_subfolder=False), files={}))
+    del data["folder"]["output_subfolder"]
+    (tmp_path / ".ocr.json").write_text(json.dumps(data), encoding="utf-8")
+    project = load_project(str(tmp_path))
+    assert project.folder.output_subfolder is True
+    assert project.migrated_from_v1 is False
 
 
 def test_to_json_folder_includes_label_mask_crops_as_lists(tmp_path):

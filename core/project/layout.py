@@ -5,19 +5,24 @@ file on its behalf -- the store, the view cache, the detection jobs, the run
 -- asks a ProjectLayout rather than joining paths onto `Project.path` itself:
 
     folder   a folder of episodes, exactly as the app has always kept it:
-             `<dir>/.ocr.json`, `<dir>/.ocr-cache/`, output in
-             `<dir>/chi/<stem>.ass` (with `eng/` and `translate/` beside it).
-             folder_layout reproduces those paths byte for byte --
-             tests/test_layout.py pins them as literals -- so a folder
-             opened after this module existed reads and writes the same
-             files it did before.
+             `<dir>/.ocr.json` and `<dir>/.ocr-cache/`. folder_layout
+             reproduces those paths byte for byte -- tests/test_layout.py
+             pins them as literals -- so a folder opened after this module
+             existed reads and writes the same files it did before.
 
     episode  one video, OCR'd on its own. Nothing but the output is written
              next to it: its settings and caches live under the per-user
              cache root (cache_root), in `<root>/videos/<key>/`, keyed by the
              video's content (video_key) so they follow the file through a
-             rename or a move. The output is `<video dir>/<stem>.zh.ass`;
-             there is no `chi/`, `eng/` or `translate/`.
+             rename or a move.
+
+Both write their output the same way, named with the OCR language's tag
+(core.project.languages.output_tag, "zh" for "ch"): `<video dir>/<tag>/
+<stem>.<tag>.ass` with FolderSettings.output_subfolder on (the default),
+`<video dir>/<stem>.<tag>.ass` with it off. Those two settings live on the
+project, not the layout it was loaded with, so layout_of fills them in each
+time it is asked. An output anywhere else -- the old `chi/<stem>.ass` --
+is not this project's output: it neither counts as done nor is replaced.
 
 The episode's `settings.json` is the same v2 document as a folder's
 `.ocr.json`, with one file entry, and its `evidence/` and `view/` have the
@@ -33,9 +38,11 @@ import hashlib
 import os
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from core.project.languages import DEFAULT_TAG, output_tag
 
 if TYPE_CHECKING:
     from core.project.model import Project
@@ -43,11 +50,8 @@ if TYPE_CHECKING:
 VIDEO_EXTENSIONS = (".mkv", ".mp4")
 CONFIG_FILENAME = ".ocr.json"
 CACHE_DIRNAME = ".ocr-cache"      # a folder's cache directory (same as core.detect.ranges.pipeline's)
-OUTPUT_DIRS = ("chi", "eng", "translate")    # a folder run's output directories; chi/ holds the output
-OUTPUT_DIR = OUTPUT_DIRS[0]
 V1_BACKUP_SUFFIX = ".v1.bak"
 
-EPISODE_SUFFIX = ".zh.ass"
 EPISODE_CONFIG_FILENAME = "settings.json"
 EPISODES_DIRNAME = "videos"       # <root>/videos/<key>/
 CACHE_ENV = "OCR_MANAGER_CACHE_DIR"
@@ -78,16 +82,10 @@ def is_video_name(name: str) -> bool:
     return name.lower().endswith(VIDEO_EXTENSIONS)
 
 
-def output_name(video_name: str) -> str:
-    """The file a folder run writes into chi/: "<stem>.ass", the stem as
-    today's OCRWorker took it (pathlib's, so "a.b.mkv" gives "a.b.ass")."""
-    return Path(video_name).stem + ".ass"
-
-
-def episode_output_name(video_name: str) -> str:
-    """The file an episode run writes next to its video: "<stem>.zh.ass",
-    with output_name's stem rule."""
-    return Path(video_name).stem + EPISODE_SUFFIX
+def output_name(video_name: str, tag: str = DEFAULT_TAG) -> str:
+    """The output file of video `video_name`: "<stem>.<tag>.ass", the stem as
+    the v1 OCRWorker took it (pathlib's, so "a.b.mkv" gives "a.b.zh.ass")."""
+    return f"{Path(video_name).stem}.{tag}.ass"
 
 
 @dataclass(frozen=True)
@@ -104,6 +102,8 @@ class ProjectLayout:
     cache_dir: str                # folder: <dir>/.ocr-cache  episode: <root>/videos/<key>
     only_file: str | None = None  # episode: the video's file name
     key: str | None = None        # episode: video_key of the video
+    output_tag: str = DEFAULT_TAG           # names the output (see the module docstring)
+    output_subfolder: bool = True           # output in <video_dir>/<tag>/, else next to the video
 
     @property
     def is_episode(self) -> bool:
@@ -120,24 +120,21 @@ class ProjectLayout:
     def output_path(self, name: str) -> str:
         """The finished subtitle file of video `name`. A run writes
         `<this>.partial` first and replaces this only when that is ready."""
-        if self.is_episode:
-            return os.path.join(self.video_dir, episode_output_name(name))
-        return os.path.join(self.video_dir, OUTPUT_DIR, output_name(name))
+        return os.path.join(self.video_dir, *self.output_label(name).split("/"))
 
     def output_label(self, name: str) -> str:
         """output_path relative to the video directory, "/"-separated on
-        every OS, for messages: "chi/EP01.ass", "EP01.zh.ass"."""
-        if self.is_episode:
-            return episode_output_name(name)
-        return f"{OUTPUT_DIR}/{output_name(name)}"
+        every OS, for messages: "zh/EP01.zh.ass", or "EP01.zh.ass" without
+        the subfolder."""
+        file_name = output_name(name, self.output_tag)
+        return f"{self.output_tag}/{file_name}" if self.output_subfolder else file_name
 
     def output_dirs(self) -> tuple[str, ...]:
-        """The directories a run creates before its first file: a folder's
-        chi/, eng/ and translate/; none for an episode, whose output goes
-        next to the video."""
-        if self.is_episode:
+        """The directories a run creates before its first file: the output
+        subfolder, or none when the output goes next to the video."""
+        if not self.output_subfolder:
             return ()
-        return tuple(os.path.join(self.video_dir, sub) for sub in OUTPUT_DIRS)
+        return (os.path.join(self.video_dir, self.output_tag),)
 
     @property
     def v1_backup_path(self) -> str | None:
@@ -177,8 +174,11 @@ def episode_layout(video_path: str, root: str | None = None, *, key: str | None 
 
 def layout_of(project: Project) -> ProjectLayout:
     """The project's layout: the one it was loaded with, or -- for a Project
-    built without one -- the folder layout of its path."""
-    return project.layout or folder_layout(project.path)
+    built without one -- the folder layout of its path, with the output
+    naming of its current settings (ocr_lang, output_subfolder)."""
+    base = project.layout or folder_layout(project.path)
+    return replace(base, output_tag=output_tag(project.folder.ocr_lang),
+                   output_subfolder=bool(project.folder.output_subfolder))
 
 
 def cache_root() -> str:
