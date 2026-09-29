@@ -24,7 +24,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         name: Tag matches app/version.py
         shell: bash
@@ -56,14 +56,14 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Download cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .build-cache
           key: build-cache-${{ matrix.os_name }}-${{ hashFiles('packaging/build.py') }}
@@ -78,9 +78,25 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 \
             libglib2.0-0 fonts-noto-cjk file
 
+      # cl and rc for the launcher: the x64 developer environment, what
+      # ilammy/msvc-dev-cmd set up (it has no Node 24 release). The
+      # variables vcvarsall.bat changes are kept for the steps after this.
       - name: MSVC
         if: matrix.os_name == 'win'
-        uses: ilammy/msvc-dev-cmd@v1
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "no Visual Studio with the x64 C++ tools" }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" x64 >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw "vcvarsall.bat failed" }
+          foreach ($line in $vars) {
+            if ($line -match '^([^=]+)=(.*)$' -and $before[$Matches[1]] -ne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
 
       - name: Inno Setup
         if: matrix.os_name == 'win'
@@ -163,7 +179,7 @@ jobs:
               print(f"::error title={log.name}::{body}")
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ocr-manager-${{ matrix.os_name }}
           path: dist/ocr-manager-v*
@@ -180,11 +196,11 @@ jobs:
     steps:
       # Full history and tags: the changelog is every commit since the
       # previous tag.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -225,7 +241,7 @@ jobs:
           EOF
           cat notes.md
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: OCR Manager ${{ github.ref_name }}
           body_path: notes.md
