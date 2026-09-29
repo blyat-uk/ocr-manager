@@ -195,13 +195,23 @@ jobs:
           sha256sum ocr-manager-v* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      # The release page is the Downloads table and the changelog, nothing
+      # The release page is the changelog, then the Downloads table, nothing
       # else. First run and platform notes live in README.md.
       - name: Release notes
         env:
           TAG: ${{ github.ref_name }}
         run: |
           cat > notes.md <<EOF
+          ## Changelog
+
+          EOF
+          # Since the previous v* tag, or all history for the first release.
+          # "chore: version X.Y.Z" is the bump the tag sits on, not a change.
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$TAG" \
+            | grep -Ev '^- chore: version [0-9]' >> notes.md || echo "- No changes." >> notes.md
+          cat >> notes.md <<EOF
+
           ## Downloads
 
           | File | For |
@@ -212,15 +222,7 @@ jobs:
           | \`ocr-manager-$TAG-linux.AppImage\` | Linux x86_64 (glibc 2.34+) |
           | \`ocr-manager-$TAG-linux.tar.gz\` | Linux x86_64 (glibc 2.34+), portable |
           | \`SHA256SUMS.txt\` | SHA-256 checksums of every file above |
-
-          ## Changelog
-
           EOF
-          # Since the previous v* tag, or all history for the first release.
-          # "chore: version X.Y.Z" is the bump the tag sits on, not a change.
-          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
-          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$TAG" \
-            | grep -Ev '^- chore: version [0-9]' >> notes.md || echo "- No changes." >> notes.md
           cat notes.md
 
       - uses: softprops/action-gh-release@v2
