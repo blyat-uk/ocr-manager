@@ -472,6 +472,9 @@ def test_a_long_kvrow_value_never_widens_its_column(qapp):
     dictate the column's width: the row's minimum is its key's, and the
     value elides into whatever is left, with the whole of it on hover."""
     long_value = "576, 1876 · 2688 × 159 · yours 579, 1876 · 2688 × 159"
+    # The theme's fonts, installed here: without them (this test alone, or
+    # first on a pytest-xdist worker) the value fits and never elides.
+    qss.apply_theme(qapp)
     row = KvRow("detected", long_value, tone="warn")
     row.show()
 

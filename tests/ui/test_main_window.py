@@ -1037,7 +1037,9 @@ def test_files_appearing_and_disappearing_update_the_queue(qapp, fake_runner, tm
         window.queue.select(SLAY_NAMES[2])
         (folder / "ZS2_-_16_[1080p]TXHBR.mp4").write_bytes(b"placeholder video")
         assert wait_for(lambda: "ZS2_-_16_[1080p]TXHBR.mp4" in window.queue.names())
-        assert window.queue.filter.labels()[0] == "All 6"
+        # The row appears at once; the filter's counts follow on the coalesced
+        # refresh, which a busy machine can hold back past the row.
+        assert wait_for(lambda: window.queue.filter.labels()[0] == "All 6")
         (folder / SLAY_NAMES[2]).unlink()
         assert wait_for(lambda: SLAY_NAMES[2] not in window.queue.names())
         assert window.queue.selected() == SLAY_NAMES[0]
@@ -1338,6 +1340,10 @@ def test_views_import_no_core_modules():
 
 def test_a_burst_of_file_changes_refreshes_counts_once_per_view(slay_window):
     controller = slay_window.controller
+    # No job runs here. The 30 ms drain tick's own activity refresh is not the
+    # burst's, and on a busy machine (or under pytest-xdist) it lands between
+    # the two settles below and counts twice more.
+    controller._drain_timer.stop()
     settle()
     counts = Calls(controller, "counts")
     startable = Calls(controller, "startable_files")
