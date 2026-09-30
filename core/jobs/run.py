@@ -115,7 +115,6 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from core import ass_qafix as _qafix
 from core.jobs.runner import JobContext, Lane, _first_line, _format_traceback
 from core.project.layout import ProjectLayout, folder_layout, output_name
 from core.project.ocr_kwargs import OcrCall
@@ -340,6 +339,9 @@ class RunJob:
                 _remove(partial)
                 status, error = _CANCELLED, ERROR_CANCELLED
             elif os.path.exists(partial):
+                # Imported here, not at the top: ass_qafix loads jieba3's dictionaries
+                # (~0.5 s), and the window imports this module at startup.
+                from core import ass_qafix as _qafix
                 stats = _qafix.process_file(partial)
                 file_log(f"QA: {stats.dialogue_lines} dialogues, {stats.fixed_lines} fixed, "
                          f"{stats.duplicates_removed} deduped\n")

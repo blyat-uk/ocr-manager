@@ -17,7 +17,6 @@ import subprocess
 from typing import NamedTuple
 
 import numpy as np
-from scipy.ndimage import maximum_filter
 
 from core.detect.ranges.config import DSPConfig, HashConfig, PeakConfig, RangesConfig
 from core.proc import TEXT_ENCODING, hidden_child
@@ -208,6 +207,7 @@ def find_peaks(spectrogram: np.ndarray, dsp: DSPConfig, peak: PeakConfig) -> Pea
         return Peaks(empty, empty, 0)
 
     neighborhood = (peak.freq_neighborhood, peak.time_neighborhood)
+    from scipy.ndimage import maximum_filter     # lazy: scipy.ndimage costs ~0.1 s at app startup
     local_max = maximum_filter(spectrogram, size=neighborhood)
     is_peak = spectrogram == local_max
     is_peak &= spectrogram > peak.noise_floor

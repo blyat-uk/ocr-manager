@@ -175,7 +175,6 @@ from app.notify import send_notification
 from app.run_snapshot import DONE, FAILED, RunSnapshot, RunTracker, notification_for
 from app.state_text import badge_for
 from app.time_spans import read_ranges
-from core.ass_qafix import load_ass
 from core.detect.crop import CONSENSUS_MIN_ENTRIES
 from core.jobs import apply as rules
 from core.jobs import view_cache
@@ -556,6 +555,7 @@ class ProjectController(QObject):
         read with core.ass_qafix.load_ass as the run's QA pass wrote it, so
         the Done screen shows exactly what is on disk. [] when there is no
         output or it cannot be read."""
+        from core.ass_qafix import load_ass       # lazy: see core.jobs.run
         try:
             document = load_ass(self.output_path(name))
         except (OSError, ValueError):

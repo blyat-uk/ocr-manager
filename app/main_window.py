@@ -669,6 +669,10 @@ class MainWindow(QMainWindow):
         app_settings().setValue(GEOMETRY_KEY, self.saveGeometry())
         if self.logs_window is not None:
             self.logs_window.close()
+        # The shutdown below waits (up to its timeout) for running jobs to
+        # notice their cancel; the window goes away first rather than sit
+        # frozen on screen for those seconds.
+        self.hide()
         self.run_view.shutdown()
         self.controller.shutdown()
         event.accept()

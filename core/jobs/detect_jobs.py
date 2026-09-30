@@ -72,8 +72,6 @@ from typing import TYPE_CHECKING
 
 import cv2
 
-from core import ass_qafix as _qafix
-from core.ass_qafix import ASS_TAG_RE
 from core.detect import audio_profile as _audio_profile
 from core.detect import brightness as _brightness
 from core.detect import confirm as _confirm
@@ -619,6 +617,7 @@ def proof_lines(ass: str) -> list[tuple[float, float, str]]:
     fields are parsed by videocr.utils.parse_ass_dialogue_line; override tags
     ({\\pos(...)} and the like, core.ass_qafix.ASS_TAG_RE) are removed and
     \\N becomes a newline. Empty text (no Dialogue lines) gives []."""
+    from core.ass_qafix import ASS_TAG_RE        # lazy: see core.jobs.run
     lines = []
     for raw in ass.split("\n"):                    # not splitlines(): OCR text may hold other separators
         parsed = _videocr_utils.parse_ass_dialogue_line(raw.rstrip("\r"))
@@ -638,6 +637,7 @@ def qa_pass(ass: str) -> str:
         path = os.path.join(directory, "proof.ass")
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(ass)
+        from core import ass_qafix as _qafix      # lazy: see core.jobs.run
         _qafix.process_file(path)
         with open(path, encoding="utf-8") as handle:
             return handle.read()

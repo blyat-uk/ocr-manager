@@ -9,7 +9,6 @@ whose bits must not change.
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import maximum_filter1d
 
 _EMPTY = np.empty(0, dtype=np.int64)
 
@@ -74,6 +73,7 @@ def histogram_peaks(deltas: np.ndarray, min_count: int) -> tuple[np.ndarray, np.
         return _EMPTY, _EMPTY
     min_val = int(deltas.min())
     counts = np.bincount(deltas - min_val)
+    from scipy.ndimage import maximum_filter1d   # lazy, as in fingerprint.find_peaks
     window_max = maximum_filter1d(counts, size=5, mode="constant", cval=0)
     idx = np.flatnonzero((counts >= min_count) & (counts == window_max))
     idx = idx[np.argsort(-counts[idx], kind="stable")]

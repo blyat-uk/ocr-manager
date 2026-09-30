@@ -61,6 +61,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import cv2
 from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
@@ -156,6 +157,23 @@ def _timecode(seconds: float) -> str:
 
 def _box_text(box) -> str:
     return f"{box[0]}, {box[1]} · {box[2]} × {box[3]}"
+
+
+def _shrink_towards(frame, width: int, height: int):
+    """`frame` area-averaged down to twice the size a KeepAspectRatioByExpanding
+    scale to `width` x `height` gives, so the QImage conversion and Qt's smooth
+    scale that follow work on a few KB instead of a whole 720p frame (~3 ms a
+    thumbnail on the GUI thread, ~0.4 ms this way). A frame that is already
+    that small, or not a pixel array, is returned as it is."""
+    shape = getattr(frame, "shape", None)
+    if not shape or len(shape) < 2 or shape[0] <= 0 or shape[1] <= 0:
+        return frame
+    rows, cols = shape[:2]
+    scale = 2 * max(width / cols, height / rows)
+    if scale >= 1:
+        return frame
+    size = (max(1, round(cols * scale)), max(1, round(rows * scale)))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
 
 def _read_box(values) -> tuple[int, int, int, int] | None:
@@ -1859,7 +1877,7 @@ class CropTab:
         frame = self._controller.frame(self._file, time)
         if frame is None:
             return None
-        image = bgr_to_qimage(frame)
+        image = bgr_to_qimage(_shrink_towards(frame, SampleStrip.THUMB_WIDTH, SampleStrip.THUMB_HEIGHT))
         if image is None or image.isNull():
             return None
         image = image.scaled(SampleStrip.THUMB_WIDTH, SampleStrip.THUMB_HEIGHT,
