@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from PyQt6 import sip
+from PyQt6.QtCore import QEvent
 from PyQt6.QtWidgets import QApplication
 
 from core.jobs.runner import JobEvent, Lane
@@ -40,6 +42,29 @@ def qapp() -> QApplication:
     to construct any QWidget."""
     app = QApplication.instance() or QApplication([])
     return app
+
+
+@pytest.fixture(autouse=True)
+def _delete_leaked_top_level_widgets():
+    """Delete the top-level widgets a test leaves behind.
+
+    Nothing else ever destroys them in a session-wide QApplication, and every
+    later `setStyleSheet` on the app (qss.apply_theme) repolishes each one:
+    by the end of tests/ui a theme test that takes 20 ms alone took 10-20 s.
+    Only widgets created during the test are deleted, never ones that
+    existed before it."""
+    app = QApplication.instance()
+    before = {sip.unwrapinstance(w) for w in app.topLevelWidgets()} if app is not None else set()
+    yield
+    app = QApplication.instance()
+    if app is None:
+        return
+    leaked = [w for w in app.topLevelWidgets() if sip.unwrapinstance(w) not in before]
+    for widget in leaked:
+        widget.hide()
+        widget.deleteLater()
+    if leaked:
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 # --------------------------------------------------------------------------
