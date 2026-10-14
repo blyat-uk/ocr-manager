@@ -289,14 +289,14 @@ def test_dragging_the_body_moves_the_box_and_commits_on_release(make_tab):
 
 
 @pytest.mark.parametrize(("handle", "expected"), [
-    ("tl", (288 - 30, 784 - 20, 1344 + 30, 55 + 20)),
-    ("tr", (288, 784 - 20, 1344 - 30, 55 + 20)),
-    ("bl", (288 - 30, 784, 1344 + 30, 55 - 20)),
-    ("br", (288, 784, 1344 - 30, 55 - 20)),
+    ("tl", (288 - 30, 784 - 20, 1344 + 60, 55 + 20)),
+    ("tr", (288 + 30, 784 - 20, 1344 - 60, 55 + 20)),
+    ("bl", (288 - 30, 784, 1344 + 60, 55 - 20)),
+    ("br", (288 + 30, 784, 1344 - 60, 55 - 20)),
     ("tc", (288, 784 - 20, 1344, 55 + 20)),
     ("bc", (288, 784, 1344, 55 - 20)),
 ])
-def test_each_handle_resizes_its_own_edges(make_tab, handle, expected):
+def test_each_handle_resizes_its_edges_and_a_corner_mirrors_the_other_side(make_tab, handle, expected):
     harness = make_tab()
     canvas = harness.tab.canvas
     start = canvas.handle_rect(handle).center()
@@ -304,6 +304,34 @@ def test_each_handle_resizes_its_own_edges(make_tab, handle, expected):
     gesture(canvas, start, end)
     assert canvas.box() == expected
     assert harness.crop() == expected
+    assert 2 * expected[0] + expected[2] == 2 * BOX[0] + BOX[2]     # the horizontal centre stays put
+
+
+def test_a_corner_mirrors_around_the_boxs_own_centre_not_the_frames(make_tab):
+    harness = make_tab()
+    canvas = harness.tab.canvas
+    off_centre = (100, 784, 501, 55)                    # an odd width: the centre sits on a half pixel
+    harness.controller.set_crop(harness.name, off_centre)
+    harness.tab.refresh()
+    start = canvas.handle_rect("br").center()
+    gesture(canvas, start, canvas.to_widget(canvas.to_video(start)[0] + 40, canvas.to_video(start)[1]))
+    assert canvas.box() == (60, 784, 581, 55)
+
+
+def test_a_mirrored_corner_stops_where_either_side_meets_its_limit(make_tab):
+    harness = make_tab()
+    canvas = harness.tab.canvas
+    off_centre = (100, 784, 600, 55)
+    harness.controller.set_crop(harness.name, off_centre)
+    harness.tab.refresh()
+    start = canvas.handle_rect("tr").center()
+    gesture(canvas, start, canvas.to_widget(4000, canvas.to_video(start)[1]))
+    assert canvas.box() == (0, 784, 800, 55)            # the far left edge hit the frame first
+
+    start = canvas.handle_rect("bl").center()
+    gesture(canvas, start, canvas.to_widget(4000, canvas.to_video(start)[1]))
+    x, _y, width, _h = canvas.box()
+    assert width == canvas.MIN_BOX and 2 * x + width == 800      # collapsed onto the same centre
 
 
 @pytest.mark.parametrize(("handle", "expected"), [("tc", (288, 796, 1344, 43)), ("bc", (288, 784, 1344, 67))])
@@ -757,7 +785,7 @@ def test_the_panel_shows_the_box_evidence_and_the_nudge_note(make_tab):
     assert rows["Samples with text"] == "11 / 12"
     assert rows["Text envelope"] == "y 791–836"
     assert panel.nudge_note() == ("Arrow keys nudge 1 px, ⇧ arrows nudge 10. "
-                                  "Free rectangle — no forced centring.")
+                                  "A corner moves the opposite side with it, mirrored.")
     assert "◆ this episode only" not in [key.lower() for key, _value in panel.rows()]
 
 

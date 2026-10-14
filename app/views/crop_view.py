@@ -1,7 +1,9 @@
 """The Crop review view (plan 3C Task 2, ui-spec §3.4, rulings B2/B3/B5).
 
-`CropTab` is a `StageTab`: a frame canvas with a free six-handle box, the
-detector's text envelope, a sample filmstrip and its own inspector panel.
+`CropTab` is a `StageTab`: a frame canvas with a six-handle box (a corner
+resizes both sides around the box's centre; dragging inside moves it
+freely), the detector's text envelope, a sample filmstrip and its own
+inspector panel.
 
 Pixels
     Every frame here -- the canvas and the filmstrip thumbnails -- comes
@@ -103,7 +105,7 @@ if TYPE_CHECKING:
 COMMIT_DEBOUNCE_MS = 400          # one command per gesture: nudges and spin-box edits
 DEFAULT_BRIGHTNESS = 230          # core.config.Config's default, for a file with no value yet
 NUDGE_SMALL, NUDGE_LARGE = 1, 10  # video pixels, plain and with Shift
-NUDGE_NOTE = "Arrow keys nudge 1 px, ⇧ arrows nudge 10. Free rectangle — no forced centring."
+NUDGE_NOTE = "Arrow keys nudge 1 px, ⇧ arrows nudge 10. A corner moves the opposite side with it, mirrored."
 # "apply this crop to all files": the file's box, as MANUAL, for every file not
 # skipped (controller.apply_crop_to_all), after one question.
 APPLY_ALL_TEXT = "apply this crop to all files"
@@ -562,10 +564,16 @@ class CropCanvas(QWidget):
             self._store_box((round(x + dx), round(y + dy), width, height))
             return
         edges = _HANDLE_EDGES[handle]
+        # A corner moves the opposite side by the mirror amount, so the box
+        # keeps its own horizontal centre; the shift stops where either side
+        # meets the frame or the box meets its minimum width.
+        slack = (width - self.MIN_BOX) // 2
         if "left" in edges:
-            left = _clamp(round(x + dx), 0, right - self.MIN_BOX)
+            shift = _clamp(round(dx), max(-left, right - video_width), slack)
+            left, right = left + shift, right - shift
         if "right" in edges:
-            right = _clamp(round(right + dx), left + self.MIN_BOX, video_width)
+            shift = _clamp(round(dx), -slack, min(video_width - right, left))
+            left, right = left - shift, right + shift
         if "top" in edges:
             top = _clamp(round(y + dy), 0, bottom - self.MIN_BOX)
         if "bottom" in edges:
