@@ -1,6 +1,6 @@
 """Before anything is open: the empty state ("Open an episode or a folder of
-episodes"), the two pickers, drag-and-drop payloads and the remembered last
-path.
+episodes"), the two pickers, drag-and-drop payloads, the remembered last
+path and the recent files & folders.
 
 This module only decides *which path* the user meant -- a folder, or one
 video file. What opens for it (the episode view or the workbench) is the
@@ -14,25 +14,50 @@ keeps painting and draining job events while it is open. The remembered path
 (QSettings "project/last_path") is whatever was opened last, a folder or an
 episode's video; `last_dir()` turns it into the start directory, defaulting
 to the user's home directory.
+
+The recent files & folders (QSettings "project/recents", the rules in
+`app/recents.py`) are listed under the two buttons: what was opened, newest
+first, each row opening it again through the window's `open_path`. Removing
+one, or clearing them all, only edits the list.
 """
 from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QProcess, QSettings, Qt, pyqtSignal
-from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PyQt6.QtCore import QObject, QProcess, QSettings, QSize, Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
+from app import recents
+from app.recents import EPISODE, FOLDER, KINDS, RecentEntry
 from app.theme import tokens
-from app.widgets.base import Button
+from app.widgets.base import Badge, Button, ElidedLabel, SectionHeader
 
 SETTINGS_ORGANIZATION = "OCRManager"
 SETTINGS_APPLICATION = "OCRTool"
 LAST_PATH_KEY = "project/last_path"
+RECENTS_KEY = "project/recents"
 PICKER_CAPTION = "Select Project Directory"
 EPISODE_PICKER_CAPTION = "Select an Episode"
 ERROR_WIDTH = 560                # mockup px; scaled through tokens.px() where it is used
+RECENTS_TITLE = "Recent files & folders"
+RECENTS_WIDTH = 600              # mockup px, like ERROR_WIDTH
+RECENTS_GAP = 18                 # mockup px between the buttons and the list
+CLEAR_RECENTS_TITLE = "Clear recent files & folders"
+CLEAR_RECENTS_TEXT = "Clear the list of recent files and folders?\n\nNothing on disk is touched."
+REMOVE_RECENT_TIP = "Take this off the list (Delete). Nothing on disk is touched."
 
 # The video extensions, lower case. The source of truth is
 # core/project/store.py VIDEO_EXTENSIONS (list_video_files' rule, case-blind);
@@ -63,6 +88,36 @@ def last_dir() -> str:
 
 def remember_path(path: str) -> None:
     app_settings().setValue(LAST_PATH_KEY, path)
+
+
+def _stored_recents() -> list[RecentEntry]:
+    value = app_settings().value(RECENTS_KEY)
+    return recents.parse(value) if isinstance(value, str) else []
+
+
+def _store_recents(entries: list[RecentEntry]) -> None:
+    app_settings().setValue(RECENTS_KEY, recents.dump(entries))
+
+
+def recent_entries() -> list[RecentEntry]:
+    """The recent files & folders, newest first: those still there. One that
+    is not (a drive that is not mounted) stays stored and comes back."""
+    return [entry for entry in _stored_recents() if entry.exists()]
+
+
+def record_recent(path: str, *, episode: bool, count: int | None = None) -> None:
+    """`path` was opened: an episode's video, or a folder holding `count`
+    episodes."""
+    entry = RecentEntry(path, EPISODE if episode else FOLDER, time.time(), None if episode else count)
+    _store_recents(recents.recorded(_stored_recents(), entry))
+
+
+def forget_recent(path: str) -> None:
+    _store_recents(recents.without(_stored_recents(), path))
+
+
+def clear_recents() -> None:
+    _store_recents([])
 
 
 def is_video_file(path: str) -> bool:
@@ -172,14 +227,149 @@ class EpisodePicker(_Picker):
         return path
 
 
+def _badge_width() -> int:
+    """The kind badge's width: the widest kind's, so every row's name starts
+    at the same x."""
+    widths = []
+    for kind in KINDS:
+        probe = Badge(kind)
+        probe.ensurePolished()                  # the stylesheet's font and padding, not the defaults
+        widths.append(probe.sizeHint().width())
+        probe.deleteLater()
+    return max(widths)
+
+
+class RecentRow(QWidget):
+    """One recent file or folder: what it is, its name and where it is, how
+    many episodes and when it was opened. A left click, Enter or Space asks
+    to open it; Delete, or the "Remove" that shows while the pointer is over
+    the row, asks to take it off the list."""
+
+    open_requested = pyqtSignal(str)
+    remove_requested = pyqtSignal(str)
+
+    def __init__(self, entry: RecentEntry, now: float, badge_width: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.entry = entry
+        self._hovered = False
+        self.setObjectName("RecentRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(entry.path)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(tokens.px(10), tokens.px(6), tokens.px(8), tokens.px(6))
+        layout.setSpacing(tokens.px(10))
+        self.kind_badge = Badge(entry.kind)
+        self.kind_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.kind_badge.setFixedWidth(badge_width)
+        layout.addWidget(self.kind_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        names = QVBoxLayout()
+        names.setContentsMargins(0, 0, 0, 0)
+        names.setSpacing(tokens.px(1))
+        self.title_label = ElidedLabel(recents.title(entry), tip_when_elided=True)
+        self.title_label.setObjectName("RecentName")
+        self.location_label = ElidedLabel(recents.location(entry), Qt.TextElideMode.ElideMiddle,
+                                          tip_when_elided=True)
+        self.location_label.setObjectName("RecentPath")
+        names.addWidget(self.title_label)
+        names.addWidget(self.location_label)
+        layout.addLayout(names, 1)
+        self.detail_label = QLabel(recents.detail(entry, now))
+        self.detail_label.setObjectName("RecentDetail")
+        layout.addWidget(self.detail_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.remove_button = Button("Remove", "ghost", small=True)
+        self.remove_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)      # the row's Delete is the key for it
+        self.remove_button.setToolTip(REMOVE_RECENT_TIP)
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self.entry.path))
+        policy = self.remove_button.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)                          # showing it never shifts the row
+        self.remove_button.setSizePolicy(policy)
+        self.remove_button.hide()
+        layout.addWidget(self.remove_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def _sync_remove(self) -> None:
+        self.remove_button.setVisible(self._hovered or self.hasFocus())
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._hovered = True
+        self._sync_remove()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._hovered = False
+        self._sync_remove()
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self._sync_remove()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self._sync_remove()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            event.accept()
+            self.open_requested.emit(self.entry.path)
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            event.accept()
+            self.open_requested.emit(self.entry.path)
+            return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            event.accept()
+            self.remove_requested.emit(self.entry.path)
+            return
+        super().keyPressEvent(event)
+
+
+class _RecentList(QScrollArea):
+    """The rows, as tall as all of them when the window has the room, and
+    scrolling when it is too short for them."""
+
+    def __init__(self, content: QWidget, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("RecentList")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setWidgetResizable(True)
+        self.setWidget(content)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+    def sizeHint(self) -> QSize:
+        return self.widget().sizeHint()
+
+    def minimumSizeHint(self) -> QSize:
+        rows = self.widget().layout()
+        first = rows.itemAt(0) if rows.count() else None
+        height = first.sizeHint().height() if first is not None else 0
+        return QSize(0, height)
+
+
 class OpenFolderView(QWidget):
     """The centre of the window while nothing is open. The episode is the
     primary action (most sessions are one episode); a folder of episodes is
     the second button. `choose_episode_requested` asks for the episode
-    picker, `choose_requested` for the folder picker."""
+    picker, `choose_requested` for the folder picker, and
+    `open_recent_requested(path)` for one of the recent files & folders
+    listed under them."""
 
     choose_requested = pyqtSignal()
     choose_episode_requested = pyqtSignal()
+    open_recent_requested = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -216,7 +406,71 @@ class OpenFolderView(QWidget):
         error_row.addWidget(self.error_label)
         error_row.addStretch(1)
         layout.addLayout(error_row)
+
+        self.recent_section = QWidget()
+        self.recent_section.setFixedWidth(tokens.px(RECENTS_WIDTH))
+        section = QVBoxLayout(self.recent_section)
+        section.setContentsMargins(0, tokens.px(RECENTS_GAP), 0, 0)
+        section.setSpacing(tokens.px(6))
+        self.clear_recents_button = Button("Clear all", "ghost", small=True)
+        self.clear_recents_button.clicked.connect(self._clear_recents)
+        self.recent_header = SectionHeader(RECENTS_TITLE, trailing=self.clear_recents_button)
+        section.addWidget(self.recent_header)
+        rows = QWidget()
+        rows.setObjectName("RecentRows")
+        self._rows_layout = QVBoxLayout(rows)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setSpacing(tokens.px(4))
+        self._recent_list = _RecentList(rows)
+        section.addWidget(self._recent_list)
+        recent_row = QHBoxLayout()
+        recent_row.addStretch(1)
+        recent_row.addWidget(self.recent_section)
+        recent_row.addStretch(1)
+        layout.addLayout(recent_row)
         layout.addStretch(1)
+        self._badge_width = _badge_width()
+        self._rows: list[RecentRow] = []
+        self.refresh_recents()
+
+    # --- recent files & folders ---------------------------------------------------------
+
+    def recent_rows(self) -> list[RecentRow]:
+        return list(self._rows)
+
+    def refresh_recents(self) -> None:
+        """List the recent files & folders again (what is there now, and
+        "2 h ago" from now). The section hides when there are none."""
+        for row in self._rows:
+            self._rows_layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()            # the row may be the one whose signal got us here
+        now = time.time()
+        self._rows = [RecentRow(entry, now, self._badge_width) for entry in recent_entries()]
+        for row in self._rows:
+            row.open_requested.connect(self.open_recent_requested)
+            row.remove_requested.connect(self._remove_recent)
+            self._rows_layout.addWidget(row)
+        self.recent_section.setVisible(bool(self._rows))
+        self._recent_list.updateGeometry()
+
+    def _remove_recent(self, path: str) -> None:
+        """Off the list; the keyboard stays on the list, on the row that
+        took its place."""
+        index = next((i for i, row in enumerate(self._rows) if row.entry.path == path), 0)
+        had_focus = any(row.hasFocus() for row in self._rows)
+        forget_recent(path)
+        self.refresh_recents()
+        if had_focus and self._rows:
+            self._rows[min(index, len(self._rows) - 1)].setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _clear_recents(self) -> None:
+        answers = QMessageBox.StandardButton
+        if QMessageBox.question(self, CLEAR_RECENTS_TITLE, CLEAR_RECENTS_TEXT, answers.Yes | answers.No,
+                                answers.No) != answers.Yes:
+            return
+        clear_recents()
+        self.refresh_recents()
 
     def show_error(self, message: str) -> None:
         self.error_label.setText(message)

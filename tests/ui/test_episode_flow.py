@@ -457,6 +457,27 @@ def test_a_folder_with_two_videos_opens_the_workbench(make_window, videos):
     assert window.topbar.start_button.text() != "▶ Start OCR"
 
 
+def test_an_episode_is_recorded_as_a_recent_by_its_video_and_reopens_as_one(make_window, videos):
+    one = videos(["EP06.mkv"], folder="one")
+    two = videos(["EP06.mkv", "EP07.mkv"], folder="two")
+    window = make_window()
+    window.open_path(str(one))                             # a one-video folder opens its episode
+    window.open_path(str(two / "EP07.mkv"))
+    settle()
+    assert [(entry.path, entry.kind, entry.count) for entry in open_folder_module.recent_entries()] == [
+        (str(two / "EP07.mkv"), "episode", None), (str(one / "EP06.mkv"), "episode", None)]
+
+    window.open_view.refresh_recents()
+    row = window.open_view.recent_rows()[1]
+    assert row.title_label.full_text() == "EP06"
+    assert row.location_label.full_text() == str(one)
+    row.open_requested.emit(row.entry.path)
+    settle()
+    assert window.controller.episode_name() == "EP06.mkv"
+    assert window.controller.project.path == str(one)
+    assert window.episode_page() == "prepare"
+
+
 def test_going_from_an_episode_back_to_a_folder_restores_the_workbench(make_window, videos):
     window = make_window()
     window.open_path(str(videos(["EP06.mkv"], folder="one")))

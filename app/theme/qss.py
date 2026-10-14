@@ -497,6 +497,37 @@ QLabel#OpenError {{
     color: {tokens.BAD};
     font-size: {_font_px(tokens.FONT_SIZE_BTN_SM)}px;
 }}
+/* The recent files & folders under the two buttons: one card per entry. */
+QScrollArea#RecentList,
+QScrollArea#RecentList > QWidget#qt_scrollarea_viewport,
+QWidget#RecentRows {{
+    background-color: {tokens.BG};
+    border: none;
+}}
+QWidget#RecentRow {{
+    background-color: {tokens.PANEL};
+    border: 1px solid {tokens.LINE};
+    border-radius: {tokens.RADIUS_ROW}px;
+}}
+QWidget#RecentRow:hover {{
+    background-color: {tokens.ROW_HOVER};
+}}
+QWidget#RecentRow:focus {{
+    border-color: {tokens.ACC_DIM};
+}}
+QLabel#RecentName {{
+    color: {tokens.TXT};
+    font-size: {_font_px(tokens.FONT_SIZE_BODY)}px;
+    font-weight: {tokens.FONT_WEIGHT_FNAME};
+}}
+QLabel#RecentPath {{
+    color: {tokens.DIM2};
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
+}}
+QLabel#RecentDetail {{
+    color: {tokens.DIM};
+    font-size: {_font_px(tokens.FONT_SIZE_SM)}px;
+}}
 """.strip("\n")
 
 

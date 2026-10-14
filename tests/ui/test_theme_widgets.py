@@ -779,6 +779,7 @@ RULES_THAT_SET_A_FONT_SIZE = [
     "QLabel#QueueName", "QLabel#QueueSub", "QLabel#QueueHint",
     "QLabel#InspectorScope", "QLabel#InspectorFile", "QLabel#InspectorSub", "QLabel#Note",
     "QLabel#OcrTime", "QWidget#ActivityStrip QLabel", "QLabel#OpenTitle", "QLabel#OpenError",
+    "QLabel#RecentName", "QLabel#RecentPath", "QLabel#RecentDetail",
     "QLabel#StartError", "QLabel#RunHeaderCell", "QLabel#RunFile, QLabel#RunPhase, QLabel#RunResult",
     "QWidget#RunFooter QLabel", "QLabel#LiveTitle", "QLabel#FeedTime",
     "QLabel#FolderSettingsTitle", "QLabel#EngineSetupTitle", "QLabel#EngineSetupScope, QLabel#EngineSetupNote",

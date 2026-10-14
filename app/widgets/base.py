@@ -241,6 +241,9 @@ class SectionHeader(QWidget):
     def set_text(self, text: str) -> None:
         self._label.setText(text.upper())
 
+    def text(self) -> str:
+        return self._label.text()
+
 
 class SegmentedControl(QWidget):
     """`.rail-head .seg` -- a row of exclusive text segments, e.g. "All 5" /

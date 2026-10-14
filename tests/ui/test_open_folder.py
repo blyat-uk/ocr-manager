@@ -13,12 +13,16 @@ import time
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QMimeData, QSettings, QUrl
+from PyQt6.QtCore import QEvent, QMimeData, QPointF, QSettings, Qt, QUrl
+from PyQt6.QtGui import QEnterEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QApplication, QMessageBox, QWidget
 
+from app.recents import EPISODE, FOLDER
 from app.views import open_folder as open_folder_module
 from app.views.open_folder import (
+    CLEAR_RECENTS_TEXT,
+    RECENTS_TITLE,
     EpisodePicker,
     FolderPicker,
     OpenFolderView,
@@ -26,6 +30,8 @@ from app.views.open_folder import (
     last_dir,
     last_path,
     path_from_mime,
+    recent_entries,
+    record_recent,
     remember_path,
 )
 
@@ -212,6 +218,154 @@ def test_empty_state_offers_an_episode_first_and_a_folder_second(qapp):
     view.choose_button.click()
     assert (episode, folder) == ([1], [1])
     view.deleteLater()
+
+
+# --------------------------------------------------------------------------
+# Recent files & folders
+# --------------------------------------------------------------------------
+
+def paths_of(view) -> list[str]:
+    return [row.entry.path for row in view.recent_rows()]
+
+
+@pytest.fixture
+def library(tmp_path):
+    """A show folder, its season folder and one episode video, recorded
+    oldest first: the show, the season, the episode."""
+    show = tmp_path / "Martial Master"
+    season = show / "Season 2"
+    season.mkdir(parents=True)
+    video = show / "Martial Master - 660.mkv"
+    video.write_bytes(b"")
+    record_recent(str(show), episode=False, count=12)
+    record_recent(str(season), episode=False, count=1)
+    record_recent(str(video), episode=True)
+    return show, season, video
+
+
+def test_with_nothing_opened_yet_there_is_no_recent_section(qapp):
+    view = OpenFolderView()
+    assert view.recent_section.isHidden()
+    assert view.recent_rows() == []
+
+
+def test_recents_are_listed_newest_first_with_what_each_one_is(qapp, library):
+    show, season, video = library
+    view = OpenFolderView()
+    assert not view.recent_section.isHidden()
+    assert view.recent_header.text() == RECENTS_TITLE.upper() == "RECENT FILES & FOLDERS"
+    assert paths_of(view) == [str(video), str(season), str(show)]
+    shown = [(row.kind_badge.text(), row.title_label.full_text(), row.location_label.full_text(),
+              row.detail_label.text()) for row in view.recent_rows()]
+    assert shown == [
+        ("episode", "Martial Master - 660", str(show), "just now"),
+        ("folder", "Martial Master", str(season), "1 episode · just now"),     # a season goes by its show
+        ("folder", "Martial Master", str(show), "12 episodes · just now"),
+    ]
+
+
+def test_opening_one_again_moves_it_to_the_top(qapp, library):
+    show, season, video = library
+    record_recent(str(show), episode=False, count=13)
+    view = OpenFolderView()
+    assert paths_of(view) == [str(show), str(video), str(season)]
+    assert view.recent_rows()[0].detail_label.text() == "13 episodes · just now"
+
+
+def test_a_recent_that_is_gone_is_hidden_but_kept(qapp, tmp_path):
+    here, away = tmp_path / "here", tmp_path / "away"
+    for folder in (here, away):
+        folder.mkdir()
+    record_recent(str(away), episode=False, count=2)
+    record_recent(str(here), episode=False, count=2)
+    away.rmdir()                                       # a drive that is not mounted, say
+    view = OpenFolderView()
+    assert paths_of(view) == [str(here)]
+    away.mkdir()
+    view.refresh_recents()
+    assert paths_of(view) == [str(here), str(away)]
+
+    for folder in (here, away):
+        folder.rmdir()
+    view.refresh_recents()
+    assert view.recent_section.isHidden()
+
+
+def test_clicking_a_recent_or_pressing_enter_on_it_asks_to_open_it(qapp, library):
+    _show, _season, video = library
+    view = OpenFolderView()
+    view.resize(900, 700)
+    view.show()
+    asked = []
+    view.open_recent_requested.connect(asked.append)
+    row = view.recent_rows()[0]
+    QTest.mouseClick(row, Qt.MouseButton.LeftButton)
+    QTest.keyClick(row, Qt.Key.Key_Return)
+    QTest.keyClick(row, Qt.Key.Key_Enter)
+    assert asked == [str(video)] * 3
+    QTest.mouseClick(row, Qt.MouseButton.RightButton)  # only a left click opens
+    assert len(asked) == 3
+
+
+def test_remove_shows_on_hover_and_takes_the_entry_off_the_list(qapp, library):
+    show, season, video = library
+    view = OpenFolderView()
+    row = view.recent_rows()[1]
+    assert row.remove_button.isHidden()
+    QApplication.sendEvent(row, QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5)))
+    assert not row.remove_button.isHidden()
+    QApplication.sendEvent(row, QEvent(QEvent.Type.Leave))
+    assert row.remove_button.isHidden()
+
+    asked = []
+    view.open_recent_requested.connect(asked.append)
+    row.remove_button.click()
+    assert asked == []                                 # removing never opens
+    assert paths_of(view) == [str(video), str(show)]
+    assert [entry.path for entry in recent_entries()] == [str(video), str(show)]
+    assert season.is_dir()                             # the list only: nothing on disk is touched
+
+
+def test_delete_on_a_focused_recent_removes_it(qapp, library):
+    show, season, _video = library
+    view = OpenFolderView()
+    QTest.keyClick(view.recent_rows()[0], Qt.Key.Key_Delete)
+    assert paths_of(view) == [str(season), str(show)]
+
+
+def test_clear_all_asks_first_and_empties_the_list(qapp, library, monkeypatch):
+    replies = [QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes]
+    asked = []
+
+    def question(parent, title, text, buttons, default):
+        asked.append(text)
+        assert default == QMessageBox.StandardButton.No
+        return replies.pop(0)
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+    view = OpenFolderView()
+    view.clear_recents_button.click()
+    assert len(view.recent_rows()) == 3                # "No" keeps them
+    view.clear_recents_button.click()
+    assert asked == [CLEAR_RECENTS_TEXT] * 2
+    assert view.recent_rows() == [] and view.recent_section.isHidden()
+    assert recent_entries() == []
+    assert all(path.exists() for path in library)
+
+
+def test_an_episode_is_recorded_as_one_and_a_folder_with_its_count(qapp, tmp_path):
+    video = tmp_path / "ep01.mkv"
+    video.write_bytes(b"")
+    record_recent(str(tmp_path), episode=False, count=4)
+    record_recent(str(video), episode=True, count=9)   # an episode has no count to keep
+    assert [(entry.path, entry.kind, entry.count) for entry in recent_entries()] == [
+        (str(video), EPISODE, None), (str(tmp_path), FOLDER, 4)]
+
+
+def test_a_damaged_recents_setting_reads_as_none(qapp):
+    open_folder_module.app_settings().setValue(open_folder_module.RECENTS_KEY, "{not json")
+    assert recent_entries() == []
+    assert OpenFolderView().recent_section.isHidden()
 
 
 # --------------------------------------------------------------------------

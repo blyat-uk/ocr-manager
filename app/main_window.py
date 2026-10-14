@@ -103,6 +103,7 @@ from app.views.open_folder import (
     app_settings,
     last_dir,
     path_from_mime,
+    record_recent,
     remember_path,
 )
 from app.views.queue import QueueView
@@ -300,6 +301,7 @@ class MainWindow(QMainWindow):
         self.topbar.mode_changed.connect(self.set_mode)
         self.open_view.choose_requested.connect(self.choose_folder)
         self.open_view.choose_episode_requested.connect(self.choose_episode)
+        self.open_view.open_recent_requested.connect(self.open_path)
         self.prepare_view.review_requested.connect(self.show_episode_review)
         self.prepare_view.start_requested.connect(self.start_run)
         self.done_view.review_requested.connect(self.show_episode_review)
@@ -362,6 +364,7 @@ class MainWindow(QMainWindow):
             message = _open_error_text(path, exc)
             if self.controller.project is None:
                 self.open_view.show_error(message)
+                self.open_view.refresh_recents()     # a recent that is gone leaves the list
             else:
                 self.error_banner.show_message(OPEN_FAILED_TITLE, message, "bad")
 
@@ -379,13 +382,15 @@ class MainWindow(QMainWindow):
             self.choose_folder()
 
     def _on_project_opened(self, path: str) -> None:
+        name = self.controller.episode_name()
         remember_path(path)
+        record_recent(path, episode=name is not None,
+                      count=None if name is not None else len(self.controller.names()))
         self.setWindowTitle(f"{APP_NAME} — {os.path.basename(path) or path}")
         self.open_view.clear_error()
         if self.error_banner.title() != SAVE_FAILED_TITLE:
             self.error_banner.hide()      # an open failure is over; a warning about unsaved work is not
         self.centre.setCurrentWidget(self.workbench)
-        name = self.controller.episode_name()
         self._episode_mode = name is not None
         self.queue.setVisible(not self._episode_mode)
         if self._episode_mode:
@@ -413,6 +418,7 @@ class MainWindow(QMainWindow):
 
     def _on_project_closed(self) -> None:
         self.setWindowTitle(APP_NAME)
+        self.open_view.refresh_recents()
         self.centre.setCurrentWidget(self.open_view)
         self._episode_mode = False
         self.queue.show()

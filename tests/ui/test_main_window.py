@@ -961,6 +961,41 @@ def test_unsupported_version_is_reported_without_closing_the_open_folder(make_wi
     assert window.windowTitle().endswith(os.path.basename(good))
 
 
+def test_opening_a_folder_records_it_as_a_recent_with_its_episodes(make_window, tmp_project):
+    folder = tmp_project(fixture="slay")
+    window = make_window()
+    window.open_folder(str(folder))
+    assert [(entry.path, entry.kind, entry.count) for entry in open_folder_module.recent_entries()] == [
+        (str(folder), "folder", len(SLAY_NAMES))]
+
+
+def test_a_recent_on_the_welcome_screen_opens_it(make_window, tmp_project):
+    older, newer = tmp_project(["a.mkv", "b.mkv"]), tmp_project(fixture="slay")
+    open_folder_module.record_recent(str(older), episode=False, count=2)
+    open_folder_module.record_recent(str(newer), episode=False, count=len(SLAY_NAMES))
+    window = make_window()
+    rows = window.open_view.recent_rows()
+    assert [row.entry.path for row in rows] == [str(newer), str(older)]
+    rows[1].open_requested.emit(rows[1].entry.path)
+    assert window.controller.project.path == str(older)
+    assert window.centre.currentWidget() is window.workbench
+    assert open_folder_module.recent_entries()[0].path == str(older)        # now the newest
+
+
+def test_a_recent_that_vanished_reports_it_and_leaves_the_list(make_window, tmp_project):
+    import shutil
+
+    folder = tmp_project(["a.mkv", "b.mkv"])
+    open_folder_module.record_recent(str(folder), episode=False, count=2)
+    window = make_window()
+    (row,) = window.open_view.recent_rows()
+    shutil.rmtree(folder)                                  # gone between the listing and the click
+    row.open_requested.emit(row.entry.path)
+    assert window.controller.project is None
+    assert not window.open_view.error_label.isHidden()
+    assert window.open_view.recent_rows() == []
+
+
 def test_a_failed_save_is_reported_in_a_banner(slay_window):
     slay_window.controller.save_failed.emit("Could not save /x/.ocr.json: disk full")
     assert not slay_window.error_banner.isHidden()
